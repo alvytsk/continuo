@@ -19,3 +19,13 @@ pub enum DomainError {
     #[error("cannot parse media identity {input:?}: {reason}")]
     InvalidMediaId { input: String, reason: &'static str },
 }
+
+#[derive(Debug, thiserror::Error)]
+pub enum TelemetryError {
+    #[error("invalid tracing filter")]
+    Filter(#[from] tracing_subscriber::filter::ParseError),
+    #[error("RUST_LOG is not valid Unicode")]
+    Environment(#[source] std::env::VarError),
+    #[error("cannot initialize tracing")]
+    Install(#[from] tracing::subscriber::SetGlobalDefaultError),
+}
