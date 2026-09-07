@@ -12,7 +12,7 @@ The canonical position contract is:
 
 > **Position** is the session's logical resume point. It advances from estimated playback of media frames. Stop and transport recreation preserve it; restoration, media selection, explicit restart, and successful seeks establish a new position.
 
-M0 ships values and this documentation only. M1 will implement the in-session position behavior, and M2 will persist it.
+M0 ships values, tracing, repository checks, and this documentation. M1 will implement the in-session position behavior, and M2 will persist it.
 
 ## 2. Execution contexts
 
@@ -59,6 +59,8 @@ Resume capability is derived from continuity and seek support rather than stored
 | `Finite` | `Unsupported` | `Unsupported` |
 | `Finite` | `Native` or `RestartAndDiscard` | `Supported` |
 
+M0 implements this matrix as `MediaCapabilities::resume_capability`.
+
 M0 implements the validating identity types. `FeedId` is a nonempty opaque string assigned by the future subscription layer; it is immutable and is never derived from the mutable feed fetch URL. `EpisodeKey` distinguishes an opaque nonempty GUID from an identity-normalized enclosure or item-link URL. GUIDs are preserved and compared byte-for-byte, including whitespace. Resolution prefers GUID, then enclosure URL, then item link. Enclosure and item-link fallback share the URL namespace, while a GUID that happens to equal a URL cannot collide with them.
 
 `NormalizedUrl` accepts HTTP or HTTPS with a host. The URL parser normalizes scheme, host, and default port; identity normalization removes fragments and preserves query serialization. It is used only for identity. `SourceLocation::Http` retains a separate parsed fetch `Url`, including its fragment and query order and percent-encoding as serialized by `url`; Continuo does not route it through identity normalization. Parsed serialization can differ from the original feed text. If a real signed URL later proves lossy through parsing, M4 may retain the original string alongside the parsed value.
@@ -94,9 +96,9 @@ Current media references one checkpoint per media identity inside the single ato
 
 A single writer's accepted update sequence orders snapshots after generation validation. Neither timestamps nor maximum positions order updates: clocks can move backward, and a deliberate backward seek supersedes an earlier larger position. `updated_at` exists only for human inspection. There is no merge algorithm.
 
-The application captures checkpoints periodically while playing and on pause, stop, track change, and successful seek, then flushes pending state during graceful shutdown. The capture interval and writer's maximum coalescing interval are each bounded to single-digit seconds, which bounds worst-case loss end to end. The writer creates a temporary file in the destination directory, writes and `fsync`s it, renames it over the destination, then `fsync`s the parent directory where supported.
+The application will capture checkpoints periodically while playing and on pause, stop, track change, and successful seek, then flush pending state during graceful shutdown. The capture interval and writer's maximum coalescing interval are each bounded to single-digit seconds, which bounds worst-case loss end to end. The writer will create a temporary file in the destination directory, write and `fsync` it, rename it over the destination, then `fsync` the parent directory where supported.
 
-Every snapshot has `schema_version` from its first write. Malformed and unsupported-version files are preserved and reported rather than overwritten. `Unsupported` or `Undetermined` resume capability never deletes a checkpoint. Completed status is separate from position and is set after output drains. Replay-from-beginning requires explicit completed-status policy in M2. There is no near-end reset: stopping near the end preserves that logical position.
+Every snapshot will have `schema_version` from its first write. Malformed and unsupported-version files are preserved and reported rather than overwritten. `Unsupported` or `Undetermined` resume capability never deletes a checkpoint. Completed status is separate from position and is set after output drains. Replay-from-beginning requires explicit completed-status policy in M2. There is no near-end reset: stopping near the end preserves that logical position.
 
 ## 7. Diagnostics and errors
 

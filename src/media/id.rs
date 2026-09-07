@@ -27,7 +27,9 @@ impl AbsolutePath {
             Some(Component::Prefix(prefix)) => prefix.as_os_str().len(),
             _ => 0,
         };
-        let rooted = &raw[prefix_len..];
+        let rooted = raw
+            .get(prefix_len..)
+            .ok_or_else(|| invalid("unsupported path prefix"))?;
         let tail = rooted
             .strip_prefix(std::path::is_separator)
             .ok_or_else(|| invalid("path must include a root separator"))?;

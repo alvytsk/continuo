@@ -17,4 +17,5 @@ fn startup_is_minimal_and_reports_filter_errors() {
     let stderr = String::from_utf8_lossy(&failure.stderr);
     assert!(stderr.contains("continuo: invalid tracing filter"));
     assert!(stderr.contains("application startup failed"));
+    assert!(stderr.contains("error parsing level filter"));
 }

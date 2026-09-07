@@ -20,7 +20,10 @@ fn main() -> ExitCode {
                 let mut chain = vec![error.to_string()];
                 let mut source = error.source();
                 while let Some(cause) = source {
-                    chain.push(cause.to_string());
+                    let text = cause.to_string();
+                    if chain.last() != Some(&text) {
+                        chain.push(text);
+                    }
                     source = cause.source();
                 }
                 tracing::error!(error = %error, causes = ?chain, "application startup failed");
