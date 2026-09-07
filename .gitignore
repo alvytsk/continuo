@@ -1,0 +1,15 @@
+# Build artifacts
+/target
+
+# Backtrace / debug output
+*.pdb
+
+# Environment
+.env
+.env.local
+
+# Editor / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
