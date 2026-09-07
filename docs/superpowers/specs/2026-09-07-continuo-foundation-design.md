@@ -49,6 +49,13 @@ Persistence performs filesystem work — including `fsync` — on a dedicated wr
 
 Control and audio use different transports. Bounded command/event channels connect the application to the decode worker. A real-time-suitable SPSC ring buffer connects the worker to the callback. No bridge task is mandated; channel types are chosen to fit their endpoints, and a forwarding task is added only if one proves necessary.
 
+Because the event channel is bounded, it is a third blocking point alongside source reads and PCM backpressure, and it needs its own contract:
+
+- **The worker never performs an unbounded blocking send.** Event publication must be non-blocking or cancellable by the shutdown signal. A full event channel must never prevent the worker from processing stop or shutdown.
+- **Progress events may coalesce.** Position updates are keep-latest: dropping intermediate values is harmless, because position is recomputed from the anchor rather than accumulated from the event stream.
+- **Lifecycle and error events retain ordering and are not dropped.** State transitions, seek results, end-of-track, and errors carry information that cannot be reconstructed from a later event. If backpressure threatens these, the correct response is to widen the channel or coalesce progress harder, never to drop them.
+- **A disconnected receiver means shutdown, not failure.** The worker treats it as a shutdown signal and unwinds, rather than retrying or blocking.
+
 ---
 
 ## 3. The canonical position contract
@@ -140,13 +147,15 @@ Identity requirements:
 - **Canonical string form**, percent-encoding each component so `podcast:<feed>/<guid>` is unambiguous regardless of what characters appear in a feed URL or GUID.
 - **Serde uses an explicit string representation** via `#[serde(into = "String", try_from = "String")]`. `Display`/`FromStr` alone do not give JSON map-key serialization; this does.
 - **GUIDs are opaque.** They are never parsed, normalized, or interpreted — only escaped and compared byte-for-byte.
-- **Identity normalization is separate from the fetch URL.** The enclosure URL used to retrieve bytes is stored verbatim, because podcast CDNs sign URLs in the query string and normalizing one breaks it.
+- **Identity normalization is never applied to the fetch URL.** The enclosure URL used to retrieve bytes preserves its query string exactly as parsed — parameter order and percent-encoding included — because CDN signatures are computed over the query. Note the precise claim: host lowercasing and default-port removal do not generally invalidate signed URLs; query rewriting does. The rule is that the fetch URL is never routed through identity normalization, not that identity normalization is inherently destructive.
+- **"Not normalized" is not "byte-identical to the feed."** `Url` stores a parsed serialization, which may differ from the feed's original text (notably in percent-encoding). The contract is that Continuo applies no normalization of its own. If M4 encounters a real signed URL that `Url::parse` round-trips lossily, the remedy is to store the original string alongside the parsed value — deferred until such a case actually appears.
 - **Non-UTF-8 paths are rejected** with a domain error rather than lossily converted. Documented v0.1 limitation.
 - **M0 accepts a validated absolute path and performs no I/O.** `fs::canonicalize` is I/O and belongs at the source-opening boundary in M1.
+- **`AbsolutePath` never collapses `..` lexically.** Collapsing `/a/link/../episode.mp3` to `/a/episode.mp3` is wrong whenever `link` is a symlink, and would attach the checkpoint to the wrong file. Rather than normalize, the constructor **rejects** paths containing `.` or `..`, so the hazard cannot be represented. M1 feeds it the output of `fs::canonicalize`, which resolves symlinks and by construction contains no parent components.
 
 The three inner types are validating newtypes, each rejecting invalid input at construction so that an existing value is always well-formed:
 
-- `AbsolutePath` — a UTF-8, absolute, lexically normalized path. Rejects relative and non-UTF-8 input. Performs no filesystem access.
+- `AbsolutePath` — a UTF-8, absolute path containing no `.` or `..` components. Rejects relative input, non-UTF-8 input, and unresolved parent components. Performs no filesystem access.
 - `EpisodeKey` — an opaque escaped identifier produced by the resolution order below. Never parsed or interpreted after construction.
 - `NormalizedUrl` — a URL normalized for identity purposes only, per the rules below. Never used to fetch bytes.
 
@@ -199,7 +208,8 @@ Rules:
 
 - **One writer serializes snapshots.** Updates coalesce, but a maximum write interval is enforced so continuous playback cannot postpone persistence indefinitely.
 - **Atomic replacement:** write a temporary file in the destination directory, `fsync` it, `rename` it, then `fsync` the parent directory where supported. Rename alone does not guarantee durability across power loss.
-- **Checkpoints are captured** on pause, on stop, on track change, and after successful seeks, with pending state flushed during graceful shutdown.
+- **Checkpoints are captured periodically while playing**, on pause, on stop, on track change, and after successful seeks, with pending state flushed during graceful shutdown. Periodic capture is required, not optional: without it an uninterrupted episode triggers no discrete action for hours and a crash loses all of its progress.
+- **Worst-case loss is bounded end to end.** The capture interval and the writer's maximum coalescing interval together bound how much progress a crash can destroy. Both are bounded to single-digit seconds. Bounding only the writer is insufficient, since a snapshot written promptly still holds a stale position if capture never ran.
 - **`schema_version` is present from the first write.** Malformed or unsupported-version files are preserved and reported, never silently overwritten.
 - **Position is persisted once per media identity**; the current-media field references that identity.
 - Storage lives behind a small concrete persistence module with typed load/save operations. **No repository trait.** Domain types stay free of filesystem paths and serialization details, which is separation enough for a later SQLite migration.
@@ -281,8 +291,9 @@ Implementing the pipeline will reveal protocol details that cannot be guessed �
 - `MediaId` serializes as a JSON **map key** and round-trips
 - Episode identity priority: GUID → enclosure URL → `<link>`
 - URL normalization preserves the query string, drops the fragment, strips the default port, lowercases scheme and host
-- Enclosure URL is stored verbatim and is not normalized
-- Non-UTF-8 paths rejected; relative paths rejected
+- The fetch URL retains query parameter order and percent-encoding, and does not pass through identity normalization
+- `AbsolutePath` rejects non-UTF-8 input, relative paths, and any path containing a `.` or `..` component
+- `AbsolutePath` does not collapse `..`: `/a/link/../episode.mp3` is rejected rather than silently rewritten to `/a/episode.mp3`
 
 ---
 
