@@ -1,5 +1,11 @@
 use crate::error::DomainError;
-use std::path::{Component, Path, PathBuf};
+use percent_encoding::{AsciiSet, CONTROLS, percent_decode_str, utf8_percent_encode};
+use serde::{Deserialize, Serialize};
+use std::{
+    fmt,
+    path::{Component, Path, PathBuf},
+    str::FromStr,
+};
 use url::Url;
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
@@ -106,5 +112,105 @@ impl EpisodeKey {
         Ok(Self(EpisodeIdentity::Url(NormalizedUrl::parse(
             url.as_str(),
         )?)))
+    }
+
+    fn canonical(&self) -> String {
+        match &self.0 {
+            EpisodeIdentity::Guid(guid) => format!("guid:{guid}"),
+            EpisodeIdentity::Url(url) => format!("url:{}", url.as_str()),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[serde(into = "String", try_from = "String")]
+pub enum MediaId {
+    LocalFile(AbsolutePath),
+    PodcastEpisode { feed: FeedId, episode: EpisodeKey },
+    RemoteUrl(NormalizedUrl),
+}
+
+const ID_ESCAPE: &AsciiSet = &CONTROLS.add(b' ').add(b'"').add(b'\\').add(b'%');
+const PODCAST_ESCAPE: &AsciiSet = &ID_ESCAPE.add(b'/');
+
+fn escape(value: &str, set: &'static AsciiSet) -> String {
+    utf8_percent_encode(value, set).to_string()
+}
+
+impl fmt::Display for MediaId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::LocalFile(path) => write!(f, "local:{}", escape(path.as_str(), ID_ESCAPE)),
+            Self::RemoteUrl(url) => write!(f, "remote:{}", escape(url.as_str(), ID_ESCAPE)),
+            Self::PodcastEpisode { feed, episode } => write!(
+                f,
+                "podcast:{}/{}",
+                escape(feed.as_str(), PODCAST_ESCAPE),
+                escape(&episode.canonical(), PODCAST_ESCAPE)
+            ),
+        }
+    }
+}
+
+impl From<MediaId> for String {
+    fn from(value: MediaId) -> Self {
+        value.to_string()
+    }
+}
+
+impl TryFrom<String> for MediaId {
+    type Error = DomainError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        value.parse()
+    }
+}
+
+impl FromStr for MediaId {
+    type Err = DomainError;
+
+    fn from_str(input: &str) -> Result<Self, Self::Err> {
+        let invalid = |reason| DomainError::InvalidMediaId {
+            input: input.into(),
+            reason,
+        };
+        let decode = |part: &str| -> Result<String, DomainError> {
+            percent_decode_str(part)
+                .decode_utf8()
+                .map(|value| value.into_owned())
+                .map_err(|_| invalid("component is not UTF-8"))
+        };
+        let (kind, body) = input
+            .split_once(':')
+            .ok_or_else(|| invalid("missing kind separator"))?;
+        let id = match kind {
+            "local" => Self::LocalFile(AbsolutePath::new(PathBuf::from(decode(body)?))?),
+            "remote" => Self::RemoteUrl(NormalizedUrl::parse(&decode(body)?)?),
+            "podcast" => {
+                let (feed, key) = body
+                    .split_once('/')
+                    .ok_or_else(|| invalid("missing episode separator"))?;
+                let key = decode(key)?;
+                let episode = if let Some(guid) = key.strip_prefix("guid:") {
+                    if guid.is_empty() {
+                        return Err(invalid("empty GUID"));
+                    }
+                    EpisodeKey(EpisodeIdentity::Guid(guid.into()))
+                } else if let Some(url) = key.strip_prefix("url:") {
+                    EpisodeKey(EpisodeIdentity::Url(NormalizedUrl::parse(url)?))
+                } else {
+                    return Err(invalid("unknown episode key kind"));
+                };
+                Self::PodcastEpisode {
+                    feed: FeedId::new(decode(feed)?)?,
+                    episode,
+                }
+            }
+            _ => return Err(invalid("unknown media kind")),
+        };
+        if id.to_string() != input {
+            return Err(invalid("noncanonical representation"));
+        }
+        Ok(id)
     }
 }
