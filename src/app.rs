@@ -255,10 +255,13 @@ fn to_command(key: KeyEvent, mirror: &Mirror) -> Option<PlaybackCommand> {
         KeyCode::Left => Some(PlaybackCommand::SeekBy(-SEEK_STEP_SECS)),
         KeyCode::Right => Some(PlaybackCommand::SeekBy(SEEK_STEP_SECS)),
         KeyCode::Home => Some(PlaybackCommand::Restart),
-        KeyCode::Char('-') => Some(PlaybackCommand::SetVolume(
+        // `+` sits behind Shift on the `=` key on most layouts, while `-` does
+        // not, so binding only `+` makes the two directions asymmetric to press.
+        // Accept the unshifted and shifted spelling of each.
+        KeyCode::Char('-' | '_') => Some(PlaybackCommand::SetVolume(
             mirror.volume.adjusted(-VOLUME_STEP),
         )),
-        KeyCode::Char('+') => Some(PlaybackCommand::SetVolume(
+        KeyCode::Char('+' | '=') => Some(PlaybackCommand::SetVolume(
             mirror.volume.adjusted(VOLUME_STEP),
         )),
         KeyCode::Char('s') => Some(PlaybackCommand::Stop),
@@ -309,4 +312,54 @@ fn format_hms(duration: Duration) -> String {
     let minutes = (total_seconds % 3600) / 60;
     let seconds = total_seconds % 60;
     format!("{hours:02}:{minutes:02}:{seconds:02}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn press(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::empty())
+    }
+
+    /// Default volume is `FULL`, and `adjusted` clamps at 1.0, so a raise test
+    /// has to start below full or it measures the clamp instead of the binding.
+    fn volume_after(code: KeyCode, from: f32) -> Option<f32> {
+        let mirror = Mirror {
+            volume: Volume::new(from),
+            ..Mirror::default()
+        };
+        match to_command(press(code), &mirror) {
+            Some(PlaybackCommand::SetVolume(volume)) => Some(volume.as_gain()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn volume_up_does_not_require_shift() {
+        // `+` shares a key with `=` on most layouts, so binding only `+` makes
+        // turning the volume up need Shift while turning it down does not.
+        let baseline = 0.5;
+        let shifted = volume_after(KeyCode::Char('+'), baseline).expect("+ raises volume");
+        let unshifted = volume_after(KeyCode::Char('='), baseline).expect("= raises volume");
+        assert_eq!(shifted, unshifted);
+        assert!(unshifted > baseline);
+    }
+
+    #[test]
+    fn volume_down_accepts_both_spellings_of_its_key() {
+        let baseline = 0.5;
+        let unshifted = volume_after(KeyCode::Char('-'), baseline).expect("- lowers volume");
+        let shifted = volume_after(KeyCode::Char('_'), baseline).expect("_ lowers volume");
+        assert_eq!(shifted, unshifted);
+        assert!(unshifted < baseline);
+    }
+
+    #[test]
+    fn the_two_directions_are_symmetric_to_press() {
+        // Whatever raises volume must be reachable with the same effort as what
+        // lowers it: an unshifted key exists for each.
+        assert!(volume_after(KeyCode::Char('='), 0.5).is_some());
+        assert!(volume_after(KeyCode::Char('-'), 0.5).is_some());
+    }
 }
