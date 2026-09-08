@@ -54,13 +54,14 @@ Tokio is absent. The worker creates, parks, and destroys the CPAL stream; the ca
 
 ## 4. The shared output link
 
-`Arc<OutputLink>` is the only state shared between worker and callback. It contains no locks reachable from the callback.
+`Arc<OutputLink>` holds the atomics shared between worker and callback. It contains no locks reachable from the callback, and — critically — **no ring endpoints**.
+
+rtrb's `Producer<T>` and `Consumer<T>` are `Send` but **not `Sync`** (they hold a `Cell` cache), and `push` takes `&mut self`, so neither can live behind an `Arc`. Ownership is therefore split, not shared: the callback closure owns `Producer<SpanRecord>` and `Consumer<f32>`; the worker owns `Consumer<SpanRecord>` and `Producer<f32>`. Both rings are created before the stream is built and their endpoints are moved to their owners.
 
 | Field | Writer | Purpose |
 |---|---|---|
 | `control: AtomicU64` | worker | `(gen:u16 \| epoch:u32 \| phase:u8)` |
 | `ack: AtomicU64` | callback | echoes the exact `(gen, epoch)` plus adopted state |
-| `spans: Producer<SpanRecord>` | callback | bounded history ring (rtrb, initial capacity 64) |
 | `rescue: [AtomicU64; 3] + AtomicU8` | callback | last unpublished span, readable only after teardown |
 | `gain: AtomicU32` | worker | target gain, `f32` bit pattern |
 | `xruns`, `spans_dropped`, `faults` | callback | aggregated diagnostics |
@@ -99,6 +100,8 @@ On drain the worker validates monotonic totals and non-overlapping intervals. A 
 
 **Dropped-span recovery.** On push failure the callback replaces a callback-local `pending` record and bumps `spans_dropped`. Every subsequent callback republishes `pending` first — **including while `Frozen` or `Parked`**, which is exactly when the ring is draining. The rule that closes the capture hole: **the callback may not acknowledge `Frozen` or `Parked` while `pending` is `Some`.** The acknowledgment therefore proves the *latest cumulative* record arrived; intermediate records may still have been dropped, which is compatible with degraded timing but is not a completeness claim.
 
+This rule and the worker's wait would deadlock on a saturated ring, so the worker **drains spans continuously while awaiting the acknowledgment**, which is what frees the slot the callback needs. Waiting without draining would time out on a perfectly healthy device.
+
 Because dropping the stream destroys the closure and any state inside it, `pending` is mirrored into the link's `rescue` slot. It is written by the callback with a `Release` validity flag and read **only after teardown has joined the backend thread**, so the read is not concurrent and needs no sequence protocol — the ordering obligation is discharged by the join inside `Drop`. If teardown itself fails and the record cannot be recovered, the worker **preserves the last validated position and marks it `Degraded`**. It never fabricates a position.
 
 `PositionQuality` is `Exact`, `Estimated` (the normal case), or `Degraded`.
@@ -107,8 +110,8 @@ Because dropping the stream destroys the closure and any state inside it, `pendi
 
 Every step carries a deadline of `max(250 ms, 4 output periods)`.
 
-1. **Freeze** — the worker stops producing, publishes `(g, e, Freeze)`. The callback stops popping, emits silence, republishes any `pending`, then acknowledges `(g, e, Frozen)`. The worker **acquire-loads that exact acknowledgment before reading spans**, so an in-flight callback cannot still be submitting media.
-2. **Capture** — the worker derives the final position. Stop, pause and failed seek all land here.
+1. **Freeze** — the worker stops producing and publishes `(g, e, Freeze)`. The callback stops popping, emits silence, republishes any `pending`, then acknowledges `(g, e, Frozen)`. **While waiting, the worker keeps draining the span ring**: the callback cannot acknowledge until `pending` is published, and it cannot publish into a full ring, so a non-draining wait would deadlock and time out on a healthy device.
+2. **Capture** — gated on *both* the exact acknowledgment and a final drain after it, so no already-published span is missed. The worker then derives the final position. Stop, pause and failed seek all land here.
 3. **Discard** — the callback takes `read_chunk(slots())`, `commit_all()` — an O(1) index advance, since `f32` is `Copy` with no `Drop` — then acknowledges `(g, e, Parked)` and **consumes nothing further until it adopts a new phase**. The worker waits on that acknowledgment, never on `slots()`. Waiting on an empty ring alone is unsound: the callback could observe `Discard`, the worker observe an empty ring and refill, and the callback then discard the new PCM.
 4. **Install silently** — the worker sets the anchor, refills, and publishes `(g+1, e', Park)`. The callback zeroes counters, resets span state, acknowledges adoption.
 5. **Release** — `Run` is published **only when the desired state is playing**. A paused install never passes through `Run`, so no audio escapes.
@@ -125,6 +128,7 @@ States: `Idle` → `Loading` → `Playing` ⇄ `Paused` → `Ended`, with `Stopp
 |---|---|---|
 | `Load{start_at}` | **establishes** (media selection / restoration) | new generation, silent install |
 | Seek success | **establishes** at refined `actual_ts` | full handshake |
+| `Restart` | **establishes** at zero, after validation | validate, then full handshake |
 | Seek failure | **preserves** the captured value | see below |
 | `Pause` / `Play` | **preserves**, continues | `Park` / `Run`, same generation, new epoch |
 | `Stop` | **preserves** (the M0 invariant) | Freeze → capture → teardown |
@@ -134,17 +138,17 @@ States: `Idle` → `Loading` → `Playing` ⇄ `Paused` → `Ended`, with `Stopp
 
 **Seek failure is not a transactional rollback.** Symphonia seeking mutates reader state and requires a decoder reset, so the rule is: *preserve the captured logical position; retain the old pipeline only if still valid, otherwise reopen at that position using a fresh generation, or enter `Failed`.* The rejected target is never published as progress.
 
-**Boundary outcomes.** `Play` from `Stopped` reopens at the preserved position and never resets it. `Play` from `Ended` is a no-op plus a warning — **explicit restart is the documented sequence `SeekTo(0)` then `Play`**, bound to `Home`, with `Play` **sequenced on a successful `SeekCompleted`, not enqueued unconditionally**, so a failed restart cannot start playback at the old position. `Play` from `Failed` is rejected; retry is a fresh `Load` at the preserved position. Seek while `Paused` uses the silent install. Seek from `Ended` re-enters `Paused` at the target; from `Idle` it is rejected. Load failure enters `Failed` with the position pinned at the requested `start_at`. Interruption during `Loading` yields `Idle`, or `Stopped` when media was previously loaded; during seeking it yields the captured position under the rule above. Repeated pause and stop requests are idempotent. Negative, non-finite, or overflowing seek input is rejected before dispatch; clamping to duration happens only when duration is known, and the decoder's actual result is still reported.
+**Boundary outcomes.** `Play` from `Stopped` reopens at the preserved position and never resets it. `Play` from `Ended` is a no-op plus a warning — **explicit restart is a single worker-owned `Restart` command**, bound to `Home`. It validates first — open, seek to zero, refine — and starts output only on success, so a failed restart cannot start playback at the old position. Restart is one command rather than an app-sequenced `SeekTo(0)` + `Play` because the app cannot sequence on an acknowledgment that some states never emit (see stopped seeks below); `Restart` works uniformly from `Playing`, `Paused`, `Stopped` and `Ended`. `Play` from `Failed` is rejected; retry is a fresh `Load` at the preserved position. Seek while `Paused` uses the silent install. Seek from `Ended` re-enters `Paused` at the target; from `Idle` it is rejected. Load failure enters `Failed` with the position pinned at the requested `start_at`. Interruption during `Loading` yields `Idle`, or `Stopped` when media was previously loaded; during seeking it yields the captured position under the rule above. Repeated pause and stop requests are idempotent. Negative, non-finite, or overflowing seek input is rejected before dispatch; clamping to duration happens only when duration is known, and the decoder's actual result is still reported.
 
-**Seek while `Stopped` has no transport but still requires validation.** It stores a `requested_target` and emits only a state change; `SeekCompleted` is deferred until the next `Play` opens the decoder, seeks, and refines. An unvalidated target is never reported as an achieved position.
+**Seek while `Stopped` has no transport but still requires validation.** It stores a `requested_target` and emits **`SeekTargetStored{target}`, deliberately not `SeekCompleted`** — validation happens when the next `Play` or `Restart` opens the decoder, seeks and refines, which then emits `SeekCompleted`. The distinct event exists so nothing can wait on an acknowledgment the current state cannot produce. An unvalidated target is never reported as an achieved position.
 
 M1 guarantees preservation for the current session only. It writes no `PlaybackCheckpoint`.
 
 ## 8. Command and event protocol
 
-**Commands:** `Load{media, source, start_at}`, `Play`, `Pause`, `TogglePause`, `SeekTo`, `SeekBy`, `SetVolume`, `Stop`, `Shutdown`.
+**Commands:** `Load{media, source, start_at}`, `Play`, `Pause`, `TogglePause`, `SeekTo`, `SeekBy`, `Restart`, `SetVolume`, `Stop`, `Shutdown`.
 
-**Events:** `Loaded{metadata, capabilities}`, `StateChanged`, `SeekCompleted{requested, actual, refinement_truncated}`, `SeekRejected{reason}`, `VolumeChanged`, `EndOfTrack{position}`, `DeviceRecovered`, `Warning`, `Failed`. Every event carries `session_rev`.
+**Events:** `Loaded{metadata, capabilities}`, `StateChanged`, `SeekCompleted{requested, actual, refinement_truncated}`, `SeekTargetStored{target}`, `SeekRejected{reason}`, `VolumeChanged`, `EndOfTrack{position}`, `DeviceRecovered`, `Warning`, `Failed`. Every event carries `session_rev`.
 
 **Two paths.** Lifecycle and error events use a bounded crossbeam channel — lossless and ordered. Progress is **pulled, not pushed**: the worker replaces a keep-latest `Mutex<Progress>` snapshot (main thread only, never the callback; the critical section copies and returns), and the render tick reads it. Coalescing is structural, so no progress event can displace an ordered lifecycle event.
 
@@ -152,7 +156,7 @@ M1 guarantees preservation for the current session only. It writes no `PlaybackC
 
 **Bounded lossless delivery.** A `pending_events: VecDeque` with a hard cap holds events that could not be sent. **Command admission stops while it is non-empty** — the worker selects only on `send` until the backlog drains — which structurally bounds further command-driven event generation. Backlog processing continues to drain the span ring and service device faults; it is not a bare send loop. Reserved tail slots hold terminal outcomes (`Failed`, `EndOfTrack`, `Stopped`, shutdown acknowledgment) and ordinary events may not occupy them. The implementation plan must enumerate each operation's maximum event count and prove the reserve budget, including simultaneous EOF and output fault.
 
-**Asynchronous generation is bounded too.** An `Xrun` storm cannot exhaust storage: repeating faults increment aggregated counters in the link, and the worker emits at most one rate-limited `Warning` per second carrying the aggregate count.
+**Diagnostics are the one coalescing exception to lossless delivery, and it is deliberate.** Rate-limiting alone does not bound anything: one warning per second still exhausts any finite queue against a receiver that stays connected without draining. So diagnostics are **never queued into `pending_events`**. They live only as aggregated counters in the link, and a `Warning` carrying the running aggregate is emitted solely when an *ordinary* (non-reserved) event slot is already free. If none is free the counters keep accumulating and the next emitted warning reports the larger total — counts survive, individual notifications do not. Lifecycle and terminal events remain lossless and ordered; this exception applies to diagnostics only.
 
 **Stop and shutdown travel out of band.** A sticky `interrupt: AtomicU8` (`STOP`, `SHUTDOWN`) is paired with a **bounded wake channel of capacity 1** that is included in every `select!`; the setter sets bits then `try_send(())`, and a full channel is harmless because one pending wake suffices. An atomic alone cannot wake a blocked `select!`, so the channel is required, not decorative. Shutdown dominates stop. Every worker wait is a `select!` with a timeout — never a bare sleep. Event-receiver disconnection is shutdown: the worker stops retrying delivery and exits.
 
@@ -225,8 +229,8 @@ Tests require no network and no audio hardware. Fixtures are generated locally a
 
 - **`timeline.rs` units:** `now < t0`, dropped spans, overlapping or non-monotonic records, underrun silence, recorded silence, EOF offset within the final buffer, clamping to `[0, k]`.
 - **Production callback core through `TestOutput`:** span publication, gain ramp across stereo, `pending` republication while parked, **dropped-final-span teardown recovery via the rescue slot**.
-- **Handshake:** freeze-then-capture ordering, refill-after-`Parked` only, stale-epoch rejection, paused install never entering `Run`, deadline-to-teardown.
-- **Position contract**, worded from M0: stop preserves, recreation preserves, seek establishes, load establishes; backward seek, failed seek, failed `Home` restart not starting playback.
+- **Handshake:** freeze-then-capture ordering, refill-after-`Parked` only, stale-epoch rejection, paused install never entering `Run`, deadline-to-teardown, and **freeze against a saturated span ring completing without timeout** because the worker drains while waiting.
+- **Position contract**, worded from M0: stop preserves, recreation preserves, seek establishes, load establishes; backward seek, failed seek, `Restart` from `Stopped` and from `Ended`, and a failed `Restart` not starting playback.
 - **Conversion:** differing rates, mono/stereo, partial final blocks, startup delay trim, **EOF tail trimming at a differing rate**.
 - **Backpressure:** saturated command, event, and PCM capacity; command admission; **interrupting a saturated event send** via the wake channel; receiver disconnection; bounded memory.
 - **CLI:** help, invalid input, key handling, interrupt-driven shutdown, all device-free.
