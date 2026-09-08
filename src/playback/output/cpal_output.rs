@@ -28,8 +28,14 @@ impl OutputFault {
             // may jump, so the caller marks position degraded.
             DeviceChanged | Xrun | RealtimeDenied => Self::Recoverable(kind),
             DeviceNotAvailable | StreamInvalidated | DeviceBusy => Self::Rebuild(kind),
-            PermissionDenied | HostUnavailable | UnsupportedConfig => Self::Fatal(kind),
-            // Fallback: one rebuild attempt, then the caller gives up.
+            // `Other` is cpal's own catch-all for genuinely unclassifiable
+            // conditions; cpal documents it as permanent, so no retry is
+            // attempted without host-specific knowledge.
+            PermissionDenied | HostUnavailable | UnsupportedConfig | Other => Self::Fatal(kind),
+            // Fallback: one rebuild attempt, then the caller gives up. `ErrorKind`
+            // is `#[non_exhaustive]`, so this also absorbs any variant cpal adds
+            // in a future release — such a variant should be classified
+            // explicitly once it appears, rather than left to this fallback.
             _ => Self::Rebuild(kind),
         }
     }
@@ -209,6 +215,17 @@ mod tests {
                 matches!(OutputFault::classify(kind), OutputFault::Fatal(kind2) if kind2 == kind)
             );
         }
+    }
+
+    #[test]
+    fn an_unclassifiable_other_error_is_permanent_and_not_retried() {
+        // cpal documents `Other` as its own catch-all for genuinely
+        // unclassifiable conditions and states it is permanent: no retry
+        // strategy is possible without host-specific knowledge.
+        assert!(matches!(
+            OutputFault::classify(ErrorKind::Other),
+            OutputFault::Fatal(ErrorKind::Other)
+        ));
     }
 
     #[test]
