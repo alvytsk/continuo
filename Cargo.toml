@@ -12,6 +12,13 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"
 percent-encoding = "2"
 time = { version = "0.3", features = ["serde", "serde-well-known"] }
+symphonia = { version = "0.6.1", features = ["mp3", "aac", "isomp4", "alac"] }
+cpal = "0.18.2"
+rtrb = "0.4.0"
+rubato = "5.0.0"
+crossbeam-channel = "0.5.17"
+crossterm = "0.29"
+clap = { version = "4", features = ["derive"] }
 
 [dev-dependencies]
 serde_json = "1"

@@ -1,0 +1,772 @@
+//! Harness for the engine contract tests.
+//!
+//! The engine runs on its own thread against a virtual device, so the tests
+//! control time explicitly. The driver thread has two modes:
+//!
+//! * *frozen* — the clock does not move, and the callback runs only while a
+//!   handshake is in flight (any phase but `Run`). Transitions still complete,
+//!   but no audio is consumed and no instant passes, so a position read before
+//!   a command and one read after it are comparable exactly.
+//! * *advancing* — one buffer period of virtual time per step, which is what
+//!   playing audio looks like. Used only to reach the end of a track, where
+//!   how much time passes on the way does not matter.
+//!
+//! Anything that has to stop at a particular point instead steps the clock from
+//! the test thread — `play_for`, `let_time_pass` — so that how far playback ran
+//! is a count this harness kept rather than a consequence of how long the
+//! scheduler kept the test thread away.
+//!
+//! Every assertion about preservation is made with the clock frozen; that is
+//! what makes `assert_eq!` on a position honest rather than flaky.
+
+#![allow(dead_code)]
+
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+
+use crossbeam_channel::Sender;
+
+use continuo::media::id::{AbsolutePath, MediaId};
+use continuo::media::source::SourceLocation;
+use continuo::playback::callback::CallbackCore;
+use continuo::playback::command::PlaybackCommand;
+use continuo::playback::engine::EngineHandle;
+use continuo::playback::error::PlaybackError;
+use continuo::playback::event::{PlaybackEvent, Progress};
+use continuo::playback::link::{OutputLink, Phase};
+use continuo::playback::output::cpal_output::OutputFault;
+use continuo::playback::output::test_output::TestOutput;
+use continuo::playback::output::{AudioOutput, Nanos, NegotiatedOutput, OutputRequest};
+use continuo::playback::state::PlaybackState;
+use continuo::playback::volume::Volume;
+
+const CHANNELS: u16 = 2;
+const RATE: u32 = 48_000;
+/// 2 ms at 48 kHz: one period, and the granularity of the virtual clock.
+const BUFFER_FRAMES: u32 = 96;
+const PERIOD: Duration = Duration::from_millis(2);
+/// Deliberately generous, so that "the ring is empty" and "the last frame has
+/// been heard" are far apart in time and the end-of-track rule is observable.
+const LATENCY: Duration = Duration::from_millis(100);
+const DRIVER_NAP: Duration = Duration::from_micros(500);
+/// Between two periods of a drain that is still producing audio.
+const PACING_NAP: Duration = Duration::from_millis(1);
+/// Between two periods of a drain that has gone silent. Long enough that a
+/// worker thread waiting behind a full CPU has been scheduled and has had its
+/// chance to refill the ring, so silence means the ring is empty rather than
+/// that the machine was busy.
+const SILENCE_GRACE: Duration = Duration::from_millis(25);
+/// How far the harness clock may run ahead of the playback it drives, over and
+/// above the one output latency the pipeline owes it. Ten periods: the engine's
+/// span ring holds 64 records and the callback writes one per period, so this
+/// keeps the backlog an order of magnitude short of losing a span.
+const CLOCK_LEAD_SLACK: Duration = Duration::from_millis(20);
+const PATIENCE: Duration = Duration::from_secs(20);
+
+const FROZEN: u8 = 0;
+const ADVANCING: u8 = 1;
+
+#[allow(clippy::unwrap_used)]
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    // A poisoned harness mutex means a test thread already panicked; there is
+    // nothing better to do than propagate it.
+    mutex.lock().unwrap()
+}
+
+#[allow(clippy::unwrap_used)]
+fn fixture(name: &str) -> AbsolutePath {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(name);
+    AbsolutePath::new(path.canonicalize().unwrap()).unwrap()
+}
+
+struct Device {
+    output: TestOutput,
+    /// Stashed on every `open`, so the harness can reach the counters the
+    /// callback writes without the engine exposing its internals.
+    link: Option<Arc<OutputLink>>,
+}
+
+struct HarnessOutput {
+    device: Arc<Mutex<Device>>,
+}
+
+impl AudioOutput for HarnessOutput {
+    fn negotiate(&mut self, request: &OutputRequest) -> Result<NegotiatedOutput, PlaybackError> {
+        lock(&self.device).output.negotiate(request)
+    }
+
+    fn open(
+        &mut self,
+        config: &NegotiatedOutput,
+        link: Arc<OutputLink>,
+        core: CallbackCore,
+    ) -> Result<(), PlaybackError> {
+        let mut device = lock(&self.device);
+        device.link = Some(Arc::clone(&link));
+        device.output.open(config, link, core)
+    }
+
+    fn now(&self) -> Nanos {
+        lock(&self.device).output.now()
+    }
+
+    fn close(&mut self) {
+        let mut device = lock(&self.device);
+        device.output.close();
+        device.link = None;
+    }
+}
+
+struct Driver {
+    device: Arc<Mutex<Device>>,
+    mode: AtomicU8,
+    /// When set, the callback is not run while the worker is waiting for a
+    /// `Discard` to be acknowledged. Every other phase is answered normally,
+    /// which is what separates this from `silence_the_device`: the recovery
+    /// the timeout drops into still gets a live device to capture from, which
+    /// is the only condition under which a stale timeline can be misread.
+    deaf_to_discard: AtomicBool,
+    stop: AtomicBool,
+}
+
+impl Driver {
+    fn step(&self) {
+        let mut device = lock(&self.device);
+        let phase = device.link.as_ref().map(|link| link.load_control().phase);
+        if self.deaf_to_discard.load(Ordering::Relaxed) && phase == Some(Phase::Discard) {
+            return;
+        }
+        if self.mode.load(Ordering::Relaxed) == ADVANCING {
+            device.output.advance(PERIOD);
+            return;
+        }
+        // Frozen: only run the callback while a transition needs answering.
+        // Running it in `Run` would replay a buffer at an instant that has
+        // already been used, which is not something a device ever does.
+        let running = device
+            .link
+            .as_ref()
+            .is_some_and(|link| link.load_control().phase == Phase::Run);
+        if !running && device.link.is_some() {
+            device.output.pump_in_place();
+        }
+    }
+}
+
+pub struct TestEngine {
+    handle: Mutex<Option<EngineHandle>>,
+    commands: Sender<PlaybackCommand>,
+    faults: Sender<OutputFault>,
+    wake: Sender<()>,
+    device: Arc<Mutex<Device>>,
+    driver: Arc<Driver>,
+    thread: Mutex<Option<JoinHandle<()>>>,
+    inbox: Mutex<Vec<PlaybackEvent>>,
+    states: Mutex<Vec<PlaybackState>>,
+    /// How far `await_state` has consumed the state history. A state the
+    /// engine has already passed through must not satisfy a later wait.
+    consumed_states: Mutex<usize>,
+    draining: AtomicBool,
+}
+
+impl TestEngine {
+    pub fn start(name: &str) -> Self {
+        let device = Arc::new(Mutex::new(Device {
+            output: TestOutput::new(CHANNELS, RATE, BUFFER_FRAMES, LATENCY),
+            link: None,
+        }));
+        let (fault_tx, fault_rx) = crossbeam_channel::bounded(16);
+        let handle = EngineHandle::spawn_with(
+            Box::new(HarnessOutput {
+                device: Arc::clone(&device),
+            }),
+            fault_rx,
+        );
+        let driver = Arc::new(Driver {
+            device: Arc::clone(&device),
+            mode: AtomicU8::new(FROZEN),
+            deaf_to_discard: AtomicBool::new(false),
+            stop: AtomicBool::new(false),
+        });
+        let thread = {
+            let driver = Arc::clone(&driver);
+            std::thread::Builder::new()
+                .name("harness-device".into())
+                .spawn(move || {
+                    while !driver.stop.load(Ordering::Relaxed) {
+                        driver.step();
+                        std::thread::sleep(DRIVER_NAP);
+                    }
+                })
+                .ok()
+        };
+        let mut engine = Self {
+            commands: handle.commands().clone(),
+            wake: handle.wake().clone(),
+            handle: Mutex::new(Some(handle)),
+            faults: fault_tx,
+            device,
+            driver,
+            thread: Mutex::new(thread),
+            inbox: Mutex::new(Vec::new()),
+            states: Mutex::new(Vec::new()),
+            consumed_states: Mutex::new(0),
+            draining: AtomicBool::new(true),
+        };
+        let path = fixture(name);
+        engine.send(PlaybackCommand::Load {
+            media: MediaId::LocalFile(path.clone()),
+            source: SourceLocation::LocalPath(path.as_path().to_path_buf()),
+            start_at: Duration::ZERO,
+        });
+        engine.await_state(PlaybackState::Paused);
+        engine.send(PlaybackCommand::Play);
+        engine.await_state(PlaybackState::Playing);
+        // The events a start-up emits are not what any test is looking at.
+        lock(&engine.inbox).clear();
+        engine
+    }
+
+    // ------------------------------------------------------------- commands
+
+    pub fn send(&mut self, command: PlaybackCommand) {
+        if self.commands.send(command).is_err() {
+            panic!("the engine stopped accepting commands");
+        }
+    }
+
+    pub fn interrupt_stop(&mut self) {
+        if let Some(handle) = lock(&self.handle).as_ref() {
+            handle.interrupt_stop();
+        }
+    }
+
+    /// Inject a fatal device fault, the kind that ends a session.
+    pub fn force_fatal_device_fault(&mut self) {
+        let _ = self
+            .faults
+            .send(OutputFault::Fatal(cpal::ErrorKind::PermissionDenied));
+        let _ = self.wake.try_send(());
+    }
+
+    /// Inject the device fault a vanished output device reports.
+    pub fn force_device_loss(&mut self) {
+        let _ = self
+            .faults
+            .send(OutputFault::Rebuild(cpal::ErrorKind::DeviceNotAvailable));
+        let _ = self.wake.try_send(());
+    }
+
+    /// Answer every handshake phase except `Discard`, which is left to run to
+    /// its deadline. Reversible, so the recovery the timeout triggers can
+    /// complete against a device that works again.
+    pub fn stop_answering_discards(&mut self) {
+        self.driver.deaf_to_discard.store(true, Ordering::Relaxed);
+    }
+
+    pub fn answer_discards_again(&mut self) {
+        self.driver.deaf_to_discard.store(false, Ordering::Relaxed);
+    }
+
+    /// Kill the device: it accepts everything and answers nothing, so every
+    /// handshake wait runs to its deadline. Opt-in and permanent, so a recovery
+    /// that reopens the device still meets a dead one.
+    pub fn silence_the_device(&mut self) {
+        lock(&self.device).output.stop_responding();
+    }
+
+    /// Wait until the worker has published `Freeze`, which is the first thing a
+    /// recovery does. Polling the published phase rather than sleeping a guessed
+    /// interval is what keeps the cancellation test deterministic: the freeze
+    /// then sits on its deadline for as long as the test needs.
+    pub fn await_recovery_capture(&mut self) {
+        let deadline = Instant::now() + PATIENCE;
+        loop {
+            {
+                let device = lock(&self.device);
+                if device
+                    .link
+                    .as_ref()
+                    .is_some_and(|link| link.load_control().phase == Phase::Freeze)
+                {
+                    return;
+                }
+            }
+            if Instant::now() >= deadline {
+                panic!("the worker never began capturing for a recovery");
+            }
+            std::thread::sleep(Duration::from_micros(200));
+        }
+    }
+
+    pub fn inject_xruns(&mut self, count: usize) {
+        let device = lock(&self.device);
+        let Some(link) = device.link.as_ref() else {
+            panic!("no transport is open, so there is nothing to inject into");
+        };
+        for _ in 0..count {
+            link.note_xrun();
+        }
+    }
+
+    /// Commands the worker has not taken off the channel yet. Admission
+    /// closing is otherwise invisible from outside.
+    pub fn pending_commands(&mut self) -> usize {
+        lock(&self.handle)
+            .as_ref()
+            .map_or(0, |handle| handle.commands().len())
+    }
+
+    pub fn drop_event_receiver(&self) {
+        if let Some(handle) = lock(&self.handle).as_mut() {
+            handle.release_events();
+        }
+    }
+
+    // ---------------------------------------------------------------- clock
+
+    /// Held under the device lock, which the driver also takes before reading
+    /// the mode: without it a step already in flight advances the clock after
+    /// the test believes it froze, and a preserved position drifts by a period.
+    fn set_mode(&self, mode: u8) {
+        let _device = lock(&self.device);
+        self.driver.mode.store(mode, Ordering::Relaxed);
+    }
+
+    /// Play until the reported position reaches `target`, and stop there.
+    ///
+    /// The clock is stepped from this thread rather than left to the driver,
+    /// and it stops whenever the worker stops accounting for the steps already
+    /// taken. Neither half is optional. A free-running driver advances virtual
+    /// time on its own schedule, so how far past `target` playback runs is a
+    /// function of how long the scheduler kept the test thread away from the
+    /// position it was watching — under CPU contention that overshot by the
+    /// whole fixture. And a clock this thread steps as fast as it likes is not
+    /// a device either: it outruns the worker, fills the 64-record span ring,
+    /// and leaves the callback holding a span it could not publish, which is a
+    /// state a later device loss is read through instead of the timeline.
+    /// Waiting for the position to move keeps the clock inside what the engine
+    /// has accounted for, so what a test measures here is the pipeline rather
+    /// than the scheduler.
+    pub fn play_for(&mut self, target: Duration) {
+        let deadline = Instant::now() + PATIENCE;
+        let clock_at_entry = self.clock();
+        let position_at_entry = self.raw_position();
+        loop {
+            let position = self.raw_position();
+            if position >= target {
+                break;
+            }
+            if Instant::now() >= deadline {
+                panic!("position never reached {target:?}; it stalled at {position:?}");
+            }
+            // How far the clock has run beyond the playback it is supposed to
+            // be driving. One output latency of it is the pipeline and cannot
+            // be helped: a span is published a latency before it is heard.
+            // Anything past that is the worker not having caught up, and is
+            // where the clock waits.
+            let lead = self
+                .clock()
+                .saturating_sub(clock_at_entry)
+                .saturating_sub(position.saturating_sub(position_at_entry));
+            if lead < LATENCY + CLOCK_LEAD_SLACK {
+                lock(&self.device).output.advance(PERIOD);
+            }
+            self.pump_events();
+            std::thread::sleep(PACING_NAP);
+        }
+        self.settle();
+    }
+
+    pub fn play_to_end(&mut self) {
+        self.set_mode(ADVANCING);
+        let deadline = Instant::now() + PATIENCE;
+        while !self.take_state(PlaybackState::Ended) {
+            if Instant::now() >= deadline {
+                self.set_mode(FROZEN);
+                panic!("the track never ended");
+            }
+            self.pump_events();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        self.set_mode(FROZEN);
+        self.settle();
+    }
+
+    /// Advance one period at a time until the callback has been handed nothing
+    /// but silence twice running, which is what an empty ring sounds like, and
+    /// stop there. The output latency means the final span's predicted play
+    /// time is still far ahead, so end of track must not have fired yet.
+    pub fn drain_ring_without_advancing_clock(&mut self) {
+        let deadline = Instant::now() + PATIENCE;
+        let mut silent = 0;
+        while silent < 2 {
+            if Instant::now() >= deadline {
+                panic!("the ring never drained");
+            }
+            {
+                let mut device = lock(&self.device);
+                device.output.clear_captured();
+                device.output.advance(PERIOD);
+                if device.output.captured().iter().all(|sample| *sample == 0.0) {
+                    silent += 1;
+                } else {
+                    silent = 0;
+                }
+            }
+            // Paced so the worker is never the reason the ring runs dry. Once a
+            // period has come back silent the pause gets much longer, because
+            // from here on the question is no longer how fast the ring drains
+            // but whether it is really empty: a worker that a loaded machine
+            // descheduled would refill it given the chance, and the point of
+            // waiting is to give it that chance before calling the ring dry.
+            let pause = if silent > 0 {
+                SILENCE_GRACE
+            } else {
+                PACING_NAP
+            };
+            std::thread::sleep(pause);
+        }
+        self.pump_events();
+    }
+
+    /// Let virtual time pass without asking anything of the engine. Used to
+    /// show that a parked transport does not move the position.
+    pub fn let_time_pass(&mut self, span: Duration) {
+        self.advance_clock(span);
+        self.settle();
+    }
+
+    pub fn advance_past_output_latency(&mut self) {
+        self.advance_clock(LATENCY + LATENCY);
+        self.pump_events();
+    }
+
+    /// Advance the virtual clock by `span`, a period at a time, and do not
+    /// return until all of it has passed.
+    ///
+    /// The amount is what the caller asked for rather than whatever fitted in a
+    /// real-time budget: a truncated advance is indistinguishable from an
+    /// engine that failed to move, and on a loaded machine it is the budget
+    /// that runs out first. The real-time bound is only a deadlock guard, and
+    /// reaching it is a failure rather than an early exit.
+    fn advance_clock(&mut self, span: Duration) {
+        let deadline = Instant::now() + PATIENCE;
+        let mut advanced = Duration::ZERO;
+        while advanced < span {
+            if Instant::now() >= deadline {
+                panic!("only {advanced:?} of the requested {span:?} of virtual time passed");
+            }
+            lock(&self.device).output.advance(PERIOD);
+            advanced += PERIOD;
+            std::thread::sleep(Duration::from_micros(200));
+        }
+    }
+
+    // --------------------------------------------------------------- events
+
+    fn pump_events(&self) {
+        if !self.draining.load(Ordering::Relaxed) {
+            return;
+        }
+        let handle = lock(&self.handle);
+        let Some(handle) = handle.as_ref() else {
+            return;
+        };
+        while let Ok(event) = handle.events().try_recv() {
+            if let PlaybackEvent::StateChanged { state, .. } = &event {
+                lock(&self.states).push(*state);
+            }
+            lock(&self.inbox).push(event);
+        }
+    }
+
+    pub fn stop_draining_events(&mut self) {
+        self.draining.store(false, Ordering::Relaxed);
+    }
+
+    pub fn resume_draining_events(&mut self) {
+        self.draining.store(true, Ordering::Relaxed);
+        self.pump_events();
+    }
+
+    pub fn try_event(&mut self) -> Option<PlaybackEvent> {
+        self.pump_events();
+        let mut inbox = lock(&self.inbox);
+        if inbox.is_empty() {
+            None
+        } else {
+            Some(inbox.remove(0))
+        }
+    }
+
+    pub fn await_event(&mut self, predicate: impl Fn(&PlaybackEvent) -> bool) -> PlaybackEvent {
+        let deadline = Instant::now() + PATIENCE;
+        loop {
+            self.pump_events();
+            {
+                let mut inbox = lock(&self.inbox);
+                if let Some(index) = inbox.iter().position(&predicate) {
+                    return inbox.remove(index);
+                }
+            }
+            if Instant::now() >= deadline {
+                panic!("no matching event arrived; saw {:?}", lock(&self.inbox));
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    pub fn count_events(&mut self, predicate: impl Fn(&PlaybackEvent) -> bool) -> usize {
+        // Give anything still in flight a moment to arrive.
+        let until = Instant::now() + Duration::from_millis(200);
+        while Instant::now() < until {
+            self.pump_events();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        lock(&self.inbox).iter().filter(|e| predicate(e)).count()
+    }
+
+    /// Consume the next occurrence of `state` from the history, if it has
+    /// happened yet.
+    fn take_state(&self, state: PlaybackState) -> bool {
+        let states = lock(&self.states);
+        let mut consumed = lock(&self.consumed_states);
+        match states[*consumed..].iter().position(|s| *s == state) {
+            Some(offset) => {
+                *consumed += offset + 1;
+                true
+            }
+            None => false,
+        }
+    }
+
+    pub fn await_state(&mut self, state: PlaybackState) {
+        let deadline = Instant::now() + PATIENCE;
+        loop {
+            self.pump_events();
+            if self.take_state(state) {
+                return;
+            }
+            if Instant::now() >= deadline {
+                panic!(
+                    "the engine never reached {state:?}; it went through {:?}",
+                    lock(&self.states)
+                );
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    pub fn state(&mut self) -> PlaybackState {
+        self.pump_events();
+        lock(&self.states)
+            .last()
+            .copied()
+            .unwrap_or(PlaybackState::Idle)
+    }
+
+    // ------------------------------------------------------------- progress
+
+    pub fn progress(&mut self) -> Progress {
+        match lock(&self.handle).as_ref() {
+            Some(handle) => handle.progress(),
+            None => panic!("the engine is gone"),
+        }
+    }
+
+    fn raw_position(&mut self) -> Duration {
+        self.progress().position
+    }
+
+    /// The virtual device's clock.
+    fn clock(&self) -> Duration {
+        Duration::from_nanos(lock(&self.device).output.now().0)
+    }
+
+    /// The published position, once the worker has had a chance to publish
+    /// everything the frozen clock implies. Reading straight after a command
+    /// would otherwise see the snapshot from before it was dispatched.
+    pub fn position(&mut self) -> Duration {
+        self.settle();
+        self.raw_position()
+    }
+
+    /// Wait until the published position accounts for every span the callback
+    /// has produced. Only meaningful with the clock frozen, which is the only
+    /// time a test compares positions.
+    ///
+    /// A round trip through the worker, not "the number stopped changing for a
+    /// while". The worker drains the span ring and republishes the position at
+    /// the top of every pass of its loop and dispatches commands at the bottom,
+    /// so an event answering a command sent from here proves a whole pass ran
+    /// after the last span was published — and with the clock frozen and the
+    /// callback idle, no further span can appear. Watching the number for
+    /// stability instead mistakes a worker a loaded machine has merely
+    /// descheduled for one that has finished, and the position read then is
+    /// short by whatever the worker had not yet drained.
+    fn settle(&mut self) {
+        if !self.draining.load(Ordering::Relaxed) {
+            // Nothing is reading the event channel, so no answer can arrive.
+            return;
+        }
+        // Idempotent: full volume is what the engine starts at, and no test
+        // changes the volume before comparing positions.
+        self.send(PlaybackCommand::SetVolume(Volume::FULL));
+        let deadline = Instant::now() + PATIENCE;
+        loop {
+            self.pump_events();
+            {
+                let mut inbox = lock(&self.inbox);
+                let answer = inbox
+                    .iter()
+                    .position(|e| matches!(e, PlaybackEvent::VolumeChanged { .. }));
+                if let Some(index) = answer {
+                    inbox.remove(index);
+                    return;
+                }
+            }
+            if Instant::now() >= deadline {
+                panic!("the worker never answered the barrier the position is read behind");
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    pub fn join_within(&self, patience: Duration) -> bool {
+        let deadline = Instant::now() + patience;
+        loop {
+            {
+                let handle = lock(&self.handle);
+                match handle.as_ref() {
+                    Some(handle) if handle.is_finished() => return true,
+                    None => return true,
+                    _ => {}
+                }
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+}
+
+impl Drop for TestEngine {
+    fn drop(&mut self) {
+        // Shut the worker down first: it needs the device thread alive to
+        // answer the handshakes its teardown performs.
+        let handle = lock(&self.handle).take();
+        if let Some(handle) = handle {
+            handle.interrupt_shutdown();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !handle.is_finished() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            handle.join();
+        }
+        self.driver.stop.store(true, Ordering::Relaxed);
+        if let Some(thread) = lock(&self.thread).take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// Load `name` against a device that negotiates `channels` output channels, and
+/// return the message of the failure it produces.
+///
+/// Deliberately not a `TestEngine`: the engine never reaches `Paused` here, so
+/// there is no transport to drive and nothing for the driver thread to do.
+pub fn load_failure_on_device(name: &str, channels: u16) -> String {
+    let device = Arc::new(Mutex::new(Device {
+        output: TestOutput::new(channels, RATE, BUFFER_FRAMES, LATENCY),
+        link: None,
+    }));
+    // Held for the call's duration, so the worker's fault receiver stays live.
+    let (_faults, fault_rx) = crossbeam_channel::bounded(16);
+    let handle = EngineHandle::spawn_with(
+        Box::new(HarnessOutput {
+            device: Arc::clone(&device),
+        }),
+        fault_rx,
+    );
+    let path = fixture(name);
+    let sent = handle.commands().send(PlaybackCommand::Load {
+        media: MediaId::LocalFile(path.clone()),
+        source: SourceLocation::LocalPath(path.as_path().to_path_buf()),
+        start_at: Duration::ZERO,
+    });
+    if sent.is_err() {
+        panic!("the engine stopped accepting commands");
+    }
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        while let Ok(event) = handle.events().try_recv() {
+            if let PlaybackEvent::Failed { message, .. } = event {
+                return message;
+            }
+        }
+        if Instant::now() >= deadline {
+            panic!("the load never failed");
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// Load a path that cannot be opened, and report where the engine left the
+/// position once it entered `Failed`.
+///
+/// A failed load must pin the position at the requested `start_at`, so a retry
+/// resumes where the caller asked rather than at the beginning.
+// `clippy.toml`'s test exemption covers `#[test]` fns, not bare helpers here.
+#[allow(clippy::expect_used)]
+pub fn failed_load_position(
+    missing: &std::path::Path,
+    start_at: Duration,
+) -> (PlaybackState, Duration) {
+    let device = Arc::new(Mutex::new(Device {
+        output: TestOutput::new(CHANNELS, RATE, BUFFER_FRAMES, LATENCY),
+        link: None,
+    }));
+    let (_faults, fault_rx) = crossbeam_channel::bounded(16);
+    let handle = EngineHandle::spawn_with(
+        Box::new(HarnessOutput {
+            device: Arc::clone(&device),
+        }),
+        fault_rx,
+    );
+    let id = MediaId::LocalFile(
+        continuo::media::id::AbsolutePath::new(missing.to_path_buf()).expect("absolute path"),
+    );
+    handle
+        .commands()
+        .send(PlaybackCommand::Load {
+            media: id,
+            source: SourceLocation::LocalPath(missing.to_path_buf()),
+            start_at,
+        })
+        .expect("engine accepts the load");
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        if let Ok(PlaybackEvent::StateChanged {
+            state: PlaybackState::Failed,
+            ..
+        }) = handle.events().recv_timeout(Duration::from_millis(50))
+        {
+            break;
+        }
+        if Instant::now() > deadline {
+            panic!("the engine never reported a failed load");
+        }
+    }
+    let progress = handle.progress();
+    let state = PlaybackState::Failed;
+    handle.interrupt_shutdown();
+    handle.join();
+    (state, progress.position)
+}

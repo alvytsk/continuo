@@ -12,7 +12,7 @@ The canonical position contract is:
 
 > **Position** is the session's logical resume point. It advances from estimated playback of media frames. Stop and transport recreation preserve it; restoration, media selection, explicit restart, and successful seeks establish a new position.
 
-M0 ships values, tracing, repository checks, and this documentation. M1 will implement the in-session position behavior, and M2 will persist it.
+M0 ships values, tracing, repository checks, and this documentation. M1 ships the in-session position behavior described below; M2 will persist it.
 
 ## 2. Execution contexts
 
@@ -20,7 +20,7 @@ The future runtime has four execution contexts with strict ownership:
 
 | Context | Owns | Must not |
 |---|---|---|
-| Tokio tasks | Application orchestration, HTTP fetching, feed parsing, timers | Touch decoder or output-device state |
+| Application (main thread) | The application context is the main thread: it reads keys, renders status, and owns the command sender and event receiver. Tokio arrives with M3's networking, not before. | Hold a decoder or a CPAL stream |
 | Decode thread (`std::thread`) | Symphonia demux/decode, resampling, command processing, PCM production, position anchoring, **the CPAL stream's full lifecycle** | Block on the Tokio runtime |
 | CPAL callback | Drain a bounded SPSC ring buffer, emit silence on underrun, publish a frame counter | Lock, allocate, wait, or perform I/O |
 | Persistence writer thread | Serialize and atomically write state snapshots | Run on Tokio's executor |
@@ -33,7 +33,7 @@ The rule against blocking on Tokio still permits cancellable synchronous waits o
 
 Command and event channels will be bounded. The worker must never block indefinitely while publishing an event. Progress is keep-latest and intermediate progress may be coalesced. Lifecycle events, seek results, end-of-track events, and errors remain ordered and lossless. Pressure is handled by widening the bounded channel or coalescing progress more aggressively, never by dropping lifecycle or error events. A disconnected event receiver means shutdown, so the worker unwinds instead of retrying.
 
-M1 will choose concrete channels and protocol enums. No bridge task is assumed; one is added only if the chosen endpoints require it.
+M1 ships this as two bounded `crossbeam-channel` queues plus a keep-latest snapshot, wired by `EngineHandle`. `PlaybackCommand` (`Load`, `Play`, `Pause`, `TogglePause`, `SeekTo`, `SeekBy`, `Restart`, `SetVolume`, `Stop`, `Shutdown`) is the application-to-worker protocol; `PlaybackEvent` (`Loaded`, `StateChanged`, `SeekCompleted`, `SeekTargetStored`, `SeekRejected`, `VolumeChanged`, `EndOfTrack`, `DeviceRecovered`, `Warning`, `Failed`) is the worker-to-application protocol, and every variant carries the `session_rev` the mirror keys its rendering on. The event channel reserves a fixed tail (`RESERVED_EVENT_SLOTS`) that ordinary events may not occupy but terminal outcomes may — `Failed`, `EndOfTrack`, and any `StateChanged` into `Stopped`, `Ended`, or `Failed` (`PlaybackEvent::is_terminal`) — so a full backlog of ordinary events can never starve the outcome the application is waiting to react to. Diagnostics (dropped spans, output xruns) do not enter this channel as individual events; they accumulate and are periodically coalesced into a single aggregated `Warning`, keeping the lossless guarantee scoped to lifecycle and error events rather than per-occurrence noise. `Progress` (`session_rev`, `media`, `position`, `quality`) is a separate `Mutex`-guarded keep-latest snapshot read with `EngineHandle::progress()`; because it is refreshed independently of the event stream, a consumer must accept a snapshot only when its `session_rev` matches the session it believes is current (see §4) rather than assuming the two stay in lockstep. No bridge task was needed: the application thread owns both endpoints directly.
 
 ## 4. Position accounting
 
@@ -44,6 +44,10 @@ Only media frames advance position. Silence inserted during underrun or pause do
 Buffer invalidation, callback handoff, and progress publication form one coordinated transition. Generation tags alone do not make that transition safe, and progress is accepted only from a coherent anchor/counter snapshot for the active generation. Buffering reads ring occupancy directly. `decoded_position` and occupancy are diagnostics rather than domain state.
 
 Decoder EOF does not mean output has drained: buffered audio can remain after decoding finishes. Completion is recorded only after output drain.
+
+M1 derives position from media spans rather than a shared counter. The realtime CPAL callback never locks or allocates; instead, on every fill it pushes a `SpanRecord { generation, media_total_after, t0, frames }` — the media-frame total reached and the predicted device playback instant `t0` it starts at — into a lock-free SPSC ring (`rtrb`) read by the worker. The worker's `Timeline` accepts spans tagged with the current generation, discards spans from a retired generation (a stale callback finishing after a rebuild cannot rewind position), and reconstructs `played_frames` at a queried instant by locating the span that instant falls in and interpolating within it; queried before the first span or past the last known span it clamps rather than extrapolating. An interpolated read reports `PositionQuality::Estimated`; a dropped span (the ring was full) or overlapping spans (the callback's clock moved non-monotonically) cannot be interpolated safely and report `PositionQuality::Degraded` until the next clean span arrives. Position is `PositionQuality::Exact` only immediately after an event that establishes it outright — load, restart, or a completed seek — before any span has been read back.
+
+Transitions between callback phases (`Run`, `Freeze`, `Discard`, `Park`) are coordinated by an acknowledged handshake (`Handshake` over `OutputLink`) rather than by hoping the callback notices new state on its own. The worker publishes one `Control { generation, epoch, phase }` word; the callback reads it, acts, and hands back an acknowledgment carrying the same epoch. Every transition increments the epoch first, so a stale acknowledgment from a phase the worker already moved past is distinguishable from the current one and cannot be mistaken for it. Every wait on an acknowledgment carries a deadline (250 ms); a timeout does not mean the request failed outright, it means *attempt teardown and recovery* — the worker tears the transport down and reopens it at the preserved position, because the underlying ALSA/PipeWire/PulseAudio stream joins its backend thread on `Drop` with no timeout of its own, so the deadline bounds only the handshake wait, not end-to-end recovery.
 
 ## 5. Identity and capabilities
 
