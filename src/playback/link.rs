@@ -225,12 +225,19 @@ mod tests {
     #[test]
     fn a_stale_epoch_acknowledgment_is_distinguishable() {
         // Repeated same-generation Park/Run transitions must not accept an old
-        // acknowledgment, which is why every publication bumps the epoch.
+        // acknowledgment, which is why every publication bumps the epoch. Vary
+        // only the epoch here so its contribution to the packed word is
+        // isolated from the Adopted tag.
         let link = OutputLink::new();
         link.acknowledge(3, 10, Adopted::Parked);
         assert_eq!(link.load_ack(), (3, 10, Adopted::Parked));
-        link.acknowledge(3, 11, Adopted::Running);
+        link.acknowledge(3, 11, Adopted::Parked);
         assert_ne!(link.load_ack(), (3, 10, Adopted::Parked));
+        assert_eq!(link.load_ack(), (3, 11, Adopted::Parked));
+
+        // The Adopted variant is independently distinguishable too.
+        link.acknowledge(3, 11, Adopted::Running);
+        assert_ne!(link.load_ack(), (3, 11, Adopted::Parked));
         assert_eq!(link.load_ack(), (3, 11, Adopted::Running));
     }
 
