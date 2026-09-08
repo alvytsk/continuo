@@ -991,7 +991,10 @@ mod tests {
             pcm_tx.push(0.5).unwrap();
         }
         link.publish_control(Control { generation: 1, epoch: 1, phase: Phase::Run });
-        out.advance(Duration::from_millis(20));      // fills the 1-slot span ring, then drops one
+        // Three callbacks: the first publishes, the second is retained as
+        // `pending`, the third displaces that retained record - the first
+        // actual loss. A retained span is not a lost one.
+        out.advance(Duration::from_millis(30));
         assert!(link.take_diagnostics().spans_dropped >= 1);
 
         link.publish_control(Control { generation: 1, epoch: 2, phase: Phase::Freeze });
@@ -1338,6 +1341,7 @@ git commit -m "Add allocation-free callback core and virtual-clock test output"
   - `pub fn discard(&mut self, pump: &mut dyn FnMut(), deadline: Duration) -> Result<(), HandshakeError>`
   - `pub fn install(&mut self, generation: u16, playing: bool, pump: &mut dyn FnMut(), deadline: Duration) -> Result<(), HandshakeError>`
   - `pub fn park(&mut self, pump: &mut dyn FnMut(), deadline: Duration) -> Result<(), HandshakeError>`
+  - Private `await_ack(&mut self, epoch, expected, timeline: Option<&mut Timeline>, pump, deadline)` — the timeline is `Some` only for the freeze wait
   - `pub fn start_running(&mut self, generation: u16)`, `pub fn drain_spans(&mut self, &mut Timeline)`, `pub fn generation(&self) -> u16`, `pub fn next_epoch(&mut self) -> u32`
 
 `pump` is the caller-supplied "let the output make progress" closure — in tests it advances `TestOutput`; in production it is a short `select!` on the wake channel, so every wait is interruptible by stop and shutdown.
@@ -1575,7 +1579,7 @@ impl Handshake {
             epoch,
             phase: Phase::Park,
         });
-        self.await_ack(epoch, Adopted::Parked, pump, deadline)
+        self.await_ack(epoch, Adopted::Parked, None, pump, deadline)
     }
 
     /// Step 1 and 2: freeze submission, then capture the final played position.
@@ -1596,7 +1600,10 @@ impl Handshake {
             epoch,
             phase: Phase::Freeze,
         });
-        self.await_ack(epoch, Adopted::Frozen, pump, deadline)?;
+        // The wait must ACCEPT the spans it drains, not discard them: draining
+        // is what frees the slot the callback needs, and those same records are
+        // the ones the capture is computed from.
+        self.await_ack(epoch, Adopted::Frozen, Some(timeline), pump, deadline)?;
         // A final drain after the acknowledgment, so no published span is missed.
         self.drain_spans(timeline);
         Ok(timeline.played_frames(clock()))
@@ -1610,7 +1617,7 @@ impl Handshake {
             epoch,
             phase: Phase::Discard,
         });
-        self.await_ack(epoch, Adopted::Parked, pump, deadline)
+        self.await_ack(epoch, Adopted::Parked, None, pump, deadline)
     }
 
     /// Steps 4 and 5: adopt the new generation parked, and release to `Run` only
@@ -1626,7 +1633,7 @@ impl Handshake {
         let epoch = self.next_epoch();
         self.link
             .publish_control(Control { generation, epoch, phase: Phase::Park });
-        self.await_ack(epoch, Adopted::Parked, pump, deadline)?;
+        self.await_ack(epoch, Adopted::Parked, None, pump, deadline)?;
         if playing {
             let epoch = self.next_epoch();
             self.link
@@ -1643,10 +1650,14 @@ impl Handshake {
         }
     }
 
+    /// `timeline` is `Some` only while freezing, where the drained records are
+    /// the ones the capture is computed from. Every other transition is about to
+    /// void this generation, so its records are discarded.
     fn await_ack(
         &mut self,
         epoch: u32,
         expected: Adopted,
+        mut timeline: Option<&mut Timeline>,
         pump: &mut dyn FnMut(),
         deadline: Duration,
     ) -> Result<(), HandshakeError> {
@@ -1654,7 +1665,11 @@ impl Handshake {
         loop {
             // Draining is what frees the slot the callback needs to publish its
             // pending span, which is what unblocks the acknowledgment.
-            while let Ok(_record) = self.spans.pop() {}
+            while let Ok(record) = self.spans.pop() {
+                if let Some(timeline) = timeline.as_deref_mut() {
+                    timeline.accept(record);
+                }
+            }
             let (generation, acked_epoch, adopted) = self.link.load_ack();
             if generation == self.generation && acked_epoch == epoch && adopted == expected {
                 return Ok(());
@@ -2536,8 +2551,8 @@ use crate::playback::callback::CallbackCore;
 use crate::playback::error::PlaybackError;
 use crate::playback::link::OutputLink;
 
+// `pub mod test_output;` was added by Task 4 - do not re-declare it here.
 pub mod cpal_output;
-pub mod test_output;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct OutputRequest {
@@ -2722,6 +2737,42 @@ impl CpalOutput {
     }
 }
 ```
+
+Task 4 created `TestOutput` before this trait existed, so implement the trait for it here — both implementations belong beside the trait, and Task 9's `TestEngine` needs it:
+
+```rust
+// src/playback/output/test_output.rs — append
+impl super::AudioOutput for TestOutput {
+    fn negotiate(&mut self, _request: &super::OutputRequest)
+        -> Result<super::NegotiatedOutput, crate::playback::error::PlaybackError> {
+        Ok(super::NegotiatedOutput {
+            sample_rate: self.sample_rate,
+            channels: self.channels,
+            buffer_frames: self.buffer_frames,
+        })
+    }
+
+    fn open(
+        &mut self,
+        _config: &super::NegotiatedOutput,
+        _link: std::sync::Arc<crate::playback::link::OutputLink>,
+        core: crate::playback::callback::CallbackCore,
+    ) -> Result<(), crate::playback::error::PlaybackError> {
+        self.attach(core);
+        Ok(())
+    }
+
+    fn now(&self) -> super::Nanos {
+        self.now
+    }
+
+    fn close(&mut self) {
+        self.core = None;
+    }
+}
+```
+
+`TestOutput` must be `Send` for `Box<dyn AudioOutput>`; it already is, since `CallbackCore` owns only `Send` ring endpoints and an `Arc<OutputLink>`.
 
 - [ ] **Step 4: Run the tests and confirm they pass**
 
@@ -3076,6 +3127,7 @@ struct Worker {
     volume: Volume,
     pushed_total: u64,
     decoder_drained: bool,
+    receivers_gone: bool,
     pending_events: VecDeque<PlaybackEvent>,
     progress: Arc<Mutex<Progress>>,
     commands: Receiver<PlaybackCommand>,
@@ -3128,8 +3180,11 @@ impl Worker {
             }
             self.check_end_of_track();
 
-            // A disconnected event receiver is shutdown.
-            if self.events.is_full() && self.events.is_empty() {
+            // A disconnected event receiver is shutdown. Detected from the
+            // channel's own errors - `SendError` when flushing events, and
+            // `RecvError` above when the command sender is gone - never from
+            // channel occupancy, which says nothing about connectedness.
+            if self.receivers_gone {
                 self.shutdown();
                 return;
             }
@@ -3140,7 +3195,7 @@ impl Worker {
     fn do_stop(&mut self) { /* freeze, capture, teardown; position preserved */ }
     fn publish_progress(&mut self) { /* replace the snapshot; nothing else in the lock */ }
     fn service_faults(&mut self) { /* classify; recover, rebuild, or fail */ }
-    fn flush_events(&mut self) { /* honour RESERVED_EVENT_SLOTS */ }
+    fn flush_events(&mut self) { /* honour RESERVED_EVENT_SLOTS; SendError sets receivers_gone */ }
     fn emit_aggregated_warning_if_slot_free(&mut self) { /* counters, not a queue */ }
     fn pump_audio(&mut self) { /* decode, convert, push; wake-channel backpressure */ }
     fn check_end_of_track(&mut self) { /* played == pushed AND last span's end passed */ }
