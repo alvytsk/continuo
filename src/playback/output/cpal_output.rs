@@ -101,17 +101,24 @@ impl AudioOutput for CpalOutput {
             config
         } else {
             let wanted = config.sample_rate();
-            let mut ranges = device
+            // Filter on channel count as well as format. This milestone drives
+            // mono or stereo only, and the engine refuses anything wider, so a
+            // six-channel f32 range is not a usable answer even though it is an
+            // f32 one - picking it would refuse a device that offers stereo.
+            let usable = |range: &cpal::SupportedStreamConfigRange| {
+                range.sample_format() == cpal::SampleFormat::F32
+                    && matches!(range.channels(), 1 | 2)
+            };
+            let chosen = device
                 .supported_output_configs()
                 .map_err(PlaybackError::Output)?
-                .filter(|range| range.sample_format() == cpal::SampleFormat::F32);
-            let chosen = ranges
+                .filter(usable)
                 .find_map(|range| range.try_with_sample_rate(wanted))
                 .or_else(|| {
                     device
                         .supported_output_configs()
                         .ok()?
-                        .filter(|range| range.sample_format() == cpal::SampleFormat::F32)
+                        .filter(usable)
                         .map(|range| {
                             let rate = range.max_sample_rate();
                             range.with_sample_rate(rate)
@@ -124,7 +131,7 @@ impl AudioOutput for CpalOutput {
                     return Err(PlaybackError::UnsupportedInput {
                         path: Default::default(),
                         reason: format!(
-                            "the audio device offers no f32 configuration \
+                            "the audio device offers no mono or stereo f32 configuration \
                              (its default is {:?}); this build outputs f32 only",
                             config.sample_format()
                         ),

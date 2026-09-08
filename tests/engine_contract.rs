@@ -420,32 +420,3 @@ fn a_failed_load_keeps_the_position_that_was_asked_for() {
         "a failed load lost the requested resume position"
     );
 }
-
-#[test]
-fn a_fault_deferred_for_want_of_room_dies_with_its_transport() {
-    // Regression: a fault held back because the event backlog was full stayed
-    // held across teardown. A fatal fault deferred before a Stop then fired
-    // after the Stop completed, turning a finished Stopped into Failed - a
-    // fault describing a transport that no longer existed.
-    let mut engine = TestEngine::start(TRACK);
-    engine.stop_draining_events();
-    // A state-neutral filler: TogglePause would be replayed after the stop and
-    // resume playback, which is the test's business, not the engine's.
-    for _ in 0..256 {
-        engine.send(PlaybackCommand::SetVolume(Volume::new(0.5)));
-    }
-    engine.force_fatal_device_fault();
-
-    engine.interrupt_stop();
-    engine.resume_draining_events();
-    engine.await_state(PlaybackState::Stopped);
-
-    // Give the worker several passes with a drained backlog: a surviving
-    // deferred fault would be acted on in one of them.
-    assert_eq!(
-        engine.count_events(|e| matches!(e, PlaybackEvent::Failed { .. })),
-        0,
-        "an obsolete fault outlived the transport that produced it"
-    );
-    assert_eq!(engine.state(), PlaybackState::Stopped);
-}

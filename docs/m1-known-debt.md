@@ -77,6 +77,19 @@ playback position) and found not to threaten it.
   treated as a failure. The bare-invocation behaviour is deliberate and tested; the
   explicit-flag case likely is not.
 
+## Untested paths
+
+- The fault **deferral** gate (holding a fault back when the event backlog has no room)
+  has no end-to-end test. Command admission closes as soon as one event is pending, so a
+  harness cannot build the ~121-deep backlog deferral needs by sending commands; reaching
+  it requires many asynchronous events. The *retirement* rule that pairs with it is unit
+  tested (`retire_faults`), and the gate arithmetic is documented beside the constant, but
+  neither is evidence the gate fires correctly in a running engine.
+- F1's whole-frame ring atomicity is structural (one commit per batch) and has no test:
+  the race needs a consumer observing a partially written batch, which the sequential
+  harness cannot stage.
+- Integer-only and multichannel-only device refusals are unverified without such hardware.
+
 ## Not measured
 
 - Span-ring capacity (64) and the PCM ring target (250 ms) remain the spec's starting

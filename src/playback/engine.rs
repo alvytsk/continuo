@@ -946,13 +946,7 @@ impl Worker {
         // Close first: dropping the stream joins the backend thread, which is
         // what makes the link's rescue slot safe to read afterwards.
         self.output.close();
-        // Faults describe the transport being torn down here, so they retire
-        // with it. That means BOTH the one held back for want of event room and
-        // any still queued in the channel: carrying either past the teardown
-        // lets an obsolete fatal fault fire later and turn a completed Stop
-        // into Failed. Draining without acting is the point.
-        self.deferred_fault = None;
-        while self.faults.try_recv().is_ok() {}
+        retire_faults(&mut self.deferred_fault, &self.faults);
         let link = self.transport.take().map(|transport| transport.link);
         self.converter = None;
         self.staging.clear();
@@ -1480,6 +1474,18 @@ fn severity(fault: OutputFault) -> u8 {
     }
 }
 
+/// Retire every fault belonging to a transport being torn down.
+///
+/// A fault describes the transport that produced it, so carrying one past a
+/// teardown lets an obsolete fatal fault fire later and turn a completed `Stop`
+/// into `Failed`. Both sources have to go: the one held back for want of event
+/// room, and anything still queued in the channel — an interrupt arriving
+/// before the queue was drained leaves the fault there rather than deferred.
+fn retire_faults(deferred: &mut Option<OutputFault>, faults: &Receiver<OutputFault>) {
+    *deferred = None;
+    while faults.try_recv().is_ok() {}
+}
+
 fn frames_to_duration(frames: u64, rate: u32) -> Duration {
     Duration::from_secs_f64(frames as f64 / f64::from(rate.max(1)))
 }
@@ -1493,5 +1499,42 @@ fn adopt_preserved(promised: Duration, actual: Duration) -> Duration {
         promised
     } else {
         actual
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retiring_faults_clears_the_deferred_slot_and_the_queue() {
+        // Both halves matter. Clearing only the deferred slot leaves a fault
+        // that was still queued when the interrupt arrived, and that one fires
+        // after the stop completes.
+        let (tx, rx) = crossbeam_channel::bounded(8);
+        tx.send(OutputFault::Fatal(cpal::ErrorKind::PermissionDenied))
+            .expect("queue accepts a fault");
+        tx.send(OutputFault::Rebuild(cpal::ErrorKind::DeviceNotAvailable))
+            .expect("queue accepts a fault");
+        let mut deferred = Some(OutputFault::Fatal(cpal::ErrorKind::HostUnavailable));
+
+        retire_faults(&mut deferred, &rx);
+
+        assert!(
+            deferred.is_none(),
+            "a deferred fault outlived its transport"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "a queued fault outlived its transport"
+        );
+    }
+
+    #[test]
+    fn retiring_faults_is_safe_when_there_is_nothing_to_retire() {
+        let (_tx, rx) = crossbeam_channel::bounded::<OutputFault>(8);
+        let mut deferred = None;
+        retire_faults(&mut deferred, &rx);
+        assert!(deferred.is_none());
     }
 }
