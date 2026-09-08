@@ -69,3 +69,34 @@ impl TestOutput {
         self.channels
     }
 }
+
+impl super::AudioOutput for TestOutput {
+    fn negotiate(
+        &mut self,
+        _request: &super::OutputRequest,
+    ) -> Result<super::NegotiatedOutput, crate::playback::error::PlaybackError> {
+        Ok(super::NegotiatedOutput {
+            sample_rate: self.sample_rate,
+            channels: self.channels,
+            buffer_frames: self.buffer_frames,
+        })
+    }
+
+    fn open(
+        &mut self,
+        _config: &super::NegotiatedOutput,
+        _link: std::sync::Arc<crate::playback::link::OutputLink>,
+        core: crate::playback::callback::CallbackCore,
+    ) -> Result<(), crate::playback::error::PlaybackError> {
+        self.attach(core);
+        Ok(())
+    }
+
+    fn now(&self) -> super::Nanos {
+        self.now
+    }
+
+    fn close(&mut self) {
+        self.core = None;
+    }
+}

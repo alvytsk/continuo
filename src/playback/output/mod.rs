@@ -1,5 +1,12 @@
+use std::sync::Arc;
 use std::time::Duration;
 
+use crate::playback::callback::CallbackCore;
+use crate::playback::error::PlaybackError;
+use crate::playback::link::OutputLink;
+
+// `pub mod test_output;` was added by Task 4 - do not re-declare it here.
+pub mod cpal_output;
 pub mod test_output;
 
 /// A point on the output device's clock, in nanoseconds.
@@ -55,4 +62,33 @@ impl SpanRecord {
         self.media_total_after
             .saturating_sub(u64::from(self.frames))
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OutputRequest {
+    pub preferred_rate: u32,
+    pub preferred_channels: u16,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NegotiatedOutput {
+    pub sample_rate: u32,
+    pub channels: u16,
+    pub buffer_frames: u32,
+}
+
+/// The internal device seam. Narrow by design: exactly the operations both
+/// `CpalOutput` and `TestOutput` exercise, and nothing speculative.
+pub trait AudioOutput: Send {
+    /// Report the device's actual configuration, before any ring is sized.
+    fn negotiate(&mut self, request: &OutputRequest) -> Result<NegotiatedOutput, PlaybackError>;
+    /// Build the stream **parked**, so no audio flows until the worker releases it.
+    fn open(
+        &mut self,
+        config: &NegotiatedOutput,
+        link: Arc<OutputLink>,
+        core: CallbackCore,
+    ) -> Result<(), PlaybackError>;
+    fn now(&self) -> Nanos;
+    fn close(&mut self);
 }
