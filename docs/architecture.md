@@ -20,7 +20,7 @@ The future runtime has four execution contexts with strict ownership:
 
 | Context | Owns | Must not |
 |---|---|---|
-| Tokio tasks | Application orchestration, HTTP fetching, feed parsing, timers | Touch decoder or output-device state |
+| Application (main thread) | The application context is the main thread: it reads keys, renders status, and owns the command sender and event receiver. Tokio arrives with M3's networking, not before. | Hold a decoder or a CPAL stream |
 | Decode thread (`std::thread`) | Symphonia demux/decode, resampling, command processing, PCM production, position anchoring, **the CPAL stream's full lifecycle** | Block on the Tokio runtime |
 | CPAL callback | Drain a bounded SPSC ring buffer, emit silence on underrun, publish a frame counter | Lock, allocate, wait, or perform I/O |
 | Persistence writer thread | Serialize and atomically write state snapshots | Run on Tokio's executor |
