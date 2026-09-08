@@ -38,6 +38,40 @@ fn play_from_stopped_resumes_at_the_preserved_position_without_resetting() {
 }
 
 #[test]
+fn pause_holds_the_position_still_and_resume_continues_from_it() {
+    // Pause and resume are the same transport generation: the callback keeps
+    // its cumulative counter and the timeline keeps its floor. If either were
+    // voided, resuming would jump the position by everything played since the
+    // generation was installed.
+    let mut engine = TestEngine::start("sine.flac");
+    engine.play_for(Duration::from_millis(200));
+    engine.send(PlaybackCommand::Pause);
+    engine.await_state(PlaybackState::Paused);
+    // The frames already handed to the device still play out after the park,
+    // so let that settle before taking the reading that must not move.
+    engine.let_time_pass(Duration::from_millis(300));
+    let paused_at = engine.position();
+    engine.let_time_pass(Duration::from_millis(300));
+    assert_eq!(
+        engine.position(),
+        paused_at,
+        "a parked transport must not advance the position"
+    );
+    engine.send(PlaybackCommand::Play);
+    engine.await_state(PlaybackState::Playing);
+    assert_eq!(
+        engine.position(),
+        paused_at,
+        "resume must continue from the paused position, not jump or rewind"
+    );
+    engine.play_for(paused_at + Duration::from_millis(100));
+    assert!(
+        engine.position() > paused_at,
+        "playback must actually run again after resuming"
+    );
+}
+
+#[test]
 fn transport_recreation_preserves_position() {
     let mut engine = TestEngine::start("sine.flac");
     engine.play_for(Duration::from_millis(200));
@@ -60,6 +94,13 @@ fn a_successful_seek_establishes_a_new_position() {
         unreachable!()
     };
     assert!(actual.as_millis().abs_diff(300) <= 5);
+    // The event alone only shows what the decoder did. The engine must also
+    // have adopted it as the position it reports.
+    assert!(
+        engine.position() >= Duration::from_millis(295),
+        "a successful seek must establish the new position, got {:?}",
+        engine.position()
+    );
 }
 
 #[test]
@@ -127,10 +168,12 @@ fn progress_carries_the_session_revision_it_belongs_to() {
 }
 
 #[test]
-fn a_saturated_event_channel_stops_admitting_commands_but_not_stop() {
-    // Command admission halts while a backlog exists, which bounds further
-    // event generation. Stop travels out of band on the interrupt flag plus
-    // wake channel, so a full queue cannot delay it.
+fn stop_travels_out_of_band_past_a_pending_backlog() {
+    // Stop travels on the interrupt flag plus the wake channel, so neither a
+    // queue of commands nor a backlog of undelivered events can delay it.
+    // Note that this does not exercise the admission limit: each TogglePause
+    // costs two handshakes, so Stop arrives long before enough events pile up
+    // to saturate the channel. The test below covers admission.
     let mut engine = TestEngine::start("sine.flac");
     engine.stop_draining_events();
     for _ in 0..256 {
@@ -157,8 +200,7 @@ fn a_backlog_closes_command_admission_until_it_drains() {
     let pending = engine.pending_commands();
     assert!(
         pending > 128,
-        "admission must halt while a backlog exists; only {} commands were left",
-        256 - pending
+        "admission must halt while a backlog exists; only {pending} of 256 commands were left unread"
     );
     engine.interrupt_stop();
     engine.resume_draining_events();

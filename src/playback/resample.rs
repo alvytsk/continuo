@@ -30,6 +30,12 @@ pub struct Converter {
     /// Output frames still to be discarded from the resampler's priming delay.
     trim_remaining: usize,
     input_frames_seen: u64,
+    /// Output frames handed to callers since creation or the last `reset`.
+    ///
+    /// Counted here rather than inferred from the caller's buffer, because a
+    /// streaming caller drains that buffer between calls: its length says how
+    /// much this call produced, never how much the conversion has produced.
+    emitted_frames: u64,
 }
 
 impl Converter {
@@ -74,6 +80,7 @@ impl Converter {
             output: vec![vec![0.0; output_capacity]; channels],
             trim_remaining,
             input_frames_seen: 0,
+            emitted_frames: 0,
         })
     }
 
@@ -87,6 +94,7 @@ impl Converter {
             plane.clear();
         }
         self.input_frames_seen = 0;
+        self.emitted_frames = 0;
     }
 
     pub fn expected_output_frames(&self, input_frames: u64) -> u64 {
@@ -98,6 +106,7 @@ impl Converter {
         self.input_frames_seen += frames as u64;
         if self.resampler.is_none() {
             self.interleave_planes(planes, frames, out);
+            self.emitted_frames += frames as u64;
             return;
         }
         for (plane, buffered) in planes.iter().zip(self.input.iter_mut()) {
@@ -114,10 +123,18 @@ impl Converter {
     /// Feed the final partial chunk with `partial_len` so the resampler emits
     /// its delayed valid output, then drain any remaining delay with silent
     /// chunks and trim back to the expected extent.
+    ///
+    /// Both the flush and the trim are measured against the conversion's own
+    /// running total, not against `out`. A caller that drains `out` into a ring
+    /// between calls hands this an almost empty buffer, and a flush sized from
+    /// that would append several chunks of pure silence and report frames the
+    /// media does not contain.
     pub fn finish(&mut self, out: &mut Vec<f32>) {
         if self.resampler.is_none() {
             return;
         }
+        let before = self.emitted_frames;
+        let expected = self.expected_output_frames(self.input_frames_seen);
         let remaining = self.buffered_frames();
         if remaining > 0 {
             for plane in &mut self.input {
@@ -128,10 +145,8 @@ impl Converter {
                 plane.clear();
             }
         }
-        let expected = self.expected_output_frames(self.input_frames_seen) as usize;
-        let wanted = expected * usize::from(self.target_channels);
         let mut flushes = 0;
-        while out.len() < wanted && flushes < MAX_FLUSH_CHUNKS {
+        while self.emitted_frames < expected && flushes < MAX_FLUSH_CHUNKS {
             for plane in &mut self.input {
                 plane.resize(CHUNK, 0.0);
             }
@@ -141,8 +156,14 @@ impl Converter {
             }
             flushes += 1;
         }
-        if out.len() > wanted {
-            out.truncate(wanted);
+        // Trim only what this call appended: everything before `before` either
+        // belongs to an earlier call or has already left in someone else's ring.
+        let overshoot = self.emitted_frames.saturating_sub(expected);
+        let drop = overshoot.min(self.emitted_frames - before) as usize;
+        if drop > 0 {
+            let samples = drop * usize::from(self.target_channels);
+            out.truncate(out.len().saturating_sub(samples));
+            self.emitted_frames -= drop as u64;
         }
     }
 
@@ -186,6 +207,7 @@ impl Converter {
             .map(|plane| plane[start..start + usable].to_vec())
             .collect();
         self.interleave_planes(&planes, usable, out);
+        self.emitted_frames += usable as u64;
     }
 
     fn interleave_planes(&self, planes: &[Vec<f32>], frames: usize, out: &mut Vec<f32>) {
@@ -290,6 +312,41 @@ mod tests {
             delta <= 2 * 2,
             "got {} samples, expected about {expected}",
             out.len()
+        );
+    }
+
+    #[test]
+    fn a_streaming_caller_gets_the_same_total_as_one_that_accumulates() {
+        // The engine drains its buffer into the PCM ring between calls, so
+        // `finish` sees an almost empty buffer. Sizing the flush from that
+        // buffer appended chunks of pure silence and pushed the reported
+        // position past the end of the media.
+        let mut converter = Converter::new(44_100, 48_000, 2, 2).unwrap();
+        let chunks = 22u64;
+        let mut total = 0usize;
+        let mut last = Vec::new();
+        for _ in 0..chunks {
+            let mut out = Vec::new();
+            converter.push(&sine(1024, 2), &mut out);
+            total += out.len();
+            if !out.is_empty() {
+                last = out;
+            }
+        }
+        let mut tail = Vec::new();
+        converter.finish(&mut tail);
+        total += tail.len();
+        if !tail.is_empty() {
+            last = tail;
+        }
+        let expected = converter.expected_output_frames(chunks * 1024) as usize * 2;
+        assert_eq!(
+            total, expected,
+            "streaming must emit exactly what the conversion predicts"
+        );
+        assert!(
+            last.iter().rev().take(16).any(|sample| *sample != 0.0),
+            "the last frames emitted must be audio, not flush padding"
         );
     }
 

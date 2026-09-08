@@ -319,6 +319,19 @@ impl TestEngine {
         self.pump_events();
     }
 
+    /// Let virtual time pass without asking anything of the engine. Used to
+    /// show that a parked transport does not move the position.
+    pub fn let_time_pass(&mut self, span: Duration) {
+        let until = Instant::now() + Duration::from_secs(5);
+        let mut advanced = Duration::ZERO;
+        while advanced < span && Instant::now() < until {
+            lock(&self.device).output.advance(PERIOD);
+            advanced += PERIOD;
+            std::thread::sleep(Duration::from_micros(200));
+        }
+        self.settle();
+    }
+
     pub fn advance_past_output_latency(&mut self) {
         let until = Instant::now() + Duration::from_secs(5);
         let mut advanced = Duration::ZERO;

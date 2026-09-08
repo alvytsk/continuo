@@ -52,10 +52,13 @@ const PUMP_NAP: Duration = Duration::from_micros(250);
 const DIAGNOSTIC_INTERVAL: Duration = Duration::from_millis(500);
 /// Refinement budget for an *explicit* seek. Preserving seeks pass `None`.
 const SEEK_BUDGET: Duration = Duration::from_secs(5);
-/// A refined seek lands on a whole source frame, so a preserving seek can come
-/// back a fraction of a frame short of the position it promised to preserve.
-/// Within this tolerance the promise is kept, so repeated stop/resume cycles
-/// cannot walk the position backwards one frame at a time.
+/// A refined seek lands on a whole *source* frame, while the position it is
+/// asked to preserve is a whole *output* frame, so a preserving seek can come
+/// back a fraction of a frame short of what it promised (under 23 us at
+/// 44.1 kHz). Within this tolerance the promise is kept, so that repeated
+/// stop/resume cycles cannot walk the position backwards a frame at a time.
+/// Pause and resume no longer need this - they never re-seek - but stop,
+/// resume-at-a-stored-target and device recovery still do.
 const RESUME_TOLERANCE: Duration = Duration::from_millis(1);
 
 /// The event stream, handed out as one unit.
@@ -241,9 +244,6 @@ struct Worker {
     volume: Volume,
     generation: u16,
     pushed_total: u64,
-    /// Source frames handed to the converter in this generation. `finish`
-    /// needs it to size its flush; see `flush_converter`.
-    source_frames_fed: u64,
     source_eof: bool,
     converter_flushed: bool,
     decoder_drained: bool,
@@ -294,7 +294,6 @@ impl Worker {
             volume: Volume::FULL,
             generation: 0,
             pushed_total: 0,
-            source_frames_fed: 0,
             source_eof: false,
             converter_flushed: false,
             decoder_drained: false,
@@ -496,6 +495,17 @@ impl Worker {
         });
     }
 
+    /// Announce playback only when there is a transport to play it.
+    ///
+    /// Recovery can abandon a rebuild without failing - a stop arriving while
+    /// it re-seeks, say - and the caller must not report `Playing` over a
+    /// pipeline that no longer exists.
+    fn announce_playing(&mut self) {
+        if self.transport.is_some() {
+            self.set_state(PlaybackState::Playing);
+        }
+    }
+
     fn set_state(&mut self, state: PlaybackState) {
         if self.state == state {
             return;
@@ -506,6 +516,11 @@ impl Worker {
     }
 
     fn fail(&mut self, message: String) {
+        if self.state == PlaybackState::Failed {
+            // A repeating fatal fault must not re-announce the same failure
+            // every iteration.
+            return;
+        }
         self.teardown();
         let session_rev = self.session_rev;
         self.emit(PlaybackEvent::Failed {
@@ -522,13 +537,18 @@ impl Worker {
             return PositionQuality::Degraded;
         }
         match self.state {
-            PlaybackState::Playing => self.timeline.quality(),
+            PlaybackState::Playing | PlaybackState::Paused => self.timeline.quality(),
             _ => PositionQuality::Exact,
         }
     }
 
     fn publish_progress(&mut self) {
-        if self.state == PlaybackState::Playing
+        // Paused counts as well: parking silences the callback, but the frames
+        // it already handed to the device still play out, so the position goes
+        // on rising for one output latency after the park and only then
+        // settles. Freezing the number at the instant of the park would report
+        // a position slightly behind what the listener actually heard.
+        if matches!(self.state, PlaybackState::Playing | PlaybackState::Paused)
             && let Some(rate) = self.transport.as_ref().map(|t| t.config.sample_rate)
         {
             let now = self.output.now();
@@ -585,25 +605,37 @@ impl Worker {
             // Rerouted or refused realtime: playback continues, but the timing
             // base underneath the timeline may have jumped.
             OutputFault::Recoverable(_) => self.degraded = true,
-            OutputFault::Rebuild(kind) => self.rebuild(&format!("{kind:?}")),
+            OutputFault::Rebuild(kind) => {
+                let resume = self.state == PlaybackState::Playing;
+                self.rebuild(&format!("{kind:?}"), resume);
+            }
             OutputFault::Fatal(kind) => self.fail(format!("audio device failed: {kind:?}")),
         }
     }
 
     /// Capture, tear down, then rebuild at the preserved position.
-    fn rebuild(&mut self, reason: &str) {
+    ///
+    /// `resume` is the state the caller *intends*, not the state the worker
+    /// happens to be in: a recovery reached from `resume` or `restart` runs
+    /// before either has announced `Playing`, and reading it off `self.state`
+    /// would bring the transport back parked while the caller announced that
+    /// playback had started.
+    ///
+    /// Returns `false` when recovery failed, in which case `Failed` has already
+    /// been emitted and the caller must not announce anything else.
+    fn rebuild(&mut self, reason: &str, resume: bool) -> bool {
         if self.source.is_none() {
             self.teardown();
-            return;
+            return false;
         }
-        let resume = self.state == PlaybackState::Playing;
         self.capture_and_teardown();
         let target = self.position;
         match self.reseek(target) {
             Ok(actual) => self.position = adopt_preserved(target, actual),
+            Err(PlaybackError::Cancelled) => return false,
             Err(error) => {
                 self.fail(format!("cannot recover after {reason}: {error}"));
-                return;
+                return false;
             }
         }
         self.session_rev += 1;
@@ -611,8 +643,12 @@ impl Worker {
             Ok(()) => {
                 let session_rev = self.session_rev;
                 self.emit(PlaybackEvent::DeviceRecovered { session_rev });
+                true
             }
-            Err(error) => self.fail(format!("cannot reopen the audio device: {error}")),
+            Err(error) => {
+                self.fail(format!("cannot reopen the audio device: {error}"));
+                false
+            }
         }
     }
 
@@ -677,9 +713,7 @@ impl Worker {
             pcm: pcm_tx,
             config,
         });
-        if playing {
-            self.prime_and_run();
-        }
+        self.prime_and_run(playing);
         Ok(())
     }
 
@@ -715,13 +749,16 @@ impl Worker {
         };
         if adopted.is_err() {
             // The device stopped answering. Recreate it rather than run on
-            // against a transport whose state can no longer be established.
-            self.rebuild("handshake timeout");
-            return Ok(());
+            // against a transport whose state can no longer be established -
+            // and report whether that worked, so the caller does not announce
+            // playback over an engine that has just failed.
+            return if self.rebuild("handshake timeout", playing) {
+                Ok(())
+            } else {
+                Err(PlaybackError::Timeout)
+            };
         }
-        if playing {
-            self.prime_and_run();
-        }
+        self.prime_and_run(playing);
         Ok(())
     }
 
@@ -730,7 +767,6 @@ impl Worker {
         self.generation = self.generation.wrapping_add(1);
         self.anchor = self.position;
         self.pushed_total = 0;
-        self.source_frames_fed = 0;
         self.staging.clear();
         self.source_eof = false;
         self.converter_flushed = false;
@@ -740,8 +776,15 @@ impl Worker {
 
     /// Fill the ring before releasing the callback, so that starting playback
     /// does not begin with a self-inflicted underrun.
-    fn prime_and_run(&mut self) {
+    ///
+    /// The ring is primed even when the transport stays parked: a seek taken
+    /// while paused installs a new generation, and the `release` that resumes
+    /// it would otherwise start against an empty ring.
+    fn prime_and_run(&mut self, playing: bool) {
         self.pump_audio();
+        if !playing {
+            return;
+        }
         let Self {
             transport,
             timeline,
@@ -821,7 +864,6 @@ impl Worker {
         self.converter = None;
         self.staging.clear();
         self.pushed_total = 0;
-        self.source_frames_fed = 0;
         self.source_eof = false;
         self.converter_flushed = false;
         self.decoder_drained = false;
@@ -862,7 +904,9 @@ impl Worker {
             if self.source_eof {
                 if !self.converter_flushed {
                     self.converter_flushed = true;
-                    self.flush_converter(channels);
+                    if let Some(converter) = self.converter.as_mut() {
+                        converter.finish(&mut self.staging);
+                    }
                     continue;
                 }
                 self.decoder_drained = true;
@@ -881,43 +925,22 @@ impl Worker {
                 };
                 match source.next_planar() {
                     Ok(Some(planes)) => {
-                        let frames = planes.first().map_or(0, Vec::len) as u64;
                         converter.push(planes, staging);
-                        Ok(frames)
+                        Ok(true)
                     }
-                    Ok(None) => Ok(0),
+                    Ok(None) => Ok(false),
                     Err(error) => Err(error),
                 }
             };
             match decoded {
-                Ok(0) => self.source_eof = true,
-                Ok(frames) => self.source_frames_fed += frames,
+                Ok(true) => {}
+                Ok(false) => self.source_eof = true,
                 Err(error) => {
                     self.source_eof = true;
                     self.warn(format!("decoding stopped early: {error}"));
                 }
             }
         }
-    }
-
-    /// Recover the resampler's delayed tail without inheriting its assumption
-    /// that the output buffer holds the whole stream.
-    ///
-    /// `Converter::finish` flushes silent chunks until the buffer it was given
-    /// reaches the extent the whole conversion predicts. This buffer is drained
-    /// into the ring as it fills, so left alone `finish` would append several
-    /// chunks of silence and push the position past the end of the media.
-    fn flush_converter(&mut self, channels: usize) {
-        let already = self.pushed_total + (self.staging.len() / channels) as u64;
-        let fed = self.source_frames_fed;
-        let Some(converter) = self.converter.as_mut() else {
-            return;
-        };
-        let expected = converter.expected_output_frames(fed);
-        let mut tail = Vec::new();
-        converter.finish(&mut tail);
-        tail.truncate(expected.saturating_sub(already) as usize * channels);
-        self.staging.extend_from_slice(&tail);
     }
 
     /// End of track fires only once every pushed frame has been played, which
@@ -1061,15 +1084,26 @@ impl Worker {
                 self.warn("playback failed; load the media again before playing".into())
             }
             PlaybackState::Idle => self.warn("nothing is loaded".into()),
+            // Resuming a parked transport is the same generation released
+            // again: nothing was discarded, so nothing has to be rebuilt.
+            PlaybackState::Paused
+                if self.transport.is_some() && self.requested_target.is_none() =>
+            {
+                if let Some(transport) = self.transport.as_mut() {
+                    transport.handshake.release();
+                }
+                self.set_state(PlaybackState::Playing);
+            }
             PlaybackState::Loading | PlaybackState::Paused | PlaybackState::Stopped => {
-                self.resume()
+                self.restore()
             }
         }
     }
 
-    /// Resume at the preserved position - or at a target stored while stopped,
-    /// which is the one case where resuming establishes a new position.
-    fn resume(&mut self) {
+    /// Restore playback from a torn-down transport, at the preserved position
+    /// or at a target stored while stopped - the one case where resuming
+    /// establishes a new position rather than preserving one.
+    fn restore(&mut self) {
         if self.source.is_none() {
             self.warn("nothing is loaded".into());
             return;
@@ -1080,31 +1114,31 @@ impl Worker {
         let target = self.requested_target.take().unwrap_or(self.position);
         match self.reseek(target) {
             Ok(actual) => self.position = adopt_preserved(target, actual),
+            // A stop or a shutdown arrived mid-refinement. The preserved
+            // position still stands; the interrupt is handled by the loop.
+            Err(PlaybackError::Cancelled) => return,
             Err(error) => {
                 self.fail(format!("cannot resume at {target:?}: {error}"));
                 return;
             }
         }
         match self.reinstall(true) {
-            Ok(()) => self.set_state(PlaybackState::Playing),
+            Ok(()) => self.announce_playing(),
             Err(error) => self.fail(format!("cannot start the audio device: {error}")),
         }
     }
 
+    /// Park the callback and leave everything else exactly as it is. The ring
+    /// keeps its audio, the callback keeps counting from where it stopped, and
+    /// the timeline keeps its floor, so resuming is a single `release`.
     fn pause(&mut self) {
         if self.state != PlaybackState::Playing {
             return;
         }
-        self.capture_position();
         {
             let mut pump = || std::thread::sleep(PUMP_NAP);
             if let Some(transport) = self.transport.as_mut() {
-                // Drop the buffered audio: resuming re-establishes the decoder
-                // at the captured position, so keeping it would double it.
-                let _ = transport
-                    .handshake
-                    .discard(&mut pump, DEADLINE)
-                    .and_then(|()| transport.handshake.park(&mut pump, DEADLINE));
+                let _ = transport.handshake.park(&mut pump, DEADLINE);
             }
         }
         self.set_state(PlaybackState::Paused);
@@ -1188,6 +1222,10 @@ impl Worker {
                 // position has to be re-established explicitly, never assumed.
                 self.position = preserved;
                 match self.reseek(preserved) {
+                    // Cancelled again: the stop or shutdown that cancelled the
+                    // seek is about to be handled, and it tears the decoder
+                    // down anyway. The preserved position stands.
+                    Err(PlaybackError::Cancelled) => {}
                     Ok(actual) => {
                         self.position = adopt_preserved(preserved, actual);
                         if let Err(error) = self.reinstall(playing) {
@@ -1219,21 +1257,25 @@ impl Worker {
                 self.position = actual;
                 self.requested_target = None;
             }
+            Err(PlaybackError::Cancelled) => return,
             Err(error) => {
                 self.reject_seek(format!("{error}"));
                 return;
             }
         }
         match self.reinstall(true) {
-            Ok(()) => self.set_state(PlaybackState::Playing),
+            Ok(()) => self.announce_playing(),
             Err(error) => self.fail(format!("cannot start the audio device: {error}")),
         }
     }
 
-    /// A preserving seek: no budget, because it promises to land where it was
-    /// told to, and no cancellation, because an interrupted one would leave the
-    /// decoder nowhere in particular.
+    /// A preserving seek: no budget, because it promises to land exactly where
+    /// it was told to, but cancellable, so that a stop or a shutdown is not
+    /// left waiting for a refinement to finish. A cancelled one leaves the
+    /// decoder at an arbitrary point, which is why every caller either
+    /// re-establishes it or abandons the operation entirely.
     fn reseek(&mut self, target: Duration) -> Result<Duration, PlaybackError> {
+        let interrupt = Arc::clone(&self.interrupt);
         let Some(source) = self.source.as_mut() else {
             return Ok(target);
         };
@@ -1241,7 +1283,7 @@ impl Worker {
             return Ok(target);
         }
         source
-            .seek_refined(target, None, &mut || false)
+            .seek_refined(target, None, &mut || interrupt.load(Ordering::Acquire) != 0)
             .map(|outcome| outcome.actual)
     }
 
@@ -1269,9 +1311,10 @@ fn frames_to_duration(frames: u64, rate: u32) -> Duration {
     Duration::from_secs_f64(frames as f64 / f64::from(rate.max(1)))
 }
 
-/// A preserving seek lands on a whole source frame at or just below the value
-/// it promised to preserve. Keep the promise when the shortfall is sub-frame
-/// quantization; adopt the decoder's answer when it is a real difference.
+/// Keep the promised value when the shortfall is sub-frame quantization, and
+/// adopt the decoder's answer when it is a real difference. Dropping this makes
+/// both `play_from_stopped_resumes_at_the_preserved_position_without_resetting`
+/// and `transport_recreation_preserves_position` fail on their `>=`.
 fn adopt_preserved(promised: Duration, actual: Duration) -> Duration {
     if actual <= promised && promised - actual <= RESUME_TOLERANCE {
         promised

@@ -85,10 +85,6 @@ impl TestOutput {
     pub fn channels(&self) -> u16 {
         self.channels
     }
-
-    pub fn buffer_frames(&self) -> u32 {
-        self.buffer_frames
-    }
 }
 
 impl super::AudioOutput for TestOutput {

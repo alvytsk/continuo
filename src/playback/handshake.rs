@@ -64,6 +64,25 @@ impl Handshake {
         });
     }
 
+    /// Resume the **current** generation: publish `Run` with a fresh epoch and
+    /// leave the timeline alone.
+    ///
+    /// This is the counterpart to `park`, and the reason it must not touch the
+    /// timeline is the same reason `start_running` must: the callback resets
+    /// its cumulative media counter only when the *generation* changes. Parking
+    /// and releasing keep that counter running, so voiding the timeline that
+    /// tracks it would drop the floor to zero while the next span arrived
+    /// carrying the full running total, and the position would jump forward by
+    /// everything played since the generation was installed.
+    pub fn release(&mut self) {
+        let epoch = self.next_epoch();
+        self.link.publish_control(Control {
+            generation: self.generation,
+            epoch,
+            phase: Phase::Run,
+        });
+    }
+
     pub fn park(
         &mut self,
         pump: &mut dyn FnMut(),
@@ -346,6 +365,37 @@ mod tests {
             )
             .unwrap();
         assert_eq!(rig.link.load_control().phase, Phase::Run);
+    }
+
+    #[test]
+    fn park_then_release_keeps_the_generation_and_what_it_has_played() {
+        // Pause and resume are the same generation, so the callback's counter
+        // keeps running and the timeline must keep its floor. A release that
+        // reset the timeline would report the next span's absolute total as if
+        // it had all been played since the resume.
+        let mut rig = rig(64);
+        push(&mut rig, 4_800);
+        rig.handshake.start_running(1, &mut rig.timeline);
+        let out = Rc::clone(&rig.output);
+        out.borrow_mut().advance(Duration::from_millis(50));
+        rig.handshake.drain_spans(&mut rig.timeline);
+        let played = rig.timeline.played_frames(out.borrow().now());
+        assert!(played > 0);
+
+        let out_pump = Rc::clone(&rig.output);
+        rig.handshake
+            .park(
+                &mut || out_pump.borrow_mut().advance(Duration::from_millis(10)),
+                DEADLINE,
+            )
+            .unwrap();
+        rig.handshake.release();
+        assert_eq!(rig.link.load_control().phase, Phase::Run);
+        assert_eq!(rig.handshake.generation(), 1);
+        assert!(
+            rig.timeline.played_frames(out.borrow().now()) >= played,
+            "releasing must not void what the generation already played"
+        );
     }
 
     #[test]
