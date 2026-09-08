@@ -54,12 +54,18 @@ const DIAGNOSTIC_INTERVAL: Duration = Duration::from_millis(500);
 const SEEK_BUDGET: Duration = Duration::from_secs(5);
 /// A refined seek lands on a whole *source* frame, while the position it is
 /// asked to preserve is a whole *output* frame, so a preserving seek can come
-/// back a fraction of a frame short of what it promised (under 23 us at
-/// 44.1 kHz). Within this tolerance the promise is kept, so that repeated
-/// stop/resume cycles cannot walk the position backwards a frame at a time.
-/// Pause and resume no longer need this - they never re-seek - but stop,
-/// resume-at-a-stored-target and device recovery still do.
-const RESUME_TOLERANCE: Duration = Duration::from_millis(1);
+/// back a fraction of a frame short of what it promised. Within this tolerance
+/// the promise is kept, so that repeated stop/resume cycles cannot walk the
+/// position backwards a frame at a time. Pause and resume no longer need this -
+/// they never re-seek - but stop, resume-at-a-stored-target and device recovery
+/// still do.
+///
+/// One source frame at 44.1 kHz is 22.68 us, and the residues this actually
+/// absorbs measure 4.5 us and 13.6 us. 100 us is four of those frames: wide
+/// enough for the quantum, and an order of magnitude below the packet-sized
+/// miss a genuinely failed seek leaves, so a real miss surfaces rather than
+/// being swallowed.
+const RESUME_TOLERANCE: Duration = Duration::from_micros(100);
 
 /// The event stream, handed out as one unit.
 ///
@@ -607,7 +613,9 @@ impl Worker {
             OutputFault::Recoverable(_) => self.degraded = true,
             OutputFault::Rebuild(kind) => {
                 let resume = self.state == PlaybackState::Playing;
-                self.rebuild(&format!("{kind:?}"), resume);
+                // Nothing to report here: `rebuild` has already emitted
+                // whatever the outcome warrants.
+                let _ = self.rebuild(&format!("{kind:?}"), resume);
             }
             OutputFault::Fatal(kind) => self.fail(format!("audio device failed: {kind:?}")),
         }
@@ -621,21 +629,34 @@ impl Worker {
     /// would bring the transport back parked while the caller announced that
     /// playback had started.
     ///
-    /// Returns `false` when recovery failed, in which case `Failed` has already
-    /// been emitted and the caller must not announce anything else.
-    fn rebuild(&mut self, reason: &str, resume: bool) -> bool {
+    /// Three outcomes, and callers must tell them apart:
+    ///
+    /// * `Ok(())` — recovered; the transport is live again.
+    /// * `Err(Cancelled)` — a stop or shutdown arrived during the recovery
+    ///   re-seek. Nothing failed and nothing was emitted: the interrupt is
+    ///   still set, and the loop's next pass turns it into the transition the
+    ///   user actually asked for. A caller that reported this as a failure
+    ///   would turn a requested stop into a spurious `Failed`, which `do_stop`
+    ///   would then refuse to correct.
+    /// * any other `Err` — recovery failed, `Failed` has already been emitted
+    ///   with the position preserved, and the caller must announce nothing.
+    fn rebuild(&mut self, reason: &str, resume: bool) -> Result<(), PlaybackError> {
         if self.source.is_none() {
             self.teardown();
-            return false;
+            return Err(PlaybackError::UnsupportedInput {
+                path: Default::default(),
+                reason: "no media is loaded".into(),
+            });
         }
         self.capture_and_teardown();
         let target = self.position;
         match self.reseek(target) {
             Ok(actual) => self.position = adopt_preserved(target, actual),
-            Err(PlaybackError::Cancelled) => return false,
             Err(error) => {
-                self.fail(format!("cannot recover after {reason}: {error}"));
-                return false;
+                if !is_cancelled(&error) {
+                    self.fail(format!("cannot recover after {reason}: {error}"));
+                }
+                return Err(error);
             }
         }
         self.session_rev += 1;
@@ -643,11 +664,11 @@ impl Worker {
             Ok(()) => {
                 let session_rev = self.session_rev;
                 self.emit(PlaybackEvent::DeviceRecovered { session_rev });
-                true
+                Ok(())
             }
             Err(error) => {
                 self.fail(format!("cannot reopen the audio device: {error}"));
-                false
+                Err(error)
             }
         }
     }
@@ -750,13 +771,9 @@ impl Worker {
         if adopted.is_err() {
             // The device stopped answering. Recreate it rather than run on
             // against a transport whose state can no longer be established -
-            // and report whether that worked, so the caller does not announce
-            // playback over an engine that has just failed.
-            return if self.rebuild("handshake timeout", playing) {
-                Ok(())
-            } else {
-                Err(PlaybackError::Timeout)
-            };
+            // and pass the outcome through unchanged, so the caller can tell
+            // a failed recovery from a cancelled one and announce neither.
+            return self.rebuild("handshake timeout", playing);
         }
         self.prime_and_run(playing);
         Ok(())
@@ -1049,8 +1066,17 @@ impl Worker {
             }
         };
         if start_at > Duration::ZERO {
-            match decoded.seek_refined(start_at, None, &mut || false) {
+            // Cancellable for the same reason `reseek` is: the worker must not
+            // be blind to a stop or a shutdown for the length of a refinement.
+            let interrupt = Arc::clone(&self.interrupt);
+            let seek = decoded.seek_refined(start_at, None, &mut || {
+                interrupt.load(Ordering::Acquire) != 0
+            });
+            match seek {
                 Ok(outcome) => self.position = adopt_preserved(start_at, outcome.actual),
+                // Abandon the load, leaving no decoder open. The interrupt
+                // still stands and the loop's next pass acts on it.
+                Err(error) if is_cancelled(&error) => return,
                 Err(error) => {
                     self.fail(format!("{error}"));
                     return;
@@ -1124,6 +1150,7 @@ impl Worker {
         }
         match self.reinstall(true) {
             Ok(()) => self.announce_playing(),
+            Err(error) if is_cancelled(&error) => {}
             Err(error) => self.fail(format!("cannot start the audio device: {error}")),
         }
     }
@@ -1202,7 +1229,9 @@ impl Worker {
                 self.position = actual;
                 self.requested_target = None;
                 if let Err(error) = self.reinstall(playing) {
-                    self.fail(format!("cannot restart the audio device: {error}"));
+                    if !is_cancelled(&error) {
+                        self.fail(format!("cannot restart the audio device: {error}"));
+                    }
                     return;
                 }
                 if self.state == PlaybackState::Ended {
@@ -1229,7 +1258,9 @@ impl Worker {
                     Ok(actual) => {
                         self.position = adopt_preserved(preserved, actual);
                         if let Err(error) = self.reinstall(playing) {
-                            self.fail(format!("cannot restart the audio device: {error}"));
+                            if !is_cancelled(&error) {
+                                self.fail(format!("cannot restart the audio device: {error}"));
+                            }
                             return;
                         }
                         self.reject_seek(format!("{error}"));
@@ -1265,6 +1296,7 @@ impl Worker {
         }
         match self.reinstall(true) {
             Ok(()) => self.announce_playing(),
+            Err(error) if is_cancelled(&error) => {}
             Err(error) => self.fail(format!("cannot start the audio device: {error}")),
         }
     }
@@ -1297,6 +1329,13 @@ impl Worker {
             None => requested,
         }
     }
+}
+
+/// A cancelled operation is not a failure. The interrupt that cancelled it is
+/// still set, so the loop's next pass turns it into the stop or the shutdown
+/// the user actually asked for.
+fn is_cancelled(error: &PlaybackError) -> bool {
+    matches!(error, PlaybackError::Cancelled)
 }
 
 fn severity(fault: OutputFault) -> u8 {
