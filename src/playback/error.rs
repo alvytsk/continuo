@@ -24,4 +24,8 @@ pub enum PlaybackError {
     Cancelled,
     #[error("audio output failure")]
     Output(#[source] cpal::Error),
+    #[error("terminal I/O error")]
+    Io(#[from] std::io::Error),
+    #[error("{0}")]
+    Failed(String),
 }
