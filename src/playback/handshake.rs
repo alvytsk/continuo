@@ -83,8 +83,15 @@ impl Handshake {
         });
     }
 
+    /// Park the callback, retaining the spans queued at the moment of parking.
+    ///
+    /// Unlike `discard` and `install`, parking PRESERVES position: the records
+    /// in flight when the pause lands are exactly the ones the position is
+    /// computed from, so discarding them under-reports by everything the device
+    /// had already played but not yet reported.
     pub fn park(
         &mut self,
+        timeline: &mut Timeline,
         pump: &mut dyn FnMut(),
         deadline: Duration,
     ) -> Result<(), HandshakeError> {
@@ -94,7 +101,10 @@ impl Handshake {
             epoch,
             phase: Phase::Park,
         });
-        self.await_ack(epoch, Adopted::Parked, None, pump, deadline)
+        self.await_ack(epoch, Adopted::Parked, Some(timeline), pump, deadline)?;
+        // A final drain after the acknowledgment, so no published span is missed.
+        self.drain_spans(timeline);
+        Ok(())
     }
 
     /// Step 1 and 2: freeze submission, then capture the final played position.
@@ -368,6 +378,36 @@ mod tests {
     }
 
     #[test]
+    fn park_keeps_the_spans_queued_when_the_pause_landed() {
+        // Regression: `park` used to wait with no timeline, so every span still
+        // queued when the pause landed was drained and thrown away. Pausing
+        // preserves position, and those records ARE the position - discarding
+        // them reported zero for audio the device had already played.
+        let mut rig = rig(64);
+        push(&mut rig, 4_800);
+        rig.handshake.start_running(1, &mut rig.timeline);
+        let out = Rc::clone(&rig.output);
+        // Produce spans WITHOUT draining them first, so they are in flight
+        // exactly as they would be when a pause arrives mid-playback.
+        out.borrow_mut().advance(Duration::from_millis(50));
+
+        let out_pump = Rc::clone(&rig.output);
+        rig.handshake
+            .park(
+                &mut rig.timeline,
+                &mut || out_pump.borrow_mut().advance(Duration::from_millis(10)),
+                DEADLINE,
+            )
+            .unwrap();
+
+        let played = rig.timeline.played_frames(out.borrow().now());
+        assert!(
+            played > 0,
+            "parking discarded the spans the paused position is computed from"
+        );
+    }
+
+    #[test]
     fn park_then_release_keeps_the_generation_and_what_it_has_played() {
         // Pause and resume are the same generation, so the callback's counter
         // keeps running and the timeline must keep its floor. A release that
@@ -385,6 +425,7 @@ mod tests {
         let out_pump = Rc::clone(&rig.output);
         rig.handshake
             .park(
+                &mut rig.timeline,
                 &mut || out_pump.borrow_mut().advance(Duration::from_millis(10)),
                 DEADLINE,
             )

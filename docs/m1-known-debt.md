@@ -39,8 +39,8 @@ playback position) and found not to threaten it.
 - The fault-classification fallback absorbs any variant cpal adds in future releases.
   Unavoidable given `#[non_exhaustive]`; a new variant should be classified explicitly.
 - `NegotiatedOutput` fabricates `buffer_frames: 1024` while opening with
-  `BufferSize::Default`, and carries no sample format although the spec calls for one;
-  `f32` is hardcoded at `build_output_stream`.
+  `BufferSize::Default`. (The missing sample format was fixed: negotiation now
+  refuses a device whose format is not `f32`, naming the format it wanted.)
 - `OutputFault::Rebuild(DeviceBusy)` is the only Rebuild classification without a test.
 
 ## Engine
@@ -56,6 +56,9 @@ playback position) and found not to threaten it.
   disagree. The position is correct, so the invariant holds, but the event carries the
   post-rebuild `session_rev` and cannot be filtered as stale. Fix before anything treats
   `actual` as authoritative (a checkpoint writer, a UI seek bar).
+- A panic on the decode thread leaves the worker dead while the UI keeps rendering its
+  last state: no `Failed` is emitted and the app appears frozen rather than reporting the
+  fault. A dying worker should surface as `Failed`.
 - `capture_and_teardown`'s rescue fallback reports frames *submitted* rather than *heard*,
   so a device loss taken while the callback holds an unpublished span reports a position up
   to one output latency ahead. Bounded by one output buffer and flagged `Degraded`.

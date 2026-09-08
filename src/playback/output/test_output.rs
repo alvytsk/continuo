@@ -112,6 +112,7 @@ impl super::AudioOutput for TestOutput {
         _request: &super::OutputRequest,
     ) -> Result<super::NegotiatedOutput, crate::playback::error::PlaybackError> {
         Ok(super::NegotiatedOutput {
+            sample_format: super::SampleFormat::F32,
             sample_rate: self.sample_rate,
             channels: self.channels,
             buffer_frames: self.buffer_frames,

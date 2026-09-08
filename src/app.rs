@@ -78,6 +78,11 @@ pub fn run(cli: cli::Cli) -> Result<(), PlaybackError> {
             Ok(true) => match crossterm::event::read() {
                 Ok(Event::Key(key)) => match to_command(key, &mirror) {
                     Some(PlaybackCommand::Shutdown) => break Ok(()),
+                    // Stop travels out of band. The ordinary command queue stops
+                    // being read while an event backlog exists, and a queued
+                    // Stop cannot interrupt a refinement already running, so
+                    // pressing `s` would not stop anything when it matters most.
+                    Some(PlaybackCommand::Stop) => engine.interrupt_stop(),
                     Some(command) => {
                         engine.commands().send(command).ok();
                     }

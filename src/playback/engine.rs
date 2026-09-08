@@ -40,6 +40,21 @@ const DEADLINE: Duration = Duration::from_millis(250);
 const RESERVED_EVENT_SLOTS: usize = 8;
 const EVENT_CAPACITY: usize = 64;
 const PENDING_CAP: usize = 128;
+
+// Reserve budget. Terminal outcomes may occupy the reserved tail; ordinary
+// events may not. The worst case is one loop iteration emitting, at most:
+//
+//   stop interrupt        1  StateChanged{Stopped}
+//   a serviced fault      2  Failed + StateChanged, or DeviceRecovered + StateChanged
+//   a dispatched command  2  including the nested reinstall -> rebuild -> fail path
+//   end of track          2  EndOfTrack + StateChanged{Ended}
+//                        --
+//                         7  <= RESERVED_EVENT_SLOTS
+//
+// Those four are not mutually exclusive in a single pass, so the union is the
+// bound rather than the maximum of them. Command admission closes while a
+// backlog exists, and `service_faults` defers a fault whose events would not
+// fit, so neither source can outrun the drain.
 const COMMAND_CAPACITY: usize = 1024;
 const SPAN_CAPACITY: usize = 64;
 /// How much audio the PCM ring holds. Large enough that one loop iteration
@@ -266,6 +281,9 @@ struct Worker {
     xruns: u64,
     lost_spans: u64,
     dropped_events: u64,
+    /// A collapsed fault held back because the event backlog had no room for
+    /// the events acting on it would produce.
+    deferred_fault: Option<OutputFault>,
     device_warnings: u64,
     reported_diagnostics: u64,
     last_diagnostic: Instant,
@@ -316,6 +334,7 @@ impl Worker {
             xruns: 0,
             lost_spans: 0,
             dropped_events: 0,
+            deferred_fault: None,
             device_warnings: 0,
             reported_diagnostics: 0,
             last_diagnostic: Instant::now()
@@ -592,8 +611,12 @@ impl Worker {
 
     // ----------------------------------------------------------------- faults
 
+    /// Events one fault can produce: a terminal pair (`Failed` +
+    /// `StateChanged`), or a recovery pair (`DeviceRecovered` + `StateChanged`).
+    const FAULT_EVENT_BUDGET: usize = 2;
+
     fn service_faults(&mut self) {
-        let mut worst: Option<OutputFault> = None;
+        let mut worst: Option<OutputFault> = self.deferred_fault.take();
         let mut seen = 0u64;
         // Collapse the queue to its most severe entry: acting on each one in
         // turn would let a burst of faults generate a burst of events.
@@ -606,6 +629,15 @@ impl Worker {
         let Some(fault) = worst else {
             return;
         };
+        // Command admission already stops the loop creating events faster than
+        // they drain. Faults arrive asynchronously and answer to no such gate,
+        // so apply the same rule here: hold the fault until its events fit,
+        // rather than acting now and dropping the report at the cap.
+        if self.pending_events.len() + Self::FAULT_EVENT_BUDGET > PENDING_CAP {
+            self.deferred_fault = Some(fault);
+            self.device_warnings += seen;
+            return;
+        }
         self.device_warnings += seen;
         match fault {
             // Rerouted or refused realtime: playback continues, but the timing
@@ -939,10 +971,19 @@ impl Worker {
             let ready = self.staging.len() / channels * channels;
             let count = free.min(ready);
             if count > 0 {
-                for sample in self.staging.drain(..count) {
-                    let _ = transport.pcm.push(sample);
+                // Publish the whole batch with ONE tail advance. Pushing sample
+                // by sample makes each one visible immediately, so the callback
+                // can pop a left channel whose right sibling has not been
+                // written yet - a half frame, mid-push, even though `count` is a
+                // whole number of frames.
+                if transport
+                    .pcm
+                    .push_entire_slice(&self.staging[..count])
+                    .is_ok()
+                {
+                    self.staging.drain(..count);
+                    self.pushed_total += (count / channels) as u64;
                 }
-                self.pushed_total += (count / channels) as u64;
             }
             if !self.staging.is_empty() {
                 // The ring is full; the loop's wait provides the backpressure.
@@ -1007,8 +1048,13 @@ impl Worker {
         self.position = self.anchor + frames_to_duration(self.pushed_total, rate);
         {
             let mut pump = || std::thread::sleep(PUMP_NAP);
-            if let Some(transport) = self.transport.as_mut() {
-                let _ = transport.handshake.park(&mut pump, DEADLINE);
+            let Self {
+                transport,
+                timeline,
+                ..
+            } = self;
+            if let Some(transport) = transport.as_mut() {
+                let _ = transport.handshake.park(timeline, &mut pump, DEADLINE);
             }
         }
         let session_rev = self.session_rev;
@@ -1069,8 +1115,11 @@ impl Worker {
         self.session_rev += 1;
         self.media = Some(media.clone());
         self.requested_target = None;
-        self.position = Duration::ZERO;
-        self.anchor = Duration::ZERO;
+        // Pin the requested start BEFORE opening: if the load fails, Failed must
+        // carry the position that was asked for so a retry can resume there.
+        // Zeroing here loses it for every failure path below.
+        self.position = start_at;
+        self.anchor = start_at;
         self.degraded = false;
         self.set_state(PlaybackState::Loading);
 
@@ -1167,9 +1216,17 @@ impl Worker {
         if self.transport.is_some() {
             self.capture_position();
         }
-        let target = self.requested_target.take().unwrap_or(self.position);
+        // A target stored while stopped was never validated against the decoder,
+        // so resuming is where it gets confirmed - and where the SeekCompleted
+        // the caller is still waiting for must finally be emitted.
+        let stored = self.requested_target.take();
+        let target = stored.unwrap_or(self.position);
+        let landed;
         match self.reseek(target) {
-            Ok(actual) => self.position = adopt_preserved(target, actual),
+            Ok(actual) => {
+                landed = actual;
+                self.position = adopt_preserved(target, actual);
+            }
             // A stop or a shutdown arrived mid-refinement. The preserved
             // position still stands; the interrupt is handled by the loop.
             Err(PlaybackError::Cancelled) => return,
@@ -1179,7 +1236,22 @@ impl Worker {
             }
         }
         match self.reinstall(true) {
-            Ok(()) => self.announce_playing(),
+            Ok(()) => {
+                self.announce_playing();
+                // Only now is a stored target both validated and installed,
+                // which is what SeekCompleted asserts. Emitting at store time
+                // would claim a landing no decoder had confirmed.
+                if let Some(requested) = stored {
+                    let actual = landed;
+                    let session_rev = self.session_rev;
+                    self.emit(PlaybackEvent::SeekCompleted {
+                        session_rev,
+                        requested,
+                        actual,
+                        refinement_truncated: false,
+                    });
+                }
+            }
             Err(error) if is_cancelled(&error) => {}
             Err(error) => self.fail(format!("cannot start the audio device: {error}")),
         }
@@ -1192,11 +1264,29 @@ impl Worker {
         if self.state != PlaybackState::Playing {
             return;
         }
-        {
+        let parked = {
             let mut pump = || std::thread::sleep(PUMP_NAP);
-            if let Some(transport) = self.transport.as_mut() {
-                let _ = transport.handshake.park(&mut pump, DEADLINE);
+            let Self {
+                transport,
+                timeline,
+                ..
+            } = self;
+            match transport.as_mut() {
+                Some(transport) => transport.handshake.park(timeline, &mut pump, DEADLINE),
+                None => Ok(()),
             }
+        };
+        if parked.is_err() {
+            // A park that never gets acknowledged means the device is not
+            // running. Announcing Paused here would leave a dead transport
+            // behind a state that claims it can resume, so recover instead and
+            // land parked - or fail with the position preserved.
+            match self.rebuild("the audio device stopped responding while pausing", false) {
+                Ok(()) => self.set_state(PlaybackState::Paused),
+                Err(error) if is_cancelled(&error) => {}
+                Err(error) => self.fail(format!("cannot pause: {error}")),
+            }
+            return;
         }
         self.set_state(PlaybackState::Paused);
     }

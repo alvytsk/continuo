@@ -709,3 +709,56 @@ pub fn load_failure_on_device(name: &str, channels: u16) -> String {
         std::thread::sleep(Duration::from_millis(1));
     }
 }
+
+/// Load a path that cannot be opened, and report where the engine left the
+/// position once it entered `Failed`.
+///
+/// A failed load must pin the position at the requested `start_at`, so a retry
+/// resumes where the caller asked rather than at the beginning.
+// `clippy.toml`'s test exemption covers `#[test]` fns, not bare helpers here.
+#[allow(clippy::expect_used)]
+pub fn failed_load_position(
+    missing: &std::path::Path,
+    start_at: Duration,
+) -> (PlaybackState, Duration) {
+    let device = Arc::new(Mutex::new(Device {
+        output: TestOutput::new(CHANNELS, RATE, BUFFER_FRAMES, LATENCY),
+        link: None,
+    }));
+    let (_faults, fault_rx) = crossbeam_channel::bounded(16);
+    let handle = EngineHandle::spawn_with(
+        Box::new(HarnessOutput {
+            device: Arc::clone(&device),
+        }),
+        fault_rx,
+    );
+    let id = MediaId::LocalFile(
+        continuo::media::id::AbsolutePath::new(missing.to_path_buf()).expect("absolute path"),
+    );
+    handle
+        .commands()
+        .send(PlaybackCommand::Load {
+            media: id,
+            source: SourceLocation::LocalPath(missing.to_path_buf()),
+            start_at,
+        })
+        .expect("engine accepts the load");
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        if let Ok(PlaybackEvent::StateChanged {
+            state: PlaybackState::Failed,
+            ..
+        }) = handle.events().recv_timeout(Duration::from_millis(50))
+        {
+            break;
+        }
+        if Instant::now() > deadline {
+            panic!("the engine never reported a failed load");
+        }
+    }
+    let progress = handle.progress();
+    let state = PlaybackState::Failed;
+    handle.interrupt_shutdown();
+    handle.join();
+    (state, progress.position)
+}

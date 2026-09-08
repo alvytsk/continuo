@@ -374,3 +374,49 @@ fn a_disconnected_event_receiver_terminates_the_worker() {
     engine.drop_event_receiver();
     assert!(engine.join_within(Duration::from_secs(2)));
 }
+
+#[test]
+fn a_seek_stored_while_stopped_reports_completion_when_it_is_finally_validated() {
+    // Regression: a seek taken while stopped stores an unvalidated target and
+    // emits SeekTargetStored. Resuming consumed that target and started playing
+    // without ever emitting SeekCompleted, so anything waiting for the
+    // acknowledgement of that seek waited forever.
+    let mut engine = TestEngine::start(TRACK);
+    engine.send(PlaybackCommand::Stop);
+    engine.await_state(PlaybackState::Stopped);
+
+    engine.send(PlaybackCommand::SeekTo(Duration::from_millis(1_000)));
+    engine.await_event(|e| matches!(e, PlaybackEvent::SeekTargetStored { .. }));
+
+    engine.send(PlaybackCommand::Play);
+    engine.await_state(PlaybackState::Playing);
+
+    let event = engine.await_event(|e| matches!(e, PlaybackEvent::SeekCompleted { .. }));
+    let PlaybackEvent::SeekCompleted {
+        requested, actual, ..
+    } = event
+    else {
+        unreachable!()
+    };
+    assert_eq!(requested, Duration::from_millis(1_000));
+    assert!(
+        actual.as_millis().abs_diff(1_000) <= 50,
+        "validated landing was {actual:?}"
+    );
+}
+
+#[test]
+fn a_failed_load_keeps_the_position_that_was_asked_for() {
+    // Regression: `load` zeroed the position before opening the source, so a
+    // load that failed reported zero instead of the requested start. A retry
+    // then resumed from the beginning rather than where the caller asked.
+    let missing = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/definitely-not-here.flac");
+    let start_at = Duration::from_secs(123);
+    let (state, position) = support::failed_load_position(&missing, start_at);
+    assert_eq!(state, PlaybackState::Failed);
+    assert_eq!(
+        position, start_at,
+        "a failed load lost the requested resume position"
+    );
+}

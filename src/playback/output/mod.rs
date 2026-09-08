@@ -75,6 +75,16 @@ pub struct NegotiatedOutput {
     pub sample_rate: u32,
     pub channels: u16,
     pub buffer_frames: u32,
+    /// The device's sample format. M1 writes `f32` buffers, so a device that
+    /// cannot accept `f32` is refused at negotiation with a legible message
+    /// rather than failing obscurely when the stream is built.
+    pub sample_format: SampleFormat,
+}
+
+/// The sample formats this milestone can drive.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SampleFormat {
+    F32,
 }
 
 /// The internal device seam. Narrow by design: exactly the operations both

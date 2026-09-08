@@ -93,10 +93,23 @@ impl AudioOutput for CpalOutput {
         let config = device
             .default_output_config()
             .map_err(PlaybackError::Output)?;
+        // The stream is built with an `f32` buffer, so verify the device
+        // actually accepts f32 instead of discovering it at build time. An
+        // integer-only device gets a message naming its format.
+        if config.sample_format() != cpal::SampleFormat::F32 {
+            return Err(PlaybackError::UnsupportedInput {
+                path: Default::default(),
+                reason: format!(
+                    "the audio device wants {:?} samples; this build outputs f32 only",
+                    config.sample_format()
+                ),
+            });
+        }
         let negotiated = NegotiatedOutput {
             sample_rate: config.sample_rate(),
             channels: config.channels(),
             buffer_frames: 1024,
+            sample_format: super::SampleFormat::F32,
         };
         let _ = request;
         self.device = Some(device);
