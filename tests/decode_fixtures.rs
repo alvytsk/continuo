@@ -216,3 +216,43 @@ fn a_missing_file_reports_a_contextual_error() {
     let error = DecodedSource::open(&AbsolutePath::new(path).unwrap()).unwrap_err();
     assert!(error.to_string().contains("absent.wav"), "got: {error}");
 }
+
+#[test]
+fn seeking_to_zero_lands_at_zero_on_every_format() {
+    // Regression: MP3 readers report a negative `actual_ts` when a seek lands in
+    // the encoder's delay region. Casting that straight to u64 wrapped the
+    // cursor to ~1.8e19, and the next `cursor += frames` panicked with
+    // "attempt to add with overflow" on the decode thread — reachable from the
+    // UI by pressing Home (restart) on an MP3.
+    for name in ["sine.mp3", "sine.flac", "sine.wav"] {
+        let mut source = open(name);
+        source.next_planar().unwrap();
+
+        let outcome = source
+            .seek_refined(Duration::ZERO, None, &mut || false)
+            .unwrap();
+        assert_eq!(
+            outcome.actual,
+            Duration::ZERO,
+            "{name} did not land at zero"
+        );
+        assert_eq!(
+            source.position(),
+            Duration::ZERO,
+            "{name} cursor is not zero"
+        );
+
+        // The overflow only fired on the decode AFTER the seek, so drain a few
+        // packets: a wrapped cursor panics here rather than at the seek itself.
+        for _ in 0..4 {
+            if source.next_planar().unwrap().is_none() {
+                break;
+            }
+        }
+        assert!(
+            source.position() < Duration::from_secs(1),
+            "{name} position ran away after restart: {:?}",
+            source.position()
+        );
+    }
+}

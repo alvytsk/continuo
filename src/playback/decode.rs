@@ -239,7 +239,11 @@ impl DecodedSource {
             )
             .map_err(|source| PlaybackError::SeekFailed { target, source })?;
         self.decoder.reset();
-        self.cursor = seeked.actual_ts.get() as u64;
+        // `actual_ts` is signed and MP3 readers report a NEGATIVE timestamp when
+        // seeking into an encoder's delay region, so a bare `as u64` wraps to
+        // ~1.8e19 and the next `cursor += frames` overflows. A frame before the
+        // first playable one is position zero.
+        self.cursor = seeked.actual_ts.get().max(0) as u64;
         self.pending = false;
 
         let target_frames = self.duration_to_frames(target);
