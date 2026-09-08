@@ -246,6 +246,14 @@ impl TestEngine {
         }
     }
 
+    /// Inject a fatal device fault, the kind that ends a session.
+    pub fn force_fatal_device_fault(&mut self) {
+        let _ = self
+            .faults
+            .send(OutputFault::Fatal(cpal::ErrorKind::PermissionDenied));
+        let _ = self.wake.try_send(());
+    }
+
     /// Inject the device fault a vanished output device reports.
     pub fn force_device_loss(&mut self) {
         let _ = self

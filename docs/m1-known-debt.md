@@ -39,8 +39,12 @@ playback position) and found not to threaten it.
 - The fault-classification fallback absorbs any variant cpal adds in future releases.
   Unavoidable given `#[non_exhaustive]`; a new variant should be classified explicitly.
 - `NegotiatedOutput` fabricates `buffer_frames: 1024` while opening with
-  `BufferSize::Default`. (The missing sample format was fixed: negotiation now
-  refuses a device whose format is not `f32`, naming the format it wanted.)
+  `BufferSize::Default`. (Sample format is now negotiated: if the device's default
+  config is not `f32`, its supported configurations are searched for one that is,
+  preferring the default's sample rate, before refusing.)
+- Integer-only devices remain unsupported. The engine writes `f32` buffers throughout;
+  the negotiation guard only makes the refusal legible instead of an obscure failure
+  when the stream is built. Supporting them means a format conversion at the callback.
 - `OutputFault::Rebuild(DeviceBusy)` is the only Rebuild classification without a test.
 
 ## Engine

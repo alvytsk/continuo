@@ -93,18 +93,45 @@ impl AudioOutput for CpalOutput {
         let config = device
             .default_output_config()
             .map_err(PlaybackError::Output)?;
-        // The stream is built with an `f32` buffer, so verify the device
-        // actually accepts f32 instead of discovering it at build time. An
-        // integer-only device gets a message naming its format.
-        if config.sample_format() != cpal::SampleFormat::F32 {
-            return Err(PlaybackError::UnsupportedInput {
-                path: Default::default(),
-                reason: format!(
-                    "the audio device wants {:?} samples; this build outputs f32 only",
-                    config.sample_format()
-                ),
-            });
-        }
+        // The stream is built with an `f32` buffer, so the device has to accept
+        // f32. Its DEFAULT config may not be f32 while an f32 config is still
+        // on offer, so fall back to searching what it supports before refusing
+        // - preferring one that can run at the default's sample rate.
+        let config = if config.sample_format() == cpal::SampleFormat::F32 {
+            config
+        } else {
+            let wanted = config.sample_rate();
+            let mut ranges = device
+                .supported_output_configs()
+                .map_err(PlaybackError::Output)?
+                .filter(|range| range.sample_format() == cpal::SampleFormat::F32);
+            let chosen = ranges
+                .find_map(|range| range.try_with_sample_rate(wanted))
+                .or_else(|| {
+                    device
+                        .supported_output_configs()
+                        .ok()?
+                        .filter(|range| range.sample_format() == cpal::SampleFormat::F32)
+                        .map(|range| {
+                            let rate = range.max_sample_rate();
+                            range.with_sample_rate(rate)
+                        })
+                        .next()
+                });
+            match chosen {
+                Some(config) => config,
+                None => {
+                    return Err(PlaybackError::UnsupportedInput {
+                        path: Default::default(),
+                        reason: format!(
+                            "the audio device offers no f32 configuration \
+                             (its default is {:?}); this build outputs f32 only",
+                            config.sample_format()
+                        ),
+                    });
+                }
+            }
+        };
         let negotiated = NegotiatedOutput {
             sample_rate: config.sample_rate(),
             channels: config.channels(),

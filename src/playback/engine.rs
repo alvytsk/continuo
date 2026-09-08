@@ -46,10 +46,11 @@ const PENDING_CAP: usize = 128;
 //
 //   stop interrupt        1  StateChanged{Stopped}
 //   a serviced fault      2  Failed + StateChanged, or DeviceRecovered + StateChanged
-//   a dispatched command  2  including the nested reinstall -> rebuild -> fail path
+//   a dispatched command  3  Load is the widest: StateChanged{Loading},
+//                            Loaded, StateChanged{Paused}
 //   end of track          2  EndOfTrack + StateChanged{Ended}
 //                        --
-//                         7  <= RESERVED_EVENT_SLOTS
+//                         8  <= RESERVED_EVENT_SLOTS
 //
 // Those four are not mutually exclusive in a single pass, so the union is the
 // bound rather than the maximum of them. Command admission closes while a
@@ -611,9 +612,15 @@ impl Worker {
 
     // ----------------------------------------------------------------- faults
 
-    /// Events one fault can produce: a terminal pair (`Failed` +
-    /// `StateChanged`), or a recovery pair (`DeviceRecovered` + `StateChanged`).
-    const FAULT_EVENT_BUDGET: usize = 2;
+    /// Room a fault must leave behind before it is acted on.
+    ///
+    /// Two for the fault's own pair (`Failed` + `StateChanged`, or
+    /// `DeviceRecovered` + `StateChanged`), plus the terminal work that can
+    /// still follow it: end of track is another two, and a load in the same
+    /// pass is three (`StateChanged{Loading}`, `Loaded`, `StateChanged{Paused}`).
+    /// Reserving only its own pair let a fault land at 126 pending, leaving no
+    /// room for the EOF that followed - which then evicted a lifecycle event.
+    const FAULT_EVENT_BUDGET: usize = 7;
 
     fn service_faults(&mut self) {
         let mut worst: Option<OutputFault> = self.deferred_fault.take();
@@ -939,6 +946,13 @@ impl Worker {
         // Close first: dropping the stream joins the backend thread, which is
         // what makes the link's rescue slot safe to read afterwards.
         self.output.close();
+        // Faults describe the transport being torn down here, so they retire
+        // with it. That means BOTH the one held back for want of event room and
+        // any still queued in the channel: carrying either past the teardown
+        // lets an obsolete fatal fault fire later and turn a completed Stop
+        // into Failed. Draining without acting is the point.
+        self.deferred_fault = None;
+        while self.faults.try_recv().is_ok() {}
         let link = self.transport.take().map(|transport| transport.link);
         self.converter = None;
         self.staging.clear();
