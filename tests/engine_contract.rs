@@ -12,9 +12,18 @@ use continuo::playback::volume::Volume;
 mod support;
 use support::TestEngine;
 
+/// Long enough that no margin in this file depends on how far the harness
+/// clock ran while a loaded machine had the test thread descheduled. A pause
+/// lands wherever the ring and the scheduler leave it, and the test then has to
+/// play on past that point; half a second of media has no room for either.
+const TRACK: &str = "sine-5s.flac";
+
+/// Short on purpose, for the tests whose subject *is* the end of the track.
+const SHORT_TRACK: &str = "sine.flac";
+
 #[test]
 fn stop_preserves_the_logical_position() {
-    let mut engine = TestEngine::start("sine.flac");
+    let mut engine = TestEngine::start(TRACK);
     engine.play_for(Duration::from_millis(200));
     let before = engine.position();
     engine.send(PlaybackCommand::Stop);
@@ -24,7 +33,7 @@ fn stop_preserves_the_logical_position() {
 
 #[test]
 fn play_from_stopped_resumes_at_the_preserved_position_without_resetting() {
-    let mut engine = TestEngine::start("sine.flac");
+    let mut engine = TestEngine::start(TRACK);
     engine.play_for(Duration::from_millis(200));
     engine.send(PlaybackCommand::Stop);
     engine.await_state(PlaybackState::Stopped);
@@ -47,7 +56,7 @@ fn pause_holds_the_position_still_and_resume_continues_from_it() {
     // its cumulative counter and the timeline keeps its floor. If either were
     // voided, resuming would jump the position by everything played since the
     // generation was installed.
-    let mut engine = TestEngine::start("sine.flac");
+    let mut engine = TestEngine::start(TRACK);
     engine.play_for(Duration::from_millis(200));
     engine.send(PlaybackCommand::Pause);
     engine.await_state(PlaybackState::Paused);
@@ -77,7 +86,7 @@ fn pause_holds_the_position_still_and_resume_continues_from_it() {
 
 #[test]
 fn transport_recreation_preserves_position() {
-    let mut engine = TestEngine::start("sine.flac");
+    let mut engine = TestEngine::start(TRACK);
     engine.play_for(Duration::from_millis(200));
     let before = engine.position();
     engine.force_device_loss();
@@ -102,7 +111,7 @@ fn a_discard_that_times_out_does_not_rebuild_ahead_of_where_playback_was() {
     // Only `Discard` goes unanswered, so the recovery still meets a live device
     // and really does capture - which is the whole point. A wholly dead device
     // takes the rescue path instead and never touches the stale timeline.
-    let mut engine = TestEngine::start("sine.flac");
+    let mut engine = TestEngine::start(TRACK);
     engine.play_for(Duration::from_millis(200));
     let played_to = engine.position();
     engine.stop_answering_discards();
@@ -124,7 +133,7 @@ fn a_recovery_that_never_completes_fails_once_and_keeps_the_position() {
     // have brought the transport back. This is the milestone's invariant on its
     // worst path - the pipeline is gone and cannot be rebuilt, and the logical
     // position still has to survive it.
-    let mut engine = TestEngine::start("sine.flac");
+    let mut engine = TestEngine::start(TRACK);
     engine.play_for(Duration::from_millis(200));
     let before = engine.position();
     engine.silence_the_device();
@@ -147,7 +156,7 @@ fn a_recovery_cancelled_by_stop_ends_stopped_rather_than_failed() {
     // Regression: a stop arriving during a recovery's re-seek used to come back
     // as a rebuild failure, which turned the stop the user asked for into a
     // spurious `Failed` that `do_stop` then refused to correct.
-    let mut engine = TestEngine::start("sine.flac");
+    let mut engine = TestEngine::start(TRACK);
     engine.play_for(Duration::from_millis(200));
     let before = engine.position();
     engine.silence_the_device();
@@ -169,7 +178,7 @@ fn a_recovery_cancelled_by_stop_ends_stopped_rather_than_failed() {
 
 #[test]
 fn a_successful_seek_establishes_a_new_position() {
-    let mut engine = TestEngine::start("sine.flac");
+    let mut engine = TestEngine::start(TRACK);
     engine.play_for(Duration::from_millis(100));
     engine.send(PlaybackCommand::SeekTo(Duration::from_millis(300)));
     let event = engine.await_event(|e| matches!(e, PlaybackEvent::SeekCompleted { .. }));
@@ -189,7 +198,7 @@ fn a_successful_seek_establishes_a_new_position() {
 #[test]
 fn a_seek_while_stopped_stores_a_target_and_does_not_claim_completion() {
     // Regression: emitting SeekCompleted only after Play made Restart stall.
-    let mut engine = TestEngine::start("sine.flac");
+    let mut engine = TestEngine::start(TRACK);
     engine.send(PlaybackCommand::Stop);
     engine.await_state(PlaybackState::Stopped);
     engine.send(PlaybackCommand::SeekTo(Duration::from_millis(300)));
@@ -205,7 +214,7 @@ fn a_seek_while_stopped_stores_a_target_and_does_not_claim_completion() {
 #[test]
 fn restart_works_from_stopped_and_from_ended() {
     for setup in [PlaybackState::Stopped, PlaybackState::Ended] {
-        let mut engine = TestEngine::start("sine.flac");
+        let mut engine = TestEngine::start(SHORT_TRACK);
         match setup {
             PlaybackState::Stopped => {
                 engine.send(PlaybackCommand::Stop);
@@ -221,7 +230,7 @@ fn restart_works_from_stopped_and_from_ended() {
 
 #[test]
 fn play_from_ended_does_not_restart_implicitly() {
-    let mut engine = TestEngine::start("sine.flac");
+    let mut engine = TestEngine::start(SHORT_TRACK);
     engine.play_to_end();
     engine.send(PlaybackCommand::Play);
     engine.await_event(|e| matches!(e, PlaybackEvent::Warning { .. }));
@@ -230,11 +239,23 @@ fn play_from_ended_does_not_restart_implicitly() {
 
 #[test]
 fn end_of_track_waits_for_the_final_frames_predicted_play_time() {
-    let mut engine = TestEngine::start("sine.flac");
+    let mut engine = TestEngine::start(SHORT_TRACK);
     engine.drain_ring_without_advancing_clock();
-    assert!(
-        engine.try_event().is_none(),
+    // Asserted on the two things that would *be* a premature end of track, not
+    // on the inbox being empty: a contended machine also makes the worker miss
+    // spans, and the diagnostic warning that reports the loss says nothing
+    // about when EOF fires. `count_events` pumps for a further 200 ms of real
+    // time while the virtual clock stays where the drain left it, so a
+    // too-eager EOF has more room to show up here than a bare peek gave it.
+    let premature = engine.count_events(|e| matches!(e, PlaybackEvent::EndOfTrack { .. }));
+    assert_eq!(
+        premature, 0,
         "EOF must not fire when the ring merely empties"
+    );
+    assert_eq!(
+        engine.state(),
+        PlaybackState::Playing,
+        "an empty ring is not the end of the track"
     );
     engine.advance_past_output_latency();
     engine.await_event(|e| matches!(e, PlaybackEvent::EndOfTrack { .. }));
@@ -242,7 +263,7 @@ fn end_of_track_waits_for_the_final_frames_predicted_play_time() {
 
 #[test]
 fn progress_carries_the_session_revision_it_belongs_to() {
-    let mut engine = TestEngine::start("sine.flac");
+    let mut engine = TestEngine::start(TRACK);
     engine.play_for(Duration::from_millis(100));
     let first = engine.progress();
     engine.send(PlaybackCommand::Stop);
@@ -257,7 +278,7 @@ fn stop_travels_out_of_band_past_a_pending_backlog() {
     // Note that this does not exercise the admission limit: each TogglePause
     // costs two handshakes, so Stop arrives long before enough events pile up
     // to saturate the channel. The test below covers admission.
-    let mut engine = TestEngine::start("sine.flac");
+    let mut engine = TestEngine::start(TRACK);
     engine.stop_draining_events();
     for _ in 0..256 {
         engine.send(PlaybackCommand::TogglePause);
@@ -274,7 +295,7 @@ fn a_backlog_closes_command_admission_until_it_drains() {
     // This one uses a command whose whole cost is the event it emits, which
     // is what makes the admission limit observable - the command channel
     // still holds most of the batch because the worker stopped taking from it.
-    let mut engine = TestEngine::start("sine.flac");
+    let mut engine = TestEngine::start(TRACK);
     engine.stop_draining_events();
     for step in 0..256u32 {
         engine.send(PlaybackCommand::SetVolume(Volume::new(step as f32 / 256.0)));
@@ -309,7 +330,7 @@ fn diagnostics_aggregate_rather_than_accumulating_events() {
     // coalescing from its absence is that a handful of events account for every
     // single injected xrun - so assert both halves.
     const XRUNS: usize = 10_000;
-    let mut engine = TestEngine::start("sine.flac");
+    let mut engine = TestEngine::start(TRACK);
     engine.stop_draining_events();
     engine.inject_xruns(XRUNS);
     engine.resume_draining_events();
@@ -340,7 +361,7 @@ fn a_device_with_more_than_two_channels_is_refused_rather_than_played_wrong() {
     // playback three times too fast, position inflated by the same factor, and
     // not a word of it anywhere. Refusing is the contract until downmixing
     // lands.
-    let message = support::load_failure_on_device("sine.flac", 6);
+    let message = support::load_failure_on_device(SHORT_TRACK, 6);
     assert!(
         message.contains('6') && message.contains("channels"),
         "the refusal must name the negotiated channel count, got {message:?}"
@@ -349,7 +370,7 @@ fn a_device_with_more_than_two_channels_is_refused_rather_than_played_wrong() {
 
 #[test]
 fn a_disconnected_event_receiver_terminates_the_worker() {
-    let engine = TestEngine::start("sine.flac");
+    let engine = TestEngine::start(TRACK);
     engine.drop_event_receiver();
     assert!(engine.join_within(Duration::from_secs(2)));
 }

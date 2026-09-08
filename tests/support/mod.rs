@@ -8,7 +8,13 @@
 //!   but no audio is consumed and no instant passes, so a position read before
 //!   a command and one read after it are comparable exactly.
 //! * *advancing* — one buffer period of virtual time per step, which is what
-//!   playing audio looks like.
+//!   playing audio looks like. Used only to reach the end of a track, where
+//!   how much time passes on the way does not matter.
+//!
+//! Anything that has to stop at a particular point instead steps the clock from
+//! the test thread — `play_for`, `let_time_pass` — so that how far playback ran
+//! is a count this harness kept rather than a consequence of how long the
+//! scheduler kept the test thread away.
 //!
 //! Every assertion about preservation is made with the clock frozen; that is
 //! what makes `assert_eq!` on a position honest rather than flaky.
@@ -35,6 +41,7 @@ use continuo::playback::output::cpal_output::OutputFault;
 use continuo::playback::output::test_output::TestOutput;
 use continuo::playback::output::{AudioOutput, Nanos, NegotiatedOutput, OutputRequest};
 use continuo::playback::state::PlaybackState;
+use continuo::playback::volume::Volume;
 
 const CHANNELS: u16 = 2;
 const RATE: u32 = 48_000;
@@ -45,6 +52,18 @@ const PERIOD: Duration = Duration::from_millis(2);
 /// been heard" are far apart in time and the end-of-track rule is observable.
 const LATENCY: Duration = Duration::from_millis(100);
 const DRIVER_NAP: Duration = Duration::from_micros(500);
+/// Between two periods of a drain that is still producing audio.
+const PACING_NAP: Duration = Duration::from_millis(1);
+/// Between two periods of a drain that has gone silent. Long enough that a
+/// worker thread waiting behind a full CPU has been scheduled and has had its
+/// chance to refill the ring, so silence means the ring is empty rather than
+/// that the machine was busy.
+const SILENCE_GRACE: Duration = Duration::from_millis(25);
+/// How far the harness clock may run ahead of the playback it drives, over and
+/// above the one output latency the pipeline owes it. Ten periods: the engine's
+/// span ring holds 64 records and the callback writes one per period, so this
+/// keeps the backlog an order of magnitude short of losing a span.
+const CLOCK_LEAD_SLACK: Duration = Duration::from_millis(20);
 const PATIENCE: Duration = Duration::from_secs(20);
 
 const FROZEN: u8 = 0;
@@ -311,22 +330,48 @@ impl TestEngine {
         self.driver.mode.store(mode, Ordering::Relaxed);
     }
 
-    /// Let the clock run until the reported position reaches `target`.
+    /// Play until the reported position reaches `target`, and stop there.
+    ///
+    /// The clock is stepped from this thread rather than left to the driver,
+    /// and it stops whenever the worker stops accounting for the steps already
+    /// taken. Neither half is optional. A free-running driver advances virtual
+    /// time on its own schedule, so how far past `target` playback runs is a
+    /// function of how long the scheduler kept the test thread away from the
+    /// position it was watching — under CPU contention that overshot by the
+    /// whole fixture. And a clock this thread steps as fast as it likes is not
+    /// a device either: it outruns the worker, fills the 64-record span ring,
+    /// and leaves the callback holding a span it could not publish, which is a
+    /// state a later device loss is read through instead of the timeline.
+    /// Waiting for the position to move keeps the clock inside what the engine
+    /// has accounted for, so what a test measures here is the pipeline rather
+    /// than the scheduler.
     pub fn play_for(&mut self, target: Duration) {
-        self.set_mode(ADVANCING);
         let deadline = Instant::now() + PATIENCE;
-        while self.raw_position() < target {
+        let clock_at_entry = self.clock();
+        let position_at_entry = self.raw_position();
+        loop {
+            let position = self.raw_position();
+            if position >= target {
+                break;
+            }
             if Instant::now() >= deadline {
-                self.set_mode(FROZEN);
-                panic!(
-                    "position never reached {target:?}; it stalled at {:?}",
-                    self.raw_position()
-                );
+                panic!("position never reached {target:?}; it stalled at {position:?}");
+            }
+            // How far the clock has run beyond the playback it is supposed to
+            // be driving. One output latency of it is the pipeline and cannot
+            // be helped: a span is published a latency before it is heard.
+            // Anything past that is the worker not having caught up, and is
+            // where the clock waits.
+            let lead = self
+                .clock()
+                .saturating_sub(clock_at_entry)
+                .saturating_sub(position.saturating_sub(position_at_entry));
+            if lead < LATENCY + CLOCK_LEAD_SLACK {
+                lock(&self.device).output.advance(PERIOD);
             }
             self.pump_events();
-            std::thread::sleep(Duration::from_millis(1));
+            std::thread::sleep(PACING_NAP);
         }
-        self.set_mode(FROZEN);
         self.settle();
     }
 
@@ -366,8 +411,18 @@ impl TestEngine {
                     silent = 0;
                 }
             }
-            // Paced so the worker is never the reason the ring runs dry.
-            std::thread::sleep(Duration::from_millis(1));
+            // Paced so the worker is never the reason the ring runs dry. Once a
+            // period has come back silent the pause gets much longer, because
+            // from here on the question is no longer how fast the ring drains
+            // but whether it is really empty: a worker that a loaded machine
+            // descheduled would refill it given the chance, and the point of
+            // waiting is to give it that chance before calling the ring dry.
+            let pause = if silent > 0 {
+                SILENCE_GRACE
+            } else {
+                PACING_NAP
+            };
+            std::thread::sleep(pause);
         }
         self.pump_events();
     }
@@ -375,26 +430,34 @@ impl TestEngine {
     /// Let virtual time pass without asking anything of the engine. Used to
     /// show that a parked transport does not move the position.
     pub fn let_time_pass(&mut self, span: Duration) {
-        let until = Instant::now() + Duration::from_secs(5);
-        let mut advanced = Duration::ZERO;
-        while advanced < span && Instant::now() < until {
-            lock(&self.device).output.advance(PERIOD);
-            advanced += PERIOD;
-            std::thread::sleep(Duration::from_micros(200));
-        }
+        self.advance_clock(span);
         self.settle();
     }
 
     pub fn advance_past_output_latency(&mut self) {
-        let until = Instant::now() + Duration::from_secs(5);
+        self.advance_clock(LATENCY + LATENCY);
+        self.pump_events();
+    }
+
+    /// Advance the virtual clock by `span`, a period at a time, and do not
+    /// return until all of it has passed.
+    ///
+    /// The amount is what the caller asked for rather than whatever fitted in a
+    /// real-time budget: a truncated advance is indistinguishable from an
+    /// engine that failed to move, and on a loaded machine it is the budget
+    /// that runs out first. The real-time bound is only a deadlock guard, and
+    /// reaching it is a failure rather than an early exit.
+    fn advance_clock(&mut self, span: Duration) {
+        let deadline = Instant::now() + PATIENCE;
         let mut advanced = Duration::ZERO;
-        let target = LATENCY + LATENCY;
-        while advanced < target && Instant::now() < until {
+        while advanced < span {
+            if Instant::now() >= deadline {
+                panic!("only {advanced:?} of the requested {span:?} of virtual time passed");
+            }
             lock(&self.device).output.advance(PERIOD);
             advanced += PERIOD;
             std::thread::sleep(Duration::from_micros(200));
         }
-        self.pump_events();
     }
 
     // --------------------------------------------------------------- events
@@ -513,6 +576,11 @@ impl TestEngine {
         self.progress().position
     }
 
+    /// The virtual device's clock.
+    fn clock(&self) -> Duration {
+        Duration::from_nanos(lock(&self.device).output.now().0)
+    }
+
     /// The published position, once the worker has had a chance to publish
     /// everything the frozen clock implies. Reading straight after a command
     /// would otherwise see the snapshot from before it was dispatched.
@@ -521,22 +589,44 @@ impl TestEngine {
         self.raw_position()
     }
 
-    /// Wait until the published position stops changing. Only meaningful with
-    /// the clock frozen, which is the only time a test compares positions.
+    /// Wait until the published position accounts for every span the callback
+    /// has produced. Only meaningful with the clock frozen, which is the only
+    /// time a test compares positions.
+    ///
+    /// A round trip through the worker, not "the number stopped changing for a
+    /// while". The worker drains the span ring and republishes the position at
+    /// the top of every pass of its loop and dispatches commands at the bottom,
+    /// so an event answering a command sent from here proves a whole pass ran
+    /// after the last span was published — and with the clock frozen and the
+    /// callback idle, no further span can appear. Watching the number for
+    /// stability instead mistakes a worker a loaded machine has merely
+    /// descheduled for one that has finished, and the position read then is
+    /// short by whatever the worker had not yet drained.
     fn settle(&mut self) {
+        if !self.draining.load(Ordering::Relaxed) {
+            // Nothing is reading the event channel, so no answer can arrive.
+            return;
+        }
+        // Idempotent: full volume is what the engine starts at, and no test
+        // changes the volume before comparing positions.
+        self.send(PlaybackCommand::SetVolume(Volume::FULL));
         let deadline = Instant::now() + PATIENCE;
-        let mut last = self.raw_position();
         loop {
-            std::thread::sleep(Duration::from_millis(12));
             self.pump_events();
-            let current = self.raw_position();
-            if current == last {
-                return;
+            {
+                let mut inbox = lock(&self.inbox);
+                let answer = inbox
+                    .iter()
+                    .position(|e| matches!(e, PlaybackEvent::VolumeChanged { .. }));
+                if let Some(index) = answer {
+                    inbox.remove(index);
+                    return;
+                }
             }
             if Instant::now() >= deadline {
-                panic!("the published position never settled");
+                panic!("the worker never answered the barrier the position is read behind");
             }
-            last = current;
+            std::thread::sleep(Duration::from_millis(1));
         }
     }
 
