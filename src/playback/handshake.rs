@@ -47,8 +47,15 @@ impl Handshake {
 
     /// Publish `Run` for an already-installed generation (used by tests and by
     /// resuming from `Park` without a flush).
-    pub fn start_running(&mut self, generation: u16) {
+    ///
+    /// Advancing the generation and resetting the timeline that tracks it are
+    /// the same action: a caller that bumped `self.generation` without also
+    /// voiding the old timeline state would have every subsequent span
+    /// silently dropped by `Timeline::accept`'s generation filter, and every
+    /// capture would read back as zero.
+    pub fn start_running(&mut self, generation: u16, timeline: &mut Timeline) {
         self.generation = generation;
+        timeline.reset(generation);
         let epoch = self.next_epoch();
         self.link.publish_control(Control {
             generation,
@@ -115,14 +122,19 @@ impl Handshake {
 
     /// Steps 4 and 5: adopt the new generation parked, and release to `Run` only
     /// when the desired state is playing.
+    ///
+    /// Like `start_running`, this advances the generation and resets the
+    /// timeline together so the two can never drift apart.
     pub fn install(
         &mut self,
         generation: u16,
         playing: bool,
+        timeline: &mut Timeline,
         pump: &mut dyn FnMut(),
         deadline: Duration,
     ) -> Result<(), HandshakeError> {
         self.generation = generation;
+        timeline.reset(generation);
         let epoch = self.next_epoch();
         self.link.publish_control(Control {
             generation,
@@ -226,12 +238,7 @@ mod tests {
     fn freeze_captures_the_final_position_before_anything_resets() {
         let mut rig = rig(64);
         push(&mut rig, 960);
-        rig.handshake.start_running(1);
-        // The timeline is generation-filtered (Task 2's `accept`): a real
-        // caller resets it to the new generation the moment it starts
-        // running that generation, so match that here or every span below
-        // is silently dropped and the capture reads back as zero.
-        rig.timeline.reset(1);
+        rig.handshake.start_running(1, &mut rig.timeline);
         let out = Rc::clone(&rig.output);
         out.borrow_mut().advance(Duration::from_millis(20));
 
@@ -260,8 +267,7 @@ mod tests {
         // draining deadlocks and times out on a perfectly healthy device.
         let mut rig = rig(1);
         push(&mut rig, 4_800);
-        rig.handshake.start_running(1);
-        rig.timeline.reset(1);
+        rig.handshake.start_running(1, &mut rig.timeline);
         let out = Rc::clone(&rig.output);
         out.borrow_mut().advance(Duration::from_millis(50)); // saturates the 1-slot ring
 
@@ -283,7 +289,7 @@ mod tests {
     fn discard_waits_for_the_parked_acknowledgment_not_an_empty_ring() {
         let mut rig = rig(64);
         push(&mut rig, 4_800);
-        rig.handshake.start_running(1);
+        rig.handshake.start_running(1, &mut rig.timeline);
         let out = Rc::clone(&rig.output);
         out.borrow_mut().advance(Duration::from_millis(10));
 
@@ -309,6 +315,7 @@ mod tests {
             .install(
                 2,
                 false, // desired state is paused
+                &mut rig.timeline,
                 &mut || {
                     seen_probe
                         .borrow_mut()
@@ -333,6 +340,7 @@ mod tests {
             .install(
                 2,
                 true,
+                &mut rig.timeline,
                 &mut || out_pump.borrow_mut().advance(Duration::from_millis(10)),
                 DEADLINE,
             )
@@ -343,7 +351,7 @@ mod tests {
     #[test]
     fn a_stale_epoch_acknowledgment_does_not_satisfy_a_wait() {
         let mut rig = rig(64);
-        rig.handshake.start_running(1);
+        rig.handshake.start_running(1, &mut rig.timeline);
         let stale = rig.link.load_control();
         rig.link
             .acknowledge(stale.generation, stale.epoch, Adopted::Parked);
@@ -356,7 +364,7 @@ mod tests {
     #[test]
     fn a_silent_output_times_out_rather_than_hanging() {
         let mut rig = rig(64);
-        rig.handshake.start_running(1);
+        rig.handshake.start_running(1, &mut rig.timeline);
         let out_clock = Rc::clone(&rig.output);
         let result = rig.handshake.freeze_and_capture(
             &mut rig.timeline,
