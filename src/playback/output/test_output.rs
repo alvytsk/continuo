@@ -65,8 +65,29 @@ impl TestOutput {
         }
     }
 
+    /// Run one callback period at the current instant, leaving the virtual
+    /// clock where it is.
+    ///
+    /// Every handshake acknowledgment comes from the callback, so a test that
+    /// has to complete a transition *without letting time pass* — proving that
+    /// stopping preserves the position exactly, rather than to within however
+    /// far the clock drifted — needs the callback to run at a fixed instant.
+    /// Only meaningful outside `Phase::Run`: in `Run` a caller would be asking
+    /// for two buffers of audio to be played in the same instant.
+    pub fn pump_in_place(&mut self) {
+        let playback = Nanos(self.now.0 + self.latency.as_nanos() as u64);
+        if let Some(core) = self.core.as_mut() {
+            core.fill(&mut self.scratch, playback);
+            self.captured.extend_from_slice(&self.scratch);
+        }
+    }
+
     pub fn channels(&self) -> u16 {
         self.channels
+    }
+
+    pub fn buffer_frames(&self) -> u32 {
+        self.buffer_frames
     }
 }
 
