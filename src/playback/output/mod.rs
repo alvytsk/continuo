@@ -1,5 +1,7 @@
 use std::time::Duration;
 
+pub mod test_output;
+
 /// A point on the output device's clock, in nanoseconds.
 ///
 /// This exists so `timeline` never depends on cpal: `TestOutput` synthesizes
