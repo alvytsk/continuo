@@ -117,6 +117,13 @@ pub fn run(cli: cli::Cli) -> Result<(), PlaybackError> {
         render(&mirror)?;
     };
 
+    // Out of band first, and in band only as a courtesy. The worker stops
+    // reading commands while an event backlog exists, and this loop has just
+    // stopped draining events, so an in-band `Shutdown` can sit unread in the
+    // channel forever while `join` blocks - hanging the process with the
+    // terminal still in raw mode. The interrupt is the only signal that is
+    // guaranteed to be seen.
+    engine.interrupt_shutdown();
     engine.commands().send(PlaybackCommand::Shutdown).ok();
     engine.join();
     outcome

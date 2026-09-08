@@ -87,7 +87,12 @@ impl Timeline {
             // because the previous buffer needed refilling.
             let superseded = self.pending.get(1).is_some_and(|next| now >= next.t0);
             if now >= front_end || superseded {
-                self.floor = media_total_after;
+                // `max`, not assignment. The real callback only ever increments
+                // its cumulative media counter, so this is unreachable from the
+                // device; but the floor is what every preserved position is
+                // built on, and a stale span surviving a mis-ordered generation
+                // reset must be able to do nothing worse than nothing.
+                self.floor = self.floor.max(media_total_after);
                 self.pending.pop_front();
             } else {
                 break;

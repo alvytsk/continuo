@@ -106,12 +106,22 @@ impl AudioOutput for HarnessOutput {
 struct Driver {
     device: Arc<Mutex<Device>>,
     mode: AtomicU8,
+    /// When set, the callback is not run while the worker is waiting for a
+    /// `Discard` to be acknowledged. Every other phase is answered normally,
+    /// which is what separates this from `silence_the_device`: the recovery
+    /// the timeout drops into still gets a live device to capture from, which
+    /// is the only condition under which a stale timeline can be misread.
+    deaf_to_discard: AtomicBool,
     stop: AtomicBool,
 }
 
 impl Driver {
     fn step(&self) {
         let mut device = lock(&self.device);
+        let phase = device.link.as_ref().map(|link| link.load_control().phase);
+        if self.deaf_to_discard.load(Ordering::Relaxed) && phase == Some(Phase::Discard) {
+            return;
+        }
         if self.mode.load(Ordering::Relaxed) == ADVANCING {
             device.output.advance(PERIOD);
             return;
@@ -161,6 +171,7 @@ impl TestEngine {
         let driver = Arc::new(Driver {
             device: Arc::clone(&device),
             mode: AtomicU8::new(FROZEN),
+            deaf_to_discard: AtomicBool::new(false),
             stop: AtomicBool::new(false),
         });
         let thread = {
@@ -222,6 +233,17 @@ impl TestEngine {
             .faults
             .send(OutputFault::Rebuild(cpal::ErrorKind::DeviceNotAvailable));
         let _ = self.wake.try_send(());
+    }
+
+    /// Answer every handshake phase except `Discard`, which is left to run to
+    /// its deadline. Reversible, so the recovery the timeout triggers can
+    /// complete against a device that works again.
+    pub fn stop_answering_discards(&mut self) {
+        self.driver.deaf_to_discard.store(true, Ordering::Relaxed);
+    }
+
+    pub fn answer_discards_again(&mut self) {
+        self.driver.deaf_to_discard.store(false, Ordering::Relaxed);
     }
 
     /// Kill the device: it accepts everything and answers nothing, so every
@@ -554,5 +576,46 @@ impl Drop for TestEngine {
         if let Some(thread) = lock(&self.thread).take() {
             let _ = thread.join();
         }
+    }
+}
+
+/// Load `name` against a device that negotiates `channels` output channels, and
+/// return the message of the failure it produces.
+///
+/// Deliberately not a `TestEngine`: the engine never reaches `Paused` here, so
+/// there is no transport to drive and nothing for the driver thread to do.
+pub fn load_failure_on_device(name: &str, channels: u16) -> String {
+    let device = Arc::new(Mutex::new(Device {
+        output: TestOutput::new(channels, RATE, BUFFER_FRAMES, LATENCY),
+        link: None,
+    }));
+    // Held for the call's duration, so the worker's fault receiver stays live.
+    let (_faults, fault_rx) = crossbeam_channel::bounded(16);
+    let handle = EngineHandle::spawn_with(
+        Box::new(HarnessOutput {
+            device: Arc::clone(&device),
+        }),
+        fault_rx,
+    );
+    let path = fixture(name);
+    let sent = handle.commands().send(PlaybackCommand::Load {
+        media: MediaId::LocalFile(path.clone()),
+        source: SourceLocation::LocalPath(path.as_path().to_path_buf()),
+        start_at: Duration::ZERO,
+    });
+    if sent.is_err() {
+        panic!("the engine stopped accepting commands");
+    }
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        while let Ok(event) = handle.events().try_recv() {
+            if let PlaybackEvent::Failed { message, .. } = event {
+                return message;
+            }
+        }
+        if Instant::now() >= deadline {
+            panic!("the load never failed");
+        }
+        std::thread::sleep(Duration::from_millis(1));
     }
 }

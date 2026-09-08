@@ -690,6 +690,22 @@ impl Worker {
             preferred_channels: source_channels,
         })?;
         let channels = config.channels.max(1);
+        // M1 is scoped to mono and stereo, and `Converter` only knows how to
+        // fan a source out to one or two device channels. A 6- or 8-channel
+        // default is routine on HDMI and PipeWire, and the interleave fallback
+        // would quietly emit two samples per frame into a buffer the engine
+        // strides at six: 3x-fast playback and a 3x-inflated position, with no
+        // error anywhere. Refuse the device instead. Downmixing is a later
+        // milestone.
+        if !matches!(channels, 1 | 2) {
+            return Err(PlaybackError::UnsupportedInput {
+                path: Default::default(),
+                reason: format!(
+                    "the audio device negotiated {channels} channels; \
+                     only mono and stereo output is supported"
+                ),
+            });
+        }
         let link = Arc::new(OutputLink::new());
         link.set_gain(self.volume.as_gain());
 
@@ -747,9 +763,32 @@ impl Worker {
         if let Some(converter) = self.converter.as_mut() {
             converter.reset();
         }
+        // The discard comes first, and the generation state is reset only once
+        // it has succeeded. Both are recoveries into `rebuild`, but they meet
+        // the timeline in opposite conditions: `install` resets the timeline as
+        // its first action, so a timeout there leaves `capture_position` with a
+        // voided timeline and nothing to misread. A timeout in `discard` leaves
+        // the *previous* generation's spans standing, and if the anchor had
+        // already been moved to the freshly seeked target, the capture would
+        // read back `anchor_new + played_old` - a silent forward jump of
+        // everything played since the last install.
+        let discarded = {
+            let Some(transport) = self.transport.as_mut() else {
+                return Ok(());
+            };
+            let mut pump = || std::thread::sleep(PUMP_NAP);
+            transport.handshake.discard(&mut pump, DEADLINE)
+        };
+        // The device stopped answering. Recreate it rather than run on against
+        // a transport whose state can no longer be established - and pass the
+        // outcome through unchanged, so the caller can tell a failed recovery
+        // from a cancelled one and announce neither.
+        if discarded.is_err() {
+            return self.rebuild("handshake timeout", playing);
+        }
         self.reset_generation_state();
         let generation = self.generation;
-        let adopted = {
+        let installed = {
             let Self {
                 transport,
                 timeline,
@@ -761,18 +800,9 @@ impl Worker {
             let mut pump = || std::thread::sleep(PUMP_NAP);
             transport
                 .handshake
-                .discard(&mut pump, DEADLINE)
-                .and_then(|()| {
-                    transport
-                        .handshake
-                        .install(generation, false, timeline, &mut pump, DEADLINE)
-                })
+                .install(generation, false, timeline, &mut pump, DEADLINE)
         };
-        if adopted.is_err() {
-            // The device stopped answering. Recreate it rather than run on
-            // against a transport whose state can no longer be established -
-            // and pass the outcome through unchanged, so the caller can tell
-            // a failed recovery from a cancelled one and announce neither.
+        if installed.is_err() {
             return self.rebuild("handshake timeout", playing);
         }
         self.prime_and_run(playing);

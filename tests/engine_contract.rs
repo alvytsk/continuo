@@ -31,9 +31,13 @@ fn play_from_stopped_resumes_at_the_preserved_position_without_resetting() {
     let preserved = engine.position();
     engine.send(PlaybackCommand::Play);
     engine.await_state(PlaybackState::Playing);
-    assert!(
-        engine.position() >= preserved,
-        "resume must not rewind to zero"
+    // Exact, not `>=`: the clock is frozen across the transition, so any
+    // movement at all is a bug rather than playback. A `>=` here would accept
+    // the forward jump a mis-ordered generation reset produces.
+    assert_eq!(
+        engine.position(),
+        preserved,
+        "resume must continue from the preserved position, not rewind or jump"
     );
 }
 
@@ -78,9 +82,38 @@ fn transport_recreation_preserves_position() {
     let before = engine.position();
     engine.force_device_loss();
     engine.await_event(|e| matches!(e, PlaybackEvent::DeviceRecovered { .. }));
+    assert_eq!(
+        engine.position(),
+        before,
+        "recreation must preserve the position exactly, not merely not reset it"
+    );
+}
+
+#[test]
+fn a_discard_that_times_out_does_not_rebuild_ahead_of_where_playback_was() {
+    // Regression. `reinstall` used to move the anchor onto the freshly seeked
+    // target *before* asking the callback to discard the old generation's ring.
+    // A discard that timed out dropped into `rebuild`, whose capture then ran
+    // against a timeline that had never been reset and still held the previous
+    // generation's spans: it read back `new anchor + everything played since
+    // the last install`, and the transport came back that far ahead of where
+    // the media actually was. Nothing anywhere reported it.
+    //
+    // Only `Discard` goes unanswered, so the recovery still meets a live device
+    // and really does capture - which is the whole point. A wholly dead device
+    // takes the rescue path instead and never touches the stale timeline.
+    let mut engine = TestEngine::start("sine.flac");
+    engine.play_for(Duration::from_millis(200));
+    let played_to = engine.position();
+    engine.stop_answering_discards();
+    engine.send(PlaybackCommand::SeekTo(Duration::from_millis(50)));
+    engine.await_event(|e| matches!(e, PlaybackEvent::DeviceRecovered { .. }));
+    engine.answer_discards_again();
+    let landed = engine.position();
     assert!(
-        engine.position() >= before,
-        "recreation must not reset position"
+        landed <= played_to,
+        "a rebuild may fall back to where playback was, but never jump past it; \
+         playback was at {played_to:?} and the rebuild landed at {landed:?}"
     );
 }
 
@@ -257,16 +290,60 @@ fn a_backlog_closes_command_admission_until_it_drains() {
     engine.await_state(PlaybackState::Stopped);
 }
 
+/// The underrun count an aggregated diagnostic warning reports, or zero if the
+/// message is not one.
+fn reported_underruns(message: &str) -> usize {
+    let words: Vec<&str> = message.split_whitespace().collect();
+    words
+        .windows(2)
+        .find(|pair| pair[1] == "underruns,")
+        .and_then(|pair| pair[0].parse().ok())
+        .unwrap_or(0)
+}
+
 #[test]
 fn diagnostics_aggregate_rather_than_accumulating_events() {
+    // A bare upper bound on the warning count proves nothing: the event channel
+    // holds 64 slots with 8 held back, so no more than 56 warnings can ever be
+    // emitted even with coalescing deleted outright. What distinguishes
+    // coalescing from its absence is that a handful of events account for every
+    // single injected xrun - so assert both halves.
+    const XRUNS: usize = 10_000;
     let mut engine = TestEngine::start("sine.flac");
     engine.stop_draining_events();
-    engine.inject_xruns(10_000);
+    engine.inject_xruns(XRUNS);
     engine.resume_draining_events();
-    let warnings = engine.count_events(|e| matches!(e, PlaybackEvent::Warning { .. }));
+    let aggregate = engine.await_event(|e| match e {
+        PlaybackEvent::Warning { message, .. } => reported_underruns(message) >= XRUNS,
+        _ => false,
+    });
+    let PlaybackEvent::Warning { message, .. } = &aggregate else {
+        panic!("await_event returned {aggregate:?}, which is not a warning");
+    };
     assert!(
-        warnings < 100,
-        "diagnostics must coalesce, got {warnings} warnings"
+        reported_underruns(message) >= XRUNS,
+        "one warning must account for all {XRUNS} xruns, got {message:?}"
+    );
+    // `await_event` took the aggregate out of the inbox; the rest stayed.
+    let others = engine.count_events(|e| matches!(e, PlaybackEvent::Warning { .. }));
+    let total = others + 1;
+    assert!(
+        total < 10,
+        "{XRUNS} xruns must coalesce into a handful of events, got {total} warnings"
+    );
+}
+
+#[test]
+fn a_device_with_more_than_two_channels_is_refused_rather_than_played_wrong() {
+    // M1 is scoped to mono and stereo. A 6-channel default is routine on HDMI
+    // and PipeWire, and the converter would fill only two of every six slots:
+    // playback three times too fast, position inflated by the same factor, and
+    // not a word of it anywhere. Refusing is the contract until downmixing
+    // lands.
+    let message = support::load_failure_on_device("sine.flac", 6);
+    assert!(
+        message.contains('6') && message.contains("channels"),
+        "the refusal must name the negotiated channel count, got {message:?}"
     );
 }
 
