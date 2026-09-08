@@ -85,6 +85,56 @@ fn transport_recreation_preserves_position() {
 }
 
 #[test]
+fn a_recovery_that_never_completes_fails_once_and_keeps_the_position() {
+    // The device stops answering, so every handshake in the recovery runs to
+    // its deadline: the capture times out, and so does the install that would
+    // have brought the transport back. This is the milestone's invariant on its
+    // worst path - the pipeline is gone and cannot be rebuilt, and the logical
+    // position still has to survive it.
+    let mut engine = TestEngine::start("sine.flac");
+    engine.play_for(Duration::from_millis(200));
+    let before = engine.position();
+    engine.silence_the_device();
+    engine.force_device_loss();
+    engine.await_state(PlaybackState::Failed);
+    assert_eq!(
+        engine.position(),
+        before,
+        "a failed recovery must still preserve the position"
+    );
+    assert_eq!(
+        engine.count_events(|e| matches!(e, PlaybackEvent::Failed { .. })),
+        1,
+        "a failure is reported once, not on every pass of the loop"
+    );
+}
+
+#[test]
+fn a_recovery_cancelled_by_stop_ends_stopped_rather_than_failed() {
+    // Regression: a stop arriving during a recovery's re-seek used to come back
+    // as a rebuild failure, which turned the stop the user asked for into a
+    // spurious `Failed` that `do_stop` then refused to correct.
+    let mut engine = TestEngine::start("sine.flac");
+    engine.play_for(Duration::from_millis(200));
+    let before = engine.position();
+    engine.silence_the_device();
+    engine.force_device_loss();
+    engine.await_recovery_capture();
+    engine.interrupt_stop();
+    engine.await_state(PlaybackState::Stopped);
+    assert_eq!(
+        engine.count_events(|e| matches!(e, PlaybackEvent::Failed { .. })),
+        0,
+        "a cancelled recovery is not a failure"
+    );
+    assert_eq!(
+        engine.position(),
+        before,
+        "a cancelled recovery preserves the position too"
+    );
+}
+
+#[test]
 fn a_successful_seek_establishes_a_new_position() {
     let mut engine = TestEngine::start("sine.flac");
     engine.play_for(Duration::from_millis(100));

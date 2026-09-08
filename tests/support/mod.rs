@@ -224,6 +224,37 @@ impl TestEngine {
         let _ = self.wake.try_send(());
     }
 
+    /// Kill the device: it accepts everything and answers nothing, so every
+    /// handshake wait runs to its deadline. Opt-in and permanent, so a recovery
+    /// that reopens the device still meets a dead one.
+    pub fn silence_the_device(&mut self) {
+        lock(&self.device).output.stop_responding();
+    }
+
+    /// Wait until the worker has published `Freeze`, which is the first thing a
+    /// recovery does. Polling the published phase rather than sleeping a guessed
+    /// interval is what keeps the cancellation test deterministic: the freeze
+    /// then sits on its deadline for as long as the test needs.
+    pub fn await_recovery_capture(&mut self) {
+        let deadline = Instant::now() + PATIENCE;
+        loop {
+            {
+                let device = lock(&self.device);
+                if device
+                    .link
+                    .as_ref()
+                    .is_some_and(|link| link.load_control().phase == Phase::Freeze)
+                {
+                    return;
+                }
+            }
+            if Instant::now() >= deadline {
+                panic!("the worker never began capturing for a recovery");
+            }
+            std::thread::sleep(Duration::from_micros(200));
+        }
+    }
+
     pub fn inject_xruns(&mut self, count: usize) {
         let device = lock(&self.device);
         let Some(link) = device.link.as_ref() else {

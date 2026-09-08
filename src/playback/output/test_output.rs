@@ -11,6 +11,9 @@ pub struct TestOutput {
     buffer_frames: u32,
     latency: Duration,
     now: Nanos,
+    /// When set, buffers are accepted but never run. Opt-in, and never cleared
+    /// by `close`, so a recovery that reopens the device still meets a dead one.
+    silent: bool,
     core: Option<CallbackCore>,
     scratch: Vec<f32>,
     captured: Vec<f32>,
@@ -25,6 +28,7 @@ impl TestOutput {
             buffer_frames: buffer_frames.max(1),
             latency,
             now: Nanos(0),
+            silent: false,
             core: None,
             scratch: vec![0.0; samples],
             captured: Vec::new(),
@@ -33,6 +37,17 @@ impl TestOutput {
 
     pub fn attach(&mut self, core: CallbackCore) {
         self.core = Some(core);
+    }
+
+    /// Stop running the callback, permanently.
+    ///
+    /// Time still passes, buffers are still accepted and the stream still
+    /// opens; the device simply never runs anything again, which is what a
+    /// handshake deadline exists to detect. Every wait then runs to its
+    /// deadline and comes back `HandshakeError::Timeout`, which is the only way
+    /// a test can reach the worker's recovery paths.
+    pub fn stop_responding(&mut self) {
+        self.silent = true;
     }
 
     pub fn now(&self) -> Nanos {
@@ -56,7 +71,9 @@ impl TestOutput {
             // `playback` is a prediction ahead of the callback instant, exactly
             // as cpal reports it, so `now < t0` holds for the newest span.
             let playback = Nanos(self.now.0 + self.latency.as_nanos() as u64);
-            if let Some(core) = self.core.as_mut() {
+            if !self.silent
+                && let Some(core) = self.core.as_mut()
+            {
                 core.fill(&mut self.scratch, playback);
                 self.captured.extend_from_slice(&self.scratch);
             }
@@ -76,7 +93,9 @@ impl TestOutput {
     /// for two buffers of audio to be played in the same instant.
     pub fn pump_in_place(&mut self) {
         let playback = Nanos(self.now.0 + self.latency.as_nanos() as u64);
-        if let Some(core) = self.core.as_mut() {
+        if !self.silent
+            && let Some(core) = self.core.as_mut()
+        {
             core.fill(&mut self.scratch, playback);
             self.captured.extend_from_slice(&self.scratch);
         }
