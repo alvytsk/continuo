@@ -142,6 +142,10 @@ fn a_range_less_server_plays_sequentially_and_refuses_every_seek() {
     engine.await_state(PlaybackState::Playing);
     engine.play_for(Duration::from_millis(100));
 
+    // MINOR 9 (fix round 1): captured before the seek so the request count
+    // can prove the gate rejected before ever reopening, not merely that a
+    // doomed attempt eventually failed - see IMPORTANT 3's fix.
+    let requests_before_seek = server.requests().len();
     assert_eq!(
         engine.handle().submit_seek(Duration::from_secs(2)),
         Admission::Accepted
@@ -150,11 +154,37 @@ fn a_range_less_server_plays_sequentially_and_refuses_every_seek() {
     let PlaybackEvent::SeekRejected { reason, .. } = rejection else {
         unreachable!("await_event's predicate already matched SeekRejected")
     };
-    assert!(
-        reason.to_lowercase().contains("seek"),
+    // MINOR 9: an exact match, not `.contains("seek")` - a doomed real
+    // attempt that failed and then also failed to restore renders as
+    // "seek failed (...) and the decoder could not be restored (...)",
+    // which also contains "seek" and would have passed on the pre-fix
+    // behaviour this test exists to rule out.
+    assert_eq!(
+        reason, "this source cannot seek",
         "unexpected rejection reason: {reason:?}"
     );
+    assert_eq!(
+        server.requests().len(),
+        requests_before_seek,
+        "the seek opened a fetch on a source already known to be unsupported"
+    );
     // Playback itself is undisturbed by the refused seek.
+    assert_eq!(engine.state(), PlaybackState::Playing);
+
+    // "Every seek", not just the first.
+    assert_eq!(
+        engine.handle().submit_seek(Duration::from_secs(3)),
+        Admission::Accepted
+    );
+    let second_rejection = engine.await_event(|e| matches!(e, PlaybackEvent::SeekRejected { .. }));
+    let PlaybackEvent::SeekRejected {
+        reason: second_reason,
+        ..
+    } = second_rejection
+    else {
+        unreachable!("await_event's predicate already matched SeekRejected")
+    };
+    assert_eq!(second_reason, "this source cannot seek");
     assert_eq!(engine.state(), PlaybackState::Playing);
 
     engine.finish();
@@ -343,24 +373,40 @@ fn a_truncated_tail_cannot_become_end_of_track() {
 
 #[test]
 fn a_capability_change_carries_the_current_session_rev() {
-    // H14: any demonstrated seek promotes `Unknown` to `Native`, not only
-    // one taken through the stopped-seek verification path - and the event
-    // that announces it must carry the session revision current at the
-    // moment it fires, not the one current when the source was opened.
+    // H14: the event that announces a capability change must carry the
+    // session revision current at the moment it fires, not the one current
+    // when the source was first opened. MINOR 9 (fix round 1): nothing
+    // between load and an ordinary playing seek ever bumps the revision, so
+    // the original version of this test compared against a value that
+    // could not have been wrong - it passed whether or not the event
+    // actually read the current revision. A stop in between is what makes
+    // the two revisions genuinely different, so the comparison below can
+    // fail for the reason it names.
     let server = TestServer::start(Script::from_fixture("sine-5s.flac"));
     let mut engine = TestEngine::start_idle();
     engine.load_remote(&server.url("/audio.flac"));
+    let rev_at_load = engine.progress().session_rev;
+
     assert_eq!(engine.handle().submit_play(), Admission::Accepted);
     engine.await_state(PlaybackState::Playing);
     engine.play_for(Duration::from_millis(100));
-    let session_rev = engine.progress().session_rev;
 
+    engine.handle().submit_stop();
+    engine.await_state(PlaybackState::Stopped);
+    let rev_after_stop = engine.progress().session_rev;
+    assert_ne!(
+        rev_after_stop, rev_at_load,
+        "the stop must bump the session revision for this test to distinguish anything"
+    );
+
+    // A stopped seek on a source whose demuxer seek support is still
+    // `Unknown` (the reopen this triggers has proven nothing yet) runs the
+    // trial that promotes it - the `CapabilitiesChanged` this produces must
+    // carry `rev_after_stop`, never the stale `rev_at_load`.
     assert_eq!(
         engine.handle().submit_seek(Duration::from_secs(2)),
         Admission::Accepted
     );
-    engine.await_seek_completed(Duration::from_secs(10));
-
     let event = engine.await_event(|e| matches!(e, PlaybackEvent::CapabilitiesChanged { .. }));
     let PlaybackEvent::CapabilitiesChanged {
         session_rev: event_rev,
@@ -370,7 +416,7 @@ fn a_capability_change_carries_the_current_session_rev() {
         unreachable!("await_event's predicate already matched CapabilitiesChanged")
     };
     assert_eq!(
-        event_rev, session_rev,
+        event_rev, rev_after_stop,
         "a capability change must carry the session's current revision"
     );
     assert_eq!(
@@ -586,6 +632,12 @@ fn play_after_a_remote_failure_on_an_unseekable_source_fails_honestly() {
         "the failure was reported before any audio was heard"
     );
 
+    // Fix round 1, IMPORTANT 3: the `Unsupported` gate has to run before any
+    // reopen, not after one it then abandons live. Captured here, right
+    // before the retry, so a fetch the fix's own gate should never have
+    // opened is caught even though the very first `Load` already made one
+    // request of its own.
+    let requests_before_retry = server.requests().len();
     assert_eq!(engine.handle().submit_play(), Admission::Accepted);
     engine.await_state(PlaybackState::Stopped);
     assert_eq!(
@@ -593,6 +645,61 @@ fn play_after_a_remote_failure_on_an_unseekable_source_fails_honestly() {
         heard,
         "an unseekable retry moved the position"
     );
+    assert_eq!(
+        server.requests().len(),
+        requests_before_retry,
+        "the retry opened a fetch on a source already known to be unseekable, \
+         instead of rejecting before ever reopening it"
+    );
+    engine.finish();
+    server.shutdown();
+}
+
+#[test]
+fn a_second_explicit_play_after_a_still_broken_server_fails_again_rather_than_silently() {
+    // Fix round 1, IMPORTANT 4: `fail_with`'s own "a repeating fatal fault
+    // must not re-announce itself" guard returns early once `self.state ==
+    // Failed`. A listener-driven retry that also fails is not a repeating
+    // fault - it is one explicit action - so landing back in `Failed`
+    // without ever leaving it must not swallow that action into silence.
+    let server =
+        TestServer::start(Script::from_fixture("sine-5s.flac").truncate_body_after(16 << 10));
+    let mut engine = TestEngine::start_idle();
+    engine.load_remote(&server.url("/audio.flac"));
+    assert_eq!(engine.handle().submit_play(), Admission::Accepted);
+    engine.await_state(PlaybackState::Playing);
+    engine.play_for(Duration::from_millis(40));
+    engine.let_time_pass(Duration::from_secs(2));
+    engine.await_state(PlaybackState::Failed);
+    let heard = engine.progress().position;
+    // Drain the first failure out of the inbox: otherwise `await_event`
+    // below would match it immediately and never actually observe whether
+    // the retry produced anything of its own.
+    while engine.try_event().is_some() {}
+
+    // Same server, same URL, still truncated at the same relative point -
+    // the retry must discover that failure for itself. `await_state` and
+    // `await_event` only drain and wait; the harness clock stays frozen
+    // otherwise, so this needs its own `let_time_pass` to give the reopened
+    // fetch room to reach the truncation, exactly as the first attempt did.
+    assert_eq!(engine.handle().submit_play(), Admission::Accepted);
+    engine.await_state(PlaybackState::Playing);
+    engine.let_time_pass(Duration::from_secs(2));
+    let failed = engine.await_event(|e| matches!(e, PlaybackEvent::Failed { .. }));
+    let PlaybackEvent::Failed { message, .. } = failed else {
+        unreachable!("await_event's predicate already matched Failed")
+    };
+    assert!(
+        !message.is_empty(),
+        "the retry's failure carried no message"
+    );
+    assert_eq!(engine.state(), PlaybackState::Failed);
+    assert_eq!(
+        engine.progress().position,
+        heard,
+        "the second failure moved the position"
+    );
+
     engine.finish();
     server.shutdown();
 }
@@ -610,6 +717,10 @@ fn a_seek_taken_while_paused_completes_rather_than_hanging() {
     engine.play_for(Duration::from_millis(200));
     assert_eq!(engine.handle().submit_pause(), Admission::Accepted);
     engine.await_state(PlaybackState::Paused);
+    // Clear the inbox so only events from here on are visible below - the
+    // legitimate `Playing` from the play span before this pause would
+    // otherwise contaminate the count.
+    while engine.try_event().is_some() {}
 
     assert_eq!(
         engine.handle().submit_seek(Duration::from_secs(3)),
@@ -619,6 +730,25 @@ fn a_seek_taken_while_paused_completes_rather_than_hanging() {
     assert!(
         landed >= Duration::from_secs(3),
         "landed short at {landed:?}"
+    );
+    // Fix round 1, IMPORTANT 1: a seek taken while paused must not audibly
+    // resume the device for the duration of its network wait. A stray
+    // `StateChanged{Playing}` here is exactly what a freeze gate on fetch
+    // *delivery* produced - the wait hook, invoked from inside the blocked
+    // read, released the parked device once the (globally thawed) fetch
+    // delivered bytes, then re-froze and re-announced `Paused` on return.
+    // Checking only the final state (as this test originally did) misses
+    // that entirely, since the last event still reads `Paused`.
+    assert_eq!(
+        engine.count_events(|e| matches!(
+            e,
+            PlaybackEvent::StateChanged {
+                state: PlaybackState::Playing,
+                ..
+            }
+        )),
+        0,
+        "a seek taken while paused emitted a StateChanged{{Playing}} it never asked for"
     );
     // And it is still paused: a seek does not resume playback.
     assert_eq!(engine.state(), PlaybackState::Paused);

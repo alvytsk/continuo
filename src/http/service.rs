@@ -321,11 +321,15 @@ async fn run_fetch(
         let mut chunk = pin!(response.chunk());
         let mut demanded = Duration::ZERO;
         let next = loop {
-            // Re-tested every slice, not once at the top: this is what makes
-            // a pause arriving mid-await suspend the budget rather than
-            // watch it run out (§8, "time spent paused ... does not count as
-            // a server stall").
-            interrupt.wait_while_frozen(generation).await;
+            // Deliberately no `wait_while_frozen` here (fix round 1):
+            // delivery must not be gated on the freeze level. `ByteChannel::
+            // push` already blocks on capacity once the buffer is full, and
+            // that backpressure — not a producer-side freeze gate — is what
+            // bounds a paused fetch. Gating delivery here instead deadlocked
+            // a seek or a reopen taken while paused: both need bytes from a
+            // fetch task that would otherwise sit here until a `Play` that
+            // may never come (§9). Only the stall-timer's own charging
+            // (below) still checks the level.
             let slice = TICK.min(limits.stall - demanded);
             let started = Instant::now();
             tokio::select! {
@@ -334,8 +338,7 @@ async fn run_fetch(
                 result = &mut chunk => break result,
                 () = tokio::time::sleep(slice) => {
                     // Only unfrozen time is charged. A freeze that lands
-                    // inside the sleep is caught by the next pass's
-                    // `wait_while_frozen`.
+                    // inside the sleep is caught on the next slice.
                     if !interrupt.is_frozen() {
                         demanded += started.elapsed();
                     }

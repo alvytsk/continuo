@@ -221,32 +221,6 @@ impl SourceInterrupt {
         }
     }
 
-    /// Suspend the caller for as long as playback is frozen.
-    ///
-    /// The fetch task awaits this *before* arming its stall timer, which is
-    /// what keeps paused time out of the stall budget (§8: "Time spent paused
-    /// or waiting for local buffer space does not count as a server stall").
-    ///
-    /// Takes the generation the caller belongs to and returns as soon as it
-    /// is no longer current, not only on a thaw or a retirement. `begin()`
-    /// opens a new generation without calling `retire()` first — that is how
-    /// `ensure_source_open` reopens after a stop — so a fetch task parked
-    /// here while playback happens to be paused must reach its own
-    /// `cancelled(generation)` branch as soon as the generation moves on,
-    /// rather than sit here until someone happens to press play.
-    pub async fn wait_while_frozen(&self, generation: u64) {
-        loop {
-            let notified = self.fetch_wake.notified();
-            {
-                let state = lock(&self.state);
-                if !state.frozen || state.retired || state.generation != generation {
-                    return;
-                }
-            }
-            notified.await;
-        }
-    }
-
     /// Hand the validated response — or the failure that replaced it — to the
     /// thread blocked in `wait_for_headers`. A stale generation's outcome is
     /// discarded, exactly as `finish` discards a stale body outcome.

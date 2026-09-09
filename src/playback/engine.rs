@@ -1492,6 +1492,12 @@ impl Worker {
         let captured_exactly = self.capture_position();
         self.teardown();
         self.source = None;
+        // MINOR 5 (fix round 1): `descriptor`'s own doc comment says "set by
+        // `load`, cleared by `shutdown`" - make that true rather than leave
+        // it stale. Latent either way, since every `shutdown()` call site
+        // returns immediately after, but a stale value contradicts the
+        // comment describing it.
+        self.descriptor = None;
         self.state = PlaybackState::Idle;
         if !captured_exactly {
             // The published quality checks `degraded` before it looks at
@@ -1563,8 +1569,21 @@ impl Worker {
                     ..
                 } = self;
                 let (Some(source), Some(converter)) = (source.as_mut(), converter.as_mut()) else {
-                    self.source_eof = true;
-                    continue;
+                    // IMPORTANT 2 (fix round 1): a retired remote source is
+                    // `None` here with `descriptor` still naming it - the
+                    // very next pass after `is_retired_read`'s own arm ran,
+                    // since `SEEK` takes no step-1 action and `select!` can
+                    // pick `recv(wake)` over the queued `SeekTo` on any given
+                    // pass. That is not EOF; it is nothing to decode *yet*,
+                    // and must not be converted into one by falling through
+                    // to `decoder_drained` on the next iteration. Only a
+                    // genuinely absent source - no descriptor at all - has
+                    // actually run dry.
+                    if self.descriptor.is_none() {
+                        self.source_eof = true;
+                        continue;
+                    }
+                    return;
                 };
                 match source.next_planar() {
                     Ok(Some(planes)) => {
@@ -1693,10 +1712,17 @@ impl Worker {
         if !self.source_is_remote() {
             return None;
         }
+        // MINOR 7 (fix round 1): `Duration::default()` is zero, which would
+        // make `demanded >= stall` fire on the very first slice and report a
+        // stall the server never caused. `source_is_remote()` above means an
+        // `HttpService` was necessarily installed to have opened this source
+        // in the first place, so `None` here is unreachable in practice; the
+        // fallback exists only so a defensive read of this method is never
+        // wrong, not because it should ever be taken.
         let stall = lock(&self.http)
             .as_ref()
             .map(|service| service.limits().stall)
-            .unwrap_or_default();
+            .unwrap_or(Limits::default().stall);
         let channel = ByteChannel::new(Arc::clone(&self.source_interrupt));
         let hook: Arc<dyn WaitHook> = self.service.clone();
         let mut scratch = [0u8; 64 * 1024];
@@ -1899,7 +1925,21 @@ impl Worker {
             // rules out - and it is one attempt, not a loop: a second
             // failure lands back in `Failed` and the next `Play` tries once
             // again, driven by the listener each time.
-            PlaybackState::Failed if self.remote_descriptor().is_some() => self.restore(),
+            //
+            // The state moves to `Loading` *before* `restore()` runs (fix
+            // round 1, IMPORTANT 4): `fail_with`'s very first statement
+            // returns early when `self.state == Failed`, which exists so a
+            // repeating fatal fault does not re-announce itself every loop
+            // iteration - but a listener-driven retry is not that, and a
+            // failing reopen left `self.state` at `Failed` would hit that
+            // exact guard and emit nothing at all for an explicit user
+            // action, which is worse than the duplicate the guard was
+            // written to prevent. `Loading` is also the honest state while
+            // a reopen is in flight.
+            PlaybackState::Failed if self.remote_descriptor().is_some() => {
+                self.set_state(PlaybackState::Loading);
+                self.restore();
+            }
             PlaybackState::Failed => {
                 self.warn("playback failed; load the media again before playing".into())
             }
@@ -1937,6 +1977,19 @@ impl Worker {
     /// or at a target stored while stopped - the one case where resuming
     /// establishes a new position rather than preserving one.
     fn restore(&mut self) {
+        // §9: a source that cannot seek cannot restore a nonzero position,
+        // and starting at zero silently would be exactly the reset the
+        // milestone's invariant forbids. Checked *before* any reopen (fix
+        // round 1, IMPORTANT 3): `self.capabilities` already answers this
+        // from the source's last time open - a stop-then-play cycle reopens
+        // the same location and gets the same answer - so opening a live
+        // fetch only to reject and abandon it here would leak the
+        // connection until shutdown or a new load.
+        if self.position > Duration::ZERO && self.capabilities.seek == SeekSupport::Unsupported {
+            self.reject_seek("this server cannot resume; the position is kept".into());
+            self.set_state(PlaybackState::Stopped);
+            return;
+        }
         // A remote source the worker retired - by a stop, or by a failure -
         // is reopened here, not treated as absent. A no-op when a decoder is
         // already live, so the local path is unchanged.
@@ -1951,14 +2004,6 @@ impl Worker {
             self.warn("nothing is loaded".into());
             return;
         }
-        // §9: a source that cannot seek cannot restore a nonzero position,
-        // and starting at zero silently would be exactly the reset the
-        // milestone's invariant forbids.
-        if self.position > Duration::ZERO && self.capabilities.seek == SeekSupport::Unsupported {
-            self.reject_seek("this server cannot resume; the position is kept".into());
-            self.set_state(PlaybackState::Stopped);
-            return;
-        }
         if lock(&self.transport).is_some() {
             self.capture_position();
         }
@@ -1968,11 +2013,7 @@ impl Worker {
         let stored = self.requested_target.take();
         let target = stored.unwrap_or(self.position);
         let landed;
-        // §9: legitimate while paused, same as `seek_to`'s own attempt - see
-        // `run_thawed`'s comment. `submit_play` already thaws before this
-        // dispatch runs, but out of band, so this call cannot assume it won
-        // that race.
-        match self.run_thawed(|worker| worker.reseek(target)) {
+        match self.reseek(target) {
             Ok(actual) => {
                 landed = actual;
                 self.position = adopt_preserved(target, actual);
@@ -2108,6 +2149,24 @@ impl Worker {
             self.reject_seek("playback failed; load the media again".into());
             return;
         }
+        // A source known to be unsupported is rejected before any reopen,
+        // playing or stopped alike (fix round 1, IMPORTANT 3): checked
+        // before `ensure_source_open` because `self.capabilities` already
+        // answers this from the source's last time open - a retired remote
+        // source's location hasn't changed, so opening a live fetch only to
+        // reject and abandon it here would leak the connection until
+        // shutdown or a new load. A source this project has already
+        // classified `Unsupported` has no `HttpMediaSource::seek()` to fall
+        // back on either way, so Symphonia's own recovery is to read
+        // forward on the same connection - which cannot be undone if the
+        // target turns out to be unreachable, and would otherwise turn a
+        // plain refusal into an unrecoverable `Failed` when the position
+        // cannot be restored. §10's "reject unsupported stopped seeks before
+        // SeekTargetStored" is the specific case; this is the general one.
+        if self.capabilities.seek == SeekSupport::Unsupported {
+            self.reject_seek("this source cannot seek".into());
+            return;
+        }
         // A remote source the worker retired is reopened here, not treated
         // as absent. `ensure_source_open` is a no-op when a decoder is
         // already live, so the local path is unchanged. This has to come
@@ -2124,19 +2183,6 @@ impl Worker {
             return;
         }
         let target = self.clamp_target(requested);
-        // A source known to be unsupported is rejected before any attempt,
-        // playing or stopped alike: a source this project has already
-        // classified `Unsupported` has no `HttpMediaSource::seek()` to fall
-        // back on, so Symphonia's own recovery is to read forward on the
-        // same connection - which cannot be undone if the target turns out
-        // to be unreachable, and would otherwise turn a plain refusal into
-        // an unrecoverable `Failed` when the position cannot be restored
-        // either. §10's "reject unsupported stopped seeks before
-        // SeekTargetStored" is the specific case; this is the general one.
-        if self.capabilities.seek == SeekSupport::Unsupported {
-            self.reject_seek("this source cannot seek".into());
-            return;
-        }
         match self.state {
             // Deliberately not `SeekCompleted`: with no transport running,
             // nothing has validated this target yet.
@@ -2161,37 +2207,28 @@ impl Worker {
         let playing = self.state == PlaybackState::Playing;
         self.capture_position();
         let preserved = self.position;
-        // `submit_seek` retired the generation this source's ongoing
-        // playback read was using, out of band, so the loop's dispatch of
-        // this very `SeekTo` is not left waiting behind it (§8). A
-        // byte-seekable source's own `HttpMediaSource::seek()` opens a fresh
-        // generation for itself as its first action, absorbing that stale
-        // retirement automatically - but a source this project has already
-        // classified `SeekSupport::Unsupported` or `Unknown`-but-actually-
-        // unseekable is "seeked" by Symphonia reading forward on the *same*
-        // source, through the *same* generation, with no `seek()` call at
-        // all. Left alone, that read-forward would inherit the retirement
-        // `submit_seek` just published for its own sake and fail the very
-        // seek it exists to service. Opening a fresh generation here first
-        // is what every read-touching operation in this file does before it
-        // commits to one; harmless for the byte-seekable case, where
-        // `HttpMediaSource::seek()` immediately supersedes it with its own.
-        self.source_interrupt.begin();
+        // Deliberately no pre-emptive `begin()` here (fix round 1, MINOR 8).
+        // The gate above already refused every source that would reach this
+        // point without a `MediaSource::seek()` call to answer it (Symphonia
+        // reads forward on the *same* generation for one it cannot really
+        // seek), so every source still reachable here is byte-seekable and
+        // `HttpMediaSource::seek()` opens its own fresh generation as its
+        // first action regardless. A `begin()` taken here instead would
+        // retire whatever generation is *actually* live - including one a
+        // short forward seek satisfies entirely from `MediaSourceStream`'s
+        // own read-ahead buffer, with no `seek()` call at all - and nothing
+        // would ever open a new fetch to replace it.
         let interrupt = Arc::clone(&self.interrupt);
-        // §9: a seek is legitimate while paused, and needs bytes to land -
-        // see `run_thawed`'s own comment for why the freeze level has to
-        // step aside for it.
-        let outcome = self.run_thawed(|worker| {
-            let source = worker.source.as_mut()?;
+        let outcome = {
+            let Some(source) = self.source.as_mut() else {
+                return;
+            };
             // Not the SEEK bit: `submit_seek` sets it for exactly this
             // dispatch, and checking it here would make this seek cancel
             // its own first attempt.
-            Some(source.seek_refined(target, Some(SEEK_BUDGET), &mut || {
+            source.seek_refined(target, Some(SEEK_BUDGET), &mut || {
                 stop_or_shutdown(interrupt.load(Ordering::Acquire))
-            }))
-        });
-        let Some(outcome) = outcome else {
-            return;
+            })
         };
         match outcome {
             Ok(outcome) => {
@@ -2303,9 +2340,8 @@ impl Worker {
             self.requested_target = None;
         } else {
             // Validate first: the transport is only started once the decoder
-            // has actually landed at zero. §9: legitimate while paused, same
-            // as `seek_to`'s own attempt - see `run_thawed`'s comment.
-            match self.run_thawed(|worker| worker.reseek(Duration::ZERO)) {
+            // has actually landed at zero.
+            match self.reseek(Duration::ZERO) {
                 Ok(actual) => {
                     self.position = actual;
                     self.requested_target = None;
@@ -2432,31 +2468,6 @@ impl Worker {
         });
     }
 
-    /// Thaw the source interrupt for the duration of `body`, a read-touching
-    /// operation this dispatch is running, and restore the freeze level
-    /// afterward if the worker is still `Paused` when it returns.
-    ///
-    /// §9: reopening and seek refinement both need bytes, and both are
-    /// legitimate while playback is paused - the freeze level parks the
-    /// *output*, not the network, but `run_fetch`'s body loop (already
-    /// reviewed, not this task's to change) waits on the very same level
-    /// before every chunk, for *any* generation, including a brand new one a
-    /// seek or a reopen just opened. Left frozen, an operation taken while
-    /// paused would ask the fetch task for bytes it has promised never to
-    /// send before a thaw - which, since nothing here ever plays again on
-    /// its own, is forever. Restoring unconditionally on `Paused` rather
-    /// than tracking whether this call itself froze it is safe: `submit_play`
-    /// is the only other thing that thaws, and it also moves the state out
-    /// of `Paused`, so nothing here can clobber a concurrent unrelated thaw.
-    fn run_thawed<T>(&mut self, body: impl FnOnce(&mut Self) -> T) -> T {
-        self.source_interrupt.thaw();
-        let result = body(self);
-        if self.state == PlaybackState::Paused {
-            self.source_interrupt.freeze();
-        }
-        result
-    }
-
     /// Reopen a remote source the worker retired, so a caller that needs a
     /// decoder has one. `Ok(false)` means nothing had to be done - `source`
     /// was already open, or nothing has ever been loaded.
@@ -2487,12 +2498,17 @@ impl Worker {
         // one narrow gap left is a retirement landing in the instant between
         // `prepare` returning and this check, which is the same single-
         // instant race every other cancellation check in this file accepts.
-        let prepared = self.run_thawed(|worker| prepare(&location, &worker.prepare_context()))?;
+        let prepared = prepare(&location, &self.prepare_context())?;
         if self.source_interrupt.is_retired() {
             return Err(PlaybackError::Cancelled);
         }
+        // MINOR 6 (fix round 1): a stop-then-play cycle reopens against the
+        // same location and answers with the same capabilities every time;
+        // only announce when something actually changed.
+        if self.capabilities != prepared.capabilities {
+            self.emit_capabilities(prepared.capabilities);
+        }
         self.capabilities = prepared.capabilities;
-        self.emit_capabilities(prepared.capabilities);
         self.source = Some(prepared.source);
         Ok(true)
     }
@@ -2505,16 +2521,19 @@ impl Worker {
     fn verify_seek_support(&mut self) -> bool {
         let current = self.position;
         let interrupt = Arc::clone(&self.interrupt);
-        let succeeded = self.run_thawed(|worker| match worker.source.as_mut() {
+        let succeeded = match self.source.as_mut() {
             Some(source) => source
                 .seek_refined(current, None, &mut || {
                     stop_or_shutdown(interrupt.load(Ordering::Acquire))
                 })
                 .is_ok(),
             None => false,
-        });
+        };
         if succeeded && let Some(source) = self.source.as_mut() {
             source.note_demuxer_proven();
+            // Only reachable with `self.capabilities.seek == Unknown` (this
+            // method's one caller gates on exactly that), so a successful
+            // trial is always a change to `Native` - nothing to compare here.
             self.capabilities = source.capabilities();
             self.emit_capabilities(self.capabilities);
         }
