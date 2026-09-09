@@ -20,7 +20,7 @@ The future runtime has four execution contexts with strict ownership:
 
 | Context | Owns | Must not |
 |---|---|---|
-| Application (main thread) | The application context is the main thread: it reads keys, renders status, and owns the command sender and event receiver. It also owns an `HttpService` (`src/http/service.rs`) whose Tokio runtime has exactly one worker thread — built only when the source is remote, so the local-file and `--probe-only` paths run with no Tokio runtime at all. | Hold a decoder or a CPAL stream |
+| Application (main thread) | The application context is the main thread: it reads keys, renders status, and owns the command sender and event receiver. It also owns an `HttpService` (`src/http/service.rs`) whose Tokio runtime has exactly one worker thread — built only when the source is an HTTP URL, not on the `--probe-only` flag: any local-file session runs with no Tokio runtime at all, `--probe-only` included, while probing a URL spawns the runtime the same as playing one would. | Hold a decoder or a CPAL stream |
 | Decode thread (`std::thread`) | Symphonia demux/decode, resampling, command processing, PCM production, position anchoring, **the CPAL stream's full lifecycle** | Block on the Tokio runtime |
 | CPAL callback | Drain a bounded SPSC ring buffer, emit silence on underrun, publish a frame counter | Lock, allocate, wait, or perform I/O |
 | Persistence writer thread | Serialize and atomically write state snapshots | Run on Tokio's executor |
@@ -129,7 +129,7 @@ decisions behind all of this — completion semantics, the per-identity map and 
 cap, rejected-file handling, the checkpoint triggers — and its §19 records where
 the implementation amended them.
 
-M3 adds one protection rule on top of this. When a positive checkpoint exists but capability resolution conclusively rules out resuming it, sequential playback may begin at zero instead of failing outright — and that fallback load marks the existing entry protected: periodic, pause, stop, outgoing-media and shutdown captures do not overwrite it merely because this run is playing from zero. Protection ends only on a successfully established explicit restart, a successfully established seek once support turns out to be available, or verified completion. This deliberately favors recovering the earlier resume point over saving progress from a fallback run — it is not a maximum-position merge rule, and even later progress that exceeds the protected position does not replace it while protection holds.
+M3 adds one protection rule on top of this. When a positive checkpoint exists but capability resolution conclusively rules out resuming it, sequential playback may begin at zero instead of failing outright — and that fallback load marks the existing entry protected: periodic, pause, stop, outgoing-media and shutdown captures do not overwrite it merely because this run is playing from zero. Protection ends only on a successfully established explicit restart, a successfully established seek, or verified completion. This deliberately favors recovering the earlier resume point over saving progress from a fallback run — it is not a maximum-position merge rule, and even later progress that exceeds the protected position does not replace it while protection holds.
 
 ## 7. Diagnostics and errors
 
@@ -154,7 +154,7 @@ Runtime code forbids unsafe code and denies `unwrap` and `expect`. Tests may use
 
 M0 explicitly defers `PlaybackCommand` and `PlaybackEvent`, the executable state machine, channels, worker threads, callback accounting, buffer management, detailed decoder and device errors, checkpoint storage, completion policy, HTTP buffering, and capability probing. Playback, persistence, HTTP fetching, feeds, subscriptions, and the TUI are not implemented today.
 
-M1 will use Symphonia and CPAL directly to control buffering, cancellation, and position accounting. This choice does not claim that Rodio cannot seek; Rodio's Symphonia backend implements accurate seek refinement. HTTP range support belongs to the source layer, not CPAL. Commands and events will form the application boundary, so no speculative backend trait is introduced. Rodio remains a contingency if M1 uncovers a concrete blocker.
+M1 used Symphonia and CPAL directly to control buffering, cancellation, and position accounting. This choice does not claim that Rodio cannot seek; Rodio's Symphonia backend implements accurate seek refinement. HTTP range support belongs to the source layer, not CPAL. Commands and events will form the application boundary, so no speculative backend trait is introduced. Rodio remains a contingency if M1 uncovers a concrete blocker.
 
 The v0.1 scope excludes Spotify, YouTube/yt-dlp, SoundCloud, Jellyfin, Plex, Navidrome, a visualizer, equalizer or DSP, themes, plugins, a daemon/client split, and remote control. MPRIS and media keys are deferred until the core is stable. Known limitations are non-UTF-8 paths, estimated position where device latency is unavailable, and seek support that can remain `Unknown` until probed.
 
