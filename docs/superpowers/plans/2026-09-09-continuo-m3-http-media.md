@@ -52,6 +52,20 @@ Every one was verified against the actual crate sources before being fixed, and 
 | 12 | The promised 64 KiB transfer bound was not enforced — `response.chunk()` allocates whatever the transport yields. | Task 5: `push` fed in `chunk_bytes` slices, library buffering documented separately as §8 requires. |
 | 13 | `reqwest = { features = ["rustls-tls", "stream"] }` does not resolve: 0.13.5's TLS feature is `rustls`, and there is no `stream` feature at all (`chunk()` is inherent). | Task 1, with a `cargo tree -e features` check. |
 
+### Review round 2 — nine further defects, seven of them introduced by round 1's fixes
+
+| # | Defect | Where it is fixed |
+|---|---|---|
+| 14 | `MutexGuard::unlocked` does not exist. `rustc 1.98.1` rejects it with `E0599`; the "stable since 1.86" note was fabricated — the same failure mode round 1 had just warned about. | Task 3: explicit `drop` / re-`lock`, with the probe command to check it. |
+| 15 | The header wait reproduced defect #4 one layer up: a private `Mutex` + `Condvar` that `SourceInterrupt::wake_all` does not notify, so `retire()` would leave it asleep until its deadline. | Task 5: the header outcome lives in `SourceInterrupt::State` and waits on `reader_wake`. |
+| 16 | `arm()` had no generation guard, so a seek could clear a stop's retirement and leave the fetch running; `run()` step 1 armed *after* `do_stop` had just retired. | Task 3: `arm(generation) -> bool`; Task 10: step 1 arms only when neither STOP nor SHUTDOWN fired. |
+| 17 | The hook's outbox drained onto the **front** of `pending_events`, inverting exactly the order it exists to preserve. | Task 9: drain onto the back. |
+| 18 | `publish_progress` updating `SessionFacts` and then calling `service()` — which takes that same non-reentrant lock — deadlocks the worker on its first pass, silently. | Task 9: drop the guard first; full lock order written down. |
+| 19 | `Progress.buffering` was specified as "set when it runs from the hook", but after Task 9 there is one `service()` with no way to tell its callers apart. | Task 12: `service_as(Servicing)`, with `WaitHook::service` delegating. |
+| 20 | `wait.rs`'s `announce` uses `EVENT_CAPACITY` and `RESERVED_EVENT_SLOTS`, both private to `engine.rs`. | Task 10: `pub(crate)`. |
+| 21 | Tasks 10 and 13 called seven `TestEngine` helpers and a free `fixture_path` that no Interfaces block declares. | Task 10: all eight declared, additively. |
+| 22 | H13 asserted `channel.buffered() <= buffer_bytes`, but the channel is inside the worker's decoder and unreachable from a test. | Task 13: observe backpressure via `TestServer::bytes_written`, which is the stronger claim. |
+
 
 ## Global Constraints
 
@@ -114,7 +128,7 @@ Every task's requirements implicitly include this section.
 | `src/playback/event.rs` | `Loaded.disposition`, `RestartEstablished`, `CapabilitiesChanged`, `SeekCancelled`, `Failed.cause` |
 | `src/playback/command.rs` | `Load { resume: ResumeIntent }`; `Admission` |
 | `src/playback/handshake.rs` | `Handshake` and `Timeline` move into `TransportCore` |
-| `src/playback/engine.rs` | Interrupts, submission methods, `TransportCore`, remote stop/reopen, cancelled reads, completion validation, reserve arithmetic |
+| `src/playback/engine.rs` | Interrupts, submission methods, `TransportCore`, remote stop/reopen, cancelled reads, completion validation, reserve arithmetic; `EVENT_CAPACITY` and `RESERVED_EVENT_SLOTS` become `pub(crate)` so `wait.rs` can respect the reserve |
 | `src/session.rs` | `decide_resume` moves out; protection flag; disposition handling |
 | `src/app.rs` | URL parsing, deferred raw mode, worker-side probe-only, status detail, redaction |
 | `README.md`, `docs/architecture.md`, `docs/m1-known-debt.md` | Ship the milestone honestly |
@@ -1483,7 +1497,7 @@ fn a_stale_generation_can_neither_push_bytes_nor_end_the_stream() {
     let stale = channel.generation();
     let fresh = channel.retire();
     assert_ne!(stale, fresh);
-    interrupt.arm();
+    assert!(interrupt.arm(fresh));
 
     let runtime = runtime();
     assert!(!runtime.block_on(channel.push(stale, b"stale")));
@@ -1498,6 +1512,24 @@ fn a_stale_generation_can_neither_push_bytes_nor_end_the_stream() {
     let mut buffer = [0u8; 8];
     assert_eq!(channel.read(&mut buffer, &NoHook, STALL), ReadOutcome::Bytes(5));
     assert_eq!(&buffer[..5], b"fresh");
+}
+
+#[test]
+fn arming_a_superseded_generation_cannot_clear_a_newer_retirement() {
+    // A seek retires generation N on the decode thread; a stop retires N+1
+    // from the application thread a moment later. An unguarded arm would clear
+    // the stop's retirement and leave the fetch running after the stop that
+    // existed to close it.
+    let interrupt = SourceInterrupt::new(CAPACITY);
+    let seek_generation = interrupt.retire();
+    let stop_generation = interrupt.retire();
+    assert_ne!(seek_generation, stop_generation);
+
+    assert!(!interrupt.arm(seek_generation), "a stale arm was accepted");
+    assert!(interrupt.is_retired(), "the stop's retirement was cleared");
+
+    assert!(interrupt.arm(stop_generation));
+    assert!(!interrupt.is_retired());
 }
 
 #[test]
@@ -1815,11 +1847,25 @@ impl SourceInterrupt {
         generation
     }
 
-    /// Clear the retirement so a new generation may run. Does not rewind the
-    /// generation counter: a superseded response must stay superseded.
-    pub fn arm(&self) {
-        lock(&self.state).retired = false;
+    /// Clear the retirement so a new generation may run — but only the
+    /// retirement this caller created.
+    ///
+    /// The guard is load-bearing. `retire` is called from the application
+    /// thread (stop, shutdown) as well as the decode thread (seek, reopen), so
+    /// an unguarded `arm` lets a seek that retired generation N clear a *stop*
+    /// that retired generation N+1 a moment later, leaving the fetch running
+    /// after the stop that was supposed to close it. Pass the generation
+    /// `retire` returned; a newer one means somebody else has since retired
+    /// this source and their retirement stands.
+    pub fn arm(&self, generation: u64) -> bool {
+        let mut state = lock(&self.state);
+        if state.generation != generation {
+            return false;
+        }
+        state.retired = false;
+        drop(state);
         self.wake_all();
+        true
     }
 
     pub fn freeze(&self) {
@@ -1971,7 +2017,14 @@ impl ByteChannel {
             // slice, which is what keeps position and checkpoints current while
             // the network is quiet (§8), what services a freeze (Task 9), and
             // what a test uses to prove the wait was entered.
-            MutexGuard::unlocked(&mut state, || service.service());
+            //
+            // The lock is dropped across the call, and retaken afterwards. The
+            // hook takes the facts lock and then the transport lock, and a
+            // worker that already holds the transport lock may reach this
+            // interrupt; holding both here would close that cycle.
+            drop(state);
+            service.service();
+            state = lock(&self.0.state);
         }
     }
 
@@ -2023,12 +2076,34 @@ impl ByteChannel {
 }
 ```
 
-**Note for the implementer.** `MutexGuard::unlocked` is `std::sync::MutexGuard::unlocked`, stable since 1.86. If the toolchain in use does not have it, replace the two lines with an explicit `drop(state); service.service(); state = lock(&self.0.state);` — same semantics, one more line. Do not hold the interrupt lock across `service.service()`: the hook takes the transport lock, and holding both in one order here and the other order in the worker is a deadlock.
+**Lock order, written down once because three locks now exist.** Taken in this order and never any other:
+
+```
+   (no lock)  ->  SessionFacts  ->  TransportCore
+   SourceInterrupt::state is a leaf: it is never held while taking either.
+```
+
+`ByteChannel::read` therefore drops the interrupt lock across `service.service()` — the explicit `drop` / re-`lock` above — rather than holding it. An earlier draft wrote this as `MutexGuard::unlocked(&mut state, ...)`; **that function does not exist.** `rustc 1.98.1` rejects it with `E0599: no associated function or constant named 'unlocked' found for struct 'std::sync::MutexGuard'`. Verify any such claim before relying on it:
+
+```bash
+cat > /tmp/probe.rs <<'EOF'
+use std::sync::Mutex;
+fn main() {
+    let m = Mutex::new(1u32);
+    let mut g = m.lock().expect("fresh mutex");
+    std::sync::MutexGuard::unlocked(&mut g, || {});
+    let _ = *g;
+}
+EOF
+rustc --edition 2024 -o /tmp/probe /tmp/probe.rs
+```
+
+Re-checking the loop after re-acquiring is not optional and the code above does it: the predicate is re-tested at the top of every iteration, so anything that changed while the lock was released is seen.
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test --test http_channel 2>&1 | tail -30`
-Expected: PASS, 16 tests. If `a_retirement_wakes_a_blocked_read_within_one_second` is slow, the `SLICE` constant is the knob — but do not raise it above 50 ms, or the §8 bound stops holding with margin.
+Expected: PASS, 17 tests. If `a_retirement_wakes_a_blocked_read_within_one_second` is slow, the `SLICE` constant is the knob — but do not raise it above 50 ms, or the §8 bound stops holding with margin.
 
 Run: `cargo fmt --check && cargo clippy --locked --all-targets --all-features -- -D warnings`
 
@@ -2099,6 +2174,15 @@ impl Script {
     /// generous stall budget, which is what makes an opening deadline checked
     /// only *around* probing useless.
     pub fn trickle(self, bytes: usize, gap: Duration) -> Self;
+}
+
+impl TestServer {
+    /// Body bytes this server has actually written to the socket.
+    ///
+    /// This is how H13 observes the buffer bound: the channel lives inside the
+    /// worker's decoder and no test can reach it, and backpressure visible on
+    /// the wire is the stronger claim anyway.
+    pub fn bytes_written(&self) -> usize;
 }
 ```
 
@@ -2379,15 +2463,13 @@ pub struct FetchRequest { pub origin: Url, pub start: u64, pub established: Opti
 pub struct FetchAccepted { pub accepted: Accepted, pub validator: Validator, pub headers: Headers, pub redirects: u8 }
 ```
 
-**Ownership (§4).** `HttpService` owns a multi-thread Tokio runtime built with `Builder::new_multi_thread().worker_threads(1).enable_all()`. One worker thread is enough — there is one active fetch per source generation — and the runtime is owned by the *application*, not the worker, so `--probe-only` and the local-file path can run with no runtime at all. `fetch` is called from the decode thread and returns as soon as headers are validated; the body streams on the runtime. The decode thread never calls `block_on` on this runtime's futures except inside `fetch`'s bounded header phase, which is itself a `runtime.block_on(timeout(...))` — the one place a synchronous wait on the runtime is permitted, because it is bounded by `limits.headers` and happens before any decoding.
+**Ownership (§4).** `HttpService` owns a multi-thread Tokio runtime built with `Builder::new_multi_thread().worker_threads(1).enable_all()`. One worker thread is enough — there is one active fetch per source generation — and the runtime is owned by the *application*, not the worker, so `--probe-only` and the local-file path can run with no runtime at all.
 
-Wait — that *is* a `block_on` from the worker thread, which §4 forbids. Resolve it as follows and say so in the code: `fetch` does **not** block. It spawns the whole request-plus-body task on the runtime and returns a `oneshot` receiver; the caller waits on that receiver through the same `ByteChannel` machinery (a `header_outcome` slot with the same condvar), so the wait is cancellable by `SourceInterrupt` exactly like a body read. The decode thread therefore waits on a `Condvar`, never on a Tokio future.
-
-Revised signature:
+**`fetch` never blocks the calling thread, and never awaits on it.** §4 forbids the decode worker blocking on the Tokio runtime, and that rules out the obvious `runtime.block_on(timeout(headers, execute(request)))` however tightly it is bounded. Instead `fetch` spawns the whole request-plus-body task and returns immediately with a `HeaderWait`; the caller waits on a `Condvar`, exactly as it waits for body bytes. So:
 
 ```rust
-pub fn fetch(&self, request: FetchRequest, channel: Arc<ByteChannel>, generation: u64) -> HeaderWait;
-pub struct HeaderWait { /* Arc<HeaderSlot> */ }
+pub fn fetch(&self, request: FetchRequest, channel: ByteChannel, generation: u64) -> HeaderWait;
+pub struct HeaderWait { /* Arc<SourceInterrupt> + the generation it belongs to */ }
 impl HeaderWait {
     /// Cancellable by the same interrupt every read obeys.
     pub fn wait(&self, service: &dyn WaitHook, deadline: Duration) -> Result<FetchAccepted, HeaderOutcome>;
@@ -2395,7 +2477,17 @@ impl HeaderWait {
 pub enum HeaderOutcome { Retired, Failed(RemoteFailure) }
 ```
 
-`HeaderSlot` is the same `Mutex` + `Condvar` + interrupt pattern as `ByteChannel`; put it in `channel.rs` beside it as `pub struct Slot<T>` if the duplication bothers you, otherwise keep it local and small.
+**The header outcome lives inside `SourceInterrupt`'s `State`, not in a slot of its own.** `State` gains
+
+```rust
+    /// Set by the fetch task once headers are validated, or once they fail.
+    /// Cleared by `retire`, like everything else belonging to a generation.
+    headers: Option<Result<FetchAccepted, RemoteFailure>>,
+```
+
+with `publish_headers(generation, outcome)` alongside `finish`, and `HeaderWait::wait` is the same slice-and-service loop as `ByteChannel::read`, waiting on `reader_wake`.
+
+A separate `Mutex` + `Condvar` here would reproduce review-round defect #4 one layer up: `SourceInterrupt::wake_all` notifies `reader_wake`, `producer_wake` and `fetch_wake`, and a private condvar is none of them — so `retire()` would leave a blocked header wait asleep until its deadline. Every wait a retirement must reach hangs off the one lock. `a_retirement_during_a_header_wait_wakes_it_without_releasing_the_server` below is the test that catches it if this is built the other way.
 
 - [ ] **Step 1: Write the failing fetch tests**
 
@@ -3192,8 +3284,8 @@ Add `pub mod source;` to `src/http/mod.rs`, then write `src/http/source.rs` to t
    - target == `pos` → return `pos` with no request.
    - `byte_len == Some(len)` and target == `len` → set `pos`, set an `at_byte_eof` flag so the next `read` returns `Ok(0)` locally, and issue no request.
    - `!byte_seekable` → `Err(io::Error::new(ErrorKind::Unsupported, RemoteIoError(RemoteFailure::SeekUnavailable)))`.
-   - otherwise `retire()` the channel, `arm()` the interrupt, `fetch` at the new start with `established`, wait on headers with `limits.headers`, validate, set `pos`, clear `at_byte_eof`.
-   The `retire`-then-`arm` order matters: retiring bumps the generation so a superseded response's bytes cannot enter the new one (H9), and arming clears the flag the *old* read is now past caring about.
+   - otherwise `let generation = channel.retire();` then `if !interrupt.arm(generation) { return Err(retired) }`, `fetch` at the new start with `established`, wait on headers under `min(opening.remaining(), limits.headers)`, validate, set `pos`, clear `at_byte_eof`.
+   The `retire`-then-`arm` order matters: retiring bumps the generation so a superseded response's bytes cannot enter the new one (H9), and arming clears the flag the *old* read is now past caring about. `arm` returning `false` means somebody retired this source in between — a stop from the application thread — and the seek must abandon rather than reopen against a stop that has already been decided.
 4. **`MediaSource`**: `is_seekable()` returns `byte_seekable`; `byte_len()` returns `byte_len`.
 5. **`confirm_complete`** (§9): when `byte_len` is known and `pos < byte_len`, read and discard to the end under `limits.stall`, failing with `TruncatedBody` or `Timeout` rather than succeeding. When `byte_len` is unknown, read until `Ok(0)` under the same deadline. Bounded memory: discard into a fixed 64 KiB scratch buffer.
 6. **`Drop`** retires the channel so a source dropped mid-fetch cannot leave a task pushing into it.
@@ -3983,6 +4075,9 @@ fn service(&self) {
 
 ```rust
 fn announce(&self, event: PlaybackEvent) {
+    // `EVENT_CAPACITY` and `RESERVED_EVENT_SLOTS` are `pub(crate)` in
+    // `engine.rs` for this line: the hook is a second emitter, and the reserve
+    // exists so a terminal outcome always has room. It never occupies it.
     // Ordering first: the worker's backlog is ahead of anything emitted here,
     // and a Paused delivered in front of it would misreport the sequence.
     if self.backlog_empty.load(Ordering::Acquire)
@@ -4007,8 +4102,10 @@ The outbox is drained by the worker into `pending_events` at the top of its next
 - `timeline: Timeline` leaves `Worker`.
 - `anchor: Duration` leaves `Worker` (it lives in `TransportCore`); `Worker::reset_generation_state` sets it through the lock.
 - Every site that today writes `self.transport.as_mut()` and `&mut self.timeline` together — `run()` step 2, `open_transport`, `reinstall`, `prime_and_run`, `capture_position`, `pause`, `check_end_of_track` — takes the lock for the duration of that one operation and releases it.
-- `publish_progress` becomes a thin wrapper that updates `SessionFacts` and calls the same `WaitService::service()` the hook calls. One implementation, two callers, which is what makes "the hook does exactly what the loop does" a fact rather than a comment — including the freeze arm, so a pause that arrives while the worker is *not* blocked is handled by the same code.
-- `run()` gains, as the very first thing in step 4: drain `service.take_outbox()` into the front of `pending_events`, and maintain `backlog_empty` after every mutation of `pending_events`. Draining before `flush_events` is what keeps a hook-emitted `Paused` in order with everything around it.
+- `publish_progress` becomes a thin wrapper that updates `SessionFacts` and *then* calls the same `WaitService::service()` the hook calls. One implementation, two callers, which is what makes "the hook does exactly what the loop does" a fact rather than a comment — including the freeze arm, so a pause that arrives while the worker is *not* blocked is handled by the same code.
+  **It must drop the `SessionFacts` guard before calling `service`.** `std::sync::Mutex` is not reentrant and `service` takes that same lock first thing, so holding it across the call deadlocks the worker on its very first pass — with no test failure to point at, just a hang. Write it as `{ let mut facts = lock(&self.facts); …update…; } self.service.service();`
+- **Lock order, stated once and never varied:** `SessionFacts` → `TransportCore`. `SourceInterrupt::state` is a leaf and is never held while either is taken (`ByteChannel::read` drops it across the hook call for exactly this reason). Nothing takes `TransportCore` before `SessionFacts`.
+- `run()` gains, as the very first thing in step 4: drain `service.take_outbox()` onto the **back** of `pending_events`, and maintain `backlog_empty` after every mutation of `pending_events`. Back, not front: the hook uses the outbox only when `backlog_empty` was false, which means those pending events were emitted *before* the hook's, so pushing to the front would invert exactly the order the outbox exists to preserve. Draining before `flush_events` is what gets the hook's events out on the same pass.
 - `pause()` becomes idempotent with respect to the hook: if `facts.frozen_by_hook` is already set, the transport is parked and `StateChanged{Paused}` is already emitted, so it only sets `self.state = Paused` without re-emitting. Likewise `play()` checks the flag before releasing.
 - **`pump_audio` must not hold the transport lock across `source.next_planar()`.** Structure it as: lock → compute `free`, push staging, read `pushed_total` → drop the lock → decode. A single `let free = { … };` block is enough. Getting this wrong deadlocks the moment a remote read blocks, and no local test would catch it.
 
@@ -4275,8 +4372,35 @@ blocked remote read."
 Where §8 and §9 land. Needs 7, 8 and 9.
 
 **Files:**
-- Modify: `src/playback/engine.rs`, `src/playback/command.rs`
+- Modify: `src/playback/engine.rs`, `src/playback/command.rs`, `tests/support/mod.rs`
 - Test: `tests/engine_remote.rs` (new); additions to `tests/engine_contract.rs`
+
+**Harness additions.** Tasks 10 and 13 use these, and every one is new; add them to `tests/support/mod.rs` in this task, additively, before writing any test that calls them. No existing helper signature changes.
+
+```rust
+impl TestEngine {
+    /// Load an HTTP source. Builds an `HttpService` on first use and keeps it
+    /// for the engine's lifetime.
+    pub fn load_remote(&mut self, url: &str);
+    /// The handle, for the submission methods (`submit_pause`, `submit_seek`…).
+    pub fn handle(&self) -> &EngineHandle;
+    /// The mirror's current state, rebuilt from the drained event stream.
+    pub fn state(&mut self) -> PlaybackState;
+    /// Drain until the state is reached, or panic after `PATIENCE`.
+    pub fn await_state(&mut self, state: PlaybackState);
+    /// Run until Ended, Failed or the timeout, whichever comes first.
+    pub fn play_until_terminal(&mut self, patience: Duration);
+    /// Whether an `EndOfTrack` was ever observed in this run.
+    pub fn saw_end_of_track(&self) -> bool;
+}
+
+/// The path of a fixture, for tests that need its bytes rather than an
+/// `AbsolutePath`. A bare helper, so it panics with the path on failure — a
+/// missing fixture is a repository error, not a test condition.
+pub fn fixture_path(name: &str) -> std::path::PathBuf;
+```
+
+Task 8 additionally declares `TestEngine::{load_with_resume, await_loaded, await_restart_established}`; those come with that task.
 
 **Interfaces:**
 - Produces, on `EngineHandle`:
@@ -4321,13 +4445,17 @@ Pause does **not** get a bit: it is a level on `SourceInterrupt` (G2), because a
 
 **What the worker does with them:**
 
-1. `run()`'s step 1 gains, after the shutdown and stop branches:
+1. `run()`'s step 1 gains, after the shutdown and stop branches — **and only when neither of them fired**:
    ```rust
-   if flags & SEEK != 0 {
+   // Shutdown dominates stop, and both dominate seek. `do_stop` has just
+   // retired the fetch; arming here would clear that retirement and leave the
+   // request open after the stop that existed to close it.
+   if flags & SEEK != 0 && flags & (STOP | SHUTDOWN) == 0 {
        // The retirement already woke the read; the queued SeekTo carries the
-       // target. Arm the interrupt so the reopen the seek performs is not
-       // itself cancelled by the flag that woke it.
-       self.source_interrupt.arm();
+       // target. Arm so the reopen the seek performs is not itself cancelled
+       // by the flag that woke it — guarded, so a stop that lands between the
+       // swap and here still stands.
+       self.source_interrupt.arm(self.source_interrupt.generation());
    }
    ```
 2. `pump_audio` distinguishes a retired read from a decode failure:
@@ -4341,7 +4469,7 @@ Pause does **not** get a bit: it is a level on `SourceInterrupt` (G2), because a
        return;
    }
    ```
-   `is_retired_read` walks the error chain with `http::source::is_retired`. `retire_remote_source` drops `self.source` when the current `SourceLocation` is `Http`, and keeps `self.descriptor` so `restore()` can reopen.
+   `is_retired_read(&PlaybackError) -> bool` is a one-line worker-local wrapper: it matches `PlaybackError::Decode(e)` and calls `http::source::is_retired(e)`, and matches `PlaybackError::Remote(RemoteFailure::Cancelled)` directly. `retire_remote_source` drops `self.source` when the current `SourceLocation` is `Http`, and keeps `self.descriptor` so `restore()` can reopen.
 3. A decode error over a **remote** source fails the session; only a local one keeps M1's warn-and-drain behaviour:
    ```rust
    Err(error) => match (remote_cause(&error), self.source_is_remote()) {
@@ -4386,7 +4514,9 @@ Pause does **not** get a bit: it is a level on `SourceInterrupt` (G2), because a
        let Some(location) = self.descriptor.clone() else {
            return Ok(false);
        };
-       self.source_interrupt.arm();
+       // Guarded: a stop or shutdown that retired this source between the
+       // caller's decision and here must not be undone.
+       self.source_interrupt.arm(self.source_interrupt.generation());
        let prepared = prepare(&location, &self.prepare_context())?;
        self.capabilities = prepared.capabilities;
        self.emit_capabilities(prepared.capabilities);
@@ -4856,7 +4986,25 @@ println!(
 - unsupported capability → ` no-seek`;
 - currently buffering → ` buffering` appended to the `playing` label, as a *detail of Playing* — never a state of its own, and never anything that could read as live radio.
 
-`buffering` is set when a `Warning` carrying the buffering marker arrives and cleared on the next position advance. Simpler and sufficient: set it from `Progress.quality == PositionQuality::Degraded` is **wrong** — that means something else. Add a `buffering: bool` to `Progress` instead, published by `WaitService::service()` when it runs from the wait hook and cleared when it runs from the main loop. One field, set in exactly the two places the two callers are distinguishable.
+`buffering` is a new `bool` on `Progress`. It must **not** be derived from `PositionQuality::Degraded`, which means something else entirely (a timing base that jumped).
+
+After Task 9 there is one `service()` with one body, so it cannot tell its two callers apart on its own — which is why `WaitHook::service` delegates to an explicit inherent method:
+
+```rust
+/// Which caller is servicing. The only thing that differs between them, and it
+/// differs by definition: the hook runs *because* a source read is blocked.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Servicing { WorkerLoop, BlockedRead }
+
+impl WaitService {
+    pub fn service_as(&self, caller: Servicing) { /* the whole body */ }
+}
+impl WaitHook for WaitService {
+    fn service(&self) { self.service_as(Servicing::BlockedRead) }
+}
+```
+
+`Worker::publish_progress` calls `service_as(Servicing::WorkerLoop)`. `buffering` is set to `caller == Servicing::BlockedRead`, so it is true exactly while a read is waiting on the network and false the moment the worker gets going again. Add `buffering` to the `Progress` literals in `EngineHandle::assemble` and in `tests/support/mod.rs`; it is `false` in both.
 
 **Redaction (§11).** `display_name(&MediaId::RemoteUrl(url))` renders `redact_url(url.as_str())`'s last path segment, falling back to the redacted host. Every `tracing` call that carries a URL passes it through `redact_url` first. `PlaybackError`'s `Display` reaching stderr in `main.rs` already routes through `RemoteFailure`, which is redacted by construction.
 
@@ -5027,7 +5175,7 @@ Needs Task 12. Every row of §12's table, wired end to end. Several are already 
 | H10 | `engine_remote.rs::pause_during_a_stalled_read_*`, `..::quit_while_paused_*` | Task 10. |
 | H11 | `http_protocol.rs::validators_follow_the_documented_policy` | Strong change fails; weak and absent follow best-effort; assert no `If-Range` header carries a `W/` value by inspecting `server.requests()`. |
 | H12 | `prepare.rs` (Task 7) — three tests | Finite unknown-duration, finite chunked, unresolved vs live as distinct refusals. |
-| H13 | `http_playback.rs::occupancy_stays_bounded_and_starvation_silence_does_not_advance_position` | A fast server against a paced consumer; assert `channel.buffered() <= 1 MiB` throughout, and that a stall produces silence without the position moving. |
+| H13 | `http_playback.rs::occupancy_stays_bounded_and_starvation_silence_does_not_advance_position` | See the note below — the obvious assertion is not reachable from a test. |
 | H14 | `engine_remote.rs` + `session_policy.rs` (Task 11) | Revision guards, no durable target for an unsupported stopped seek, ordered shutdown backlog. |
 | H15 | `http_cli.rs` (Task 12) — seven tests | |
 | H16 | `session_policy.rs` (Task 11) — six tests, plus `http_resume.rs::the_protection_survives_a_process_boundary` | The cross-process half needs a real store. |
@@ -5037,6 +5185,19 @@ Needs Task 12. Every row of §12's table, wired end to end. Several are already 
 - [ ] **Step 1: Write the four acceptance files**
 
 Write each test named above in full. Every one follows the same shape: start a `TestServer` with a scripted `Script`, drive a `TestEngine` over `TestOutput` with the harness clock frozen except where playback must actually run, assert, `engine.finish()`, `server.shutdown()`.
+
+**H13's occupancy half needs a reachable observation.** The `ByteChannel` is owned by `HttpMediaSource`, inside a `MediaSourceStream`, inside `DecodedSource`, inside the worker — so a test cannot call `channel.buffered()` on it, and an earlier draft's assertion was unwritable. Observe it from the server side instead, which is also the stronger statement: the bound is only real if it produces backpressure on the wire.
+
+`TestServer` gains `pub fn bytes_written(&self) -> usize`, counted as the body loop writes. The test then:
+
+1. Serves a body far larger than `buffer_bytes` from a server that never stalls.
+2. Loads it and *does not* play, so nothing drains the channel.
+3. Waits until `bytes_written` stops growing for 500 ms, then asserts it settled at no more than `buffer_bytes + chunk_bytes + slack`, where `slack` is one TCP window's worth — name the constant and say it is the kernel's socket buffer, not ours.
+4. Plays, and asserts `bytes_written` resumes growing.
+
+Run it with `Limits { buffer_bytes: 64 << 10, chunk_bytes: 8 << 10, ..Limits::default() }` so the bound is reached in milliseconds and the slack is a small fraction of it rather than swamping the measurement.
+
+The starvation half is separate and needs no new hook: stall the server mid-body, let the ring drain, and assert `engine.progress().position` stops advancing once the last pushed frame has played while the state stays `Playing`.
 
 Three rules that apply to all of them, and that a reviewer should reject the task for violating:
 - **No `std::thread::sleep` as a synchronization primitive.** Every wait either polls a condition with a deadline and a failing assertion, or uses `server.wait_until_stalled`. §12: "Each cancellation test first proves the target wait was entered; sleeping and hoping for a race is insufficient."
@@ -5186,7 +5347,9 @@ Two things §12 asks for that are **not** in a task, deliberately, with the reas
 
 **Placeholder scan.** No step says "add error handling", "handle edge cases", "similar to Task N", or "write tests for the above". Three places give prose obligations rather than a full literal body — Task 4's server, Task 5's fetch task, Task 13's acceptance files — because each is several hundred lines whose every branch is already pinned by a named test above it. Each lists its obligations as a numbered or tabular checklist, and each obligation has a test that fails if it is missed.
 
-**Claims checked against the crates rather than from memory.** Four of review round 1's thirteen defects were assertions this document made about other people's code, and all four were wrong. What replaced them, and where each was verified: reqwest 0.13.5's feature list (its own manifest) and `Response::chunk` (`src/async_impl/response.rs:310`); symphonia-core 0.6.1's `Error` impl (`src/errors.rs:82`), its `read_buf_exact` retry (`src/io/media_source_stream.rs:425`), and the `MediaSource` trait's surface (`src/io/mod.rs:42`). Anything this plan asserts about a dependency should be re-checked the same way before it is relied on, rather than carried forward on the strength of appearing here.
+**Claims checked against the crates rather than from memory.** Five defects across the two review rounds were assertions this document made about code it does not own — four about dependencies, one (`MutexGuard::unlocked`) about the standard library — and all five were wrong. What replaced them, and where each was verified: reqwest 0.13.5's feature list (its own manifest) and `Response::chunk` (`src/async_impl/response.rs:310`); symphonia-core 0.6.1's `Error` impl (`src/errors.rs:82`), its `read_buf_exact` retry (`src/io/media_source_stream.rs:425`), and the `MediaSource` trait's surface (`src/io/mod.rs:42`). `MutexGuard::unlocked` was checked by compiling it (`rustc 1.98.1`, `E0599`). Anything this plan asserts about code it does not own should be re-checked the same way before it is relied on, rather than carried forward on the strength of appearing here — round 2 found that round 1 had repeated the mistake in the very paragraph warning against it.
+
+**Round 2's other lesson.** Seven of its nine defects were introduced by round 1's fixes, not present before them. A fix that adds a lock, an emitter or a wake channel changes the invariants of everything already using them, so the things to re-derive after any such change are: the lock order, who notifies which waiter, and which end of a queue an event belongs on. All three appear as explicit written statements in this plan now, rather than being left implicit for the implementer to reconstruct.
 
 **Type consistency.** Names used across task boundaries, checked against their definitions:
 `Limits` (1) → 5, 6, 7. `RemoteFailure`, `Operation`, `Phase`, `RangeRejection`, `RedirectRejection`, `redact_url` (1) → 2, 5, 6, 7, 8, 12. `Headers`, `Accepted`, `ByteRange`, `Validator`, `Established`, `accept`, `accept_redirect`, `if_range_value`, `validator_from`, `is_live`, `parse_content_range` (2) → 5, 6. `ByteChannel`, `SourceInterrupt`, `WaitHook`, `Outcome`, `ReadOutcome` (3) → 5, 6, 7, 9, 10. `TestServer`, `Script`, `RecordedRequest` (4) → 5, 6, 7, 12, 13. `HttpService`, `FetchRequest`, `FetchAccepted`, `HeaderWait`, `HeaderOutcome` (5) → 6, 7, 10, 12. `HttpMediaSource`, `SourceEvidence`, `remote_cause`, `is_retired` (6) → 7, 10. `Prepared`, `PrepareContext`, `prepare` (7) → 10, 12. `ResumeCandidate`, `ResumeDecision`, `decide_resume`, `ResumeIntent`, `Admission`, `StartDisposition`, `RestartEstablished`, `CapabilitiesChanged`, `SeekCancelled` (8) → 10, 11, 12. `TransportCore`, `WaitService`, `SessionFacts` (9) → 10. Every one is defined before its first use, and every producer/consumer pair spells it the same way.
