@@ -10,7 +10,7 @@
 use std::any::Any;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -269,18 +269,41 @@ impl Drop for EngineHandle {
     }
 }
 
-/// The transport state a blocked source read may service, behind one lock
-/// once Task 9 finishes wrapping it (step 2). For now, step 1, it is a plain
-/// field: introducing the type and moving `timeline`/`anchor` onto it is done
-/// on its own, separately from the `Arc<Mutex<...>>` wrap, so a regression is
-/// bisectable to whichever change caused it.
+/// A poisoned lock means a thread already panicked while holding it; there is
+/// nothing better to do than carry on with the state it left. Same pattern as
+/// `http::channel::lock` and `wait::lock`.
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+/// The transport state a blocked source read may service, behind one lock.
 ///
-/// `pcm`, `link` and `config` do NOT move onto this struct: `TransportCore`
-/// only ever holds what a later wait hook needs (`handshake`, `timeline`,
-/// `anchor`, `sample_rate`), and `pcm` in particular is `rtrb::Producer<f32>`,
-/// which is `!Sync` and must stay on the worker regardless of this task's
-/// later steps.
-struct TransportCore {
+/// `Handshake` and `Timeline` live here rather than on `Worker` because the
+/// wait hook needs them and `Worker` is `&mut`-shaped: the hook runs from
+/// inside `pump_audio -> source.next_planar()`, which already holds
+/// `&mut self.source`, so it cannot also reach the rest of `Worker` and
+/// `unsafe_code = "forbid"` rules out a lifetime-erased slot back onto it.
+/// Contention is nil: the hook runs only while the worker is blocked inside a
+/// decoder read, which is precisely when the worker is not touching any of
+/// this (Ruling 1's lock order note lives in `wait.rs`, which is the module
+/// that actually has two lock-takers to order).
+///
+/// `pub` (not just the fields) so `wait.rs` - and `tests/wait_service.rs` -
+/// can name `Arc<Mutex<Option<TransportCore>>>`; nothing outside this module
+/// needs to build one, so no constructor is exported alongside it.
+///
+/// `pcm`, `link` and `config` stay off this struct and live as plain `Worker`
+/// fields instead (done in step 1, ahead of this lock): `pcm` is
+/// `rtrb::Producer<f32>`, which is `!Sync` and must stay on the worker
+/// regardless — the hook must never push audio — and `link`/`config` are not
+/// needed by the hook at all (`Handshake` already holds its own clone of
+/// `link`), so putting them under this lock would only widen the hook's reach
+/// for no benefit and force `pump_audio` to touch this lock for information
+/// it does not need (Ruling 3).
+pub struct TransportCore {
     handshake: Handshake,
     timeline: Timeline,
     /// Media position the current generation's frame counting starts from.
@@ -297,7 +320,7 @@ struct TransportCore {
 struct Worker {
     output: Box<dyn AudioOutput>,
     faults: Receiver<OutputFault>,
-    transport: Option<TransportCore>,
+    transport: Arc<Mutex<Option<TransportCore>>>,
     pcm: Option<rtrb::Producer<f32>>,
     link: Option<Arc<OutputLink>>,
     config: Option<NegotiatedOutput>,
@@ -354,7 +377,7 @@ impl Worker {
         Self {
             output,
             faults,
-            transport: None,
+            transport: Arc::new(Mutex::new(None)),
             pcm: None,
             link: None,
             config: None,
@@ -411,8 +434,11 @@ impl Worker {
 
             // 2. Spans -> timeline -> keep-latest progress snapshot.
             self.collect_diagnostics();
-            if let Some(transport) = self.transport.as_mut() {
-                transport.handshake.drain_spans(&mut transport.timeline);
+            {
+                let mut guard = lock(&self.transport);
+                if let Some(transport) = guard.as_mut() {
+                    transport.handshake.drain_spans(&mut transport.timeline);
+                }
             }
             self.publish_progress();
 
@@ -577,7 +603,7 @@ impl Worker {
     /// it re-seeks, say - and the caller must not report `Playing` over a
     /// pipeline that no longer exists.
     fn announce_playing(&mut self) {
-        if self.transport.is_some() {
+        if lock(&self.transport).is_some() {
             self.set_state(PlaybackState::Playing);
         }
     }
@@ -623,8 +649,7 @@ impl Worker {
             return PositionQuality::Degraded;
         }
         match self.state {
-            PlaybackState::Playing | PlaybackState::Paused => self
-                .transport
+            PlaybackState::Playing | PlaybackState::Paused => lock(&self.transport)
                 .as_ref()
                 .map(|t| t.timeline.quality())
                 .unwrap_or(PositionQuality::Exact),
@@ -642,7 +667,8 @@ impl Worker {
             && let Some(rate) = self.config.as_ref().map(|c| c.sample_rate)
         {
             let now = self.output.now();
-            if let Some(transport) = self.transport.as_mut() {
+            let mut guard = lock(&self.transport);
+            if let Some(transport) = guard.as_mut() {
                 let played = transport.timeline.played_frames(now);
                 self.position = transport.anchor + frames_to_duration(played, rate);
             }
@@ -667,9 +693,11 @@ impl Worker {
             return;
         };
         let diagnostics = link.take_diagnostics();
-        if let Some(transport) = self.transport.as_mut() {
+        let mut guard = lock(&self.transport);
+        if let Some(transport) = guard.as_mut() {
             transport.timeline.note_dropped(diagnostics.spans_dropped);
         }
+        drop(guard);
         self.lost_spans += u64::from(diagnostics.spans_dropped);
         // Underruns after the decoder has run dry are the expected sound of a
         // track ending, not a glitch worth reporting.
@@ -858,7 +886,7 @@ impl Worker {
         self.pcm = Some(pcm_tx);
         let sample_rate = config.sample_rate;
         self.config = Some(config);
-        self.transport = Some(TransportCore {
+        *lock(&self.transport) = Some(TransportCore {
             handshake,
             timeline,
             anchor,
@@ -871,7 +899,7 @@ impl Worker {
     /// Re-adopt the existing transport under a fresh generation: discard the
     /// ring the old generation filled, install, prime, and release.
     fn reinstall(&mut self, playing: bool) -> Result<(), PlaybackError> {
-        if self.transport.is_none() {
+        if lock(&self.transport).is_none() {
             return self.open_transport(playing);
         }
         if let Some(converter) = self.converter.as_mut() {
@@ -887,7 +915,8 @@ impl Worker {
         // read back `anchor_new + played_old` - a silent forward jump of
         // everything played since the last install.
         let discarded = {
-            let Some(transport) = self.transport.as_mut() else {
+            let mut guard = lock(&self.transport);
+            let Some(transport) = guard.as_mut() else {
                 return Ok(());
             };
             let mut pump = || std::thread::sleep(PUMP_NAP);
@@ -904,12 +933,13 @@ impl Worker {
         let generation = self.generation;
         let anchor = self.position;
         let installed = {
-            let Some(transport) = self.transport.as_mut() else {
+            let mut guard = lock(&self.transport);
+            let Some(transport) = guard.as_mut() else {
                 return Ok(());
             };
-            // Set here, through the field, rather than at construction:
-            // unlike `open_transport`, this generation reuses an
-            // already-existing `TransportCore` rather than building a new one.
+            // Set here, through the lock, rather than at construction: unlike
+            // `open_transport`, this generation reuses an already-existing
+            // `TransportCore` rather than building a new one.
             transport.anchor = anchor;
             let mut pump = || std::thread::sleep(PUMP_NAP);
             transport.handshake.install(
@@ -933,7 +963,7 @@ impl Worker {
     /// counting from - is not among them: it lives on `TransportCore` now, so
     /// a caller building a brand-new one (`open_transport`) passes it straight
     /// to the constructor, and `reinstall`, which reuses an existing one,
-    /// writes it back through the field itself, right after this returns.
+    /// writes it back through the lock itself, right after this returns.
     fn reset_generation_state(&mut self) {
         self.generation = self.generation.wrapping_add(1);
         self.pushed_total = 0;
@@ -955,7 +985,8 @@ impl Worker {
         if !playing {
             return;
         }
-        if let Some(transport) = self.transport.as_mut() {
+        let mut guard = lock(&self.transport);
+        if let Some(transport) = guard.as_mut() {
             let generation = transport.handshake.generation();
             transport
                 .handshake
@@ -975,7 +1006,8 @@ impl Worker {
             let Self {
                 transport, output, ..
             } = self;
-            let Some(transport) = transport.as_mut() else {
+            let mut guard = lock(transport);
+            let Some(transport) = guard.as_mut() else {
                 return true;
             };
             let anchor = transport.anchor;
@@ -1007,8 +1039,7 @@ impl Worker {
         // never a transport to begin with - the rescue branch below is the
         // only place it matters, and it is reachable only when both a
         // transport existed and its capture timed out.
-        let anchor = self
-            .transport
+        let anchor = lock(&self.transport)
             .as_ref()
             .map(|t| t.anchor)
             .unwrap_or(self.position);
@@ -1036,7 +1067,7 @@ impl Worker {
         self.output.close();
         retire_faults(&mut self.deferred_fault, &self.faults);
         let link = self.link.take();
-        self.transport = None;
+        *lock(&self.transport) = None;
         self.pcm = None;
         self.config = None;
         self.converter = None;
@@ -1068,6 +1099,11 @@ impl Worker {
 
     // ------------------------------------------------------------------ audio
 
+    /// Ruling 3: must not hold the transport lock across `source.next_planar()`
+    /// below, or a remote read that blocks deadlocks the worker the moment it
+    /// does. In fact it never touches the transport lock at all: `pcm` and
+    /// `config` are plain `Worker` fields precisely so this loop - the one
+    /// place a decoder read can block - has nothing here to hold across it.
     fn pump_audio(&mut self) {
         loop {
             let Some(config) = self.config.as_ref() else {
@@ -1152,7 +1188,8 @@ impl Worker {
         };
         let now = self.output.now();
         let landed_anchor = {
-            let Some(transport) = self.transport.as_mut() else {
+            let mut guard = lock(&self.transport);
+            let Some(transport) = guard.as_mut() else {
                 return;
             };
             if transport.timeline.played_frames(now) < self.pushed_total {
@@ -1342,11 +1379,13 @@ impl Worker {
             // Resuming a parked transport is the same generation released
             // again: nothing was discarded, so nothing has to be rebuilt.
             PlaybackState::Paused
-                if self.transport.is_some() && self.requested_target.is_none() =>
+                if lock(&self.transport).is_some() && self.requested_target.is_none() =>
             {
-                if let Some(transport) = self.transport.as_mut() {
+                let mut guard = lock(&self.transport);
+                if let Some(transport) = guard.as_mut() {
                     transport.handshake.release();
                 }
+                drop(guard);
                 self.set_state(PlaybackState::Playing);
             }
             PlaybackState::Loading | PlaybackState::Paused | PlaybackState::Stopped => {
@@ -1363,7 +1402,7 @@ impl Worker {
             self.warn("nothing is loaded".into());
             return;
         }
-        if self.transport.is_some() {
+        if lock(&self.transport).is_some() {
             self.capture_position();
         }
         // A target stored while stopped was never validated against the decoder,
@@ -1416,7 +1455,8 @@ impl Worker {
         }
         let parked = {
             let mut pump = || std::thread::sleep(PUMP_NAP);
-            match self.transport.as_mut() {
+            let mut guard = lock(&self.transport);
+            match guard.as_mut() {
                 Some(transport) => {
                     transport
                         .handshake
@@ -1547,7 +1587,7 @@ impl Worker {
             self.warn("nothing is loaded".into());
             return;
         }
-        if self.transport.is_some() {
+        if lock(&self.transport).is_some() {
             self.capture_position();
         }
         // Validate first: the transport is only started once the decoder has
