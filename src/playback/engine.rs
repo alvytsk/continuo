@@ -18,7 +18,7 @@ use crossbeam_channel::{Receiver, RecvError, Sender, TrySendError, select};
 use url::Url;
 
 use crate::http::channel::{ByteChannel, ReadOutcome, SourceInterrupt, WaitHook};
-use crate::http::error::RemoteFailure;
+use crate::http::error::{RemoteFailure, redact_url};
 use crate::http::limits::Limits;
 use crate::http::service::HttpService;
 use crate::http::source::{is_retired, remote_cause};
@@ -72,22 +72,37 @@ const PENDING_CAP: usize = 128;
 //
 //   stop interrupt        1  StateChanged{Stopped}
 //   a serviced fault      2  Failed + StateChanged, or DeviceRecovered + StateChanged
-//   a dispatched command  4  Load is the widest: StateChanged{Loading}, Loaded,
-//                            CapabilitiesChanged, StateChanged{Paused}
+//   a dispatched command  5  Load is the widest: StateChanged{Loading},
+//                            CapabilitiesChanged, Loaded, then either
+//                            StateChanged{Paused} (`open_transport` succeeds)
+//                            or Failed + StateChanged{Failed} (it does not) -
+//                            the failure tail is one event wider than the
+//                            success one, so 5 is this row's true worst case
+//                            (fix round 2, MINOR: this used to read 4).
 //   end of track          2  EndOfTrack + StateChanged{Ended}
 //                        --
-//                         9  <= RESERVED_EVENT_SLOTS
+//                        10 (naive union)
 //
-// Those four are not mutually exclusive in a single pass, so the union is the
-// bound rather than the maximum of them. Command admission closes while a
-// backlog exists, and `service_faults` defers a fault whose events would not
-// fit, so neither source can outrun the drain.
+// 10 looks like it breaks `RESERVED_EVENT_SLOTS == 9`, but the reserve only
+// has to be as large as the TERMINAL share of that union: an ordinary event
+// that cannot flush is merely held in `pending_events` (bounded separately,
+// by `PENDING_CAP`) until the reserve clears - never lost, and so never in
+// need of reservation. Only a terminal outcome, which the reserved tail
+// exists to guarantee delivery for even under a full ordinary backlog, must
+// actually fit. Row by row, the terminal-maximizing variant is: stop's
+// StateChanged{Stopped} (1), a fatal fault's Failed + StateChanged{Failed}
+// (2), Load's failure tail above (2, not the success tail's 0), and end of
+// track's pair (2) - 7 terminal events at most, comfortably under 9 with two
+// to spare. Those four are still not mutually exclusive in a single pass, so
+// the union is the bound rather than the maximum of them; command admission
+// closes while a backlog exists, and `service_faults` defers a fault whose
+// events would not fit, so neither source can outrun the drain.
 //
 // `RestartEstablished` and `SeekCancelled` both belong to commands narrower
-// than `Load` (their own event plus a `StateChanged`, at most 2), so neither
-// raises the bound. The resume-unavailable warning does not add a fifth to
-// the dispatched-command row either: it rides on `Loaded.disposition` rather
-// than an event of its own.
+// than `Load` (their own event plus a `StateChanged`, at most 2, and neither
+// terminal), so neither raises the bound. The resume-unavailable warning does
+// not add a sixth to the dispatched-command row either: it rides on
+// `Loaded.disposition` rather than an event of its own.
 const COMMAND_CAPACITY: usize = 1024;
 const SPAN_CAPACITY: usize = 64;
 /// How much audio the PCM ring holds. Large enough that one loop iteration
@@ -264,6 +279,11 @@ impl EngineHandle {
     /// interrupt: a stop must reach a worker blocked inside a remote read,
     /// not only one waiting on the command channel or the tick.
     pub fn interrupt_stop(&self) {
+        // §11: cancellation, logged at the point the application actually
+        // decided on one - not inside `SourceInterrupt::retire` itself, which
+        // also runs on every ordinary remote-failure exit path and would
+        // mislabel a genuine fault as a user-requested cancellation.
+        tracing::debug!("stop requested; retiring the in-flight source read");
         self.source_interrupt.retire();
         self.interrupt.fetch_or(STOP, Ordering::Release);
         let _ = self.wake.try_send(());
@@ -274,6 +294,9 @@ impl EngineHandle {
     /// the worker thread blocked forever inside a remote read nobody will
     /// ever answer.
     pub fn interrupt_shutdown(&self) {
+        // §11: cancellation - see `interrupt_stop`'s comment for why this is
+        // logged here rather than inside `retire` itself.
+        tracing::debug!("shutdown requested; retiring the in-flight source read");
         self.source_interrupt.retire();
         self.interrupt.fetch_or(SHUTDOWN, Ordering::Release);
         let _ = self.wake.try_send(());
@@ -1681,6 +1704,17 @@ impl Worker {
         // consumed. A truncated or timed-out tail cannot set completed
         // status.
         if let Some(failure) = self.confirm_remote_completion() {
+            // IMPORTANT 1 (final review), site 6: `Cancelled` here means a
+            // stop, seek or shutdown retired the confirmation read, not that
+            // the tail failed to confirm anything. Reporting `Failed` would
+            // be announcing a fault over an operation that is about to be
+            // torn down anyway - the interrupt that caused this is still set
+            // and the loop's next pass turns it into the transition the user
+            // actually asked for, exactly as every other cancellation in this
+            // file is handled.
+            if matches!(failure, RemoteFailure::Cancelled) {
+                return;
+            }
             self.fail_with(format!("{failure}"), Some(failure));
             return;
         }
@@ -1809,6 +1843,12 @@ impl Worker {
 
         let prepared = match prepare(&source, &self.prepare_context()) {
             Ok(prepared) => prepared,
+            // IMPORTANT 1 (final review): a stop or shutdown landing during
+            // this open must not be reported as `Failed` - `self.state` is
+            // still `Loading` here (set above), so leaving it alone is what
+            // lets the very next pass's `do_stop` actually run instead of
+            // early-returning on a `Failed` it did not ask for.
+            Err(error) if is_cancelled(&error) => return,
             Err(error) => {
                 self.fail_from(error);
                 return;
@@ -1996,6 +2036,12 @@ impl Worker {
         // already live, so the local path is unchanged.
         match self.ensure_source_open() {
             Ok(_) => {}
+            // IMPORTANT 1 (final review): the state a caller left this in
+            // (`Loading`, from `play`'s `Failed` arm) survives untouched, so
+            // a stop landing during this reopen reaches the next pass's
+            // `do_stop` instead of being swallowed by a `Failed` it did not
+            // ask for.
+            Err(error) if is_cancelled(&error) => return,
             Err(error) => {
                 self.fail_from(error);
                 return;
@@ -2035,6 +2081,8 @@ impl Worker {
                 // would claim a landing no decoder had confirmed.
                 if let Some(requested) = stored {
                     let actual = landed;
+                    // §11: requested/actual seek.
+                    tracing::debug!(?requested, ?actual, "stored seek target confirmed");
                     let session_rev = self.session_rev;
                     self.emit(PlaybackEvent::SeekCompleted {
                         session_rev,
@@ -2176,6 +2224,19 @@ impl Worker {
         // reject the seek as "nothing is loaded" on a source whose identity,
         // descriptor and position the worker is still holding.
         if let Err(error) = self.ensure_source_open() {
+            // IMPORTANT 1 (final review), site 4: a stop or shutdown landing
+            // during this reopen is a cancellation, not a validation
+            // failure - §8's "never `SeekRejected`, which would misreport a
+            // cancellation" applies here exactly as it already does to the
+            // seek proper, below.
+            if is_cancelled(&error) {
+                let session_rev = self.session_rev;
+                self.emit(PlaybackEvent::SeekCancelled {
+                    session_rev,
+                    requested,
+                });
+                return;
+            }
             self.reject_seek(format!("{error}"));
             return;
         }
@@ -2191,9 +2252,32 @@ impl Worker {
                 // §6: until conclusive evidence exists, publish Unknown
                 // and verify on demand. A stopped seek needs the answer
                 // before it may store a target M2 treats as durable.
-                if self.capabilities.seek == SeekSupport::Unknown && !self.verify_seek_support() {
-                    self.reject_seek("this source cannot seek".into());
-                    return;
+                if self.capabilities.seek == SeekSupport::Unknown {
+                    match self.verify_seek_support() {
+                        Ok(true) => {}
+                        // A genuine demuxer refusal: this and only this
+                        // means "this source cannot seek" (IMPORTANT 1,
+                        // final review, site 5).
+                        Ok(false) => {
+                            self.reject_seek("this source cannot seek".into());
+                            return;
+                        }
+                        Err(error) if is_cancelled(&error) => {
+                            let session_rev = self.session_rev;
+                            self.emit(PlaybackEvent::SeekCancelled {
+                                session_rev,
+                                requested: target,
+                            });
+                            return;
+                        }
+                        // A typed remote failure (a 416, `ResourceChanged`, a
+                        // stall...) is reported as what it actually is,
+                        // never flattened into the capability verdict above.
+                        Err(error) => {
+                            self.reject_seek(format!("{error}"));
+                            return;
+                        }
+                    }
                 }
                 self.requested_target = Some(target);
                 let session_rev = self.session_rev;
@@ -2259,6 +2343,8 @@ impl Worker {
                 if self.state == PlaybackState::Ended {
                     self.set_state(PlaybackState::Paused);
                 }
+                // §11: requested/actual seek.
+                tracing::debug!(requested = ?target, ?actual, truncated, "seek completed");
                 let session_rev = self.session_rev;
                 self.emit(PlaybackEvent::SeekCompleted {
                     session_rev,
@@ -2319,6 +2405,10 @@ impl Worker {
     fn restart(&mut self) {
         let reopened = match self.ensure_source_open() {
             Ok(reopened) => reopened,
+            // IMPORTANT 1 (final review): same rule as `restore`'s arm above
+            // - a cancellation must not become `Failed`, or the stop that
+            // caused it is swallowed by `do_stop`'s own early return.
+            Err(error) if is_cancelled(&error) => return,
             Err(error) => {
                 self.fail_from(error);
                 return;
@@ -2511,6 +2601,12 @@ impl Worker {
         }
         self.capabilities = prepared.capabilities;
         self.source = Some(prepared.source);
+        // §11: reconnect - this is the one path that reopens a remote source
+        // the worker previously retired (a stop, or a failure), rather than
+        // establishing one for the first time.
+        if let SourceLocation::Http(url) = &location {
+            tracing::debug!(url = %redact_url(url.as_str()), "reconnected remote source");
+        }
         Ok(true)
     }
 
@@ -2519,26 +2615,43 @@ impl Worker {
     /// assumption (§6). Publishes `CapabilitiesChanged` and promotes the
     /// source's own evidence on success, so a later caller reads `Native`
     /// off the same field this one just updated.
-    fn verify_seek_support(&mut self) -> bool {
+    ///
+    /// `Result<bool, PlaybackError>`, not a bare `bool` (IMPORTANT 1, final
+    /// review, site 5): the trial goes through `HttpMediaSource::seek`, which
+    /// issues a real range request, so a cancellation and a typed remote
+    /// failure (a 416, `ResourceChanged`, a stall...) are both reachable here
+    /// and neither is the same fact as a demuxer that genuinely refused the
+    /// seek. `Ok(false)` is reserved for that last case alone; the caller
+    /// tells the three apart rather than reading every failure as "cannot
+    /// seek".
+    fn verify_seek_support(&mut self) -> Result<bool, PlaybackError> {
         let current = self.position;
         let interrupt = Arc::clone(&self.interrupt);
-        let succeeded = match self.source.as_mut() {
-            Some(source) => source
-                .seek_refined(current, None, &mut || {
-                    stop_or_shutdown(interrupt.load(Ordering::Acquire))
-                })
-                .is_ok(),
-            None => false,
+        let Some(source) = self.source.as_mut() else {
+            return Ok(false);
         };
-        if succeeded && let Some(source) = self.source.as_mut() {
-            source.note_demuxer_proven();
-            // Only reachable with `self.capabilities.seek == Unknown` (this
-            // method's one caller gates on exactly that), so a successful
-            // trial is always a change to `Native` - nothing to compare here.
-            self.capabilities = source.capabilities();
-            self.emit_capabilities(self.capabilities);
+        let outcome = source.seek_refined(current, None, &mut || {
+            stop_or_shutdown(interrupt.load(Ordering::Acquire))
+        });
+        match outcome {
+            Ok(_) => {
+                if let Some(source) = self.source.as_mut() {
+                    source.note_demuxer_proven();
+                    // Only reachable with `self.capabilities.seek == Unknown`
+                    // (this method's one caller gates on exactly that), so a
+                    // successful trial is always a change to `Native` -
+                    // nothing to compare here.
+                    self.capabilities = source.capabilities();
+                    self.emit_capabilities(self.capabilities);
+                }
+                Ok(true)
+            }
+            // Cancelled or a typed remote failure: propagate rather than
+            // flatten into "cannot seek" (see this method's own doc comment).
+            Err(error) if is_cancelled(&error) || remote_cause(&error).is_some() => Err(error),
+            // Neither cancelled nor remote: the demuxer itself refused.
+            Err(_) => Ok(false),
         }
-        succeeded
     }
 }
 
@@ -2577,6 +2690,17 @@ fn is_retired_read(error: &PlaybackError) -> bool {
 /// every caller of this function treats the two identically.
 fn is_cancelled(error: &PlaybackError) -> bool {
     matches!(error, PlaybackError::Cancelled)
+        // A direct `PlaybackError::Remote(RemoteFailure::Cancelled)` - what
+        // `prepare`/`HttpMediaSource::open` and `ensure_source_open` produce,
+        // never routed through Symphonia at all - is not caught by
+        // `remote_cause` below: `#[error(transparent)]` forwards `source()`
+        // to the inner `RemoteFailure`'s own `source()`, and `Cancelled` has
+        // none, so walking the chain finds nothing (fix round 2, IMPORTANT
+        // 1: the reopen-cancellation tests this fixed added are what caught
+        // this - every call site that previously used this helper only ever
+        // saw a *decode-layer* error Symphonia had mangled a `RemoteIoError`
+        // into, which `remote_cause` walks to correctly).
+        || matches!(error, PlaybackError::Remote(RemoteFailure::Cancelled))
         || matches!(remote_cause(error), Some(RemoteFailure::Cancelled))
 }
 

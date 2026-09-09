@@ -761,3 +761,138 @@ fn a_seek_taken_while_paused_completes_rather_than_hanging() {
     engine.finish();
     server.shutdown();
 }
+
+#[test]
+fn a_stop_during_a_play_after_stop_reopen_leaves_the_session_stopped_not_failed() {
+    // Final review, IMPORTANT 1: `ensure_source_open` manufactures
+    // `PlaybackError::Cancelled` specifically so a stop landing during a
+    // reopen can be told apart from a genuine failure - but `restore`, the
+    // one caller a play-after-stop reopen actually goes through, used to
+    // report it as `Failed` regardless. `Failed` is one of the three states
+    // `do_stop` refuses to act on, so the very stop that caused the
+    // cancellation was then swallowed on the next loop pass: the session
+    // sat in `Failed`, never `Stopped`, and in the CLI a `Failed` breaks the
+    // key loop and exits nonzero - pressing "stop" quit the player with an
+    // error.
+    let server = TestServer::start(Script::from_fixture("sine-5s.flac"));
+    let mut engine = TestEngine::start_idle();
+    engine.load_remote(&server.url("/audio.flac"));
+    assert_eq!(engine.handle().submit_play(), Admission::Accepted);
+    engine.await_state(PlaybackState::Playing);
+    engine.play_for(Duration::from_millis(100));
+
+    // The first stop, ordinary and uncontested - the reopen this test is
+    // actually about is the *next* one, triggered by the `Play` below.
+    engine.handle().submit_stop();
+    engine.await_state(PlaybackState::Stopped);
+
+    let port = server.port();
+    server.shutdown();
+    // Same URL, same `MediaId`, but every request from here on stalls before
+    // it is ever answered - the proof this test needs that the reopen's
+    // header wait was actually entered before the second stop interrupts it.
+    let stalling = TestServer::start_on(port, Script::from_fixture("sine-5s.flac").stall_headers());
+
+    assert_eq!(engine.handle().submit_play(), Admission::Accepted);
+    assert!(
+        wait_for_request(&stalling, Duration::from_secs(5)),
+        "the reopen's request never reached the server"
+    );
+
+    engine.handle().submit_stop();
+
+    // Not `await_state`: `restore()` never left `Stopped` in the first place
+    // while blocked in the reopen (it only sets `Loading` on the *other*
+    // caller, `play`'s `Failed` arm), so this second stop's `do_stop` is a
+    // correct no-op that emits no fresh `StateChanged` for `await_state`'s
+    // history-consuming wait to find - polling the *current* state directly
+    // is what this settle actually needs, with a hard failure the moment it
+    // sees the bug this test exists to catch.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let state = engine.state();
+        assert_ne!(
+            state,
+            PlaybackState::Failed,
+            "a stop cancelling a reopen was reported as Failed, not left as Stopped"
+        );
+        if state == PlaybackState::Stopped {
+            break;
+        }
+        if Instant::now() >= deadline {
+            panic!("the engine never settled back to Stopped; last state {state:?}");
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert_eq!(
+        engine.count_events(|e| matches!(
+            e,
+            PlaybackEvent::Failed { .. }
+                | PlaybackEvent::StateChanged {
+                    state: PlaybackState::Failed,
+                    ..
+                }
+        )),
+        0,
+        "a stop cancelling a reopen must never be reported as a failure"
+    );
+
+    engine.finish();
+    stalling.shutdown();
+}
+
+#[test]
+fn a_seek_cancelled_while_reopening_from_stopped_reports_cancelled_not_rejected() {
+    // Final review, IMPORTANT 1, site 4: `seek_to`'s own call to
+    // `ensure_source_open` used to flatten a cancellation into
+    // `SeekRejected(format!("{error}"))` - misreporting a stop as a
+    // validation failure, exactly what §8 says a `SeekRejected` must never
+    // do. A seek issued while stopped is the one path that actually reaches
+    // `ensure_source_open` from `seek_to`, since a live session never has a
+    // decoder to reopen.
+    let server = TestServer::start(Script::from_fixture("sine-5s.flac"));
+    let mut engine = TestEngine::start_idle();
+    engine.load_remote(&server.url("/audio.flac"));
+    assert_eq!(engine.handle().submit_play(), Admission::Accepted);
+    engine.await_state(PlaybackState::Playing);
+    engine.play_for(Duration::from_millis(100));
+
+    engine.handle().submit_stop();
+    engine.await_state(PlaybackState::Stopped);
+
+    let port = server.port();
+    server.shutdown();
+    let stalling = TestServer::start_on(port, Script::from_fixture("sine-5s.flac").stall_headers());
+
+    assert_eq!(
+        engine.handle().submit_seek(Duration::from_secs(3)),
+        Admission::Accepted
+    );
+    assert!(
+        wait_for_request(&stalling, Duration::from_secs(5)),
+        "the stopped seek's reopen never reached the server"
+    );
+
+    engine.handle().submit_stop();
+
+    let cancelled = engine.await_event(|e| {
+        matches!(
+            e,
+            PlaybackEvent::SeekCancelled { .. } | PlaybackEvent::SeekRejected { .. }
+        )
+    });
+    let PlaybackEvent::SeekCancelled { requested, .. } = cancelled else {
+        panic!(
+            "a seek cancelled while reopening from stopped must report SeekCancelled, not {cancelled:?}"
+        );
+    };
+    assert_eq!(requested, Duration::from_secs(3));
+    assert_eq!(
+        engine.count_events(|e| matches!(e, PlaybackEvent::SeekTargetStored { .. })),
+        0,
+        "a cancelled reopen must never also store the seek target it never validated"
+    );
+
+    engine.finish();
+    stalling.shutdown();
+}
