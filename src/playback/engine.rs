@@ -190,6 +190,7 @@ impl EngineHandle {
             media: None,
             position: Duration::ZERO,
             quality: PositionQuality::Exact,
+            buffering: false,
         }));
         let interrupt = Arc::new(AtomicU8::new(0));
         // One real capacity for the worker's whole life (Carried Finding 2):

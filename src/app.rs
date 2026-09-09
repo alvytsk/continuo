@@ -1,6 +1,8 @@
-//! The `continuo play` application: argument-to-path resolution, terminal
+//! The `continuo play` application: argument-to-source resolution, terminal
 //! setup, and the key-driven status loop around [`EngineHandle`].
 
+use std::io::Write;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -8,20 +10,26 @@ use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::style::Print;
 use crossterm::terminal::{Clear, ClearType};
 use crossterm::{cursor, execute};
+use url::Url;
 
 use crate::cli::{self, CliCommand};
 use crate::clock::{Clock, SystemClock};
-use crate::media::id::{AbsolutePath, MediaId};
+use crate::http::channel::{SourceInterrupt, WaitHook};
+use crate::http::error::{RemoteFailure, redact_url};
+use crate::http::limits::Limits;
+use crate::http::service::HttpService;
+use crate::media::capabilities::{MediaCapabilities, SeekSupport};
+use crate::media::id::{AbsolutePath, MediaId, NormalizedUrl};
 use crate::media::source::SourceLocation;
 use crate::persistence::PersistenceError;
 use crate::persistence::model::PersistedState;
 use crate::persistence::store::{LoadReason, StateStore};
 use crate::persistence::writer::{ShutdownOutcome, StateSink, Urgency, WriterHandle};
 use crate::playback::command::{PlaybackCommand, ResumeIntent};
-use crate::playback::decode::DecodedSource;
 use crate::playback::engine::EngineHandle;
 use crate::playback::error::PlaybackError;
 use crate::playback::event::PlaybackEvent;
+use crate::playback::prepare::{PrepareContext, prepare};
 use crate::playback::state::PlaybackState;
 use crate::playback::timeline::PositionQuality;
 use crate::playback::volume::Volume;
@@ -35,150 +43,342 @@ const HELP_LINE: &str =
 
 /// Runs the parsed CLI to completion.
 pub fn run(cli: cli::Cli) -> Result<(), PlaybackError> {
-    let CliCommand::Play { path, probe_only } = cli.command;
+    let CliCommand::Play { source, probe_only } = cli.command;
 
-    let canonical = path.canonicalize().map_err(|source| PlaybackError::Open {
-        path: path.clone(),
-        source,
-    })?;
-    let absolute =
-        AbsolutePath::new(canonical).map_err(|error| PlaybackError::UnsupportedInput {
-            path: path.clone(),
-            reason: error.to_string(),
-        })?;
-
-    // Validated on the main thread, before anything touches a terminal or a
-    // device. A rejected file — a directory, an unreadable format, an
-    // unsupported channel layout — must be reportable without an audio
-    // device or a controlling terminal, neither of which CI has, and it must
-    // never leave the terminal toggled into raw mode. The worker reopens the
-    // same path itself once `Load` is sent, so this open is pure validation
-    // and its result is not carried forward.
-    let probed = DecodedSource::open(&absolute)?;
     if probe_only {
-        println!(
-            "{} {} Hz {} ch {:?}",
-            probed.metadata().title.as_deref().unwrap_or("(untitled)"),
-            probed.sample_rate(),
-            probed.channels(),
-            probed.metadata().duration,
-        );
-        return Ok(());
+        return run_probe_only(&source);
     }
-    // This probe's own validation is all `run` needed from it; the worker
-    // reopens the same path once `Load` is sent, and it is the worker's own
-    // probe — the only one with a duration — that resolves whatever resume
-    // candidate persistence hands back (Ruling 5).
-    drop(probed);
+
+    let (media, location) = resolve_source(&source)?;
 
     // Persistence opens before the engine: the resume candidate is an
     // argument to the load, and the restored volume is a command that
     // precedes it.
-    let media = MediaId::LocalFile(absolute.clone());
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let Persistence {
         mut session,
-        mut writer,
+        writer,
         candidate,
         volume,
         persisting,
     } = open_persistence(platform_store(&clock), &media, &clock);
 
-    let engine = EngineHandle::spawn_cpal();
-    // Dropped explicitly by the shutdown sequence, before the flush waits on
-    // the disk; its `Drop` is what covers a panic.
-    let raw = RawModeGuard::enable()?;
-    let mut mirror = Mirror::default();
+    // Built before the engine spawns: `EngineHandle::set_http`'s default is
+    // `None`, which fails every remote `Load` with "no HTTP service in this
+    // session" — installing it before the first command reaches the worker
+    // is what makes that failure mode unreachable for a source this CLI
+    // itself resolved as remote.
+    let http = match &location {
+        SourceLocation::Http(_) => Some(HttpService::spawn(Limits::default())?),
+        SourceLocation::LocalPath(_) => None,
+    };
 
-    for command in resume_commands(
-        media,
-        SourceLocation::LocalPath(absolute.as_path().to_path_buf()),
-        candidate,
-        volume,
-    ) {
+    let engine = EngineHandle::spawn_cpal();
+    if let Some(service) = http {
+        engine.set_http(Some(service));
+    }
+
+    for command in resume_commands(media, location, candidate, volume) {
         engine.commands().send(command).ok();
     }
 
-    let outcome = loop {
-        match crossterm::event::poll(Duration::from_millis(100)) {
-            Ok(true) => match crossterm::event::read() {
-                Ok(Event::Key(key)) => match to_command(key, &mirror) {
-                    Some(PlaybackCommand::Shutdown) => break Ok(()),
-                    // Stop travels out of band. The ordinary command queue stops
-                    // being read while an event backlog exists, and a queued
-                    // Stop cannot interrupt a refinement already running, so
-                    // pressing `s` would not stop anything when it matters most.
-                    Some(PlaybackCommand::Stop) => engine.interrupt_stop(),
-                    Some(command) => {
-                        engine.commands().send(command).ok();
-                    }
-                    None => {}
-                },
-                Ok(_) => {}
-                // The input stream ended or failed; there is nothing left to
-                // read keys from, so shut down as cleanly as `q` would.
-                Err(_) => break Ok(()),
-            },
-            Ok(false) => {}
-            Err(_) => break Ok(()),
+    // Entered only now (R5, Ruling 1): every fallible step above can still
+    // fail before a single key is read, which is what keeps a rejected
+    // source reportable with no raw terminal. `None` means there is no tty —
+    // the CI case — and such a session simply reads no keys rather than
+    // calling into crossterm, which has nothing to open and fails outright
+    // rather than reporting "nothing ready".
+    let raw = RawModeGuard::enable();
+    let mut mirror = Mirror::default();
+
+    // Raw mode does not translate `\n`. §5: "The application displays
+    // Loading while preparation is in flight and remains able to stop or
+    // quit" — this is the one line loop A renders, before the first `Loaded`
+    // or `Failed` decides whether there is anything further to show.
+    print!("Loading \u{2026}\r\n");
+    let _ = std::io::stdout().flush();
+
+    // Loop A: keys are read (Ctrl-C and `q` included) but nothing but the
+    // line above is rendered. `Loaded` hands off to loop B; `Failed` or a
+    // quit decides the run's outcome here, before loop B ever starts.
+    let phase = loop {
+        if handle_keys(&engine, &mirror, raw.is_some()) {
+            break Phase::Done(Ok(()));
         }
 
         let mut failure = None;
+        let mut loaded = false;
         while let Ok(event) = engine.events().try_recv() {
             if let PlaybackEvent::Failed { message, .. } = &event {
                 failure = Some(message.clone());
             }
+            loaded |= matches!(event, PlaybackEvent::Loaded { .. });
             // `observe` borrows the event, so the mirror still consumes it.
             submit(&writer, session.observe(&event, clock.sample()));
             mirror.apply(event);
         }
         if let Some(message) = failure {
-            break Err(PlaybackError::Failed(message));
+            break Phase::Done(Err(PlaybackError::Failed(message)));
         }
-
-        // Render progress only when it belongs to the session the mirror is
-        // showing. The keep-latest snapshot can otherwise overtake queued
-        // lifecycle events and show one track's position under another's
-        // title. A `Failed` event can carry a newer `session_rev` than the
-        // snapshot published a tick earlier; the guard correctly skips
-        // rendering the snapshot for that tick.
-        let progress = engine.progress();
-        submit(&writer, session.tick(&progress, clock.sample()));
-        if progress.session_rev == mirror.session_rev {
-            mirror.position = progress.position;
-            mirror.quality = progress.quality;
-        }
-        // A terminal write failure is not a reason to skip the final
-        // checkpoint, so it becomes the loop's outcome instead of returning
-        // from here and bypassing the flush path (D18).
-        if let Err(error) = render(&mirror) {
-            break Err(error);
+        if loaded {
+            break Phase::Loaded;
         }
     };
 
+    let outcome = match phase {
+        Phase::Done(outcome) => outcome,
+        // Loop B: the existing key/render/checkpoint loop.
+        Phase::Loaded => loop {
+            if handle_keys(&engine, &mirror, raw.is_some()) {
+                break Ok(());
+            }
+
+            let mut failure = None;
+            while let Ok(event) = engine.events().try_recv() {
+                if let PlaybackEvent::Failed { message, .. } = &event {
+                    failure = Some(message.clone());
+                }
+                submit(&writer, session.observe(&event, clock.sample()));
+                mirror.apply(event);
+            }
+            if let Some(message) = failure {
+                break Err(PlaybackError::Failed(message));
+            }
+
+            // Render progress only when it belongs to the session the mirror is
+            // showing. The keep-latest snapshot can otherwise overtake queued
+            // lifecycle events and show one track's position under another's
+            // title. A `Failed` event can carry a newer `session_rev` than the
+            // snapshot published a tick earlier; the guard correctly skips
+            // rendering the snapshot for that tick.
+            let progress = engine.progress();
+            submit(&writer, session.tick(&progress, clock.sample()));
+            if progress.session_rev == mirror.session_rev {
+                mirror.position = progress.position;
+                mirror.quality = progress.quality;
+                mirror.buffering = progress.buffering;
+            }
+            // A terminal write failure is not a reason to skip the final
+            // checkpoint, so it becomes the loop's outcome instead of returning
+            // from here and bypassing the flush path (D18).
+            if let Err(error) = render(&mirror) {
+                break Err(error);
+            }
+        },
+    };
+
+    finish(engine, session, writer, &clock, raw, persisting, outcome)
+}
+
+/// What loop A decided: hand off to loop B once loaded, or the run is
+/// already over (a quit, or a `Failed` before anything ever loaded).
+enum Phase {
+    Loaded,
+    Done(Result<(), PlaybackError>),
+}
+
+/// Both loops break into this (Ruling 2): whichever loop produced `outcome`,
+/// the shutdown sequence — interrupt, join, reconcile, restore the terminal,
+/// flush — is one path rather than two, which is what keeps D18's "a
+/// terminal write failure must not skip the final checkpoint" true
+/// regardless of which loop hit it.
+fn finish(
+    engine: EngineHandle,
+    mut session: Session,
+    mut writer: WriterHandle,
+    clock: &Arc<dyn Clock>,
+    raw: Option<RawModeGuard>,
+    persisting: bool,
+    outcome: Result<(), PlaybackError>,
+) -> Result<(), PlaybackError> {
     // Out of band first, and in band only as a courtesy. The worker stops
-    // reading commands while an event backlog exists, and this loop has just
-    // stopped draining events, so an in-band `Shutdown` can sit unread in the
-    // channel forever while `join` blocks - hanging the process with the
-    // terminal still in raw mode. The interrupt is the only signal that is
-    // guaranteed to be seen.
+    // reading commands while an event backlog exists, and both loops have
+    // just stopped draining events, so an in-band `Shutdown` can sit unread
+    // in the channel forever while `join` blocks - hanging the process with
+    // the terminal still in raw mode. The interrupt is the only signal that
+    // is guaranteed to be seen.
     engine.interrupt_shutdown();
     engine.commands().send(PlaybackCommand::Shutdown).ok();
     let report = engine.join();
 
-    // The events the loop never drained are replayed through the policy before
-    // the snapshot is taken, so the snapshot comes from a session that has seen
-    // everything the run produced (D19).
+    // The events neither loop drained are replayed through the policy before
+    // the snapshot is taken, so the snapshot comes from a session that has
+    // seen everything the run produced (D19).
     writer.submit(
         session.reconcile_shutdown(&report, clock.sample()),
         Urgency::Forced,
     );
 
-    // Restore the terminal before waiting on the disk, so the writer's bound is
-    // never spent with the terminal still raw.
+    // Restore the terminal before waiting on the disk, and before returning
+    // to a caller that will print a diagnostic on `outcome` — so the writer's
+    // bound is never spent, and nothing is ever printed, with the terminal
+    // still raw (Ruling 1).
     drop(raw);
     report_flush(writer.shutdown(), persisting);
     outcome
+}
+
+/// One pass of key handling, shared by both loops. Returns whether the loop
+/// must stop: an explicit quit, Ctrl-C (`to_command` already maps it to
+/// `Shutdown`), or the input stream ending or failing.
+///
+/// With no raw terminal (`raw` false) there are no keys to read, and calling
+/// into crossterm anyway does not answer "nothing ready" — with no tty to
+/// open it fails outright (verified empirically against this crossterm
+/// version), which would misreport a CI run with no controlling terminal as
+/// someone having pressed `q`. Waiting out one tick and reporting nothing to
+/// do is what actually matches "no keys", leaving the event drain in each
+/// loop as the only thing such a session can still notice.
+fn handle_keys(engine: &EngineHandle, mirror: &Mirror, raw: bool) -> bool {
+    if !raw {
+        std::thread::sleep(Duration::from_millis(100));
+        return false;
+    }
+    match crossterm::event::poll(Duration::from_millis(100)) {
+        Ok(true) => match crossterm::event::read() {
+            Ok(Event::Key(key)) => match to_command(key, mirror) {
+                Some(PlaybackCommand::Shutdown) => true,
+                // Stop travels out of band. The ordinary command queue stops
+                // being read while an event backlog exists, and a queued
+                // Stop cannot interrupt a refinement already running, so
+                // pressing `s` would not stop anything when it matters most.
+                Some(PlaybackCommand::Stop) => {
+                    engine.interrupt_stop();
+                    false
+                }
+                Some(command) => {
+                    engine.commands().send(command).ok();
+                    false
+                }
+                None => false,
+            },
+            Ok(_) => false,
+            // The input stream ended or failed; there is nothing left to
+            // read keys from, so shut down as cleanly as `q` would.
+            Err(_) => true,
+        },
+        Ok(false) => false,
+        Err(_) => true,
+    }
+}
+
+/// §5's disambiguation. An explicit http/https scheme is a URL; everything
+/// else keeps existing path behaviour, so `./https:weird` remains an
+/// unambiguous local spelling.
+fn resolve_source(input: &str) -> Result<(MediaId, SourceLocation), PlaybackError> {
+    if is_url_spelling(input) {
+        return resolve_url(input);
+    }
+    let path = PathBuf::from(input);
+    let canonical = path.canonicalize().map_err(|source| PlaybackError::Open {
+        path: path.clone(),
+        source,
+    })?;
+    let absolute =
+        AbsolutePath::new(canonical.clone()).map_err(|error| PlaybackError::UnsupportedInput {
+            path: path.clone(),
+            reason: error.to_string(),
+        })?;
+    Ok((
+        MediaId::LocalFile(absolute),
+        SourceLocation::LocalPath(canonical),
+    ))
+}
+
+/// Only an explicit prefix counts, ASCII case-insensitively: `./https:weird`
+/// does not start with either spelling, so it is unaffected, and there is no
+/// looser check anywhere else that could make it one.
+fn is_url_spelling(input: &str) -> bool {
+    let starts_with_ci = |prefix: &str| {
+        input
+            .get(..prefix.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+    };
+    starts_with_ci("http://") || starts_with_ci("https://")
+}
+
+fn resolve_url(input: &str) -> Result<(MediaId, SourceLocation), PlaybackError> {
+    // Ruling 5: every `RemoteFailure` built from user input here carries an
+    // already-redacted URL — the raw text may itself be the secret (a
+    // malformed URL that embedded a token, say), so it is never echoed back.
+    let invalid = |reason: &'static str| -> PlaybackError {
+        RemoteFailure::InvalidSource {
+            input: redact_url(input),
+            reason,
+        }
+        .into()
+    };
+    let url = Url::parse(input).map_err(|_| invalid("not a valid URL"))?;
+    // §5: no implicit credential feature. Rejected here, before identity is
+    // ever built from it, rather than left for the fetch to refuse later.
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(invalid("URLs with embedded credentials are not supported"));
+    }
+    let normalized =
+        NormalizedUrl::parse(input).map_err(|_| invalid("expected http(s) with a host"))?;
+    // The parsed `Url` is kept separately as the fetch target — its query
+    // stays whole, and a redirect changes it without ever touching identity.
+    Ok((MediaId::RemoteUrl(normalized), SourceLocation::Http(url)))
+}
+
+/// §5/H15: opens and classifies `source` on the calling thread. No
+/// `EngineHandle`, no `AudioOutput` and no `StateStore` are constructed —
+/// this reads no playback state and writes none.
+fn run_probe_only(source: &str) -> Result<(), PlaybackError> {
+    let (_, location) = resolve_source(source)?;
+    let http = match &location {
+        SourceLocation::Http(_) => Some(HttpService::spawn(Limits::default())?),
+        SourceLocation::LocalPath(_) => None,
+    };
+    let context = PrepareContext {
+        http,
+        interrupt: SourceInterrupt::new(Limits::default().buffer_bytes),
+        hook: Arc::new(InertHook),
+        limits: Limits::default(),
+    };
+    let mut prepared = prepare(&location, &context)?;
+
+    // Preparation alone stops at `SeekSupport::Unknown` for every remote
+    // source (§6): performing the trial seek here, before printing, is what
+    // lets the probe tell "unresolved" from "unsupported" apart. A probe that
+    // printed `Unknown` would only be reporting its own incuriosity as a
+    // property of the recording.
+    if prepared.capabilities.seek == SeekSupport::Unknown {
+        let seeked = prepared
+            .source
+            .seek_refined(Duration::ZERO, None, &mut || false)
+            .is_ok();
+        if seeked {
+            prepared.source.note_demuxer_proven();
+            prepared.capabilities = prepared.source.capabilities();
+        }
+    }
+
+    let title = prepared
+        .source
+        .metadata()
+        .title
+        .clone()
+        .unwrap_or_else(|| "(untitled)".to_string());
+    println!(
+        "{title} {rate} Hz {channels} ch {duration:?} continuity={continuity:?} seek={seek:?} resume={resume:?}",
+        rate = prepared.source.sample_rate(),
+        channels = prepared.source.channels(),
+        duration = prepared.source.metadata().duration,
+        continuity = prepared.capabilities.continuity,
+        seek = prepared.capabilities.seek,
+        resume = prepared.capabilities.resume_capability(),
+    );
+    Ok(())
+}
+
+/// A `WaitHook` with nothing to do. `--probe-only` runs `prepare` on the
+/// calling thread with no worker behind it, so the hook a blocked read would
+/// service has no progress to publish and no freeze to act on.
+struct InertHook;
+
+impl WaitHook for InertHook {
+    fn service(&self) {}
 }
 
 /// §11's initial command sequence. Volume first: the engine accepts it with no
@@ -355,16 +555,26 @@ fn report_flush(outcome: ShutdownOutcome, persisting: bool) {
     }
 }
 
-/// Installs raw mode and restores it on drop. `run` drops it explicitly, so the
-/// writer's shutdown bound is never spent with the terminal still raw; the
-/// `Drop` covers a panic, which is the only way out of the loop above that does
+/// Installs raw mode and restores it on drop. `finish` drops it explicitly, so
+/// the writer's shutdown bound is never spent with the terminal still raw; the
+/// `Drop` covers a panic, which is the only way out of either loop that does
 /// not reach that line.
 struct RawModeGuard;
 
 impl RawModeGuard {
-    fn enable() -> Result<Self, PlaybackError> {
-        crossterm::terminal::enable_raw_mode()?;
-        Ok(Self)
+    /// `None` when there is no controlling terminal — `enable_raw_mode` fails
+    /// for want of a tty, which is the CI case this type exists to keep out
+    /// of raw-mode restoration's way (Ruling 1). Such a session reads no
+    /// keys; `Loading` and any failure still print, and nothing here is left
+    /// toggled for `finish` to restore.
+    fn enable() -> Option<Self> {
+        match crossterm::terminal::enable_raw_mode() {
+            Ok(()) => Some(Self),
+            Err(error) => {
+                tracing::debug!(%error, "no controlling terminal; running without raw mode");
+                None
+            }
+        }
     }
 }
 
@@ -384,6 +594,14 @@ struct Mirror {
     position: Duration,
     quality: PositionQuality,
     volume: Volume,
+    /// §11: carried whole, rather than as a bare `SeekSupport`, so
+    /// `status_line` can tell "unresolved" from "unsupported" apart. `None`
+    /// until the first `Loaded`.
+    capabilities: Option<MediaCapabilities>,
+    /// True exactly while a source read is blocked on the network. A detail
+    /// of `Playing`, never a state of its own (§11) — `status_line` is the
+    /// only place this is read.
+    buffering: bool,
 }
 
 impl Default for Mirror {
@@ -396,6 +614,8 @@ impl Default for Mirror {
             position: Duration::ZERO,
             quality: PositionQuality::Exact,
             volume: Volume::default(),
+            capabilities: None,
+            buffering: false,
         }
     }
 }
@@ -407,12 +627,14 @@ impl Mirror {
                 session_rev,
                 media,
                 metadata,
+                capabilities,
                 position,
                 ..
             } => {
                 self.session_rev = session_rev;
                 self.name = Some(display_name(&media));
                 self.duration = metadata.duration;
+                self.capabilities = Some(capabilities);
                 self.position = position;
                 self.quality = PositionQuality::Exact;
                 self.state = PlaybackState::Loading;
@@ -461,10 +683,20 @@ impl Mirror {
                 self.session_rev = session_rev;
                 self.position = position;
             }
+            // §11: evidence that arrived after `Loaded` — an on-demand seek
+            // probe resolving `Unknown` — updates the same field `Loaded`
+            // itself seeds, so `status_line` reads the promotion to `Native`
+            // the moment it is announced rather than only on the next load.
+            PlaybackEvent::CapabilitiesChanged {
+                session_rev,
+                capabilities,
+            } => {
+                self.session_rev = session_rev;
+                self.capabilities = Some(capabilities);
+            }
             PlaybackEvent::DeviceRecovered { session_rev }
             | PlaybackEvent::SeekRejected { session_rev, .. }
             | PlaybackEvent::SeekCancelled { session_rev, .. }
-            | PlaybackEvent::CapabilitiesChanged { session_rev, .. }
             | PlaybackEvent::Warning { session_rev, .. }
             | PlaybackEvent::Failed { session_rev, .. } => {
                 self.session_rev = session_rev;
@@ -480,7 +712,26 @@ fn display_name(media: &MediaId) -> String {
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| media.to_string()),
+        MediaId::RemoteUrl(url) => remote_display_name(url.as_str()),
         other => other.to_string(),
+    }
+}
+
+/// §11: a status line must never carry a signed query or embedded
+/// credentials, so this is built from `redact_url`'s output rather than the
+/// URL itself — the last path segment, or the redacted host when there is
+/// none.
+fn remote_display_name(url: &str) -> String {
+    let redacted = redact_url(url);
+    match Url::parse(&redacted) {
+        Ok(parsed) => parsed
+            .path_segments()
+            .and_then(|mut segments| segments.next_back())
+            .filter(|segment| !segment.is_empty())
+            .map(str::to_string)
+            .or_else(|| parsed.host_str().map(str::to_string))
+            .unwrap_or(redacted),
+        Err(_) => redacted,
     }
 }
 
@@ -540,9 +791,24 @@ fn status_line(mirror: &Mirror) -> String {
         .duration
         .map(format_hms)
         .unwrap_or_else(|| "--:--:--".to_string());
+    // §11: unresolved and unsupported are different facts about the same
+    // `SeekSupport`, and an HTTP transport must never be reported in a way
+    // that reads as live radio — neither note ever replaces the duration
+    // fallback above, which stays exactly what it always meant: an unknown
+    // duration, nothing about seeking.
+    let seek_note = match mirror.capabilities.map(|capabilities| capabilities.seek) {
+        Some(SeekSupport::Unknown) => " seek?",
+        Some(SeekSupport::Unsupported) => " no-seek",
+        _ => "",
+    };
+    let mut label = mirror.state.label().to_string();
+    // A detail of Playing, never a state of its own (§11): this never grows
+    // a fifth word beside idle/loading/playing/paused/stopped/ended/failed.
+    if mirror.buffering && mirror.state == PlaybackState::Playing {
+        label.push_str(" buffering");
+    }
     format!(
-        "{name} [{}] {position}{suffix} / {duration}  vol {}%",
-        mirror.state.label(),
+        "{name} [{label}]{seek_note} {position}{suffix} / {duration}  vol {}%",
         mirror.volume.percent(),
     )
 }
@@ -835,5 +1101,208 @@ mod tests {
             classify_flush(ShutdownOutcome::Written, true),
             FlushReport::Written
         ));
+    }
+
+    // ------------------------------------------------------- resolve_source
+
+    #[test]
+    fn only_an_explicit_http_or_https_prefix_is_a_url() {
+        assert!(is_url_spelling("http://example.com/a.mp3"));
+        assert!(is_url_spelling("https://example.com/a.mp3"));
+        // ASCII case-insensitive (§5).
+        assert!(is_url_spelling("HTTP://example.com/a.mp3"));
+        assert!(is_url_spelling("HtTpS://example.com/a.mp3"));
+        // §5: `./https:weird` is an unambiguous local spelling - the scheme
+        // has to be a genuine prefix, not merely present anywhere.
+        assert!(!is_url_spelling("./https:not-a-url"));
+        assert!(!is_url_spelling("https:not-a-url"));
+        assert!(!is_url_spelling("/music/http://weird.flac"));
+        assert!(!is_url_spelling(""));
+    }
+
+    #[test]
+    fn a_malformed_url_is_reported_as_invalid_source_not_a_missing_file() {
+        let error = match resolve_source("https://") {
+            Err(error) => error,
+            Ok(_) => panic!("an empty host must not resolve"),
+        };
+        assert!(
+            matches!(
+                error,
+                PlaybackError::Remote(RemoteFailure::InvalidSource { .. })
+            ),
+            "{error}"
+        );
+        assert!(error.to_string().contains("URL"), "{error}");
+    }
+
+    #[test]
+    fn a_url_with_embedded_credentials_is_rejected_and_the_password_never_appears() {
+        let error = match resolve_source("https://alice:hunter2@example.com/a.mp3") {
+            Err(error) => error,
+            Ok(_) => panic!("credentials must be refused"),
+        };
+        let message = error.to_string();
+        assert!(message.contains("credentials"), "{message}");
+        assert!(
+            !message.contains("hunter2"),
+            "the password leaked: {message}"
+        );
+    }
+
+    #[test]
+    fn a_valid_remote_url_resolves_to_a_remote_media_id_with_the_query_kept_for_fetching() {
+        let (media, location) = match resolve_source("https://example.com/a.flac?token=secret") {
+            Ok(resolved) => resolved,
+            Err(error) => panic!("a well-formed URL must resolve: {error}"),
+        };
+        assert!(matches!(media, MediaId::RemoteUrl(_)));
+        match location {
+            SourceLocation::Http(url) => {
+                assert_eq!(
+                    url.query(),
+                    Some("token=secret"),
+                    "the fetch URL keeps the query"
+                );
+            }
+            other => panic!("expected an HTTP source location: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_local_spelling_that_looks_like_a_url_is_never_parsed_as_one() {
+        // §5: `./https:...` stays a path. It will not canonicalize (there is
+        // no such file), but the error must be a path error, not a URL one.
+        let error = match resolve_source("./https:not-a-url") {
+            Err(error) => error,
+            Ok(_) => panic!("a nonexistent path must not resolve"),
+        };
+        assert!(matches!(error, PlaybackError::Open { .. }), "{error}");
+        assert!(
+            error.to_string().contains("https:not-a-url"),
+            "expected the literal path in the diagnostic: {error}"
+        );
+    }
+
+    // -------------------------------------------------------- display_name
+
+    #[test]
+    fn a_remote_display_name_is_the_last_path_segment_with_the_query_stripped() {
+        let media = MediaId::RemoteUrl(
+            NormalizedUrl::parse("https://cdn.example.com/shows/ep-1.mp3?token=secret")
+                .unwrap_or_else(|error| panic!("a well-formed URL must parse: {error}")),
+        );
+        let name = display_name(&media);
+        assert_eq!(name, "ep-1.mp3");
+        assert!(
+            !name.contains("token"),
+            "the query leaked into the name: {name}"
+        );
+    }
+
+    #[test]
+    fn a_remote_display_name_falls_back_to_the_host_with_no_path() {
+        let media = MediaId::RemoteUrl(
+            NormalizedUrl::parse("https://cdn.example.com")
+                .unwrap_or_else(|error| panic!("a well-formed URL must parse: {error}")),
+        );
+        assert_eq!(display_name(&media), "cdn.example.com");
+    }
+
+    // --------------------------------------------------------- status_line
+
+    fn mirror_with_capabilities(seek: SeekSupport) -> Mirror {
+        Mirror {
+            capabilities: Some(MediaCapabilities {
+                continuity: Continuity::Finite,
+                seek,
+            }),
+            ..Mirror::default()
+        }
+    }
+
+    #[test]
+    fn an_unresolved_seek_capability_is_marked_distinctly_from_unsupported() {
+        let unresolved = status_line(&mirror_with_capabilities(SeekSupport::Unknown));
+        let unsupported = status_line(&mirror_with_capabilities(SeekSupport::Unsupported));
+        assert!(unresolved.contains("seek?"), "{unresolved}");
+        assert!(!unresolved.contains("no-seek"), "{unresolved}");
+        assert!(unsupported.contains("no-seek"), "{unsupported}");
+    }
+
+    #[test]
+    fn a_seekable_source_carries_no_seek_note_at_all() {
+        let line = status_line(&mirror_with_capabilities(SeekSupport::Native));
+        assert!(!line.contains("seek?"), "{line}");
+        assert!(!line.contains("no-seek"), "{line}");
+    }
+
+    #[test]
+    fn buffering_is_shown_only_as_a_detail_of_playing() {
+        let mut mirror = Mirror {
+            state: PlaybackState::Playing,
+            buffering: true,
+            ..Mirror::default()
+        };
+        assert!(
+            status_line(&mirror).contains("buffering"),
+            "{}",
+            status_line(&mirror)
+        );
+
+        // Never a state of its own: a paused session that happens to be
+        // servicing a blocked read (e.g. a seek's own reopen) does not print
+        // "buffering" under a label that is not Playing.
+        mirror.state = PlaybackState::Paused;
+        assert!(
+            !status_line(&mirror).contains("buffering"),
+            "{}",
+            status_line(&mirror)
+        );
+    }
+
+    /// §11: `buffering` must never be derived from `PositionQuality::Degraded`
+    /// (Ruling 4) - a degraded quality with `buffering` still false must not
+    /// print "buffering" on its own account.
+    #[test]
+    fn degraded_quality_does_not_imply_buffering() {
+        let mirror = Mirror {
+            state: PlaybackState::Playing,
+            quality: PositionQuality::Degraded,
+            buffering: false,
+            ..Mirror::default()
+        };
+        assert!(
+            !status_line(&mirror).contains("buffering"),
+            "{}",
+            status_line(&mirror)
+        );
+    }
+
+    // ----------------------------------------------------- Mirror::apply
+
+    #[test]
+    fn capabilities_changed_updates_the_mirror_without_disturbing_position() {
+        let mut mirror = Mirror {
+            position: Duration::from_secs(42),
+            ..Mirror::default()
+        };
+        mirror.apply(PlaybackEvent::CapabilitiesChanged {
+            session_rev: 7,
+            capabilities: MediaCapabilities {
+                continuity: Continuity::Finite,
+                seek: SeekSupport::Native,
+            },
+        });
+        assert_eq!(mirror.session_rev, 7);
+        assert_eq!(
+            mirror.capabilities.map(|capabilities| capabilities.seek),
+            Some(SeekSupport::Native)
+        );
+        assert_eq!(
+            mirror.position,
+            Duration::from_secs(42),
+            "unrelated to capability evidence"
+        );
     }
 }

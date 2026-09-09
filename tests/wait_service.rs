@@ -57,6 +57,7 @@ fn servicing_publishes_the_position_the_timeline_reports() {
         media: None,
         position: Duration::ZERO,
         quality: PositionQuality::Exact,
+        buffering: false,
     }));
     let facts = Arc::new(Mutex::new(SessionFacts {
         session_rev: 4,
@@ -115,6 +116,7 @@ fn servicing_a_freeze_parks_the_output_and_announces_paused() {
             media: None,
             position: Duration::from_secs(7),
             quality: PositionQuality::Exact,
+            buffering: false,
         })),
         Arc::clone(&facts),
         Arc::clone(&interrupt),
@@ -167,6 +169,7 @@ fn a_hook_announcement_goes_to_the_outbox_when_the_workers_backlog_is_not_empty(
             media: None,
             position: Duration::ZERO,
             quality: PositionQuality::Exact,
+            buffering: false,
         })),
         Arc::new(Mutex::new(SessionFacts {
             session_rev: 1,
@@ -210,6 +213,7 @@ fn servicing_with_no_transport_is_harmless_and_repeatable() {
         media: None,
         position: Duration::from_secs(3),
         quality: PositionQuality::Exact,
+        buffering: false,
     }));
     let facts = Arc::new(Mutex::new(SessionFacts {
         session_rev: 1,
@@ -275,6 +279,7 @@ fn servicing_a_blocked_read_advances_the_position_as_the_clock_advances() {
         media: None,
         position: Duration::ZERO,
         quality: PositionQuality::Exact,
+        buffering: false,
     }));
     let facts = Arc::new(Mutex::new(SessionFacts {
         session_rev: 5,

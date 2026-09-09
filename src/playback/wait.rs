@@ -202,7 +202,7 @@ impl WaitService {
     /// only then settles. Freezing the number at the instant of the park
     /// would report a position slightly behind what the listener actually
     /// heard.
-    fn publish_progress(&self) {
+    fn publish_progress(&self, servicing: Servicing) {
         let snapshot = {
             let mut facts = lock(&self.facts);
             let mut quality = if facts.degraded {
@@ -240,6 +240,10 @@ impl WaitService {
                 media: facts.media.clone(),
                 position: facts.position,
                 quality,
+                // Ruling 4: true exactly for the caller that exists *because*
+                // a source read is blocked - never derived from `quality`,
+                // which reports an unrelated fact (a timing base that jumped).
+                buffering: servicing == Servicing::BlockedRead,
             }
         };
         // Keep-latest: nothing but the assignment happens under the lock.
@@ -292,12 +296,76 @@ impl WaitService {
         // lock first thing. `std::sync::Mutex` is not reentrant, so holding
         // this across the call deadlocks on the very first pass.
         drop(facts);
-        self.publish_progress();
+        self.publish_progress(servicing);
     }
 }
 
 impl WaitHook for WaitService {
     fn service(&self) {
         self.service_as(Servicing::BlockedRead);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An inert `WaitService`: no transport, an empty backlog, a channel
+    /// nobody reads. Enough to exercise `service_as` without a real decoder
+    /// or a real network read anywhere behind it.
+    fn inert_service() -> Arc<WaitService> {
+        let (tx, rx) = crossbeam_channel::bounded(64);
+        drop(rx);
+        WaitService::new(
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(Progress {
+                session_rev: 1,
+                media: None,
+                position: Duration::ZERO,
+                quality: PositionQuality::Exact,
+                buffering: false,
+            })),
+            Arc::new(Mutex::new(SessionFacts {
+                session_rev: 1,
+                media: None,
+                position: Duration::ZERO,
+                degraded: false,
+                playing: false,
+                frozen_by_hook: false,
+            })),
+            SourceInterrupt::new(1024),
+            tx,
+            Arc::new(Mutex::new(VecDeque::new())),
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(|| Nanos(0)),
+        )
+    }
+
+    fn published_buffering(service: &WaitService) -> bool {
+        match service.progress.lock() {
+            Ok(guard) => guard.buffering,
+            Err(poisoned) => poisoned.into_inner().buffering,
+        }
+    }
+
+    /// Ruling 4: `buffering` is a fact about which caller is running, not
+    /// something derived from the transport or the timing base. The worker's
+    /// own loop pass is never "buffering", even with nothing open to be
+    /// buffering on.
+    #[test]
+    fn the_worker_loops_own_pass_never_reports_buffering() {
+        let service = inert_service();
+        service.service_as(Servicing::WorkerLoop);
+        assert!(!published_buffering(&service));
+    }
+
+    /// The hook exists *because* a source read is blocked on the network -
+    /// that is the one fact this field reports, and `WaitHook::service`
+    /// always runs as `BlockedRead` (never `WorkerLoop`).
+    #[test]
+    fn a_blocked_read_is_reported_as_buffering() {
+        let service = inert_service();
+        service.service();
+        assert!(published_buffering(&service));
     }
 }

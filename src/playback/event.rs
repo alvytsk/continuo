@@ -162,6 +162,12 @@ pub struct Progress {
     pub media: Option<MediaId>,
     pub position: Duration,
     pub quality: PositionQuality,
+    /// True exactly while a source read is blocked on the network and the
+    /// hook, not the worker's own loop pass, is what is keeping progress
+    /// alive (Ruling 4). Distinct from `quality == Degraded`, which reports a
+    /// timing base that jumped - an unrelated fact this field must never be
+    /// derived from.
+    pub buffering: bool,
 }
 
 /// What a shutdown hands back: the position the worker captured on its way out,

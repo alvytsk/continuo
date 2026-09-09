@@ -78,6 +78,7 @@ fn progress(session_rev: u64, name: &str, secs: u64) -> Progress {
         media: Some(media(name)),
         position: Duration::from_secs(secs),
         quality: PositionQuality::Exact,
+        buffering: false,
     }
 }
 
