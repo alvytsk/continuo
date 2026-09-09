@@ -614,9 +614,11 @@ tempdir to stage session 1 → persist → session 2.
 - **Engine (new, additive).** `join` returns the position captured by
   `shutdown()`, and that position is at least the last one published before the
   shutdown interrupt — the fact D14 rests on. `join` also returns every event the
-  run produced and the app never drained: one test stalls the drain, emits past
-  the point where the channel stops accepting, interrupts, and asserts the report
-  carries the whole backlog in emission order (D19).
+  run produced and the app never drained: one test stops draining, issues two
+  volume changes and a stop, interrupts, and asserts the report carries all three
+  in emission order — which holds whichever side of the handoff each one was
+  sitting on when the interrupt landed, and that indifference is the guarantee
+  (D19).
 
 ## 17. Risks and deferred debt
 
