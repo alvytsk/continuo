@@ -13,7 +13,8 @@
 ## Global Constraints
 
 - Rust edition 2024, `rust-version = "1.98.1"`. Do not raise either.
-- `[lints.rust] unsafe_code = "forbid"`. `[lints.clippy] unwrap_used = "deny"`, `expect_used = "deny"`. `clippy.toml` exempts `#[test]` functions only — **bare test helpers are not exempt**, so helpers must handle their own errors.
+- `[lints.rust] unsafe_code = "forbid"`. `[lints.clippy] unwrap_used = "deny"`, `expect_used = "deny"`. `clippy.toml`'s `allow-unwrap-in-tests` / `allow-expect-in-tests` exempt the **body of a `#[test]` function only**. A bare helper in the same file is not exempt, even in `tests/`. Verified: a helper calling `.unwrap()` fails `cargo clippy --all-targets -- -D warnings` while the identical call inside the `#[test]` beneath it passes.
+  Every bare helper in this plan therefore handles its own error with an explicit `match` or `let … else` plus a `panic!` carrying a message — `panic` is not among the denied lints. `tests/support/mod.rs` instead annotates its helpers with `#[allow(clippy::unwrap_used)]`; either is acceptable, and new helpers should say *why* the failure is impossible.
 - Every task ends green on all three: `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test --locked`.
 - Linux needs `libasound2-dev` installed for `cpal` to build.
 - Baseline before this plan starts: 99 passed · 0 failed · 1 ignored (`device_smoke`, needs real hardware).
@@ -315,7 +316,12 @@ use continuo::playback::volume::Volume;
 use time::OffsetDateTime;
 
 fn media(name: &str) -> MediaId {
-    MediaId::LocalFile(AbsolutePath::new(format!("/music/{name}.flac").into()).unwrap())
+    // A bare helper, so it handles its own error: the lint exemption stops at
+    // the `#[test]` boundary.
+    match AbsolutePath::new(format!("/music/{name}.flac").into()) {
+        Ok(path) => MediaId::LocalFile(path),
+        Err(error) => panic!("a literal absolute path must parse: {error}"),
+    }
 }
 
 fn checkpoint(name: &str, secs: u64) -> PlaybackCheckpoint {
@@ -771,7 +777,12 @@ fn store(dir: &Path) -> StateStore {
 }
 
 fn media(name: &str) -> MediaId {
-    MediaId::LocalFile(AbsolutePath::new(format!("/music/{name}.flac").into()).unwrap())
+    // A bare helper, so it handles its own error: the lint exemption stops at
+    // the `#[test]` boundary.
+    match AbsolutePath::new(format!("/music/{name}.flac").into()) {
+        Ok(path) => MediaId::LocalFile(path),
+        Err(error) => panic!("a literal absolute path must parse: {error}"),
+    }
 }
 
 fn state_with(name: &str, secs: u64) -> PersistedState {
@@ -789,8 +800,10 @@ fn state_with(name: &str, secs: u64) -> PersistedState {
 }
 
 fn temp_files(dir: &Path) -> Vec<PathBuf> {
-    fs::read_dir(dir)
-        .unwrap()
+    let Ok(entries) = fs::read_dir(dir) else {
+        panic!("the tempdir must be readable");
+    };
+    entries
         .filter_map(|entry| entry.ok().map(|entry| entry.path()))
         .filter(|path| {
             path.file_name()
@@ -975,6 +988,26 @@ fn the_directory_and_the_file_are_private() {
     let file_mode = fs::metadata(nested.join("state.json")).unwrap().permissions().mode() & 0o777;
     assert_eq!(dir_mode, 0o700, "a permissive umask must not expose listening history");
     assert_eq!(file_mode, 0o600);
+}
+
+#[cfg(unix)]
+#[test]
+fn an_existing_permissive_directory_is_tightened() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = tempfile::tempdir().unwrap();
+    let nested = root.path().join("continuo");
+    fs::create_dir_all(&nested).unwrap();
+    fs::set_permissions(&nested, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let store = StateStore::new(nested.join("state.json"), Arc::new(FakeClock::new()));
+    store.write(&state_with("a", 1)).unwrap();
+
+    assert_eq!(
+        fs::metadata(&nested).unwrap().permissions().mode() & 0o777,
+        0o700,
+        "a directory that already existed is exactly the one a create-time mode never reaches"
+    );
 }
 ```
 
@@ -1223,10 +1256,10 @@ impl StateStore {
 
     #[cfg(unix)]
     fn prepare_directory(&self, dir: &Path) -> Result<(), PersistenceError> {
-        use std::os::unix::fs::DirBuilderExt;
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 
         if !dir.exists() {
-            fs::DirBuilder::new()
+            return fs::DirBuilder::new()
                 .recursive(true)
                 .mode(0o700)
                 .create(dir)
@@ -1234,7 +1267,23 @@ impl StateStore {
                     path: dir.to_path_buf(),
                     op: "create directory for",
                     source,
-                })?;
+                });
+        }
+
+        // D12 says the mode is set explicitly, and a create-time mode reaches
+        // exactly the case that never needs it. A directory left at 0755 by an
+        // earlier build, a restore, or a hand-made `mkdir` is the one that does.
+        let Ok(metadata) = fs::metadata(dir) else {
+            return Ok(());
+        };
+        if metadata.permissions().mode() & 0o777 != 0o700
+            && let Err(error) = fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
+        {
+            // Not fatal, and deliberately not a refusal to write: the listening
+            // history lives in the 0600 file, and a directory this process
+            // cannot chmod leaks a filename at worst. Losing the checkpoint
+            // over it would be the larger harm.
+            tracing::warn!(path = ?dir, %error, "cannot tighten the state directory to 0700");
         }
         Ok(())
     }
@@ -1285,14 +1334,14 @@ Add `pub mod store;` to `src/persistence/mod.rs`, after `pub mod model;`.
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test --test persistence_store`
-Expected: PASS — 10 tests (11 on Unix).
+Expected: PASS — 10 tests (12 on Unix).
 
 If `a_version_one_file_that_will_not_deserialize_is_malformed` passes for the wrong reason, check that `"not a media id"` really fails `MediaId`'s `try_from` — it has no `:` separator, so it does.
 
 - [ ] **Step 5: Verify the gates**
 
 Run: `cargo fmt --check && cargo clippy --all-targets --all-features -- -D warnings && cargo test --locked`
-Expected: clean, 121 passed.
+Expected: clean, 122 passed.
 
 - [ ] **Step 6: Commit**
 
@@ -1438,7 +1487,11 @@ fn a_forced_submit_is_written_without_waiting_for_the_window() {
 fn an_ordinary_submit_waits_out_the_window() {
     let sink = ScriptedSink::new(0);
     let clock = Arc::new(FakeClock::new());
-    let injected: Arc<dyn Clock> = Arc::clone(&clock);
+    // `Arc::clone(&clock)` here would be E0308: the annotation makes the
+    // argument position expect `&Arc<dyn Clock>`, and `&Arc<FakeClock>` does
+    // not coerce through a reference. A method call resolves on the concrete
+    // type first, and it is the *result* that unsizes.
+    let injected: Arc<dyn Clock> = clock.clone();
     let writer = WriterHandle::spawn(Box::new(Arc::clone(&sink)), injected);
 
     writer.submit(snapshot(0.5), Urgency::Ordinary);
@@ -1454,7 +1507,11 @@ fn an_ordinary_submit_waits_out_the_window() {
 fn a_replacement_never_extends_the_deadline_and_the_newest_wins() {
     let sink = ScriptedSink::new(0);
     let clock = Arc::new(FakeClock::new());
-    let injected: Arc<dyn Clock> = Arc::clone(&clock);
+    // `Arc::clone(&clock)` here would be E0308: the annotation makes the
+    // argument position expect `&Arc<dyn Clock>`, and `&Arc<FakeClock>` does
+    // not coerce through a reference. A method call resolves on the concrete
+    // type first, and it is the *result* that unsizes.
+    let injected: Arc<dyn Clock> = clock.clone();
     let writer = WriterHandle::spawn(Box::new(Arc::clone(&sink)), injected);
 
     writer.submit(snapshot(0.1), Urgency::Ordinary);
@@ -1471,7 +1528,11 @@ fn a_replacement_never_extends_the_deadline_and_the_newest_wins() {
 fn a_failed_write_is_retried_and_the_retry_carries_whatever_is_newest() {
     let sink = ScriptedSink::new(1);
     let clock = Arc::new(FakeClock::new());
-    let injected: Arc<dyn Clock> = Arc::clone(&clock);
+    // `Arc::clone(&clock)` here would be E0308: the annotation makes the
+    // argument position expect `&Arc<dyn Clock>`, and `&Arc<FakeClock>` does
+    // not coerce through a reference. A method call resolves on the concrete
+    // type first, and it is the *result* that unsizes.
+    let injected: Arc<dyn Clock> = clock.clone();
     let writer = WriterHandle::spawn(Box::new(Arc::clone(&sink)), injected);
 
     writer.submit(snapshot(0.1), Urgency::Forced);
@@ -1936,7 +1997,7 @@ Expected: PASS — 8 tests. `a_shutdown_that_is_not_acknowledged_detaches_rather
 - [ ] **Step 7: Verify the gates**
 
 Run: `cargo fmt --check && cargo clippy --all-targets --all-features -- -D warnings && cargo test --locked`
-Expected: clean, 135 passed.
+Expected: clean, 136 passed.
 
 - [ ] **Step 8: Commit**
 
@@ -1979,6 +2040,7 @@ unconditional join defeats the bound it enforces."
   - `EngineHandle::join(self) -> ShutdownReport`
   - `TestEngine::start_at(name: &str, start_at: Duration) -> Self`
   - `TestEngine::shutdown_report(&mut self) -> Option<ShutdownReport>`
+  - `TestEngine::await_commands_taken(&mut self)`
 
 **None of this knows persistence exists.** The engine publishes truth; what the application stores is not its business.
 
@@ -2038,6 +2100,14 @@ fn join_returns_the_events_the_application_never_drained() {
     engine.send(PlaybackCommand::SetVolume(Volume::new(0.25)));
     engine.send(PlaybackCommand::Stop);
 
+    // The interrupt is checked before any command is read, so without this the
+    // test would be asking after events the worker never produced.
+    engine.await_commands_taken();
+    // And one flush pass, so all three are in the channel the application is
+    // no longer draining. Which side of the handoff they sit on is the next
+    // test's subject, not this one's.
+    std::thread::sleep(Duration::from_millis(50));
+
     let report = engine.shutdown_report().expect("the engine was still running");
 
     let volumes: Vec<f32> = report
@@ -2066,9 +2136,11 @@ fn an_event_racing_the_shutdown_interrupt_still_arrives() {
     engine.stop_draining_events();
     engine.send(PlaybackCommand::SetVolume(Volume::new(0.5)));
 
-    // Deliberately no settling: whether this event is still in the worker's
-    // backlog or already in the channel when the interrupt lands is a race, and
-    // the report is required to be indifferent to which.
+    // Wait only for the command to be *taken*, never for its event to be
+    // flushed. That the event exists is the premise; whether it is still in the
+    // worker's backlog or already in the channel when the interrupt lands is
+    // the race, and the report is required to be indifferent to which.
+    engine.await_commands_taken();
     let report = engine.shutdown_report().expect("the engine was still running");
 
     assert!(
@@ -2270,6 +2342,24 @@ In `tests/support/mod.rs`, add `use continuo::playback::event::ShutdownReport;` 
         handle.interrupt_shutdown();
         Some(handle.join())
     }
+
+    /// Block until the worker has taken every queued command.
+    ///
+    /// The shutdown interrupt is checked at the **top** of the worker's pass,
+    /// before it reads any command, so a test that sends and interrupts in the
+    /// same breath is asking about events that were never produced. Commands
+    /// are dispatched in the same pass they are received, so an empty channel
+    /// means the work is done — what is still open, deliberately, is whether
+    /// the events it produced have been flushed yet.
+    pub fn await_commands_taken(&mut self) {
+        let deadline = Instant::now() + PATIENCE;
+        while self.pending_commands() > 0 {
+            if Instant::now() >= deadline {
+                panic!("the worker never took the queued commands");
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
 ```
 
 Move the existing body of `start` into `start_at` verbatim except for those two edits. No existing signature changes and no existing test is touched.
@@ -2290,7 +2380,7 @@ Expected: PASS — the same 20 contract tests as the baseline.
 - [ ] **Step 8: Verify the gates**
 
 Run: `cargo fmt --check && cargo clippy --all-targets --all-features -- -D warnings && cargo test --locked`
-Expected: clean, 139 passed.
+Expected: clean, 140 passed.
 
 - [ ] **Step 9: Commit**
 
@@ -2360,11 +2450,16 @@ use continuo::playback::timeline::PositionQuality;
 use continuo::playback::volume::Volume;
 use continuo::session::{Action, Session};
 
-pub fn media(name: &str) -> MediaId {
-    MediaId::LocalFile(AbsolutePath::new(format!("/music/{name}.flac").into()).unwrap())
+fn media(name: &str) -> MediaId {
+    // A bare helper, so it handles its own error: the lint exemption stops at
+    // the `#[test]` boundary.
+    match AbsolutePath::new(format!("/music/{name}.flac").into()) {
+        Ok(path) => MediaId::LocalFile(path),
+        Err(error) => panic!("a literal absolute path must parse: {error}"),
+    }
 }
 
-pub fn loaded(session_rev: u64, name: &str, position: Duration) -> PlaybackEvent {
+fn loaded(session_rev: u64, name: &str, position: Duration) -> PlaybackEvent {
     PlaybackEvent::Loaded {
         session_rev,
         media: media(name),
@@ -2377,11 +2472,11 @@ pub fn loaded(session_rev: u64, name: &str, position: Duration) -> PlaybackEvent
     }
 }
 
-pub fn state_changed(session_rev: u64, state: PlaybackState) -> PlaybackEvent {
+fn state_changed(session_rev: u64, state: PlaybackState) -> PlaybackEvent {
     PlaybackEvent::StateChanged { session_rev, state }
 }
 
-pub fn progress(session_rev: u64, name: &str, secs: u64) -> Progress {
+fn progress(session_rev: u64, name: &str, secs: u64) -> Progress {
     Progress {
         session_rev,
         media: Some(media(name)),
@@ -2390,20 +2485,20 @@ pub fn progress(session_rev: u64, name: &str, secs: u64) -> Progress {
     }
 }
 
-pub fn submitted(action: Action) -> (PersistedState, Urgency) {
+fn submitted(action: Action) -> (PersistedState, Urgency) {
     match action {
         Action::Submit { state, urgency } => (state, urgency),
         Action::None => panic!("expected a submission"),
     }
 }
 
-pub fn is_none(action: &Action) -> bool {
+fn is_none(action: &Action) -> bool {
     matches!(action, Action::None)
 }
 
 /// A session already playing `a`, with the clock parked at the moment playback
 /// started. Returns the session and the clock that drives it.
-pub fn playing(name: &str) -> (Session, FakeClock) {
+fn playing(name: &str) -> (Session, FakeClock) {
     let clock = FakeClock::new();
     let mut session = Session::new(PersistedState::default());
     let _ = session.observe(&loaded(1, name, Duration::ZERO), clock.sample());
@@ -2457,9 +2552,14 @@ fn a_wall_clock_that_jumps_backwards_does_not_disturb_the_interval() {
 }
 
 #[test]
-fn nothing_is_captured_while_paused() {
+fn no_ordinary_capture_happens_while_paused() {
     let (mut session, clock) = playing("a");
     let _ = session.observe(&state_changed(1, PlaybackState::Paused), clock.sample());
+    // Whatever the pause itself is worth, it is worth it once. Task 7 makes
+    // this first tick resolve a forced checkpoint; the claim here is only that
+    // nothing keeps firing behind it.
+    let _ = session.tick(&progress(1, "a", 5), clock.sample());
+
     clock.advance(Duration::from_secs(30));
     assert!(is_none(&session.tick(&progress(1, "a", 5), clock.sample())));
 }
@@ -2836,7 +2936,7 @@ Expected: PASS — 11 tests.
 - [ ] **Step 6: Verify the gates**
 
 Run: `cargo fmt --check && cargo clippy --all-targets --all-features -- -D warnings && cargo test --locked`
-Expected: clean, 150 passed.
+Expected: clean, 151 passed.
 
 - [ ] **Step 7: Commit**
 
@@ -3162,6 +3262,49 @@ fn a_second_load_cannot_inherit_the_first_ones_establishment() {
 }
 
 #[test]
+fn a_media_switch_carries_the_outgoing_stopped_seek_target_out_with_it() {
+    let (mut session, clock) = playing("a");
+    clock.advance(Duration::from_secs(5));
+    let _ = submitted(session.tick(&progress(1, "a", 93), clock.sample()));
+    let _ = session.observe(&state_changed(2, PlaybackState::Stopped), clock.sample());
+    let _ = session.tick(&progress(2, "a", 93), clock.sample());
+    let _ = session.observe(
+        &PlaybackEvent::SeekTargetStored {
+            session_rev: 2,
+            target: Duration::from_secs(30),
+        },
+        clock.sample(),
+    );
+
+    let (state, _) = submitted(session.observe(&loaded(3, "b", Duration::ZERO), clock.sample()));
+    assert_eq!(
+        state.entry_for(&media("a")).unwrap().position,
+        Duration::from_secs(30),
+        "the outgoing entry is recorded from the effective position, not the pre-seek sample"
+    );
+}
+
+#[test]
+fn a_media_switch_does_not_walk_a_completed_entry_backwards() {
+    let (mut session, clock) = playing("a");
+    let _ = submitted(session.observe(
+        &PlaybackEvent::EndOfTrack {
+            session_rev: 1,
+            position: Duration::from_secs(240),
+        },
+        clock.sample(),
+    ));
+    // A tick after the end can only report a position at or behind the one
+    // EndOfTrack already recorded.
+    let _ = session.tick(&progress(1, "a", 239), clock.sample());
+
+    let (state, _) = submitted(session.observe(&loaded(2, "b", Duration::ZERO), clock.sample()));
+    let entry = state.entry_for(&media("a")).unwrap();
+    assert_eq!(entry.position, Duration::from_secs(240), "D1 retains what it retained");
+    assert!(entry.completed, "and the switch does not clear it either");
+}
+
+#[test]
 fn the_shutdown_snapshot_refuses_a_position_from_a_session_it_was_not_tracking() {
     let (mut session, clock) = playing("a");
     clock.advance(Duration::from_secs(5));
@@ -3298,14 +3441,67 @@ Replace `on_state` with:
     }
 ```
 
-In `on_loaded`, retire the force and reset the per-media flags. Insert at the top of the method, before the `switching` check:
+Replace `on_loaded` outright. The order is the whole point: the outgoing entry
+is recorded **before** the per-media flags reset, and from the *effective*
+position rather than the raw sample.
 
 ```rust
-        // A force raised against the previous media cannot answer for this one,
-        // and the outgoing entry has already been recorded below.
+    /// A `Loaded` for a different media is **one** snapshot: the outgoing entry
+    /// is recorded from `last_sample` and `current_media` moves in a single
+    /// mutation. A keep-latest slot cannot promise that an intermediate
+    /// submission reaches disk, so "flush, then move" is unenforceable — and
+    /// unnecessary, since the snapshot is the whole state.
+    fn on_loaded(&mut self, media: &MediaId, position: Duration, now: ClockSample) -> Action {
+        let switching = self.current_media.as_ref() != Some(media);
+
+        // Recorded before anything resets, and through `position_for`: a
+        // stopped seek's target is the outgoing media's real position, and
+        // clearing it first would write the pre-seek sample back over it. A
+        // completed entry is left alone entirely — `EndOfTrack` already
+        // recorded the position D1 retains, and `last_sample` can only be
+        // behind it.
+        let outgoing = if switching { self.last_sample.take() } else { None };
+        if let Some(previous) = outgoing
+            && !self.completed
+        {
+            // §3: `load()` overwrites the engine's own position with `start_at`
+            // before anything publishes, so this is the only place the outgoing
+            // media's final position still exists.
+            let position = self.position_for(previous.position);
+            self.state.record(
+                &PlaybackCheckpoint {
+                    media: previous.media,
+                    position,
+                    updated_at: now.wall,
+                },
+                false,
+            );
+        }
+
+        // Only now: a force raised against the previous media cannot answer for
+        // this one, and none of these carry across a load.
         self.pending_force = None;
         self.resolve_target();
         self.established = false;
+        self.last_capture = None;
+
+        if switching {
+            self.current_media = Some(media.clone());
+            self.state.current_media = Some(media.clone());
+        }
+        self.completed = self.state.completed_for(media);
+        self.last_sample = Some(Sample {
+            session_rev: self.session_rev,
+            media: media.clone(),
+            position,
+        });
+
+        if switching {
+            self.submit(Urgency::Forced)
+        } else {
+            Action::None
+        }
+    }
 ```
 
 In `tick`, resolve a pending force before the ordinary check. Insert immediately after `self.last_sample = Some(...)`:
@@ -3368,14 +3564,14 @@ Add the three helpers:
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test --test session_policy`
-Expected: PASS — 25 tests.
+Expected: PASS — 27 tests.
 
 If `a_restart_clears_the_target_it_discarded` fails at the ordinary checkpoint, check that `on_state` calls `resolve_target()` **before** anything reads `position_for`.
 
 - [ ] **Step 5: Verify the gates**
 
 Run: `cargo fmt --check && cargo clippy --all-targets --all-features -- -D warnings && cargo test --locked`
-Expected: clean, 164 passed.
+Expected: clean, 167 passed.
 
 - [ ] **Step 6: Commit**
 
@@ -3433,7 +3629,10 @@ mod tests {
     use super::*;
     use time::OffsetDateTime;
 
-    fn entry(secs: u64, completed: bool) -> PersistedCheckpoint {
+    /// Deliberately not called `entry`: the tests bind their subject to
+    /// `entry`, and a helper of the same name would be shadowed out of reach
+    /// the moment a test needed a second one.
+    fn stored(secs: u64, completed: bool) -> PersistedCheckpoint {
         PersistedCheckpoint {
             position: Duration::from_secs(secs),
             completed,
@@ -3454,18 +3653,18 @@ mod tests {
 
     #[test]
     fn a_completed_entry_declines_the_resume_without_losing_its_position() {
-        let entry = entry(300, true);
+        let entry = stored(300, true);
         assert_eq!(decide_resume(Some(&entry), secs(300)), ResumeDecision::Completed);
         assert_eq!(decide_resume(Some(&entry), secs(300)).start_at(), Duration::ZERO);
         // And a completed entry short of the end declines just the same:
         // completion is a fact the engine reported, never one inferred here.
-        let short = entry(120, true);
+        let short = stored(120, true);
         assert_eq!(decide_resume(Some(&short), secs(300)), ResumeDecision::Completed);
     }
 
     #[test]
     fn an_ordinary_position_inside_the_media_is_the_start() {
-        let entry = entry(93, false);
+        let entry = stored(93, false);
         assert_eq!(
             decide_resume(Some(&entry), secs(300)),
             ResumeDecision::Resume(Duration::from_secs(93))
@@ -3474,27 +3673,27 @@ mod tests {
 
     #[test]
     fn a_position_of_zero_is_a_start_rather_than_a_resume() {
-        let entry = entry(0, false);
+        let entry = stored(0, false);
         assert_eq!(decide_resume(Some(&entry), secs(300)), ResumeDecision::AtStart);
     }
 
     #[test]
     fn a_position_exactly_at_the_end_is_degenerate_not_a_start() {
-        let entry = entry(300, false);
+        let entry = stored(300, false);
         assert_eq!(decide_resume(Some(&entry), secs(300)), ResumeDecision::DegenerateEnd);
         assert_eq!(decide_resume(Some(&entry), secs(300)).start_at(), Duration::ZERO);
     }
 
     #[test]
     fn a_position_past_the_end_is_stale_state() {
-        let entry = entry(400, false);
+        let entry = stored(400, false);
         assert_eq!(decide_resume(Some(&entry), secs(300)), ResumeDecision::StalePastEnd);
         assert_eq!(decide_resume(Some(&entry), secs(300)).start_at(), Duration::ZERO);
     }
 
     #[test]
     fn an_unknown_duration_keeps_the_position_unvalidated() {
-        let entry = entry(93, false);
+        let entry = stored(93, false);
         assert_eq!(
             decide_resume(Some(&entry), None),
             ResumeDecision::Unvalidated(Duration::from_secs(93))
@@ -3509,7 +3708,7 @@ mod tests {
     fn completion_outranks_every_position_rule() {
         // A completed entry past the end is still declined as completed, not
         // reported as stale: the two say different things about the file.
-        let entry = entry(400, true);
+        let entry = stored(400, true);
         assert_eq!(decide_resume(Some(&entry), secs(300)), ResumeDecision::Completed);
     }
 }
@@ -3591,7 +3790,7 @@ Expected: PASS — 8 tests.
 - [ ] **Step 5: Verify the gates**
 
 Run: `cargo fmt --check && cargo clippy --all-targets --all-features -- -D warnings && cargo test --locked`
-Expected: clean, 172 passed.
+Expected: clean, 175 passed.
 
 - [ ] **Step 6: Commit**
 
@@ -3723,10 +3922,14 @@ const TRACK_DURATION: Duration = Duration::from_secs(5);
 fn track_id() -> MediaId {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures")
-        .join(TRACK)
-        .canonicalize()
-        .expect("the fixture exists");
-    MediaId::LocalFile(AbsolutePath::new(path).expect("an absolute fixture path"))
+        .join(TRACK);
+    let Ok(canonical) = path.canonicalize() else {
+        panic!("the fixture must exist: {path:?}");
+    };
+    match AbsolutePath::new(canonical) {
+        Ok(path) => MediaId::LocalFile(path),
+        Err(error) => panic!("the fixture path must be identifiable: {error}"),
+    }
 }
 
 struct Rig {
@@ -3744,7 +3947,10 @@ impl Rig {
 
     fn open_at(dir: &std::path::Path, state: PersistedState, start_at: Duration) -> Self {
         let clock = Arc::new(FakeClock::new());
-        let injected: Arc<dyn Clock> = Arc::clone(&clock);
+        // `clock.clone()`, not `Arc::clone(&clock)`: the annotation constrains
+        // the argument position, and `&Arc<FakeClock>` does not coerce to
+        // `&Arc<dyn Clock>`.
+        let injected: Arc<dyn Clock> = clock.clone();
         let store = StateStore::new(dir.join("state.json"), injected);
         let mut rig = Self {
             engine: TestEngine::start_at(TRACK, start_at),
@@ -3773,8 +3979,10 @@ impl Rig {
     /// The writer thread's coalescing has its own tests; what matters here is
     /// which snapshot the policy produced, so it is written straight through.
     fn write(store: &StateStore, action: Action) {
-        if let Action::Submit { state, .. } = action {
-            store.write(&state).expect("the tempdir is writable");
+        if let Action::Submit { state, .. } = action
+            && let Err(error) = store.write(&state)
+        {
+            panic!("the tempdir must be writable: {error}");
         }
     }
 
@@ -3795,17 +4003,18 @@ impl Rig {
     /// `q`: interrupt, join, replay what the loop never drained, then one
     /// forced snapshot.
     fn quit(mut self) {
-        let report = self
-            .engine
-            .shutdown_report()
-            .expect("the engine was still running");
+        let Some(report) = self.engine.shutdown_report() else {
+            panic!("the engine was already gone");
+        };
         for event in &report.events {
             let _ = self.session.observe(event, self.clock.sample());
         }
         let final_state = self
             .session
             .shutdown_snapshot(&report.progress, self.clock.sample());
-        self.store.write(&final_state).expect("the tempdir is writable");
+        if let Err(error) = self.store.write(&final_state) {
+            panic!("the tempdir must be writable: {error}");
+        }
     }
 }
 
@@ -3904,8 +4113,11 @@ fn a_stopped_seek_target_outlives_a_quit_that_races_it() {
     rig.send(PlaybackCommand::Stop);
 
     // No pump between the seek and the quit: exactly what pressing `←` and then
-    // `q` inside one poll window does.
+    // `q` inside one poll window does. The wait is for the command to be taken,
+    // not for its event — `q` does not wait either, but a command the worker
+    // never read is not a lost event, it is a test asking the wrong question.
     rig.engine.send(PlaybackCommand::SeekTo(Duration::from_secs(1)));
+    rig.engine.await_commands_taken();
     rig.quit();
 
     let entry = reload(dir.path())
@@ -4269,7 +4481,7 @@ If `a_stopped_seek_target_outlives_a_quit_that_races_it` is flaky, that is the t
 - [ ] **Step 6: Run everything**
 
 Run: `cargo test --locked`
-Expected: PASS — 182 passed, 1 ignored.
+Expected: PASS — 185 passed, 1 ignored.
 
 - [ ] **Step 7: Verify the gates**
 
@@ -4319,7 +4531,7 @@ rejected-file handling, and the checkpoint triggers.
 - [ ] **Step 10: Final verification**
 
 Run: `cargo fmt --check && cargo clippy --all-targets --all-features -- -D warnings && cargo test --locked`
-Expected: clean, 182 passed, 1 ignored.
+Expected: clean, 185 passed, 1 ignored.
 
 Run: `git diff --stat origin/main -- tests/engine_contract.rs`
 Expected: no output.

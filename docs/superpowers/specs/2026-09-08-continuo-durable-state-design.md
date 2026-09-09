@@ -557,7 +557,7 @@ dependency; `directories` is new; `tempfile` is a new dev-dependency.
 
 ## 16. Test strategy
 
-Roughly 35 new tests. Policy tests call `Session::observe`/`tick` synchronously
+Roughly 85 new tests. Policy tests call `Session::observe`/`tick` synchronously
 with a fake clock — no threads, no tempdirs, no sleeps. Store tests use
 `tempfile`. Resume contract tests pair `TestEngine` with a `StateStore` in a
 tempdir to stage session 1 → persist → session 2.
