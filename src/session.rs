@@ -17,7 +17,7 @@ use crate::media::id::MediaId;
 use crate::persistence::model::{PersistedCheckpoint, PersistedState};
 use crate::persistence::writer::Urgency;
 use crate::playback::checkpoint::PlaybackCheckpoint;
-use crate::playback::event::{PlaybackEvent, Progress, ShutdownReport};
+use crate::playback::event::{PlaybackEvent, Progress, ShutdownReport, StartDisposition};
 use crate::playback::state::PlaybackState;
 use crate::resume::ResumeCandidate;
 // Re-exported so `src/app.rs` and `tests/resume_contract.rs` keep importing
@@ -93,6 +93,17 @@ pub struct Session {
     /// arrive on events of their own are exempt, and say so where they are
     /// recorded (D6).
     established: bool,
+    /// A positive checkpoint the current run must not overwrite, because
+    /// playback fell back to zero on a source that cannot resume (§10).
+    ///
+    /// Deliberately not a max-position merge: the point is to recover the
+    /// *earlier* resume point, and progress heard in a fallback run does not
+    /// replace it however far it goes (R4). Set from `Loaded.disposition`
+    /// rather than a later warning, so it is in force before any `Playing` or
+    /// progress event can be observed (§5). Ends only on an established
+    /// `RestartEstablished` (G1), an established `SeekCompleted`, or verified
+    /// completion — never on `CapabilitiesChanged` alone (§10).
+    protected: Option<Duration>,
 }
 
 impl Session {
@@ -110,7 +121,19 @@ impl Session {
             pending_force: None,
             outstanding_target: None,
             established: false,
+            protected: None,
         }
+    }
+
+    /// The state as it currently stands, for a reader that needs it directly
+    /// rather than through whichever `Action` happens to submit next —
+    /// `Action::Submit` only ever carries a clone of exactly this. The test
+    /// suite is the one caller today: a protected capture can legitimately
+    /// leave the state unchanged, so asserting on it this way is what lets a
+    /// test tell "no submission happened" apart from "a submission happened
+    /// and changed nothing."
+    pub fn state(&self) -> &PersistedState {
+        &self.state
     }
 
     pub fn observe(&mut self, event: &PlaybackEvent, now: ClockSample) -> Action {
@@ -127,13 +150,32 @@ impl Session {
 
         match event {
             PlaybackEvent::Loaded {
-                media, position, ..
-            } => self.on_loaded(media, *position, now),
+                media,
+                position,
+                disposition,
+                ..
+            } => self.on_loaded(media, *position, disposition, now),
             PlaybackEvent::StateChanged { state, .. } => self.on_state(*state, now),
             PlaybackEvent::SeekCompleted { .. } => {
                 self.resolve_target();
                 self.established = true;
                 self.completed = false;
+                // An established user seek (§10): the listener steered the
+                // position themselves, so whatever fallback zero was protected
+                // no longer needs protecting.
+                self.protected = None;
+                self.pending_force = Some(session_rev);
+                Action::None
+            }
+            // This event exists only because nothing else lets the policy tell
+            // an explicit restart from any other establishment (G1) — which is
+            // exactly the distinction clearing protection needs, so it clears
+            // it and otherwise behaves like `SeekCompleted`.
+            PlaybackEvent::RestartEstablished { .. } => {
+                self.resolve_target();
+                self.established = true;
+                self.completed = false;
+                self.protected = None;
                 self.pending_force = Some(session_rev);
                 Action::None
             }
@@ -161,9 +203,24 @@ impl Session {
                 self.resolve_target();
                 self.established = true;
                 self.completed = true;
+                // Cleared before `record_current`, not after: verified
+                // completion is itself the thing worth writing, and clearing
+                // afterwards would have gated that very write (§10).
+                self.protected = None;
                 self.record_current(*position, now);
                 self.submit(Urgency::Forced)
             }
+            // §10: "Capability changes alone never delete, clear or replace
+            // checkpoints." A server that starts advertising ranges mid-session
+            // must not be able to discard a protected entry by saying so —
+            // this is `Action::None` and falls through to the catch-all below
+            // for exactly that reason: there is nothing here to touch.
+            PlaybackEvent::CapabilitiesChanged { .. } => Action::None,
+            // A cancelled seek commits no target — `resolve_target()` is
+            // deliberately not called here, because the stored target it
+            // would discard belongs to a stopped seek that is still
+            // outstanding, not to this one.
+            PlaybackEvent::SeekCancelled { .. } => Action::None,
             _ => Action::None,
         }
     }
@@ -271,11 +328,18 @@ impl Session {
     /// mutation. A keep-latest slot cannot promise that an intermediate
     /// submission reaches disk, so "flush, then move" is unenforceable — and
     /// unnecessary, since the snapshot is the whole state.
-    fn on_loaded(&mut self, media: &MediaId, position: Duration, now: ClockSample) -> Action {
+    fn on_loaded(
+        &mut self,
+        media: &MediaId,
+        position: Duration,
+        disposition: &StartDisposition,
+        now: ClockSample,
+    ) -> Action {
         let switching = self.current_media.as_ref() != Some(media);
 
         // First, while every per-media field still describes the media on its
-        // way out.
+        // way out — `protected` among them, so this reads the outgoing media's
+        // protection, not the incoming one's.
         if switching {
             self.record_outgoing(now);
         }
@@ -286,6 +350,15 @@ impl Session {
         self.resolve_target();
         self.established = false;
         self.last_capture = None;
+        // Set from the disposition this `Loaded` carries, not from a later
+        // warning: this is what puts protection in force before any `Playing`
+        // or progress event for the incoming media can be observed (§5).
+        // `ResumeUnavailable` is the only disposition that sets it — every
+        // other one, including a plain reload of the same media, clears it.
+        self.protected = match disposition {
+            StartDisposition::ResumeUnavailable { retained } => Some(*retained),
+            _ => None,
+        };
 
         let completed = self.state.completed_for(media);
         self.adopt_media(media.clone(), completed);
@@ -308,22 +381,29 @@ impl Session {
     /// the only place that position still exists.
     ///
     /// **Call this before the per-media fields reset.** `completed`,
-    /// `established` and `outstanding_target` are all read here, and all three
-    /// describe the outgoing media only until `on_loaded` resets them — read
-    /// afterwards they describe the incoming one, and the mistake would be
-    /// silent. They are read nowhere else in `on_loaded`.
+    /// `established`, `outstanding_target` and `protected` are all read here,
+    /// and all four describe the outgoing media only until `on_loaded` resets
+    /// them — read afterwards they describe the incoming one, and the mistake
+    /// would be silent. They are read nowhere else in `on_loaded`.
     ///
-    /// Two things make a retained sample not worth writing. A completed entry's
-    /// position is the one `EndOfTrack` recorded and the sample can only be
-    /// behind it (D1). And a sample for a media nothing established is the zero
-    /// §11 resumes at, not a position the engine ever validated — `load()`
+    /// Three things make a retained sample not worth writing. A completed
+    /// entry's position is the one `EndOfTrack` recorded and the sample can
+    /// only be behind it (D1). A sample for a media nothing established is the
+    /// zero §11 resumes at, not a position the engine ever validated — `load()`
     /// reports `Loaded` before it opens the device, so switching away from a
     /// launch that failed would otherwise carry that zero out as the media's
-    /// final word (D20).
+    /// final word (D20). And a protected entry (§10) must not be overwritten
+    /// by this path either: this is *not* `record_current`, it writes the
+    /// previous media's entry straight from `last_sample`, so a gate placed
+    /// only in `record_current` would leave a media switch free to overwrite
+    /// the very checkpoint protection exists to keep.
     fn record_outgoing(&mut self, now: ClockSample) {
         let Some(previous) = self.last_sample.take() else {
             return;
         };
+        if self.protected.is_some() {
+            return;
+        }
         if self.completed || !self.established {
             return;
         }
@@ -409,7 +489,17 @@ impl Session {
         self.shutdown_snapshot(&report.progress, now)
     }
 
+    /// The write path for the current media's checkpoint: the periodic 5 s
+    /// capture, the pause and stop forces, the resolved shutdown snapshot and
+    /// `SeekTargetStored` all reach the stored state through here, so gating
+    /// here alone covers all of them at once. It does **not** cover
+    /// `record_outgoing`: that path writes the *previous* media's entry from
+    /// `last_sample` on a media switch, never through this function, so it
+    /// carries the identical gate on its own (§10).
     fn record_current(&mut self, position: Duration, now: ClockSample) {
+        if self.protected.is_some() {
+            return;
+        }
         let Some(media) = self.current_media.clone() else {
             return;
         };

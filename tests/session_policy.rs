@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use continuo::clock::{Clock, FakeClock};
 use continuo::media::capabilities::{Continuity, MediaCapabilities, SeekSupport};
+use continuo::media::id::MediaId;
 use continuo::media::metadata::MediaMetadata;
 use continuo::persistence::model::PersistedState;
 use continuo::persistence::writer::Urgency;
@@ -12,7 +13,7 @@ use continuo::playback::state::PlaybackState;
 use continuo::playback::timeline::PositionQuality;
 use continuo::playback::volume::Volume;
 use continuo::resume::ResumeCandidate;
-use continuo::session::{Action, ResumeDecision, Session, decide_resume};
+use continuo::session::{Action, CAPTURE_INTERVAL, ResumeDecision, Session, decide_resume};
 
 mod support;
 use support::media;
@@ -38,6 +39,39 @@ fn state_changed(session_rev: u64, state: PlaybackState) -> PlaybackEvent {
     PlaybackEvent::StateChanged { session_rev, state }
 }
 
+/// A `Loaded` for `media`, fixed at the revision every protection test in this
+/// file drives (1): the source could not honour the stored checkpoint, so
+/// playback falls back to zero and `retained` is what protection must recover.
+fn loaded_unavailable(media: &MediaId, retained: Duration) -> PlaybackEvent {
+    PlaybackEvent::Loaded {
+        session_rev: 1,
+        media: media.clone(),
+        metadata: MediaMetadata::default(),
+        capabilities: MediaCapabilities {
+            continuity: Continuity::Finite,
+            seek: SeekSupport::Native,
+        },
+        position: Duration::ZERO,
+        disposition: StartDisposition::ResumeUnavailable { retained },
+    }
+}
+
+/// A `Loaded` for `media` with nothing to protect — the counterpart to
+/// `loaded_unavailable`, at the same fixed revision.
+fn loaded_fresh(media: &MediaId) -> PlaybackEvent {
+    PlaybackEvent::Loaded {
+        session_rev: 1,
+        media: media.clone(),
+        metadata: MediaMetadata::default(),
+        capabilities: MediaCapabilities {
+            continuity: Continuity::Finite,
+            seek: SeekSupport::Native,
+        },
+        position: Duration::ZERO,
+        disposition: StartDisposition::Fresh,
+    }
+}
+
 fn progress(session_rev: u64, name: &str, secs: u64) -> Progress {
     Progress {
         session_rev,
@@ -56,6 +90,46 @@ fn submitted(action: Action) -> (PersistedState, Urgency) {
 
 fn is_none(action: &Action) -> bool {
     matches!(action, Action::None)
+}
+
+/// A file already carrying one entry, for a `Session` that opens on it rather
+/// than on `PersistedState::default()`.
+fn state_with(media: &MediaId, position: Duration, completed: bool) -> PersistedState {
+    let mut state = PersistedState::default();
+    state.record(
+        &continuo::playback::checkpoint::PlaybackCheckpoint {
+            media: media.clone(),
+            position,
+            updated_at: time::OffsetDateTime::UNIX_EPOCH,
+        },
+        completed,
+    );
+    state
+}
+
+/// The position `session` currently holds for `media`, read directly through
+/// `Session::state()` rather than through whichever `Action` a call happened
+/// to return — a protected capture can leave that action a `Submit` carrying
+/// an unchanged state, so the action alone cannot tell "nothing happened"
+/// apart from "something happened and changed nothing."
+fn stored_position(session: &Session, media: &MediaId) -> Duration {
+    match session.state().entry_for(media) {
+        Some(entry) => entry.position,
+        None => panic!("expected a stored entry for {media:?}"),
+    }
+}
+
+/// The same read as `stored_position`, against a `PersistedState` already in
+/// hand (typically the return of `shutdown_snapshot`) rather than a `Session`.
+fn position_in(state: &PersistedState, media: &MediaId) -> Duration {
+    match state.entry_for(media) {
+        Some(entry) => entry.position,
+        None => panic!("expected a stored entry for {media:?}"),
+    }
+}
+
+fn completed_in(session: &Session, media: &MediaId) -> bool {
+    session.state().completed_for(media)
 }
 
 /// A session already playing `a`, with the clock parked at the moment playback
@@ -839,5 +913,183 @@ fn the_shutdown_snapshot_refuses_a_position_from_a_session_it_was_not_tracking()
         final_state.entry_for(&media("a")).unwrap().position,
         Duration::from_secs(93),
         "it falls back to last_sample rather than trusting the stranger"
+    );
+}
+
+// ------------------------------------------- checkpoint protection (§10)
+
+#[test]
+fn a_protected_entry_survives_every_capture_path() {
+    // §10/H16. Periodic, pause, stop, media switch and shutdown all reach the
+    // state through record_current or record_outgoing; one gate covers all
+    // five, and this test is what proves none of them slipped past it.
+    let clock = FakeClock::new();
+    let retained = Duration::from_secs(2400);
+    let mut session = Session::new(state_with(&media("ep1"), retained, false));
+
+    let _ = session.observe(&loaded_unavailable(&media("ep1"), retained), clock.sample());
+    let _ = session.observe(&state_changed(1, PlaybackState::Playing), clock.sample());
+
+    // Periodic.
+    clock.advance_monotonic(CAPTURE_INTERVAL + Duration::from_secs(1));
+    let _ = session.tick(&progress(1, "ep1", 120), clock.sample());
+    assert_eq!(stored_position(&session, &media("ep1")), retained);
+
+    // Pause, then stop.
+    let _ = session.observe(&state_changed(1, PlaybackState::Paused), clock.sample());
+    let _ = session.tick(&progress(1, "ep1", 130), clock.sample());
+    let _ = session.observe(&state_changed(1, PlaybackState::Stopped), clock.sample());
+    let _ = session.tick(&progress(1, "ep1", 130), clock.sample());
+    assert_eq!(stored_position(&session, &media("ep1")), retained);
+
+    // A media switch carries the outgoing entry out — but not over this one.
+    let _ = session.observe(&loaded_fresh(&media("ep2")), clock.sample());
+    assert_eq!(stored_position(&session, &media("ep1")), retained);
+
+    // And the shutdown snapshot.
+    let state = session.shutdown_snapshot(&progress(2, "ep2", 5), clock.sample());
+    assert_eq!(position_in(&state, &media("ep1")), retained);
+}
+
+#[test]
+fn an_established_restart_lifts_the_protection() {
+    // G1: without RestartEstablished this can never happen, and a listener who
+    // deliberately started over would be unable to save that fact.
+    let clock = FakeClock::new();
+    let retained = Duration::from_secs(2400);
+    let mut session = Session::new(state_with(&media("ep1"), retained, false));
+    let _ = session.observe(&loaded_unavailable(&media("ep1"), retained), clock.sample());
+
+    let _ = session.observe(
+        &PlaybackEvent::RestartEstablished {
+            session_rev: 1,
+            position: Duration::ZERO,
+        },
+        clock.sample(),
+    );
+    let _ = session.observe(&state_changed(1, PlaybackState::Playing), clock.sample());
+    clock.advance_monotonic(CAPTURE_INTERVAL + Duration::from_secs(1));
+    let _ = session.tick(&progress(1, "ep1", 30), clock.sample());
+
+    assert_eq!(
+        stored_position(&session, &media("ep1")),
+        Duration::from_secs(30)
+    );
+}
+
+#[test]
+fn an_established_seek_lifts_the_protection() {
+    let clock = FakeClock::new();
+    let retained = Duration::from_secs(2400);
+    let mut session = Session::new(state_with(&media("ep1"), retained, false));
+    let _ = session.observe(&loaded_unavailable(&media("ep1"), retained), clock.sample());
+
+    let _ = session.observe(
+        &PlaybackEvent::SeekCompleted {
+            session_rev: 1,
+            requested: Duration::from_secs(60),
+            actual: Duration::from_secs(60),
+            refinement_truncated: false,
+        },
+        clock.sample(),
+    );
+    let _ = session.tick(&progress(1, "ep1", 60), clock.sample());
+    assert_eq!(
+        stored_position(&session, &media("ep1")),
+        Duration::from_secs(60)
+    );
+}
+
+#[test]
+fn verified_completion_lifts_the_protection_and_records_the_completion() {
+    let clock = FakeClock::new();
+    let retained = Duration::from_secs(2400);
+    let mut session = Session::new(state_with(&media("ep1"), retained, false));
+    let _ = session.observe(&loaded_unavailable(&media("ep1"), retained), clock.sample());
+
+    let _ = session.observe(
+        &PlaybackEvent::EndOfTrack {
+            session_rev: 1,
+            position: Duration::from_secs(3000),
+        },
+        clock.sample(),
+    );
+    assert_eq!(
+        stored_position(&session, &media("ep1")),
+        Duration::from_secs(3000)
+    );
+    assert!(completed_in(&session, &media("ep1")));
+}
+
+#[test]
+fn a_capability_change_alone_never_lifts_the_protection() {
+    // §10: "Capability changes alone never delete, clear or replace
+    // checkpoints." A server that starts advertising ranges mid-session must
+    // not be able to discard the entry by saying so.
+    let clock = FakeClock::new();
+    let retained = Duration::from_secs(2400);
+    let mut session = Session::new(state_with(&media("ep1"), retained, false));
+    let _ = session.observe(&loaded_unavailable(&media("ep1"), retained), clock.sample());
+
+    let _ = session.observe(
+        &PlaybackEvent::CapabilitiesChanged {
+            session_rev: 1,
+            capabilities: MediaCapabilities {
+                continuity: Continuity::Finite,
+                seek: SeekSupport::Native,
+            },
+        },
+        clock.sample(),
+    );
+    let _ = session.observe(&state_changed(1, PlaybackState::Playing), clock.sample());
+    clock.advance_monotonic(CAPTURE_INTERVAL + Duration::from_secs(1));
+    let _ = session.tick(&progress(1, "ep1", 30), clock.sample());
+
+    assert_eq!(stored_position(&session, &media("ep1")), retained);
+}
+
+#[test]
+fn a_fresh_sequential_session_with_nothing_to_protect_records_normally() {
+    // §10's last paragraph: with no positive checkpoint to protect, heard
+    // progress is recorded normally even though it cannot currently be
+    // resumed.
+    let clock = FakeClock::new();
+    let mut session = Session::new(PersistedState::default());
+    let _ = session.observe(&loaded_fresh(&media("ep1")), clock.sample());
+    let _ = session.observe(&state_changed(1, PlaybackState::Playing), clock.sample());
+    clock.advance_monotonic(CAPTURE_INTERVAL + Duration::from_secs(1));
+    let _ = session.tick(&progress(1, "ep1", 45), clock.sample());
+    assert_eq!(
+        stored_position(&session, &media("ep1")),
+        Duration::from_secs(45)
+    );
+}
+
+#[test]
+fn a_cancelled_seek_commits_no_target_and_leaves_an_outstanding_one_alone() {
+    let clock = FakeClock::new();
+    let mut session = Session::new(PersistedState::default());
+    let _ = session.observe(&loaded_fresh(&media("ep1")), clock.sample());
+    let _ = session.observe(
+        &PlaybackEvent::SeekTargetStored {
+            session_rev: 1,
+            target: Duration::from_secs(90),
+        },
+        clock.sample(),
+    );
+    let _ = session.observe(
+        &PlaybackEvent::SeekCancelled {
+            session_rev: 1,
+            requested: Duration::from_secs(200),
+        },
+        clock.sample(),
+    );
+    // The stopped seek's target still supersedes whatever the tick reports —
+    // the sampled position here is a placeholder, since resolve_target() is
+    // never reached to let it matter.
+    let _ = session.tick(&progress(1, "ep1", 5), clock.sample());
+    assert_eq!(
+        stored_position(&session, &media("ep1")),
+        Duration::from_secs(90)
     );
 }
