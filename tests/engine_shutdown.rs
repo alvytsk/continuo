@@ -6,6 +6,7 @@ use std::time::Duration;
 use continuo::playback::command::PlaybackCommand;
 use continuo::playback::event::PlaybackEvent;
 use continuo::playback::state::PlaybackState;
+use continuo::playback::timeline::PositionQuality;
 use continuo::playback::volume::Volume;
 
 mod support;
@@ -19,8 +20,27 @@ const TRACK: &str = "sine-5s.flac";
 /// `flush_events` to hand it to the channel the test then drains via `join`.
 const FLUSH_PASS: Duration = Duration::from_millis(50);
 
+/// This does **not** discriminate D14 (that `shutdown` republishes a fresh
+/// capture rather than leaving the last per-pass value in place): under this
+/// harness's frozen clock, `play_for`'s own `settle()` already leaves
+/// `Progress` equal to what a subsequent `capture_position()` computes on top
+/// of it, so the assertion below holds whether or not `shutdown` calls
+/// `publish_progress()` at all. Forcing the two to diverge deterministically
+/// would need a capture that lands strictly after the run loop's last
+/// ordinary publish and strictly before its next one - and the loop republishes
+/// on every ~10ms tick, so pinning a test to that window means racing it,
+/// which this suite does not accept. D14's freshness is verified by
+/// inspection instead: `Worker::shutdown` calls `publish_progress()` after
+/// `capture_position()` and after `state` is set to `Idle`, which is what
+/// makes the published number the just-captured one - the `Playing`/`Paused`
+/// recompute branch in `publish_progress` is skipped once state is `Idle`.
+///
+/// What this test does verify is the plumbing: that `join`'s
+/// `ShutdownReport.progress` is a legitimate snapshot consistent with the
+/// position the harness already observed, not some other session's or a
+/// default one.
 #[test]
-fn join_returns_the_position_the_shutdown_captured() {
+fn join_reports_progress_consistent_with_the_last_published_position() {
     let mut engine = TestEngine::start(TRACK);
     engine.play_for(Duration::from_secs(1));
     let published = engine.position();
@@ -31,7 +51,7 @@ fn join_returns_the_position_the_shutdown_captured() {
 
     assert!(
         report.progress.position >= published,
-        "the captured position must be at least the last one published: {:?} < {:?}",
+        "the reported position must be at least the last one published: {:?} < {:?}",
         report.progress.position,
         published
     );
@@ -39,6 +59,33 @@ fn join_returns_the_position_the_shutdown_captured() {
         report.progress.position < Duration::from_secs(5),
         "and it must still be a position in this track: {:?}",
         report.progress.position
+    );
+}
+
+/// A capture that cannot be confirmed must not be published as `Exact`.
+/// `silence_the_device` is not a timing race: it flips `TestOutput.silent`
+/// permanently, so the callback never runs again and never publishes the
+/// acknowledgment `capture_position`'s handshake is waiting on. The wait is
+/// therefore guaranteed - not merely likely - to run out its real-time
+/// deadline and come back `HandshakeError::Timeout`; `a_recovery_that_never_
+/// completes_fails_once_and_keeps_the_position` in `engine_contract.rs` relies
+/// on the same guarantee for the same reason.
+#[test]
+fn a_capture_that_times_out_is_reported_degraded_not_exact() {
+    let mut engine = TestEngine::start(TRACK);
+    engine.play_for(Duration::from_secs(1));
+    engine.silence_the_device();
+
+    let report = engine
+        .shutdown_report()
+        .expect("the engine was still running");
+
+    assert_eq!(
+        report.progress.quality,
+        PositionQuality::Degraded,
+        "a capture the engine could not confirm must not be labelled Exact just \
+         because shutdown has already set state to Idle: {:?}",
+        report.progress
     );
 }
 

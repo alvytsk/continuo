@@ -984,10 +984,16 @@ impl Worker {
     }
 
     fn shutdown(&mut self) {
-        self.capture_position();
+        let captured_exactly = self.capture_position();
         self.teardown();
         self.source = None;
         self.state = PlaybackState::Idle;
+        if !captured_exactly {
+            // quality() checks `degraded` before it looks at `state`, so this is
+            // what keeps a capture that timed out from being published as
+            // Exact on the strength of `state` having just become `Idle`.
+            self.degraded = true;
+        }
         // With the transport gone the recompute branch is skipped, so this
         // publishes precisely the captured position (D14). Without it, the last
         // Progress a reader can see is the one from the previous pass and the
