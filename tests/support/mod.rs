@@ -84,6 +84,18 @@ fn fixture(name: &str) -> AbsolutePath {
     AbsolutePath::new(path.canonicalize().unwrap()).unwrap()
 }
 
+/// A `MediaId` for a local file that need not exist, for tests that only care
+/// about identity. Shared across the persistence and session test files
+/// rather than duplicated in each (R20).
+pub fn media(name: &str) -> MediaId {
+    // A bare helper, so it handles its own error: the lint exemption stops at
+    // the `#[test]` boundary.
+    match AbsolutePath::new(format!("/music/{name}.flac").into()) {
+        Ok(path) => MediaId::LocalFile(path),
+        Err(error) => panic!("a literal absolute path must parse: {error}"),
+    }
+}
+
 struct Device {
     output: TestOutput,
     /// Stashed on every `open`, so the harness can reach the counters the
