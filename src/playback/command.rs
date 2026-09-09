@@ -13,7 +13,9 @@ use super::volume::Volume;
 /// mean opening the media twice, once to decide and once to play.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ResumeIntent {
-    /// The application has already decided. Used by Restart and by tests.
+    /// The application has already decided — there was no candidate to
+    /// resolve, or a test wants a known start. `Restart` is unaffected: it is
+    /// its own command, always to zero, and never goes through `Load`.
     StartAt(Duration),
     /// Resolved by the worker after its single probe, using the same rules the
     /// application would apply if it had a duration to apply them to.
