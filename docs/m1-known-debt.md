@@ -3,7 +3,8 @@
 Findings raised during M1 review that were deliberately deferred rather than
 fixed. None blocks correctness of the shipped slice; each was judged against the
 milestone's binding invariant (stop and transport recreation preserve the logical
-playback position) and found not to threaten it.
+playback position) and found not to threaten it. Milestone 2's carried debt is
+recorded in the second half of this file.
 
 ## Error modelling
 
@@ -95,3 +96,54 @@ playback position) and found not to threaten it.
 - Span-ring capacity (64) and the PCM ring target (250 ms) remain the spec's starting
   values. Validating them needs a full track on real hardware with `spans_dropped` and
   xrun counts logged — part of the outstanding manual acceptance.
+
+# Milestone 2 — carried debt
+
+Findings from the M2 review that were judged fine to carry. None threatens the
+milestone's invariant (a position the listener reached is never overwritten by
+one the engine never validated); each is here so the next milestone inherits the
+reasoning rather than rediscovering the finding.
+
+## Writer thread
+
+- The writer wakes ten times a second even with an empty slot, because
+  `IDLE_WAIT` caps every wait in `src/persistence/writer.rs`. The principled fix
+  is to read `closing` inside the slot's critical section, so an empty slot can
+  wait unbounded and still be woken by the shutdown.
+- A detach after the D10 timeout can leave an orphan
+  `state.json.tmp-<pid>-<seq>` behind if the process dies mid-write
+  (`src/persistence/store.rs`). It partly self-heals: a later run that reuses the
+  pid hits `create_new` → `AlreadyExists`, removes the stale temp, and succeeds
+  on the next sequence.
+- `submits_after_shutdown_are_rejected` in `tests/persistence_writer.rs` passes
+  for the wrong reason — by the time `shutdown()` has returned the writer thread
+  has already exited, so the test would pass without the `closing` check it
+  claims to pin.
+
+## Untested paths
+
+- D11's three-failure warning, D3's disable reasons and the honest-flush log are
+  all policy expressed through `tracing` (`src/persistence/writer.rs`,
+  `src/app.rs`), and none of them is assertable. A small
+  `tracing_subscriber::Layer` collecting `(level, message)` pairs would close the
+  whole class at once.
+- D19's backlog half is covered only by a race
+  (`an_event_racing_the_shutdown_interrupt_still_arrives` in
+  `tests/engine_shutdown.rs`), which passes whichever side of the race wins. The
+  deterministic companion it wants would overflow the worker past
+  `EVENT_CAPACITY - RESERVED_EVENT_SLOTS`, so that `flush_events` provably breaks,
+  and then assert that the overflow events arrive after the channel's.
+- The atomic-replace test in `tests/persistence_store.rs` proves that two
+  successive writes leave no stale tail, but it cannot simulate a crash. Crash
+  safety rests on the mechanism being inspectable — `create_new`, `fsync`,
+  `rename` — rather than on a test.
+
+## Session policy
+
+- `record_outgoing`'s "call this before the per-media fields reset" contract
+  (`src/session.rs`) is documentary. Taking the three fields it reads as
+  parameters would make the ordering a fact the borrow checker enforces.
+- `playback` still describes the previous media for one iteration after a
+  `Loaded` (`src/session.rs`), which is safe only because the establishment gate
+  covers that window. The invariant it rests on — `playback == Playing` implies
+  `established` — is asserted nowhere.

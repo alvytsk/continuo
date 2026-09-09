@@ -45,3 +45,6 @@ left exactly where it is with writing disabled for that session.
 
 Reaching the end of a track marks it complete and keeps the position it ended
 at; reopening a completed track starts from the beginning.
+
+Deleting `state.json` forgets every remembered position, which is also the way
+out if a stored position ever stops a file from opening.

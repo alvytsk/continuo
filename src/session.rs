@@ -63,10 +63,14 @@ pub struct Session {
     outstanding_target: Option<Duration>,
     /// Whether playback established, or the position changed explicitly, since
     /// the current media was loaded. It gates every checkpoint whose position
-    /// comes from `Progress` — a resolved force and the shutdown snapshot —
+    /// comes from `Progress` — a resolved force, the ordinary 5 s capture, the
+    /// shutdown snapshot and the outgoing entry a media switch records —
     /// because such a position is one the engine never validated until
-    /// something established (D20). The two positions that arrive on events of
-    /// their own are exempt, and say so where they are recorded (D6).
+    /// something established. D20 gates only the shutdown force and reads the
+    /// flag at the current revision; §19 records why the shipped gate is wider
+    /// and why the flag latches until the next `Loaded`. The two positions that
+    /// arrive on events of their own are exempt, and say so where they are
+    /// recorded (D6).
     established: bool,
 }
 

@@ -1,8 +1,9 @@
 # Continuo M2 — durable playback state (design)
 
-Status: approved, not implemented.
+Status: approved and implemented.
 Date: 2026-09-08. Revised the same day after design review, and again on
-2026-09-09 after a third review; §18 records what changed and what was declined.
+2026-09-09 after a third review; §18 records what changed and what was declined,
+and §19 records the amendments adopted while implementing it.
 Supersedes nothing. Refines `docs/architecture.md` §6 with the decisions that
 section deferred to M2.
 
@@ -653,6 +654,22 @@ tempdir to stage session 1 → persist → session 2.
   in the engine asserts the two agree. The duplication should collapse into the
   engine reporting its own outstanding target as soon as a later milestone needs
   it for a seek bar.
+- **An unvalidated position cannot be rescued once the media behind it
+  changes.** When the probe reports no duration — realistic for a VBR MP3 with
+  no Xing header — §11's last row retains the stored position as
+  `Unvalidated`, and the `position > duration` row that would have caught a
+  stale one needs a duration it does not have. If the file at that path is then
+  replaced by a shorter recording, the resume asks for a position past its end.
+  A reader that errors instead of clamping makes the worker fail *before* it
+  ever reports `Loaded`, so the session never learns which media it was playing:
+  the shutdown snapshot leaves the entry untouched, the position stays in the
+  file, and every subsequent launch fails identically. Nothing in the failure
+  says the file is recoverable, so the user's only route out is deleting the
+  state file, which the README now documents. The candidate fix is retrying the
+  initial `Load` once at zero when a load carrying a restored position fails
+  before `Loaded`. It is deliberately not in M2: reachability depends on decoder
+  behaviour nobody has demonstrated, and the retry would add an untestable path
+  to the least testable code in the milestone.
 - **Deferred to M3.** `SourceLocation::Http` remains unsupported by the engine;
   nothing in this design is shaped around remote media beyond `MediaId` already
   covering it.
@@ -696,3 +713,101 @@ decisions built on it, so the row is corrected and split in two.
 | A restart leaves the persisted stopped-seek target standing, because `restart()` clears the target and announces `Playing` without a `SeekCompleted` | **Accepted**, cause confirmed at `engine.rs` `fn restart`. §12 had already named `StateChanged{Playing}` as the observable establishment for exactly this reason; D17 now uses the same signal rather than defining a second one. The §3 row that misdescribed `Restart` is corrected. The reported severity is if anything understated: D17 supersedes `Progress.position` while the target stands, so the stale target reaches every checkpoint after the restart, not only the shutdown one |
 | Shutdown builds the final snapshot from state that queued and worker-pending events never reached | **Accepted**, and it is two independent losses rather than one: the worker discards `pending_events` at the shutdown interrupt, and `app::run` breaks before its own drain. D19 returns the backlog through the thread's join value and drains the channel inside `join`, which is lossless and ordered; the suggested channel flush is neither, and would have to block against a full channel while the app sits in `join` |
 | A failed startup still overwrites a completed entry's retained position | **Accepted**, and widened. `load()` pins `start_at` before opening, so an *incomplete* entry survives a device-open failure unharmed; the loss is confined to the three §11 rows that map to `start_at = 0` while retaining a position — `completed`, `position == duration`, `position > duration`. D20 gates the shutdown checkpoint on establishment rather than special-casing `completed`, which also stops launch-then-immediate-quit from spending a `touch_seq` on a checkpoint that records nothing new |
+
+## 19. Amendments adopted during implementation
+
+The shipped code departs from the decisions above in six places, and resolves one
+contradiction the spec itself contained. Every change was reviewed and agreed as
+it arose. They are recorded here rather than edited into D1–D20 because the
+sequence that forced each one is the part worth keeping: a decision rewritten in
+place reads as though it had always said that, and the next reader inherits the
+rule without the evidence for it.
+
+### D20 gates every position that derives from `Progress`
+
+D20 gates the shutdown force on establishment. The shipped policy routes *every*
+position that comes from `Progress` through one helper and gates all of them: the
+resolved pending force, the ordinary 5 s capture and the shutdown snapshot. The
+outgoing entry recorded on a media switch is gated on the same flag. Three
+sequences forced the widening, each of them writing a zero over a position D1
+deliberately retains:
+
+- **The resolved force.** Launch on a completed entry: §11 starts it at 0,
+  `load()` emits `Loaded` and then the establishment `Paused`, and a stop in the
+  same iteration resolves its force against a sample of 0 — written over the
+  240 s the completed entry had retained.
+- **The ordinary capture.** A switch onto a completed entry: the policy's
+  `playback` can still read `Playing` from the outgoing media, because the
+  `StateChanged{Loading}` that precedes `Loaded` is an ordinary event the engine
+  drops at `PENDING_CAP` — exactly the backlog pressure a switch happens under.
+  The 5 s rule then captures the incoming media's unvalidated 0 over its retained
+  240 s.
+- **The outgoing entry.** `Loaded{a, 0}` → `Failed` → `Loaded{b, 0}`: the switch
+  records `a` from `last_sample`, which holds the 0 `load()` pinned before the
+  device failed, over a retained 300 s.
+
+The two sources D6 names as exceptions — `SeekTargetStored.target` (D7) and
+`EndOfTrack.position` — are deliberately **not** gated. Neither is a number the
+engine has still to validate: one is the listener's own intent, the other a
+position the engine reached and reported in the event that carries it. So exactly
+six paths can write a stored position, and each is either behind the gate or
+carries its own position.
+
+### D20's flag is latched rather than read at the current revision
+
+D20 asks for an establishment observed *at the current revision*. The shipped
+flag is latched: set by the first establishing event, cleared only by `Loaded`.
+Read literally, the gate would close again whenever a `DeviceRecovered` bumped
+the revision — and §3 records that `rebuild` keeps the position continuous across
+that bump, so the gate would discard a position D20 never asks anyone to discard.
+It would discard it for good in the case that matters, since a paused session
+fires no ordinary trigger to replace it.
+
+### §12's clearing set gains `SeekTargetStored`
+
+A contradiction resolved rather than a deviation. D7 says a stopped seek's target
+is persisted; §11 says a completed entry resumes at 0. On a completed entry the
+two decisions cancel: the target is written beside `completed == true`, and the
+resume D7 exists to steer then throws it away. A stopped seek is the same
+listener intent one step earlier than the seek §12 already clears completion for,
+so `SeekTargetStored` joins `SeekCompleted` and `StateChanged{Playing}` in the
+clearing set.
+
+### §7: `pending_force` carries no trigger
+
+§7 describes `pending_force: Option<(session_rev, Trigger)>`. The shipped field is
+`Option<u64>`, the revision alone. Nothing ever read the trigger: every forced
+checkpoint resolves identically, from the tick sample carrying that revision, so
+the enum was write-only state and was dropped.
+
+### §8's media-switch row gains two qualifications
+
+The row records the outgoing entry from `last_sample`. Two conditions qualify it.
+A completed outgoing entry is not re-recorded at all, because the retained sample
+can only be behind the position `EndOfTrack` already recorded (D1). And an
+outstanding stopped-seek target supersedes the sampled position (D17): resolving
+the target first would write the pre-seek sample back over the target.
+
+### §14: `checkpoint_for` was not shipped, and `session_rev()` was added
+
+§14 lists `PersistedState::checkpoint_for` and calls `PlaybackCheckpoint` the
+currency between session and persistence. That is true of what the policy
+**records** — `record(&PlaybackCheckpoint, completed)` is the only write path —
+and false of what the resume **reads**. `PlaybackCheckpoint` carries no
+`completed` flag, so it structurally cannot answer §11's first question; the
+resume path runs `entry_for(&media)` → `decide_resume(Option<&PersistedCheckpoint>,
+Option<Duration>)` instead. `checkpoint_for` would have had no caller and was not
+written.
+
+`PlaybackEvent::session_rev()` is an addition §14 does not list. §7 requires the
+revision to be adopted from every observed event, which wants one accessor
+covering every variant rather than a match repeated at each call site.
+
+### D14: the shutdown publish carries confidence as well as position
+
+D14 settles *which* position the shutdown publishes. The shipped `fn shutdown`
+also carries *how well that position is known*: a `capture_position` that did not
+confirm marks the state degraded before publishing, so the final `Progress`
+reports `Degraded` instead of inheriting `Exact` from the `Idle` state the
+teardown has just set. The position is the one D14 promises; only its honesty
+about confidence is new.

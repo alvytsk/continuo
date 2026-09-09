@@ -87,7 +87,7 @@ Controls, spaces, double quotes, backslashes, percent signs, and non-ASCII UTF-8
 
 ## 6. Durable state (M2)
 
-Persistence is a future M2 subsystem. It will honor XDG environment variables and their standard defaults:
+Persistence honors XDG environment variables and their standard defaults:
 
 | Location | Contents |
 |---|---|
@@ -96,22 +96,18 @@ Persistence is a future M2 subsystem. It will honor XDG environment variables an
 | `$XDG_DATA_HOME/continuo/subscriptions.json` | Podcast subscriptions (durable user data) |
 | `$XDG_CACHE_HOME/continuo/` | Refetchable feed data |
 
-Current media references one checkpoint per media identity inside the single atomic playback snapshot. Keeping these together prevents disagreement after a crash between writes. Subscriptions remain separate durable user data. Storage will be a small concrete module with typed load/save operations; there is no repository trait.
+Current media references one checkpoint per media identity inside the single atomic playback snapshot. Keeping these together prevents disagreement after a crash between writes. Subscriptions remain separate durable user data. Storage is a small concrete module with typed load/save operations; there is no repository trait.
 
 A single writer's accepted update sequence orders snapshots after generation validation. Neither timestamps nor maximum positions order updates: clocks can move backward, and a deliberate backward seek supersedes an earlier larger position. `updated_at` exists only for human inspection. There is no merge algorithm.
 
-The application will capture checkpoints periodically while playing and on pause, stop, track change, and successful seek, then flush pending state during graceful shutdown. The capture interval and writer's maximum coalescing interval are each bounded to single-digit seconds, which bounds worst-case loss end to end. The writer will create a temporary file in the destination directory, write and `fsync` it, rename it over the destination, then `fsync` the parent directory where supported.
+The application captures checkpoints periodically while playing and on pause, stop, track change, and successful seek, then flushes pending state during graceful shutdown. The capture interval and writer's maximum coalescing interval are each bounded to single-digit seconds, which bounds worst-case loss end to end. The writer creates a temporary file in the destination directory, writes and `fsync`s it, renames it over the destination, then `fsync`s the parent directory where supported.
 
-Every snapshot will have `schema_version` from its first write. Malformed and unsupported-version files are preserved and reported rather than overwritten. `Unsupported` or `Undetermined` resume capability never deletes a checkpoint. Completed status is separate from position and is set after output drains. Replay-from-beginning requires explicit completed-status policy in M2. There is no near-end reset: stopping near the end preserves that logical position.
+Every snapshot carries `schema_version` from its first write. Malformed and unsupported-version files are preserved and reported rather than overwritten. `Unsupported` or `Undetermined` resume capability never deletes a checkpoint. Completed status is separate from position and is set after output drains. Replay-from-beginning requires explicit completed-status policy in M2. There is no near-end reset: stopping near the end preserves that logical position.
 
-M2 settles this: see `docs/superpowers/specs/2026-09-08-continuo-durable-state-design.md`
-for the decisions — completion semantics, the per-identity map and its cap,
-rejected-file handling, and the checkpoint triggers. Two refinements the
-implementation carries are not in that spec's media-switch table: a completed
-outgoing entry is not re-recorded, and an outstanding stopped-seek target
-supersedes the recorded position. Its components section calls
-`PlaybackCheckpoint` the currency, which holds for what the policy records; the
-resume path reads `PersistedCheckpoint` instead.
+`docs/superpowers/specs/2026-09-08-continuo-durable-state-design.md` carries the
+decisions behind all of this — completion semantics, the per-identity map and its
+cap, rejected-file handling, the checkpoint triggers — and its §19 records where
+the implementation amended them.
 
 ## 7. Diagnostics and errors
 
