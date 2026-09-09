@@ -4,6 +4,7 @@
 //! produces encoded bytes and the evidence needed to classify them; the decode
 //! worker does everything else.
 
+pub mod channel;
 pub mod error;
 pub mod limits;
 pub mod response;
