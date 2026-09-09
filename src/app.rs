@@ -80,7 +80,7 @@ pub fn run(cli: cli::Cli) -> Result<(), PlaybackError> {
         start_at,
         volume,
         persisting,
-    } = open_persistence(&media, duration, &clock);
+    } = open_persistence(platform_store(&clock), &media, duration, &clock);
 
     let engine = EngineHandle::spawn_cpal();
     // Dropped explicitly by the shutdown sequence, before the flush waits on
@@ -225,19 +225,27 @@ struct Persistence {
     persisting: bool,
 }
 
-fn open_persistence(
-    media: &MediaId,
-    duration: Option<Duration>,
-    clock: &Arc<dyn Clock>,
-) -> Persistence {
-    let store = match StateStore::platform_path() {
+/// The store on the platform's state path, or `None` when the platform offers
+/// no state directory at all. Path discovery is kept out of `open_persistence`
+/// so that everything downstream of it — the load classification, the resume
+/// decision, the sink selection — can be driven from a store in a tempdir, and
+/// so that `platform_path` keeps exactly one caller in the program (§13).
+fn platform_store(clock: &Arc<dyn Clock>) -> Option<StateStore> {
+    match StateStore::platform_path() {
         Ok(path) => Some(StateStore::new(path, Arc::clone(clock))),
         Err(error) => {
             tracing::warn!(%error, "no state directory; this session will not be persisted");
             None
         }
-    };
+    }
+}
 
+fn open_persistence(
+    store: Option<StateStore>,
+    media: &MediaId,
+    duration: Option<Duration>,
+    clock: &Arc<dyn Clock>,
+) -> Persistence {
     let (state, writable) = match &store {
         Some(store) => {
             let outcome = store.load();
@@ -312,18 +320,40 @@ fn submit(writer: &WriterHandle, action: Action) {
     }
 }
 
-/// What the flush is reported as. A session whose writing is disabled reaches
-/// `Written` having written nothing, so the outcome alone must not be logged as
-/// a checkpoint that landed.
-fn report_flush(outcome: ShutdownOutcome, persisting: bool) {
+/// What the flush is reported as, decided apart from the logging so that the
+/// one branch that exists to prevent a dishonest line can be asserted rather
+/// than read.
+enum FlushReport {
+    Written,
+    Failed(PersistenceError),
+    Unconfirmed,
+    /// Nothing was ever going to reach the disk this session.
+    Disabled,
+}
+
+/// A disabled sink reports every write as a success, deliberately — the writer
+/// must not count a deliberate disable as a failure (D11) — so a session that
+/// was not persisting reaches `Written` having written nothing. The outcome
+/// alone must therefore never be reported as a checkpoint that landed.
+fn classify_flush(outcome: ShutdownOutcome, persisting: bool) -> FlushReport {
     if !persisting {
-        tracing::debug!("persistence is disabled for this session; no checkpoint was written");
-        return;
+        return FlushReport::Disabled;
     }
     match outcome {
-        ShutdownOutcome::Written => tracing::debug!("final checkpoint written"),
-        ShutdownOutcome::Failed(error) => tracing::warn!(%error, "final checkpoint failed"),
-        ShutdownOutcome::Unconfirmed => tracing::warn!("final checkpoint UNCONFIRMED"),
+        ShutdownOutcome::Written => FlushReport::Written,
+        ShutdownOutcome::Failed(error) => FlushReport::Failed(error),
+        ShutdownOutcome::Unconfirmed => FlushReport::Unconfirmed,
+    }
+}
+
+fn report_flush(outcome: ShutdownOutcome, persisting: bool) {
+    match classify_flush(outcome, persisting) {
+        FlushReport::Written => tracing::debug!("final checkpoint written"),
+        FlushReport::Failed(error) => tracing::warn!(%error, "final checkpoint failed"),
+        FlushReport::Unconfirmed => tracing::warn!("final checkpoint UNCONFIRMED"),
+        FlushReport::Disabled => {
+            tracing::debug!("persistence is disabled for this session; no checkpoint was written");
+        }
     }
 }
 
@@ -518,8 +548,10 @@ fn format_hms(duration: Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clock::FakeClock;
     use crate::media::capabilities::{Continuity, MediaCapabilities, SeekSupport};
     use crate::media::metadata::MediaMetadata;
+    use crate::playback::checkpoint::PlaybackCheckpoint;
 
     fn press(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::empty())
@@ -627,5 +659,100 @@ mod tests {
             }
             other => panic!("volume must be issued before the load: {other:?}"),
         }
+    }
+
+    /// A store in a tempdir. Nothing in these tests reaches `$HOME`:
+    /// `platform_path` is called by `run` and by nothing else, which is exactly
+    /// what hoisting it out of `open_persistence` buys.
+    fn store_at(path: &std::path::Path) -> (StateStore, Arc<dyn Clock>) {
+        let clock: Arc<dyn Clock> = Arc::new(FakeClock::new());
+        (
+            StateStore::new(path.to_path_buf(), Arc::clone(&clock)),
+            clock,
+        )
+    }
+
+    #[test]
+    fn a_stored_entry_decides_the_start_position_and_the_restored_volume() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, clock) = store_at(&dir.path().join("state.json"));
+        let media = local("/music/sonata.flac");
+        let mut stored = PersistedState::default();
+        stored.set_volume(Volume::new(0.25));
+        stored.record(
+            &PlaybackCheckpoint {
+                media: media.clone(),
+                position: Duration::from_secs(93),
+                updated_at: clock.sample().wall,
+            },
+            false,
+        );
+        store.write(&stored).unwrap();
+
+        let persistence =
+            open_persistence(Some(store), &media, Some(Duration::from_secs(300)), &clock);
+
+        assert_eq!(
+            persistence.start_at,
+            Duration::from_secs(93),
+            "the load starts where the entry left off"
+        );
+        assert_eq!(persistence.volume, Volume::new(0.25));
+        assert!(persistence.persisting);
+    }
+
+    /// D3: a file this build cannot read is preserved in place and writing is
+    /// off for the session. The sink the disable selects has to write nowhere,
+    /// or the preservation is a claim rather than a fact.
+    #[test]
+    fn a_state_file_from_a_newer_build_disables_writing_and_is_left_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let newer = br#"{"schema_version":99,"current_media":null,"volume":0.5,"checkpoints":{}}"#;
+        std::fs::write(&path, newer).unwrap();
+        let (store, clock) = store_at(&path);
+        let media = local("/music/sonata.flac");
+
+        let mut persistence =
+            open_persistence(Some(store), &media, Some(Duration::from_secs(300)), &clock);
+
+        assert!(!persistence.persisting);
+        assert_eq!(
+            persistence.start_at,
+            Duration::ZERO,
+            "nothing is restored from a file this build cannot read"
+        );
+        assert_eq!(persistence.volume, Volume::FULL);
+
+        persistence
+            .writer
+            .submit(PersistedState::default(), Urgency::Forced);
+        let outcome = persistence.writer.shutdown();
+        assert!(
+            matches!(
+                classify_flush(outcome, persistence.persisting),
+                FlushReport::Disabled
+            ),
+            "a session that wrote nothing must not be reported as having written"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            newer,
+            "the preserved file must come out byte for byte as it went in"
+        );
+    }
+
+    #[test]
+    fn a_disabled_session_never_reports_a_written_checkpoint() {
+        // The sink answers `Ok` for a write it deliberately never performed, so
+        // the outcome on its own cannot tell the two apart.
+        assert!(matches!(
+            classify_flush(ShutdownOutcome::Written, false),
+            FlushReport::Disabled
+        ));
+        assert!(matches!(
+            classify_flush(ShutdownOutcome::Written, true),
+            FlushReport::Written
+        ));
     }
 }
