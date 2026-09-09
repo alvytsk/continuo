@@ -90,9 +90,12 @@ pub struct WaitService {
     /// `AudioOutput::now()` needs `&self.output`, which the hook cannot
     /// reach — it runs from inside `next_planar()`, deep under
     /// `&mut self.source`, structurally unable to borrow the rest of
-    /// `Worker`. The caller supplies a `Send + Sync` stand-in instead; the
-    /// worker's own wiring refreshes it from the real device clock right
-    /// before every call this module makes to `service_as`.
+    /// `Worker`. The caller supplies a `Send + Sync` stand-in instead. In
+    /// production this reads `Worker.device_clock`, which
+    /// `CallbackCore::fill` keeps live on the audio backend thread — the one
+    /// context still running while the decode thread this module's own
+    /// caller may be blocked on is stuck — so it keeps advancing for the
+    /// full length of a blocked read, not just once per worker loop pass.
     clock: Arc<dyn Fn() -> Nanos + Send + Sync>,
 }
 
@@ -209,6 +212,19 @@ impl WaitService {
             } else {
                 PositionQuality::Exact
             };
+            // Gating the recompute — and so the span-queue drain inside
+            // `observed_position` — on `facts.playing` narrows what used to
+            // run whenever a transport existed at all. It is safe today
+            // because `facts.playing` is `matches!(state, Playing | Paused)`,
+            // and those are the only states where the callback publishes NEW
+            // spans (`CallbackCore::fill`'s `Run` phase). The remaining case —
+            // `Ended`, where a transport can still be `Some` but parked — has
+            // nothing to lose: `check_end_of_track` calls
+            // `TransportCore::park`, which drains every already-queued span
+            // as its own last step before returning, and a parked callback
+            // publishes none after that. If a transport is ever left running
+            // unparked outside Playing/Paused, this stops being true and
+            // needs revisiting.
             if facts.playing {
                 let now = (self.clock)();
                 let mut transport = lock(&self.transport);
@@ -250,7 +266,15 @@ impl WaitService {
             // resuming a single release (§9).
             if self.park() {
                 facts.frozen_by_hook = true;
-                facts.playing = false;
+                // `facts.playing` is deliberately left untouched: it tracks
+                // "the transport is in a Playing-or-Paused generation",
+                // exactly as `Worker::pause()` leaves `self.state` at
+                // `Paused` rather than something the recompute below would
+                // skip. Clearing it here would report a position frozen at
+                // the instant of the park, which is precisely what
+                // `publish_progress`'s own doc comment says the recompute
+                // exists to avoid — and it would report `Exact` quality over
+                // a device that is still draining buffered frames.
                 self.announce(PlaybackEvent::StateChanged {
                     session_rev: facts.session_rev,
                     state: PlaybackState::Paused,
@@ -259,7 +283,6 @@ impl WaitService {
         } else if !frozen && facts.frozen_by_hook {
             self.release();
             facts.frozen_by_hook = false;
-            facts.playing = true;
             self.announce(PlaybackEvent::StateChanged {
                 session_rev: facts.session_rev,
                 state: PlaybackState::Playing,

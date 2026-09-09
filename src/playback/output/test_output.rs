@@ -70,11 +70,15 @@ impl TestOutput {
         while remaining >= period_nanos {
             // `playback` is a prediction ahead of the callback instant, exactly
             // as cpal reports it, so `now < t0` holds for the newest span.
+            // `self.now` stands in for `info.timestamp().callback` - the
+            // actual current instant - so it is what `fill` mirrors into the
+            // clock sink, distinct from `playback` which still stamps span
+            // `t0` only.
             let playback = Nanos(self.now.0 + self.latency.as_nanos() as u64);
             if !self.silent
                 && let Some(core) = self.core.as_mut()
             {
-                core.fill(&mut self.scratch, playback);
+                core.fill(&mut self.scratch, self.now, playback);
                 self.captured.extend_from_slice(&self.scratch);
             }
             self.now = Nanos(self.now.0 + period_nanos);
@@ -96,7 +100,7 @@ impl TestOutput {
         if !self.silent
             && let Some(core) = self.core.as_mut()
         {
-            core.fill(&mut self.scratch, playback);
+            core.fill(&mut self.scratch, self.now, playback);
             self.captured.extend_from_slice(&self.scratch);
         }
     }

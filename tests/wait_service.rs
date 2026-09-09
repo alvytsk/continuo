@@ -6,15 +6,18 @@
 //! read is blocked - needs a stalled server to stage, so it lives in Task 13
 //! (H13). This is only the layer that fact rests on.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use continuo::http::channel::{SourceInterrupt, WaitHook};
 use continuo::playback::engine::TransportCore;
 use continuo::playback::event::{PlaybackEvent, Progress};
-use continuo::playback::output::Nanos;
+use continuo::playback::handshake::Handshake;
+use continuo::playback::link::OutputLink;
+use continuo::playback::output::{Nanos, SpanRecord};
 use continuo::playback::state::PlaybackState;
-use continuo::playback::timeline::PositionQuality;
+use continuo::playback::timeline::{PositionQuality, Timeline};
 use continuo::playback::wait::{SessionFacts, WaitService};
 
 /// The four wiring arguments that only the freeze tests care about, in the
@@ -235,4 +238,91 @@ fn servicing_with_no_transport_is_harmless_and_repeatable() {
         Err(poisoned) => poisoned.into_inner().clone(),
     };
     assert_eq!(published.position, Duration::from_secs(3));
+}
+
+/// Fix-round evidence for the clock path: a real `TransportCore`, one
+/// already-published span to interpolate within, and a clock the test
+/// advances itself — with no `Worker` and no worker loop anywhere in this
+/// test. This is what proves `service_as(Servicing::BlockedRead)` can move
+/// the published position on its own, which is the entire point of the hook
+/// existing (G5/§8): a blocked decoder read reaches only this path.
+#[test]
+fn servicing_a_blocked_read_advances_the_position_as_the_clock_advances() {
+    const RATE: u32 = 48_000;
+
+    let link = Arc::new(OutputLink::new());
+    // Capacity 4 is plenty: this test publishes exactly one span, directly,
+    // bypassing the callback protocol entirely — `drain_spans` only ever
+    // pops from this ring, so nothing here needs `Phase::Run` to be running.
+    let (mut span_tx, span_rx) = rtrb::RingBuffer::<SpanRecord>::new(4);
+    let handshake = Handshake::new(Arc::clone(&link), span_rx);
+    let timeline = Timeline::new(RATE);
+    let core = TransportCore::new(handshake, timeline, Duration::ZERO, RATE);
+    let transport = Arc::new(Mutex::new(Some(core)));
+
+    // One second of media at 48 kHz, starting at t0 = 0.
+    span_tx
+        .push(SpanRecord {
+            generation: 0,
+            media_total_after: u64::from(RATE),
+            t0: Nanos(0),
+            frames: RATE,
+        })
+        .expect("a fresh 4-slot ring accepts one record");
+
+    let progress = Arc::new(Mutex::new(Progress {
+        session_rev: 5,
+        media: None,
+        position: Duration::ZERO,
+        quality: PositionQuality::Exact,
+    }));
+    let facts = Arc::new(Mutex::new(SessionFacts {
+        session_rev: 5,
+        media: None,
+        position: Duration::ZERO,
+        degraded: false,
+        playing: true,
+        frozen_by_hook: false,
+    }));
+    let (interrupt, events, outbox, backlog_empty) = inert();
+    let now = Arc::new(AtomicU64::new(100_000_000)); // 100ms into the span
+    let clock = {
+        let now = Arc::clone(&now);
+        Arc::new(move || Nanos(now.load(Ordering::Relaxed)))
+    };
+    let service = WaitService::new(
+        Arc::clone(&transport),
+        Arc::clone(&progress),
+        facts,
+        interrupt,
+        events,
+        outbox,
+        backlog_empty,
+        clock,
+    );
+
+    // First slice of a blocked read: the worker loop is not running, only
+    // the hook is - exactly `WaitHook::service`'s call shape.
+    service.service();
+    let first = match progress.lock() {
+        Ok(guard) => guard.position,
+        Err(poisoned) => poisoned.into_inner().position,
+    };
+
+    // The read is still blocked; the clock advances (as `CallbackCore::fill`
+    // would, on the audio backend thread) and the hook is serviced again -
+    // still with no worker loop pass in between.
+    now.store(300_000_000, Ordering::Relaxed); // 300ms into the span
+    service.service();
+    let second = match progress.lock() {
+        Ok(guard) => guard.position,
+        Err(poisoned) => poisoned.into_inner().position,
+    };
+
+    assert!(
+        second > first,
+        "position must advance across two blocked-read services with no \
+         worker loop pass between them: {first:?} -> {second:?}"
+    );
+    assert_eq!(second, Duration::from_millis(300));
 }

@@ -229,6 +229,7 @@ mod tests {
     use crate::playback::output::test_output::TestOutput;
     use std::cell::RefCell;
     use std::rc::Rc;
+    use std::sync::atomic::AtomicU64;
 
     const RATE: u32 = 48_000;
     const DEADLINE: Duration = Duration::from_millis(250);
@@ -245,7 +246,16 @@ mod tests {
         let link = Arc::new(OutputLink::new());
         let (pcm_tx, pcm_rx) = rtrb::RingBuffer::<f32>::new(48_000);
         let (span_tx, span_rx) = rtrb::RingBuffer::<SpanRecord>::new(span_capacity);
-        let core = CallbackCore::new(Arc::clone(&link), pcm_rx, span_tx, 2, RATE);
+        // These tests exercise the handshake protocol, not the clock mirror,
+        // so the sink is a throwaway nobody reads back.
+        let core = CallbackCore::new(
+            Arc::clone(&link),
+            pcm_rx,
+            span_tx,
+            2,
+            RATE,
+            Arc::new(AtomicU64::new(0)),
+        );
         let mut output = TestOutput::new(2, RATE, 480, Duration::from_millis(20));
         output.attach(core);
         Rig {

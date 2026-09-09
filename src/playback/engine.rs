@@ -323,7 +323,17 @@ pub struct TransportCore {
 }
 
 impl TransportCore {
-    fn new(handshake: Handshake, timeline: Timeline, anchor: Duration, sample_rate: u32) -> Self {
+    /// `pub`, unlike the rest of this impl block, so a test can build a real
+    /// `TransportCore` and exercise `WaitService::service_as` against it with
+    /// no `Worker` in the loop at all — the only way to prove the clock path
+    /// `observed_position` depends on actually advances a published position,
+    /// which nothing in this crate's `tests/` could otherwise reach.
+    pub fn new(
+        handshake: Handshake,
+        timeline: Timeline,
+        anchor: Duration,
+        sample_rate: u32,
+    ) -> Self {
         Self {
             handshake,
             timeline,
@@ -412,12 +422,18 @@ struct Worker {
     /// task): the one implementation `publish_progress` and `WaitHook::service`
     /// both call (Ruling 4).
     service: Arc<WaitService>,
-    /// A `Send + Sync` mirror of `output.now()`, refreshed here before every
-    /// call into `service`, so `WaitService` — reachable from inside a
-    /// decoder read that already holds `&mut self.source` and so cannot see
-    /// the rest of `Worker` — has a clock to read the transport with. See
-    /// `WaitService`'s own `clock` field for why this cannot simply be
-    /// `output.now()` called directly from there.
+    /// A `Send + Sync` mirror of the device's current instant, so
+    /// `WaitService` — reachable from inside a decoder read that already
+    /// holds `&mut self.source` and so cannot see the rest of `Worker`, let
+    /// alone `output` — has a clock to read the transport with. Two writers:
+    /// `CallbackCore::fill`, on the audio backend thread, on every
+    /// invocation — including while parked or frozen — which is the one
+    /// context still running while the decode thread is blocked, and
+    /// `Worker::publish_progress`, immediately before it calls into
+    /// `service`, which is what keeps an ordinary loop pass exactly as fresh
+    /// as `self.output.now()` rather than up to one buffer period stale. See
+    /// `publish_progress`'s, `CallbackCore::fill`'s and `WaitService`'s own
+    /// `clock` field's doc comments.
     device_clock: Arc<AtomicU64>,
     /// Mirrors whether `pending_events` is empty, so `WaitService::announce`
     /// can tell whether jumping the worker's own backlog would misreport
@@ -454,9 +470,14 @@ impl Worker {
             Arc::new(move || Nanos(device_clock.load(Ordering::Relaxed)))
         };
         // Nothing opens an HTTP source through `Worker::load` yet (a later
-        // task), so this never actually freezes anything today; it exists so
-        // `WaitService` has one to poll, and so the wiring is already correct
-        // once a source is handed a clone of it.
+        // task), so this never actually freezes anything today; it exists
+        // only so `WaitService` has one to poll. It is NOT ready to be handed
+        // to a real HTTP source as-is: `SourceInterrupt::new`'s argument is
+        // the byte-buffer capacity, and `IDLE_SOURCE_INTERRUPT_CAPACITY` sizes
+        // it for "never buffers anything," which would throttle a real fetch
+        // to a byte per wakeup. The task that wires HTTP into `Worker::load`
+        // must construct its own `SourceInterrupt` with a real capacity and
+        // replace this one - not clone and share this instance.
         let source_interrupt = SourceInterrupt::new(IDLE_SOURCE_INTERRUPT_CAPACITY);
         let service = WaitService::new(
             Arc::clone(&transport),
@@ -637,14 +658,22 @@ impl Worker {
 
     /// Drain `WaitService`'s outbox onto the back of `pending_events`. Called
     /// at the very top of every loop pass, before step 1's interrupt
-    /// handling, and again as `shutdown`'s own first action (Ruling 5) - see
-    /// `run`'s step 0 comment for why both are needed and why it must be the
-    /// back, never the front.
+    /// handling, again in `check_end_of_track` before it can emit
+    /// `EndOfTrack`/`StateChanged{Ended}` in the same pass a blocked read
+    /// returned in, and again as `shutdown`'s own first action (Ruling 5) -
+    /// see `run`'s step 0 comment for why the first and last are needed and
+    /// why it must be the back, never the front.
+    ///
+    /// Routed through `emit` rather than pushing directly: the hook is a
+    /// second emitter, and its events must answer to the same `PENDING_CAP`
+    /// and terminal-displaces-oldest drop policy as the worker's own, or a
+    /// source that freeze/thaws repeatedly during one long block could grow
+    /// `pending_events` without limit and without `dropped_events` ever
+    /// reflecting it.
     fn drain_outbox(&mut self) {
         for event in self.service.take_outbox() {
-            self.pending_events.push_back(event);
+            self.emit(event);
         }
-        self.note_backlog();
     }
 
     /// Mirrors whether `pending_events` is empty into `backlog_empty`, so
@@ -734,6 +763,14 @@ impl Worker {
     /// Recovery can abandon a rebuild without failing - a stop arriving while
     /// it re-seeks, say - and the caller must not report `Playing` over a
     /// pipeline that no longer exists.
+    ///
+    /// `lock(&self.transport)` here is a temporary: it is dropped at the end
+    /// of the `if` condition, before the body runs, so `set_state` below is
+    /// never called while the guard is still held. This pattern — a
+    /// condition-position `lock(...)` whose guard cannot outlive the
+    /// condition — recurs throughout this file (`reinstall`, `restore`,
+    /// `restart`, `play`'s match guard) and is always this same rule, not
+    /// repeated at every site.
     fn announce_playing(&mut self) {
         if lock(&self.transport).is_some() {
             self.set_state(PlaybackState::Playing);
@@ -781,12 +818,28 @@ impl Worker {
     /// the live position from the transport while playing, publishes the
     /// `Progress` snapshot, and services the freeze level. One implementation,
     /// two callers.
+    ///
+    /// Two writers keep `device_clock` current, for two different reasons.
+    /// `CallbackCore::fill` writes it on every callback invocation, including
+    /// while parked or frozen, which is what keeps the recompute below seeing
+    /// the clock advance while the worker itself is stuck inside a blocked
+    /// decoder read and this method is not running at all — Cause A this
+    /// exists to fix. This method *also* writes it, immediately before
+    /// `service_as`, because it is the only writer that can be exactly as
+    /// fresh as `self.output.now()` at the instant this recompute actually
+    /// runs: `CallbackCore::fill` only fires once per output buffer period
+    /// (2 ms with this crate's own `TestOutput` harness, and it is what
+    /// `capture_position`'s protocol round-trip is compared against in
+    /// `tests/engine_contract.rs`), so relying on it alone during an ordinary
+    /// loop pass would leave the published position up to one buffer period
+    /// behind a freeze-captured one taken moments later — which is exactly
+    /// the discrepancy that broke `stop_preserves_the_logical_position` and
+    /// its siblings the first time this was tried. Reading `self.output.now()`
+    /// unconditionally is safe even while idle: it can return `Nanos(0)`
+    /// (`CpalOutput::now()`'s `None` arm) when no stream is open, but nothing
+    /// ever reads `device_clock` unless `facts.playing` is true, and that is
+    /// only ever true when a transport - and so a stream - exists.
     fn publish_progress(&mut self) {
-        // `AudioOutput::now()` needs `&self.output`, which the hook cannot
-        // reach once it is called from inside a decoder read (see
-        // `TransportCore`'s and `WaitService`'s doc comments). Refreshing this
-        // mirror here, synchronously, right before `service_as`, is what lets
-        // that same recompute run from either caller.
         self.device_clock
             .store(self.output.now().0, Ordering::Relaxed);
         {
@@ -994,6 +1047,11 @@ impl Worker {
             span_tx,
             channels,
             config.sample_rate,
+            // The callback thread is the one context still running while the
+            // decode thread is blocked inside a read, so it is the only
+            // place that can keep `device_clock` live for `WaitService`
+            // during that block (see `CallbackCore::fill`'s doc comment).
+            Arc::clone(&self.device_clock),
         );
         self.output.open(&config, Arc::clone(&link), core)?;
 
@@ -1326,6 +1384,14 @@ impl Worker {
     /// the timeline reports only after the final span's predicted play time
     /// has passed - not when the ring merely empties.
     fn check_end_of_track(&mut self) {
+        // Symmetric with `shutdown()`: this is the one place besides `run()`'s
+        // own step 0 that can emit in the same pass a blocked read returned
+        // in — `pump_audio`, called just before this, is where that read
+        // lives. Draining first, before the early returns below, closes the
+        // window step 0 does not cover: a `EndOfTrack`/`StateChanged{Ended}`
+        // this call is about to emit must not land ahead of a `Paused` the
+        // hook announced earlier in the very same pass.
+        self.drain_outbox();
         if self.state != PlaybackState::Playing || !self.decoder_drained {
             return;
         }
