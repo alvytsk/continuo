@@ -462,7 +462,7 @@ fn volume_survives_the_restart() {
 
     let state = reload(dir.path());
     assert_eq!(state.volume(), Volume::new(0.25));
-    assert_eq!(state.current_media, Some(track_id()));
+    assert_eq!(state.current_media(), Some(&track_id()));
 }
 
 #[test]

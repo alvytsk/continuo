@@ -24,7 +24,7 @@ fn store(dir: &Path) -> StateStore {
 
 fn state_with(name: &str, secs: u64) -> PersistedState {
     let mut state = PersistedState::default();
-    state.current_media = Some(media(name));
+    state.set_current_media(media(name));
     state.record(
         &PlaybackCheckpoint {
             media: media(name),
@@ -56,7 +56,7 @@ fn a_missing_file_yields_empty_state_and_writing_stays_on() {
     let outcome = store(dir.path()).load();
     assert!(matches!(outcome.reason, LoadReason::Missing));
     assert!(outcome.writable);
-    assert!(outcome.state.checkpoints.is_empty());
+    assert!(outcome.state.is_empty());
 }
 
 #[test]
@@ -101,7 +101,7 @@ fn an_overwrite_replaces_rather_than_truncates() {
 
     let outcome = store.load();
     assert!(matches!(outcome.reason, LoadReason::Loaded));
-    assert_eq!(outcome.state.checkpoints.len(), 1);
+    assert_eq!(outcome.state.len(), 1);
 }
 
 #[test]

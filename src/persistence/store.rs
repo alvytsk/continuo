@@ -135,6 +135,18 @@ impl StateStore {
     }
 
     pub fn write(&self, state: &PersistedState) -> Result<(), PersistenceError> {
+        // The version the file claims is this build's, asserted here rather than
+        // taken from the snapshot on trust: a file stamped with a version this
+        // build cannot read would be quarantined or preserved by its own next
+        // load (D3). Only a defect inside this crate could get one here — the
+        // field is private to the model and writing is already disabled for
+        // every version but this one — so it is an assertion, not a repair, and
+        // it stays out of the release path where D11 forbids a panic.
+        debug_assert_eq!(
+            state.schema_version(),
+            SCHEMA_VERSION,
+            "only this build's schema version is ever written"
+        );
         let dir = self.parent();
         self.prepare_directory(dir)?;
 

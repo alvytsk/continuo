@@ -209,8 +209,8 @@ fn a_media_switch_produces_one_snapshot_carrying_both_halves() {
         "the outgoing entry comes from last_sample; load() has already overwritten the engine's position"
     );
     assert_eq!(
-        state.current_media,
-        Some(media("b")),
+        state.current_media(),
+        Some(&media("b")),
         "and the move of current_media is the same mutation"
     );
 }
@@ -708,7 +708,7 @@ fn a_launch_that_never_establishes_still_writes_volume_and_current_media() {
 
     let final_state = session.shutdown_snapshot(&progress(1, "a", 0), clock.sample());
     assert_eq!(final_state.volume(), Volume::new(0.25));
-    assert_eq!(final_state.current_media, Some(media("a")));
+    assert_eq!(final_state.current_media(), Some(&media("a")));
     assert!(
         final_state.entry_for(&media("a")).is_none(),
         "neither of those is a position claim"

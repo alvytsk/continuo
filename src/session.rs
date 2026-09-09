@@ -321,7 +321,7 @@ impl Session {
     /// `completed` in the same breath.
     fn adopt_media(&mut self, media: MediaId, completed: bool) {
         self.current_media = Some(media.clone());
-        self.state.current_media = Some(media);
+        self.state.set_current_media(media);
         self.completed = completed;
     }
 

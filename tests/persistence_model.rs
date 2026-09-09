@@ -22,7 +22,7 @@ fn checkpoint(name: &str, secs: u64) -> PlaybackCheckpoint {
 fn a_recorded_state_round_trips_through_json() {
     let mut state = PersistedState::default();
     state.set_volume(Volume::new(0.5));
-    state.current_media = Some(media("a"));
+    state.set_current_media(media("a"));
     state.record(&checkpoint("a", 93), false);
 
     let json = serde_json::to_string(&state).unwrap();
@@ -34,9 +34,9 @@ fn a_recorded_state_round_trips_through_json() {
     );
 
     let back: PersistedState = serde_json::from_str(&json).unwrap();
-    assert_eq!(back.schema_version, SCHEMA_VERSION);
+    assert_eq!(back.schema_version(), SCHEMA_VERSION);
     assert_eq!(back.volume(), Volume::new(0.5));
-    assert_eq!(back.current_media, Some(media("a")));
+    assert_eq!(back.current_media(), Some(&media("a")));
     assert_eq!(
         back.entry_for(&media("a")).unwrap().position,
         Duration::from_secs(93)
@@ -107,16 +107,12 @@ fn eviction_takes_the_lowest_touch_seq_that_is_not_current() {
         state.record(&checkpoint(&format!("m{index}"), index as u64), false);
     }
     // m0 is the oldest, so make it current and watch m1 go instead.
-    state.current_media = Some(media("m0"));
-    assert_eq!(state.checkpoints.len(), MAX_ENTRIES);
+    state.set_current_media(media("m0"));
+    assert_eq!(state.len(), MAX_ENTRIES);
 
     state.record(&checkpoint("incoming", 1), false);
 
-    assert_eq!(
-        state.checkpoints.len(),
-        MAX_ENTRIES,
-        "the cap counts the current entry"
-    );
+    assert_eq!(state.len(), MAX_ENTRIES, "the cap counts the current entry");
     assert!(
         state.entry_for(&media("m0")).is_some(),
         "the current entry is never evictable"
@@ -135,7 +131,7 @@ fn updating_an_existing_entry_at_the_cap_evicts_nothing() {
         state.record(&checkpoint(&format!("m{index}"), index as u64), false);
     }
     state.record(&checkpoint("m5", 999), false);
-    assert_eq!(state.checkpoints.len(), MAX_ENTRIES);
+    assert_eq!(state.len(), MAX_ENTRIES);
     assert_eq!(
         state.entry_for(&media("m5")).unwrap().position,
         Duration::from_secs(999)

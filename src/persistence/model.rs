@@ -25,6 +25,11 @@ pub struct PersistedCheckpoint {
     pub updated_at: OffsetDateTime,
 }
 
+/// Every field is private, so the paths that can write a stored position are an
+/// enumeration the compiler keeps rather than one a reader has to trust: a
+/// position reaches the map through [`PersistedState::record`] and nowhere else.
+/// The accessors below are the whole surface.
+///
 /// `next_seq` is derived, never stored (§10). Deserialization goes through
 /// [`RawState`] so that deriving it is the only way to build one from a file:
 /// a `#[serde(skip)]` field would arrive as `0` and hand every caller a
@@ -32,10 +37,10 @@ pub struct PersistedCheckpoint {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(from = "RawState")]
 pub struct PersistedState {
-    pub schema_version: u32,
-    pub current_media: Option<MediaId>,
+    schema_version: u32,
+    current_media: Option<MediaId>,
     volume: f32,
-    pub checkpoints: BTreeMap<MediaId, PersistedCheckpoint>,
+    checkpoints: BTreeMap<MediaId, PersistedCheckpoint>,
     #[serde(skip)]
     next_seq: u64,
 }
@@ -95,6 +100,33 @@ impl PersistedState {
 
     pub fn set_volume(&mut self, volume: Volume) {
         self.volume = volume.as_gain();
+    }
+
+    /// Read-only: no path outside this module can change the version a snapshot
+    /// carries, and the store asserts [`SCHEMA_VERSION`] again before it writes.
+    pub fn schema_version(&self) -> u32 {
+        self.schema_version
+    }
+
+    pub fn current_media(&self) -> Option<&MediaId> {
+        self.current_media.as_ref()
+    }
+
+    /// Named rather than ambient: the policy moves `current_media` in the same
+    /// mutation that records the outgoing entry, and a plain field would let a
+    /// later edit move it from anywhere.
+    pub fn set_current_media(&mut self, media: MediaId) {
+        self.current_media = Some(media);
+    }
+
+    /// How many media identities the file remembers, which is what the cap
+    /// bounds (D2).
+    pub fn len(&self) -> usize {
+        self.checkpoints.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.checkpoints.is_empty()
     }
 
     pub fn entry_for(&self, media: &MediaId) -> Option<&PersistedCheckpoint> {
