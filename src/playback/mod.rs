@@ -13,3 +13,4 @@ pub mod resample;
 pub mod state;
 pub mod timeline;
 pub mod volume;
+pub mod wait;

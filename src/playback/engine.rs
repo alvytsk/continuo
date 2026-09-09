@@ -9,13 +9,14 @@
 
 use std::any::Any;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, RecvError, Sender, TrySendError, select};
 
+use crate::http::channel::SourceInterrupt;
 use crate::http::error::RemoteFailure;
 use crate::media::id::{AbsolutePath, MediaId};
 use crate::media::source::SourceLocation;
@@ -29,20 +30,38 @@ use super::event::{PlaybackEvent, Progress, ShutdownReport, StartDisposition};
 use super::handshake::Handshake;
 use super::link::OutputLink;
 use super::output::cpal_output::{CpalOutput, OutputFault};
-use super::output::{AudioOutput, NegotiatedOutput, OutputRequest, SpanRecord};
+use super::output::{AudioOutput, Nanos, NegotiatedOutput, OutputRequest, SpanRecord};
 use super::resample::Converter;
 use super::state::PlaybackState;
 use super::timeline::{PositionQuality, Timeline};
 use super::volume::Volume;
+use super::wait::{Servicing, SessionFacts, WaitService};
 
 const STOP: u8 = 1;
 const SHUTDOWN: u8 = 2;
 const TICK: Duration = Duration::from_millis(10);
-const DEADLINE: Duration = Duration::from_millis(250);
+/// `pub(crate)` so `wait.rs`'s `WaitService` — the hook's other caller — waits
+/// on the exact same deadline as the worker's own handshake calls.
+pub(crate) const DEADLINE: Duration = Duration::from_millis(250);
+/// Idle wait inside a handshake. The device runs on its own thread, so the
+/// worker only has to stop spinning while it waits for an acknowledgment.
+/// `pub(crate)`, shared with `wait.rs`, so the hook's `park`/`release` calls
+/// pump the wait exactly as the worker's own do.
+pub(crate) const PUMP_NAP: Duration = Duration::from_micros(250);
 /// Ordinary events may not occupy these; terminal outcomes may.
-const RESERVED_EVENT_SLOTS: usize = 9;
-const EVENT_CAPACITY: usize = 64;
+///
+/// `pub(crate)` (Ruling 7) so `wait.rs`'s `announce` — the hook's own event
+/// path — respects the same reserve `flush_events` does; the hook is a second
+/// emitter and must never occupy the reserved tail.
+pub(crate) const RESERVED_EVENT_SLOTS: usize = 9;
+pub(crate) const EVENT_CAPACITY: usize = 64;
 const PENDING_CAP: usize = 128;
+/// Capacity for the `SourceInterrupt` every worker owns so `WaitService` has
+/// one to poll for a freeze. Unused for buffering in this build — nothing
+/// opens an HTTP source through `Worker::load` yet, so nothing ever pushes a
+/// byte into it — and sized minimally rather than left at zero for that
+/// reason.
+const IDLE_SOURCE_INTERRUPT_CAPACITY: usize = 1;
 
 // Reserve budget. Terminal outcomes may occupy the reserved tail; ordinary
 // events may not. The worst case is one loop iteration emitting, at most:
@@ -70,9 +89,6 @@ const SPAN_CAPACITY: usize = 64;
 /// How much audio the PCM ring holds. Large enough that one loop iteration
 /// cannot drain it, small enough that discarding it on a seek is cheap.
 const RING_MILLIS: u64 = 300;
-/// Idle wait inside a handshake. The device runs on its own thread, so the
-/// worker only has to stop spinning while it waits for an acknowledgment.
-const PUMP_NAP: Duration = Duration::from_micros(250);
 /// Floor on the interval between aggregated diagnostic warnings.
 const DIAGNOSTIC_INTERVAL: Duration = Duration::from_millis(500);
 /// Refinement budget for an *explicit* seek. Preserving seeks pass `None`.
@@ -291,36 +307,64 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 /// this (Ruling 1's lock order note lives in `wait.rs`, which is the module
 /// that actually has two lock-takers to order).
 ///
-/// `pub` (not just the fields) so `wait.rs` - and `tests/wait_service.rs` -
-/// can name `Arc<Mutex<Option<TransportCore>>>`; nothing outside this module
-/// needs to build one, so no constructor is exported alongside it.
-///
 /// `pcm`, `link` and `config` stay off this struct and live as plain `Worker`
-/// fields instead (done in step 1, ahead of this lock): `pcm` is
-/// `rtrb::Producer<f32>`, which is `!Sync` and must stay on the worker
-/// regardless — the hook must never push audio — and `link`/`config` are not
-/// needed by the hook at all (`Handshake` already holds its own clone of
-/// `link`), so putting them under this lock would only widen the hook's reach
-/// for no benefit and force `pump_audio` to touch this lock for information
-/// it does not need (Ruling 3).
+/// fields instead: `pcm` is `rtrb::Producer<f32>`, which is `!Sync` and must
+/// stay on the worker regardless — the hook must never push audio — and
+/// `link`/`config` are not needed by the hook at all (`Handshake` already
+/// holds its own clone of `link`), so putting them under this lock would only
+/// widen the hook's reach for no benefit and force `pump_audio` to touch this
+/// lock for information it does not need (Ruling 3).
 pub struct TransportCore {
     handshake: Handshake,
     timeline: Timeline,
     /// Media position the current generation's frame counting starts from.
     anchor: Duration,
-    // Not read until step 4, when `WaitService`'s shared recompute needs it
-    // to convert played frames back to a `Duration` without a second lookup
-    // into `Worker::config`, which the hook cannot reach. Carried from step 1
-    // regardless, alongside the other three fields the interface specifies,
-    // rather than added piecemeal later.
-    #[allow(dead_code)]
     sample_rate: u32,
+}
+
+impl TransportCore {
+    fn new(handshake: Handshake, timeline: Timeline, anchor: Duration, sample_rate: u32) -> Self {
+        Self {
+            handshake,
+            timeline,
+            anchor,
+            sample_rate,
+        }
+    }
+
+    /// Drain spans and return the position implied by what has actually
+    /// played.
+    pub(crate) fn observed_position(&mut self, now: Nanos) -> Duration {
+        self.handshake.drain_spans(&mut self.timeline);
+        let played = self.timeline.played_frames(now);
+        self.anchor + frames_to_duration(played, self.sample_rate)
+    }
+
+    pub(crate) fn quality(&self) -> PositionQuality {
+        self.timeline.quality()
+    }
+
+    /// Park the callback, for the hook's freeze arm. Returns whether it was
+    /// acknowledged, exactly as `Handshake::park`'s `Result` does, just
+    /// flattened to a `bool` since the caller only branches on which.
+    pub(crate) fn park(&mut self, pump: &mut dyn FnMut(), deadline: Duration) -> bool {
+        self.handshake
+            .park(&mut self.timeline, pump, deadline)
+            .is_ok()
+    }
+
+    /// Release a parked callback, for the hook's thaw arm.
+    pub(crate) fn release(&mut self) {
+        self.handshake.release();
+    }
 }
 
 struct Worker {
     output: Box<dyn AudioOutput>,
     faults: Receiver<OutputFault>,
     transport: Arc<Mutex<Option<TransportCore>>>,
+    /// The PCM producer side of the ring. `!Sync`, so it stays here rather
+    /// than behind `transport`'s lock — see `TransportCore`'s doc comment.
     pcm: Option<rtrb::Producer<f32>>,
     link: Option<Arc<OutputLink>>,
     config: Option<NegotiatedOutput>,
@@ -345,7 +389,6 @@ struct Worker {
     shutting_down: bool,
     receivers_gone: bool,
     pending_events: VecDeque<PlaybackEvent>,
-    progress: Arc<Mutex<Progress>>,
     commands: Receiver<PlaybackCommand>,
     events: Sender<PlaybackEvent>,
     liveness: Sender<()>,
@@ -360,6 +403,26 @@ struct Worker {
     device_warnings: u64,
     reported_diagnostics: u64,
     last_diagnostic: Instant,
+    /// The scalars the shared `service` needs, mirrored from the fields above
+    /// on every `publish_progress` pass. Lock order: this before `transport`
+    /// (Ruling 1) — enforced by `WaitService`, which is the only thing that
+    /// ever takes both.
+    facts: Arc<Mutex<SessionFacts>>,
+    /// Shared with the wait hook once one is wired to an open source (a later
+    /// task): the one implementation `publish_progress` and `WaitHook::service`
+    /// both call (Ruling 4).
+    service: Arc<WaitService>,
+    /// A `Send + Sync` mirror of `output.now()`, refreshed here before every
+    /// call into `service`, so `WaitService` — reachable from inside a
+    /// decoder read that already holds `&mut self.source` and so cannot see
+    /// the rest of `Worker` — has a clock to read the transport with. See
+    /// `WaitService`'s own `clock` field for why this cannot simply be
+    /// `output.now()` called directly from there.
+    device_clock: Arc<AtomicU64>,
+    /// Mirrors whether `pending_events` is empty, so `WaitService::announce`
+    /// can tell whether jumping the worker's own backlog would misreport
+    /// event order. Maintained after every mutation of `pending_events`.
+    backlog_empty: Arc<AtomicBool>,
 }
 
 impl Worker {
@@ -374,10 +437,41 @@ impl Worker {
         wake: Receiver<()>,
         interrupt: Arc<AtomicU8>,
     ) -> Self {
+        let transport = Arc::new(Mutex::new(None));
+        let facts = Arc::new(Mutex::new(SessionFacts {
+            session_rev: 0,
+            media: None,
+            position: Duration::ZERO,
+            degraded: false,
+            playing: false,
+            frozen_by_hook: false,
+        }));
+        let backlog_empty = Arc::new(AtomicBool::new(true));
+        let outbox = Arc::new(Mutex::new(VecDeque::new()));
+        let device_clock = Arc::new(AtomicU64::new(0));
+        let clock: Arc<dyn Fn() -> Nanos + Send + Sync> = {
+            let device_clock = Arc::clone(&device_clock);
+            Arc::new(move || Nanos(device_clock.load(Ordering::Relaxed)))
+        };
+        // Nothing opens an HTTP source through `Worker::load` yet (a later
+        // task), so this never actually freezes anything today; it exists so
+        // `WaitService` has one to poll, and so the wiring is already correct
+        // once a source is handed a clone of it.
+        let source_interrupt = SourceInterrupt::new(IDLE_SOURCE_INTERRUPT_CAPACITY);
+        let service = WaitService::new(
+            Arc::clone(&transport),
+            Arc::clone(&progress),
+            Arc::clone(&facts),
+            source_interrupt,
+            events.clone(),
+            outbox,
+            Arc::clone(&backlog_empty),
+            clock,
+        );
         Self {
             output,
             faults,
-            transport: Arc::new(Mutex::new(None)),
+            transport,
             pcm: None,
             link: None,
             config: None,
@@ -399,7 +493,6 @@ impl Worker {
             shutting_down: false,
             receivers_gone: false,
             pending_events: VecDeque::new(),
-            progress,
             commands,
             events,
             liveness,
@@ -414,6 +507,10 @@ impl Worker {
             last_diagnostic: Instant::now()
                 .checked_sub(DIAGNOSTIC_INTERVAL)
                 .unwrap_or_else(Instant::now),
+            facts,
+            service,
+            device_clock,
+            backlog_empty,
         }
     }
 
@@ -422,6 +519,21 @@ impl Worker {
         let wake = self.wake.clone();
         let liveness = self.liveness.clone();
         loop {
+            // 0. Drain whatever the hook announced while a read was blocked,
+            //    onto the BACK of pending_events, before anything else can
+            //    emit (Ruling 5). Two reasons this has to be first, ahead of
+            //    even step 1's interrupt handling:
+            //    - Step 1's stop branch calls `do_stop`, which emits
+            //      `StateChanged{Stopped}`. Draining after it would put a
+            //      `Paused` the hook announced *earlier* behind it.
+            //    - Step 1's shutdown branch returns `pending_events`
+            //      immediately. Anything still in the outbox at that point
+            //      would never reach the shutdown report, breaking D19's
+            //      losslessness for exactly the events a stalled read
+            //      produced. `shutdown()` also drains it, as its own first
+            //      action, so every exit out of this loop carries it.
+            self.drain_outbox();
+
             // 1. Out-of-band interrupts. Shutdown dominates stop.
             let flags = self.interrupt.swap(0, Ordering::Acquire);
             if flags & SHUTDOWN != 0 {
@@ -432,14 +544,10 @@ impl Worker {
                 self.do_stop();
             }
 
-            // 2. Spans -> timeline -> keep-latest progress snapshot.
+            // 2. Spans -> timeline -> keep-latest progress snapshot, through
+            //    the same `WaitService` the hook uses (one implementation,
+            //    two callers - Ruling 4).
             self.collect_diagnostics();
-            {
-                let mut guard = lock(&self.transport);
-                if let Some(transport) = guard.as_mut() {
-                    transport.handshake.drain_spans(&mut transport.timeline);
-                }
-            }
             self.publish_progress();
 
             // 3. Asynchronous device faults.
@@ -524,6 +632,28 @@ impl Worker {
             }
         }
         self.pending_events.push_back(event);
+        self.note_backlog();
+    }
+
+    /// Drain `WaitService`'s outbox onto the back of `pending_events`. Called
+    /// at the very top of every loop pass, before step 1's interrupt
+    /// handling, and again as `shutdown`'s own first action (Ruling 5) - see
+    /// `run`'s step 0 comment for why both are needed and why it must be the
+    /// back, never the front.
+    fn drain_outbox(&mut self) {
+        for event in self.service.take_outbox() {
+            self.pending_events.push_back(event);
+        }
+        self.note_backlog();
+    }
+
+    /// Mirrors whether `pending_events` is empty into `backlog_empty`, so
+    /// `WaitService::announce` can tell whether jumping the worker's own
+    /// backlog would misreport event order. Called after every mutation of
+    /// `pending_events`.
+    fn note_backlog(&self) {
+        self.backlog_empty
+            .store(self.pending_events.is_empty(), Ordering::Release);
     }
 
     fn free_event_slots(&self) -> usize {
@@ -547,10 +677,12 @@ impl Worker {
                 }
                 Err(TrySendError::Disconnected(_)) => {
                     self.receivers_gone = true;
+                    self.note_backlog();
                     return;
                 }
             }
         }
+        self.note_backlog();
     }
 
     /// Counters, not a queue: an aggregated warning goes out only when an
@@ -644,60 +776,65 @@ impl Worker {
 
     // --------------------------------------------------------------- progress
 
-    fn quality(&self) -> PositionQuality {
-        if self.degraded {
-            return PositionQuality::Degraded;
-        }
-        match self.state {
-            PlaybackState::Playing | PlaybackState::Paused => lock(&self.transport)
-                .as_ref()
-                .map(|t| t.timeline.quality())
-                .unwrap_or(PositionQuality::Exact),
-            _ => PositionQuality::Exact,
-        }
-    }
-
+    /// Mirror the worker's own truth into `SessionFacts`, then run the same
+    /// `service` the hook does (Ruling 4) — which is what actually recomputes
+    /// the live position from the transport while playing, publishes the
+    /// `Progress` snapshot, and services the freeze level. One implementation,
+    /// two callers.
     fn publish_progress(&mut self) {
-        // Paused counts as well: parking silences the callback, but the frames
-        // it already handed to the device still play out, so the position goes
-        // on rising for one output latency after the park and only then
-        // settles. Freezing the number at the instant of the park would report
-        // a position slightly behind what the listener actually heard.
-        if matches!(self.state, PlaybackState::Playing | PlaybackState::Paused)
-            && let Some(rate) = self.config.as_ref().map(|c| c.sample_rate)
+        // `AudioOutput::now()` needs `&self.output`, which the hook cannot
+        // reach once it is called from inside a decoder read (see
+        // `TransportCore`'s and `WaitService`'s doc comments). Refreshing this
+        // mirror here, synchronously, right before `service_as`, is what lets
+        // that same recompute run from either caller.
+        self.device_clock
+            .store(self.output.now().0, Ordering::Relaxed);
         {
-            let now = self.output.now();
-            let mut guard = lock(&self.transport);
-            if let Some(transport) = guard.as_mut() {
-                let played = transport.timeline.played_frames(now);
-                self.position = transport.anchor + frames_to_duration(played, rate);
-            }
+            let mut facts = lock(&self.facts);
+            facts.session_rev = self.session_rev;
+            facts.media = self.media.clone();
+            facts.position = self.position;
+            facts.degraded = self.degraded;
+            // Paused counts as well as Playing: parking silences the
+            // callback, but the frames it already handed to the device still
+            // play out, so the position goes on rising for one output
+            // latency after the park and only then settles. Freezing the
+            // number at the instant of the park would report a position
+            // slightly behind what the listener actually heard.
+            facts.playing = matches!(self.state, PlaybackState::Playing | PlaybackState::Paused);
+            // `frozen_by_hook` is deliberately left untouched here: it is the
+            // hook's own bookkeeping (Ruling 1's `SessionFacts` lives in
+            // `wait.rs`), and this pass has nothing new to tell it.
         }
-        let snapshot = Progress {
-            session_rev: self.session_rev,
-            media: self.media.clone(),
-            position: self.position,
-            quality: self.quality(),
-        };
-        // Keep-latest: nothing but the assignment happens under the lock.
-        match self.progress.lock() {
-            Ok(mut slot) => *slot = snapshot,
-            Err(poisoned) => *poisoned.into_inner() = snapshot,
-        }
+        self.service.service_as(Servicing::WorkerLoop);
+        // Read back whatever the shared recompute settled on, so
+        // `self.position` - the field every command (`SeekBy` among them)
+        // reads as "the current position" - stays live while playing, exactly
+        // as this method used to keep it before the recompute moved into
+        // `WaitService` so the hook could share it.
+        self.position = lock(&self.facts).position;
     }
 
     /// Read the link's counters before anything else can swap them away, and
     /// forward the span losses to the timeline that has to account for them.
+    ///
+    /// Runs before `publish_progress`: `Handshake::drain_spans` (invoked
+    /// inside `TransportCore::observed_position`, which `publish_progress`
+    /// reaches through `service_as`) reads the same link and forwards
+    /// `spans_dropped` into the timeline itself, so reading it here first is
+    /// what makes that second read come back zero and leaves the timeline as
+    /// the one place span losses actually get counted.
     fn collect_diagnostics(&mut self) {
         let Some(link) = self.link.as_ref() else {
             return;
         };
         let diagnostics = link.take_diagnostics();
-        let mut guard = lock(&self.transport);
-        if let Some(transport) = guard.as_mut() {
-            transport.timeline.note_dropped(diagnostics.spans_dropped);
+        {
+            let mut guard = lock(&self.transport);
+            if let Some(core) = guard.as_mut() {
+                core.timeline.note_dropped(diagnostics.spans_dropped);
+            }
         }
-        drop(guard);
         self.lost_spans += u64::from(diagnostics.spans_dropped);
         // Underruns after the decoder has run dry are the expected sound of a
         // track ending, not a glitch worth reporting.
@@ -886,12 +1023,7 @@ impl Worker {
         self.pcm = Some(pcm_tx);
         let sample_rate = config.sample_rate;
         self.config = Some(config);
-        *lock(&self.transport) = Some(TransportCore {
-            handshake,
-            timeline,
-            anchor,
-            sample_rate,
-        });
+        *lock(&self.transport) = Some(TransportCore::new(handshake, timeline, anchor, sample_rate));
         self.prime_and_run(playing);
         Ok(())
     }
@@ -916,11 +1048,11 @@ impl Worker {
         // everything played since the last install.
         let discarded = {
             let mut guard = lock(&self.transport);
-            let Some(transport) = guard.as_mut() else {
+            let Some(core) = guard.as_mut() else {
                 return Ok(());
             };
             let mut pump = || std::thread::sleep(PUMP_NAP);
-            transport.handshake.discard(&mut pump, DEADLINE)
+            core.handshake.discard(&mut pump, DEADLINE)
         };
         // The device stopped answering. Recreate it rather than run on against
         // a transport whose state can no longer be established - and pass the
@@ -934,21 +1066,20 @@ impl Worker {
         let anchor = self.position;
         let installed = {
             let mut guard = lock(&self.transport);
-            let Some(transport) = guard.as_mut() else {
+            let Some(core) = guard.as_mut() else {
                 return Ok(());
             };
             // Set here, through the lock, rather than at construction: unlike
             // `open_transport`, this generation reuses an already-existing
             // `TransportCore` rather than building a new one.
-            transport.anchor = anchor;
+            core.anchor = anchor;
+            let TransportCore {
+                handshake,
+                timeline,
+                ..
+            } = core;
             let mut pump = || std::thread::sleep(PUMP_NAP);
-            transport.handshake.install(
-                generation,
-                false,
-                &mut transport.timeline,
-                &mut pump,
-                DEADLINE,
-            )
+            handshake.install(generation, false, timeline, &mut pump, DEADLINE)
         };
         if installed.is_err() {
             return self.rebuild("handshake timeout", playing);
@@ -960,9 +1091,9 @@ impl Worker {
     /// Everything that a new generation invalidates, in one place.
     ///
     /// The anchor - `self.position` at the moment this generation starts
-    /// counting from - is not among them: it lives on `TransportCore` now, so
+    /// counting from - is not among them: it lives in `TransportCore` now, so
     /// a caller building a brand-new one (`open_transport`) passes it straight
-    /// to the constructor, and `reinstall`, which reuses an existing one,
+    /// to `TransportCore::new`, and `reinstall`, which reuses an existing one,
     /// writes it back through the lock itself, right after this returns.
     fn reset_generation_state(&mut self) {
         self.generation = self.generation.wrapping_add(1);
@@ -986,11 +1117,14 @@ impl Worker {
             return;
         }
         let mut guard = lock(&self.transport);
-        if let Some(transport) = guard.as_mut() {
-            let generation = transport.handshake.generation();
-            transport
-                .handshake
-                .start_running(generation, &mut transport.timeline);
+        if let Some(core) = guard.as_mut() {
+            let generation = core.handshake.generation();
+            let TransportCore {
+                handshake,
+                timeline,
+                ..
+            } = core;
+            handshake.start_running(generation, timeline);
         }
     }
 
@@ -1007,15 +1141,19 @@ impl Worker {
                 transport, output, ..
             } = self;
             let mut guard = lock(transport);
-            let Some(transport) = guard.as_mut() else {
+            let Some(core) = guard.as_mut() else {
                 return true;
             };
-            let anchor = transport.anchor;
+            let anchor = core.anchor;
+            let TransportCore {
+                handshake,
+                timeline,
+                ..
+            } = core;
             let mut clock = || output.now();
             let mut pump = || std::thread::sleep(PUMP_NAP);
-            transport
-                .handshake
-                .freeze_and_capture(&mut transport.timeline, &mut clock, &mut pump, DEADLINE)
+            handshake
+                .freeze_and_capture(timeline, &mut clock, &mut pump, DEADLINE)
                 .map(|frames| anchor + frames_to_duration(frames, rate))
         };
         match captured {
@@ -1041,7 +1179,7 @@ impl Worker {
         // transport existed and its capture timed out.
         let anchor = lock(&self.transport)
             .as_ref()
-            .map(|t| t.anchor)
+            .map(|core| core.anchor)
             .unwrap_or(self.position);
         let generation = self.generation;
         let link = self.teardown();
@@ -1080,14 +1218,22 @@ impl Worker {
     }
 
     fn shutdown(&mut self) {
+        // Ruling 5: drained here too, as this method's own first action, so
+        // every exit out of `run()` carries whatever the hook announced while
+        // a read was blocked - see `run`'s step 0 comment. `capture_position`
+        // and `teardown` below can only emit through `pending_events`
+        // (neither calls `self.emit` directly), so nothing between here and
+        // `publish_progress` can reorder ahead of what was just drained.
+        self.drain_outbox();
         let captured_exactly = self.capture_position();
         self.teardown();
         self.source = None;
         self.state = PlaybackState::Idle;
         if !captured_exactly {
-            // quality() checks `degraded` before it looks at `state`, so this is
-            // what keeps a capture that timed out from being published as
-            // Exact on the strength of `state` having just become `Idle`.
+            // The published quality checks `degraded` before it looks at
+            // `state`, so this is what keeps a capture that timed out from
+            // being published as Exact on the strength of `state` having just
+            // become `Idle`.
             self.degraded = true;
         }
         // With the transport gone the recompute branch is skipped, so this
@@ -1187,22 +1333,29 @@ impl Worker {
             return;
         };
         let now = self.output.now();
+        // No call here reaches the decoder, so nothing risks a blocked read
+        // while this is held (Ruling 3 is about `pump_audio`, not this).
         let landed_anchor = {
             let mut guard = lock(&self.transport);
-            let Some(transport) = guard.as_mut() else {
+            let Some(core) = guard.as_mut() else {
                 return;
             };
-            if transport.timeline.played_frames(now) < self.pushed_total {
+            if core.timeline.played_frames(now) < self.pushed_total {
                 return;
             }
+            let anchor = core.anchor;
+            let TransportCore {
+                handshake,
+                timeline,
+                ..
+            } = core;
             let mut pump = || std::thread::sleep(PUMP_NAP);
-            // The outcome is deliberately ignored: a timed-out park does not
-            // prevent EndOfTrack from being reported - the decoder has
-            // genuinely run dry either way.
-            let _ = transport
-                .handshake
-                .park(&mut transport.timeline, &mut pump, DEADLINE);
-            transport.anchor
+            // The outcome is deliberately ignored, exactly as before this
+            // moved behind a lock: a timed-out park does not prevent
+            // EndOfTrack from being reported - the decoder has genuinely run
+            // dry either way.
+            let _ = handshake.park(timeline, &mut pump, DEADLINE);
+            anchor
         };
         self.position = landed_anchor + frames_to_duration(self.pushed_total, rate);
         let session_rev = self.session_rev;
@@ -1381,11 +1534,18 @@ impl Worker {
             PlaybackState::Paused
                 if lock(&self.transport).is_some() && self.requested_target.is_none() =>
             {
-                let mut guard = lock(&self.transport);
-                if let Some(transport) = guard.as_mut() {
-                    transport.handshake.release();
+                {
+                    let mut guard = lock(&self.transport);
+                    if let Some(core) = guard.as_mut() {
+                        core.handshake.release();
+                    }
                 }
-                drop(guard);
+                // If the hook parked for a freeze that has not yet thawed, an
+                // explicit `Play` from the application takes over: the flag
+                // no longer describes reality once this dispatch has released
+                // the transport itself (the counterpart to `pause`'s check of
+                // the same flag, below).
+                lock(&self.facts).frozen_by_hook = false;
                 self.set_state(PlaybackState::Playing);
             }
             PlaybackState::Loading | PlaybackState::Paused | PlaybackState::Stopped => {
@@ -1453,14 +1613,25 @@ impl Worker {
         if self.state != PlaybackState::Playing {
             return;
         }
+        // Idempotent with respect to the hook: if it already parked the
+        // transport for a freeze and announced `Paused` itself, that
+        // announcement already stands, so this only updates local state
+        // rather than parking (redundantly) and re-emitting.
+        if lock(&self.facts).frozen_by_hook {
+            self.state = PlaybackState::Paused;
+            return;
+        }
         let parked = {
-            let mut pump = || std::thread::sleep(PUMP_NAP);
             let mut guard = lock(&self.transport);
             match guard.as_mut() {
-                Some(transport) => {
-                    transport
-                        .handshake
-                        .park(&mut transport.timeline, &mut pump, DEADLINE)
+                Some(core) => {
+                    let TransportCore {
+                        handshake,
+                        timeline,
+                        ..
+                    } = core;
+                    let mut pump = || std::thread::sleep(PUMP_NAP);
+                    handshake.park(timeline, &mut pump, DEADLINE)
                 }
                 None => Ok(()),
             }
