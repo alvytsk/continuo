@@ -32,6 +32,27 @@ Five spec gaps found against the shipped tree; each is closed by a named task ra
 | G4 | §3's "HTTP must not duplicate that probe" versus the M1 property that a bad file reports with no device and no raw mode (`tests/cli_playback.rs`). | R5 above; Task 12. |
 | G5 | §8's wait-service hook is called from inside `source.next_planar()`, which already holds `&mut self.source`; the state it must service is `&mut` worker state, and `unsafe_code = "forbid"` rules out a lifetime-erased slot. | Task 9 moves `Handshake` + `Timeline` + the anchor behind `Arc<Mutex<TransportCore>>`, so the hook shares them by `Arc` and structurally cannot reach a decoder. |
 
+### Review round 1 — thirteen defects fixed in this document
+
+Every one was verified against the actual crate sources before being fixed, and each carries a test that fails without the fix.
+
+| # | Defect | Where it is fixed |
+|---|---|---|
+| 1 | `ErrorKind::Interrupted` for a retirement. `symphonia-core-0.6.1/src/io/media_source_stream.rs:432` swallows it inside `while !buf.is_empty()`, and `std`'s `read_exact` does the same — so latching it is a *guaranteed* infinite loop, the opposite of what the draft claimed. | Task 6: `ErrorKind::Other` carrying `RemoteFailure::Cancelled`, plus a test driving the real `MediaSourceStream::read_buf_exact`. |
+| 2 | `source()`-only error traversal. `symphonia-core-0.6.1/src/errors.rs:82` implements the deprecated `cause()` and not `source()`, and `io::Error::source()` returns the *payload's* source rather than the payload (`get_ref()` does that). Task 10's whole control flow rested on a function that would have returned `None` every time. | Task 6: `remote_cause` unwraps both explicitly. |
+| 3 | Pause could not park output during a blocked read. The worker never reaches its command loop, so a hook that only publishes progress leaves the output draining and `Paused` unannounced. | Task 9: `WaitService::service` gains a freeze arm that parks the transport and announces, with an outbox that preserves event ordering. |
+| 4 | Retirement woke only the synchronous reader. `push` awaited the channel's `Notify` while `retire` notified the interrupt's, and the fetch task's futures saw nothing but timeouts. | Task 3: one lock, three wake channels, all owned by `SourceInterrupt`; `cancelled()` races every await in Task 5. |
+| 5 | Paused time consumed the stall budget. A deadline computed once at entry keeps running through a pause and fails the very next read. | Task 3: `read` charges only unfrozen slices; Task 5's body awaits `wait_while_frozen()` before arming its timer. |
+| 6 | Malformed audio could still complete. A perfect transfer of corrupt bytes carries no `RemoteFailure`, so keying the failure on one drained to `EndOfTrack` — exactly what H8 forbids. | Task 10: any decode failure over a remote source fails the attempt; local keeps M1's warn-and-drain. |
+| 7 | No reopen path for seeks. Reopening was given only to `restore()`, so a seek after a stop or a retired seek hit `source.is_none()` and was rejected as "nothing is loaded". | Task 10: `ensure_source_open()`, called by `restore`, `seek_to` and `restart`. |
+| 8 | The opening deadline was checked around probing rather than inside it, so a slow trickle stays within every per-read stall budget and opens indefinitely. | Task 7: one `OpeningDeadline` clamped into every wait, with a `trickle` server script to prove it. |
+| 9 | `time_base + num_frames` treated as proof of `Native` seeking. Those describe timing; `MediaSource` (`io/mod.rs:42`) carries no seek evidence and `FormatReader` exposes no query. | Task 7: `DemuxerSeek::{Proven, Unproven}`; remote opens `Unknown` and is verified on demand, as §6 asks. |
+| 10 | `bytes 0-99/10` accepted, and `bytes 0-<u64::MAX>/*` overflowed `len()`. The body loop checked only for shortfall, never excess. | Task 2: `IntervalPastTotal` plus checked arithmetic; Task 5 rejects excess bytes during the loop. |
+| 11 | Only strong ETags compared. `Last-Modified` was stored and never read; weak ETags were discarded, against §7's best-effort comparison. | Task 2: all three compared; only *sending* a weak validator as `If-Range` stays forbidden. |
+| 12 | The promised 64 KiB transfer bound was not enforced — `response.chunk()` allocates whatever the transport yields. | Task 5: `push` fed in `chunk_bytes` slices, library buffering documented separately as §8 requires. |
+| 13 | `reqwest = { features = ["rustls-tls", "stream"] }` does not resolve: 0.13.5's TLS feature is `rustls`, and there is no `stream` feature at all (`chunk()` is inherent). | Task 1, with a `cargo tree -e features` check. |
+
+
 ## Global Constraints
 
 Every task's requirements implicitly include this section.
@@ -122,11 +143,18 @@ In `Cargo.toml`, under `[dependencies]`:
 
 ```toml
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "macros"] }
-reqwest = { version = "0.13", default-features = false, features = ["rustls-tls", "stream", "http2"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "http2"] }
 http = "1"
 ```
 
-`default-features = false` is load-bearing: it keeps `gzip`/`brotli`/`deflate` off, so reqwest never transparently decodes a body and §7's identity-encoding rule is enforceable. Do not add `reqwest`'s `blocking` feature — the worker must never `block_on`.
+**The feature names are verified against reqwest 0.13.5's own manifest, not carried over from 0.12.** The TLS feature is `rustls` (`rustls-tls` does not exist in 0.13). There is **no `stream` feature** in 0.13 either: `Response::chunk()` is an inherent async method, always available, and `bytes_stream()` is the one that would need `futures_core`. Do not add either name; `cargo build` fails on an unknown feature, so a mistake here is loud, but the wrong fix is to invent a feature rather than drop it.
+
+`default-features = false` is load-bearing twice over: it keeps `gzip`/`brotli`/`deflate`/`zstd` off, so reqwest never transparently decodes a body and §7's identity-encoding rule is enforceable, and it drops `default-tls`/`system-proxy`/`charset`. Do not add `reqwest`'s `blocking` feature — the worker must never `block_on`.
+
+Confirm the features resolved rather than trusting this list:
+
+Run: `cargo tree -p reqwest --depth 0 -e features 2>&1 | head -20`
+Expected: `rustls` and `http2` present; no `gzip`, `brotli`, `deflate`, `zstd` or `blocking`.
 
 Run: `cargo build` (once, without `--locked`, to let `Cargo.lock` take the new crates), then `cargo build --locked`.
 Expected: both succeed. Then pin the majors actually resolved:
@@ -187,6 +215,7 @@ fn every_category_the_spec_names_has_a_distinct_variant() {
         RemoteFailure::SeekUnavailable,
         RemoteFailure::NonIdentityEncoding { encoding: "gzip".into() },
         RemoteFailure::Transport { operation: Operation::Read, detail: "reset".into() },
+        RemoteFailure::Cancelled,
     ];
     for (i, a) in categories.iter().enumerate() {
         for b in categories.iter().skip(i + 1) {
@@ -194,7 +223,7 @@ fn every_category_the_spec_names_has_a_distinct_variant() {
         }
         assert!(!a.to_string().is_empty(), "{a:?} renders empty");
     }
-    assert_eq!(categories.len(), 13);
+    assert_eq!(categories.len(), 14);
 }
 ```
 
@@ -339,6 +368,9 @@ pub enum RangeRejection {
     RangeIgnored,
     /// A body shorter or longer than the interval the header advertised.
     LengthMismatch,
+    /// `last >= total`: the interval does not fit inside the object it claims
+    /// to be part of.
+    IntervalPastTotal,
     /// A 416 for a range that is not the known byte EOF.
     Unsatisfiable,
 }
@@ -376,6 +408,11 @@ pub enum RemoteFailure {
     NonIdentityEncoding { encoding: String },
     #[error("network error while {operation:?}: {detail}")]
     Transport { operation: Operation, detail: String },
+    /// Not a fault: a stop, seek or shutdown retired the read that was in
+    /// flight. §8 requires this to stay distinguishable from every failure
+    /// above even after Symphonia wraps the `io::Error`.
+    #[error("the read was cancelled")]
+    Cancelled,
 }
 
 /// Scheme, host, port and path only.
@@ -575,7 +612,11 @@ fn a_body_length_that_contradicts_the_interval_is_rejected() {
 fn a_total_that_conflicts_with_the_established_one_is_a_resource_change() {
     let established = Established {
         total: Some(8192),
-        validator: Validator { strong_etag: Some("\"v1\"".into()), last_modified: None },
+        validator: Validator {
+            strong_etag: Some("\"v1\"".into()),
+            weak_etag: None,
+            last_modified: None,
+        },
     };
     assert_eq!(
         accept(
@@ -594,7 +635,11 @@ fn a_changed_strong_validator_fails_as_resource_changed() {
     // H11. The length can be identical; the validator is what settles it.
     let established = Established {
         total: Some(8192),
-        validator: Validator { strong_etag: Some("\"v1\"".into()), last_modified: None },
+        validator: Validator {
+            strong_etag: Some("\"v1\"".into()),
+            weak_etag: None,
+            last_modified: None,
+        },
     };
     assert_eq!(
         accept(
@@ -613,12 +658,115 @@ fn a_changed_strong_validator_fails_as_resource_changed() {
 }
 
 #[test]
+fn weak_and_last_modified_validators_are_compared_even_though_they_are_never_sent() {
+    // §7: without a strong validator, range access is *best effort* — "compare
+    // available length and validator metadata". Best effort forbids claiming an
+    // unchanged weak validator proves sameness; it does not license throwing
+    // the metadata away, which would let a same-length replacement through
+    // silently.
+    let weak = Established {
+        total: Some(8192),
+        validator: Validator {
+            strong_etag: None,
+            weak_etag: Some("W/\"v1\"".into()),
+            last_modified: None,
+        },
+    };
+    assert_eq!(
+        accept(
+            206,
+            &headers(&[
+                ("content-range", "bytes 0-1023/8192"),
+                ("content-length", "1024"),
+                ("etag", "W/\"v2\""),
+            ]),
+            0,
+            false,
+            Some(&weak),
+        ),
+        Err(RemoteFailure::ResourceChanged)
+    );
+
+    let dated = Established {
+        total: Some(8192),
+        validator: Validator {
+            strong_etag: None,
+            weak_etag: None,
+            last_modified: Some("Tue, 09 Sep 2026 00:00:00 GMT".into()),
+        },
+    };
+    assert_eq!(
+        accept(
+            206,
+            &headers(&[
+                ("content-range", "bytes 0-1023/8192"),
+                ("content-length", "1024"),
+                ("last-modified", "Wed, 10 Sep 2026 00:00:00 GMT"),
+            ]),
+            0,
+            false,
+            Some(&dated),
+        ),
+        Err(RemoteFailure::ResourceChanged)
+    );
+
+    // An absent validator on either side is no evidence and must not fail.
+    assert!(
+        accept(
+            206,
+            &headers(&[("content-range", "bytes 0-1023/8192"), ("content-length", "1024")]),
+            0,
+            false,
+            Some(&dated),
+        )
+        .is_ok()
+    );
+}
+
+#[test]
+fn an_interval_that_cannot_fit_inside_its_total_is_rejected() {
+    // `bytes 0-99/10` describes 100 bytes of a 10-byte object. Accepting it
+    // installs bytes past the end of the recording at offsets nothing owns.
+    assert_eq!(
+        parse_content_range("bytes 0-99/10"),
+        Err(RangeRejection::IntervalPastTotal)
+    );
+    assert_eq!(
+        parse_content_range("bytes 10-10/10"),
+        Err(RangeRejection::IntervalPastTotal)
+    );
+    // The last legal byte of a 10-byte object is 9.
+    assert_eq!(
+        parse_content_range("bytes 9-9/10"),
+        Ok(ByteRange { first: 9, last: 9, total: Some(10) })
+    );
+}
+
+#[test]
+fn an_interval_length_that_overflows_is_malformed_rather_than_wrapping() {
+    // In release mode `last - first + 1` wraps to zero here, turning a hostile
+    // header into a silently empty interval.
+    assert_eq!(
+        parse_content_range("bytes 0-18446744073709551615/*"),
+        Err(RangeRejection::Malformed)
+    );
+}
+
+#[test]
 fn a_weak_etag_is_never_sent_as_if_range() {
     // RFC 9110 §13.1.5: If-Range takes a strong validator only. Sending a weak
     // one asks the server a question it is entitled to answer wrongly.
-    let weak = Validator { strong_etag: None, last_modified: Some("Tue, 09 Sep 2026 00:00:00 GMT".into()) };
+    let weak = Validator {
+        strong_etag: None,
+        weak_etag: Some("W/\"v1\"".into()),
+        last_modified: Some("Tue, 09 Sep 2026 00:00:00 GMT".into()),
+    };
     assert_eq!(if_range_value(&weak), None);
-    let strong = Validator { strong_etag: Some("\"v1\"".into()), last_modified: None };
+    let strong = Validator {
+        strong_etag: Some("\"v1\"".into()),
+        weak_etag: None,
+        last_modified: None,
+    };
     assert_eq!(if_range_value(&strong), Some("\"v1\"".to_string()));
 }
 
@@ -626,6 +774,8 @@ fn a_weak_etag_is_never_sent_as_if_range() {
 fn a_weak_etag_header_is_not_stored_as_a_strong_one() {
     let validator = continuo::http::response::validator_from(&headers(&[("etag", "W/\"v1\"")]));
     assert_eq!(validator.strong_etag, None);
+    // Kept, though: it is comparable even when it is not sendable.
+    assert_eq!(validator.weak_etag.as_deref(), Some("W/\"v1\""));
 }
 
 #[test]
@@ -782,12 +932,12 @@ pub struct ByteRange {
 
 impl ByteRange {
     /// Inclusive interval, so the body is `last - first + 1` bytes.
-    pub fn len(&self) -> u64 {
-        self.last - self.first + 1
-    }
-
-    pub fn is_empty(&self) -> bool {
-        false
+    ///
+    /// Checked, because `last` comes off the wire: `bytes 0-18446744073709551615/*`
+    /// parses fine and overflows a bare `+ 1`, which in release mode wraps to
+    /// zero and turns a hostile header into a silently empty interval.
+    pub fn len(&self) -> Option<u64> {
+        self.last.checked_sub(self.first)?.checked_add(1)
     }
 }
 
@@ -797,6 +947,10 @@ pub struct Validator {
     /// stored here: §7 forbids sending a weak validator as `If-Range`, and
     /// keeping the two apart at parse time makes that unforgettable.
     pub strong_etag: Option<String>,
+    /// A `W/`-prefixed tag. Never sent as `If-Range` — but §7 says range access
+    /// without a strong validator is *best effort*, which means comparing the
+    /// metadata that is available, not discarding it.
+    pub weak_etag: Option<String>,
     pub last_modified: Option<String>,
 }
 
@@ -829,17 +983,30 @@ pub fn parse_content_range(value: &str) -> Result<ByteRange, RangeRejection> {
         "*" => None,
         digits => Some(digits.parse().map_err(|_| RangeRejection::Malformed)?),
     };
-    Ok(ByteRange { first, last, total })
+    let range = ByteRange { first, last, total };
+    // An interval that cannot fit inside its own total is impossible, not
+    // merely odd: `bytes 0-99/10` describes 100 bytes of a 10-byte object.
+    if let Some(total) = total
+        && last >= total
+    {
+        return Err(RangeRejection::IntervalPastTotal);
+    }
+    // And an interval whose length does not compute at all is malformed.
+    if range.len().is_none() {
+        return Err(RangeRejection::Malformed);
+    }
+    Ok(range)
 }
 
 pub fn validator_from(headers: &Headers) -> Validator {
-    let strong_etag = headers
-        .get("etag")
-        .map(str::trim)
+    let etag = headers.get("etag").map(str::trim);
+    let strong_etag = etag
         .filter(|tag| !tag.starts_with("W/") && tag.starts_with('"') && tag.ends_with('"'))
         .map(str::to_string);
+    let weak_etag = etag.filter(|tag| tag.starts_with("W/")).map(str::to_string);
     Validator {
         strong_etag,
+        weak_etag,
         last_modified: headers.get("last-modified").map(str::to_string),
     }
 }
@@ -911,7 +1078,7 @@ pub fn accept(
                 });
             }
             if let Some(declared) = declared_len
-                && declared != range.len()
+                && Some(declared) != range.len()
             {
                 return Err(RemoteFailure::InvalidRange {
                     reason: RangeRejection::LengthMismatch,
@@ -939,18 +1106,32 @@ pub fn accept(
     }
 }
 
-/// A strong validator that changed means the bytes are no longer the same
-/// recording. Without one, §7's best-effort policy applies: compare what is
-/// available and do not claim to detect same-length replacement.
+/// A validator that changed means the bytes are no longer the same recording.
+///
+/// §7 is a *hierarchy*, not a single rule. A strong ETag is conclusive. Without
+/// one, range access is best effort — which obliges us to compare the metadata
+/// that is available rather than to ignore it. What best effort forbids is the
+/// opposite claim: that an unchanged weak validator *proves* the content is the
+/// same. So a changed weak ETag or a changed `Last-Modified` fails, and an
+/// absent or unchanged one proves nothing and is allowed through.
 fn check_validator(headers: &Headers, established: Option<&Established>) -> Result<(), RemoteFailure> {
     let Some(established) = established else {
         return Ok(());
     };
+    let known = &established.validator;
     let fresh = validator_from(headers);
-    match (&established.validator.strong_etag, &fresh.strong_etag) {
-        (Some(known), Some(got)) if known != got => Err(RemoteFailure::ResourceChanged),
-        _ => Ok(()),
+    let changed = |a: &Option<String>, b: &Option<String>| match (a, b) {
+        (Some(known), Some(got)) => known != got,
+        // An absent validator on either side is no evidence either way.
+        _ => false,
+    };
+    if changed(&known.strong_etag, &fresh.strong_etag)
+        || changed(&known.weak_etag, &fresh.weak_etag)
+        || changed(&known.last_modified, &fresh.last_modified)
+    {
+        return Err(RemoteFailure::ResourceChanged);
     }
+    Ok(())
 }
 
 pub fn accept_redirect(
@@ -990,10 +1171,10 @@ pub fn accept_redirect(
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test --test http_response 2>&1 | tail -20`
-Expected: PASS, 18 tests.
+Expected: PASS, 21 tests.
 
 Run: `cargo fmt --check && cargo clippy --locked --all-targets --all-features -- -D warnings`
-Expected: clean. `ByteRange::is_empty` exists only to satisfy `clippy::len_without_is_empty`; leave the comment on it saying so if clippy is quiet without it, delete it.
+Expected: clean. `ByteRange::len` returns `Option<u64>`, so `clippy::len_without_is_empty` does not fire — that lint only applies to a `len` returning `usize`.
 
 - [ ] **Step 5: Commit**
 
@@ -1094,8 +1275,8 @@ fn runtime() -> tokio::runtime::Runtime {
 
 #[test]
 fn a_read_returns_the_bytes_the_producer_pushed() {
-    let interrupt = SourceInterrupt::new();
-    let channel = Arc::new(ByteChannel::new(1024, Arc::clone(&interrupt)));
+    let interrupt = SourceInterrupt::new(CAPACITY);
+    let channel = Arc::new(ByteChannel::new(Arc::clone(&interrupt)));
     let generation = channel.generation();
     runtime().block_on(channel.push(generation, b"hello"));
 
@@ -1108,8 +1289,8 @@ fn a_read_returns_the_bytes_the_producer_pushed() {
 fn a_read_never_reports_zero_bytes_for_an_empty_buffer() {
     // Symphonia reads `Ok(0)` as clean EOF. An empty buffer is not EOF, and
     // conflating them turns a stalled network into a silently truncated track.
-    let interrupt = SourceInterrupt::new();
-    let channel = Arc::new(ByteChannel::new(1024, Arc::clone(&interrupt)));
+    let interrupt = SourceInterrupt::new(CAPACITY);
+    let channel = Arc::new(ByteChannel::new(Arc::clone(&interrupt)));
     let generation = channel.generation();
 
     let reader = {
@@ -1128,8 +1309,8 @@ fn a_read_never_reports_zero_bytes_for_an_empty_buffer() {
 
 #[test]
 fn only_a_clean_finish_reports_eof() {
-    let interrupt = SourceInterrupt::new();
-    let channel = ByteChannel::new(1024, Arc::clone(&interrupt));
+    let interrupt = SourceInterrupt::new(CAPACITY);
+    let channel = ByteChannel::new(Arc::clone(&interrupt));
     let generation = channel.generation();
     channel.finish(generation, Outcome::Eof);
     assert_eq!(channel.read(&mut [0u8; 4], &NoHook, STALL), ReadOutcome::Eof);
@@ -1139,8 +1320,8 @@ fn only_a_clean_finish_reports_eof() {
 fn a_failure_stays_a_failure_and_never_becomes_eof() {
     // H8. A truncated body that read back as EOF would be reported as a
     // completed track.
-    let interrupt = SourceInterrupt::new();
-    let channel = ByteChannel::new(1024, Arc::clone(&interrupt));
+    let interrupt = SourceInterrupt::new(CAPACITY);
+    let channel = ByteChannel::new(Arc::clone(&interrupt));
     let generation = channel.generation();
     let failure = RemoteFailure::TruncatedBody { missing: 42 };
     channel.finish(generation, Outcome::Failed(failure.clone()));
@@ -1152,8 +1333,8 @@ fn a_failure_stays_a_failure_and_never_becomes_eof() {
 
 #[test]
 fn buffered_bytes_are_drained_before_a_pending_outcome_is_reported() {
-    let interrupt = SourceInterrupt::new();
-    let channel = Arc::new(ByteChannel::new(1024, Arc::clone(&interrupt)));
+    let interrupt = SourceInterrupt::new(CAPACITY);
+    let channel = Arc::new(ByteChannel::new(Arc::clone(&interrupt)));
     let generation = channel.generation();
     runtime().block_on(channel.push(generation, b"tail"));
     channel.finish(generation, Outcome::Eof);
@@ -1168,8 +1349,8 @@ fn buffered_bytes_are_drained_before_a_pending_outcome_is_reported() {
 fn a_retirement_wakes_a_blocked_read_within_one_second() {
     // H9, and §8's stated bound. The server is never released: the wake must
     // come from the interrupt, not from bytes arriving.
-    let interrupt = SourceInterrupt::new();
-    let channel = Arc::new(ByteChannel::new(1024, Arc::clone(&interrupt)));
+    let interrupt = SourceInterrupt::new(CAPACITY);
+    let channel = Arc::new(ByteChannel::new(Arc::clone(&interrupt)));
     let hook = Arc::new(CountingHook::default());
 
     let reader = {
@@ -1204,8 +1385,8 @@ fn a_retirement_wakes_a_blocked_read_within_one_second() {
 fn a_freeze_keeps_a_read_pending_without_erroring_and_a_thaw_releases_it() {
     // H10, and §9's "service the freeze without returning a destructive read
     // error to the demuxer".
-    let interrupt = SourceInterrupt::new();
-    let channel = Arc::new(ByteChannel::new(1024, Arc::clone(&interrupt)));
+    let interrupt = SourceInterrupt::new(CAPACITY);
+    let channel = Arc::new(ByteChannel::new(Arc::clone(&interrupt)));
     let hook = Arc::new(CountingHook::default());
     let generation = channel.generation();
     interrupt.freeze();
@@ -1233,8 +1414,8 @@ fn a_freeze_keeps_a_read_pending_without_erroring_and_a_thaw_releases_it() {
 #[test]
 fn a_retirement_reaches_a_frozen_read_too() {
     // Quitting while paused must still wake every source wait (H10).
-    let interrupt = SourceInterrupt::new();
-    let channel = Arc::new(ByteChannel::new(1024, Arc::clone(&interrupt)));
+    let interrupt = SourceInterrupt::new(CAPACITY);
+    let channel = Arc::new(ByteChannel::new(Arc::clone(&interrupt)));
     let hook = Arc::new(CountingHook::default());
     interrupt.freeze();
 
@@ -1258,8 +1439,8 @@ fn a_retirement_reaches_a_frozen_read_too() {
 #[test]
 fn the_buffer_never_exceeds_its_capacity_and_the_producer_waits() {
     // H13. A fast server against a slow consumer must not accumulate.
-    let interrupt = SourceInterrupt::new();
-    let channel = Arc::new(ByteChannel::new(64, Arc::clone(&interrupt)));
+    let interrupt = SourceInterrupt::new(CAPACITY);
+    let channel = Arc::new(ByteChannel::new(Arc::clone(&interrupt)));
     let generation = channel.generation();
     let chunk = [7u8; 64];
 
@@ -1297,8 +1478,8 @@ fn the_buffer_never_exceeds_its_capacity_and_the_producer_waits() {
 fn a_stale_generation_can_neither_push_bytes_nor_end_the_stream() {
     // H9's second half: a superseded response's bytes and its outcome must
     // both be rejected before they can enter the new generation.
-    let interrupt = SourceInterrupt::new();
-    let channel = Arc::new(ByteChannel::new(1024, Arc::clone(&interrupt)));
+    let interrupt = SourceInterrupt::new(CAPACITY);
+    let channel = Arc::new(ByteChannel::new(Arc::clone(&interrupt)));
     let stale = channel.generation();
     let fresh = channel.retire();
     assert_ne!(stale, fresh);
@@ -1320,9 +1501,170 @@ fn a_stale_generation_can_neither_push_bytes_nor_end_the_stream() {
 }
 
 #[test]
+fn a_retirement_wakes_a_blocked_producer_too() {
+    // The first draft woke only the synchronous reader, leaving the producer
+    // parked on its Notify and the fetch still running. A stop that does not
+    // close the fetch is not a stop.
+    let interrupt = SourceInterrupt::new(64);
+    let channel = Arc::new(ByteChannel::new(Arc::clone(&interrupt)));
+    let generation = channel.generation();
+    assert!(runtime().block_on(channel.push(generation, &[1u8; 64])));
+    assert_eq!(channel.buffered(), 64);
+
+    let producer = {
+        let channel = Arc::clone(&channel);
+        std::thread::spawn(move || {
+            let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+                Ok(rt) => rt,
+                Err(error) => panic!("a current-thread runtime must build: {error}"),
+            };
+            let started = Instant::now();
+            let accepted = rt.block_on(async move { channel.push(generation, &[2u8; 64]).await });
+            (accepted, started.elapsed())
+        })
+    };
+    // The buffer is full, so the producer is provably parked.
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(channel.buffered(), 64);
+    interrupt.retire();
+
+    match producer.join() {
+        Ok((accepted, elapsed)) => {
+            assert!(!accepted, "a retired push reported success");
+            assert!(elapsed < Duration::from_secs(1), "the producer woke after {elapsed:?}");
+        }
+        Err(_) => panic!("the producer thread panicked"),
+    }
+}
+
+#[test]
+fn a_retirement_resolves_the_fetch_tasks_cancellation() {
+    // The third waiter. Without it the request stays open after a stop and the
+    // server goes on streaming into a buffer nobody will drain.
+    let interrupt = SourceInterrupt::new(CAPACITY);
+    let generation = interrupt.generation();
+    let woken = {
+        let interrupt = Arc::clone(&interrupt);
+        std::thread::spawn(move || {
+            let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+                Ok(rt) => rt,
+                Err(error) => panic!("a current-thread runtime must build: {error}"),
+            };
+            let started = Instant::now();
+            rt.block_on(interrupt.cancelled(generation));
+            started.elapsed()
+        })
+    };
+    std::thread::sleep(Duration::from_millis(50));
+    interrupt.retire();
+    match woken.join() {
+        Ok(elapsed) => assert!(elapsed < Duration::from_secs(1), "woke after {elapsed:?}"),
+        Err(_) => panic!("the waiter thread panicked"),
+    }
+    // And it resolves at once for a generation that is already superseded.
+    runtime().block_on(interrupt.cancelled(generation));
+}
+
+#[test]
+fn a_freeze_suspends_the_fetch_tasks_stall_timer() {
+    let interrupt = SourceInterrupt::new(CAPACITY);
+    interrupt.freeze();
+    let waiter = {
+        let interrupt = Arc::clone(&interrupt);
+        std::thread::spawn(move || {
+            let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+                Ok(rt) => rt,
+                Err(error) => panic!("a current-thread runtime must build: {error}"),
+            };
+            rt.block_on(interrupt.wait_while_frozen());
+        })
+    };
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(!waiter.is_finished(), "wait_while_frozen returned while frozen");
+    interrupt.thaw();
+    if waiter.join().is_err() {
+        panic!("the waiter thread panicked");
+    }
+    // Already thawed: returns at once.
+    runtime().block_on(interrupt.wait_while_frozen());
+}
+
+#[test]
+fn paused_time_is_not_charged_against_the_stall_budget() {
+    // §8: "Time spent paused or waiting for local buffer space does not count
+    // as a server stall." A deadline computed once at entry keeps running
+    // through the pause and fails the very next read with a stall the server
+    // never caused.
+    let interrupt = SourceInterrupt::new(CAPACITY);
+    let channel = Arc::new(ByteChannel::new(Arc::clone(&interrupt)));
+    let generation = channel.generation();
+    let hook = Arc::new(CountingHook::default());
+    let stall = Duration::from_millis(300);
+    interrupt.freeze();
+
+    let reader = {
+        let channel = Arc::clone(&channel);
+        let hook = Arc::clone(&hook);
+        std::thread::spawn(move || channel.read(&mut [0u8; 16], hook.as_ref(), stall))
+    };
+    let entered = Instant::now();
+    while hook.count() == 0 {
+        assert!(entered.elapsed() < Duration::from_secs(5), "the read never blocked");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    // Stay frozen for several times the stall budget.
+    std::thread::sleep(stall * 4);
+    assert!(!reader.is_finished(), "the read timed out while paused");
+
+    interrupt.thaw();
+    runtime().block_on(channel.push(generation, b"resumed"));
+    match reader.join() {
+        Ok(outcome) => assert_eq!(outcome, ReadOutcome::Bytes(7)),
+        Err(_) => panic!("the reader thread panicked"),
+    }
+}
+
+#[test]
+fn a_delivery_resets_the_stall_budget() {
+    // A trickling server that keeps delivering is not stalled, however long the
+    // whole transfer takes. §8: ordinary playback has no whole-response
+    // deadline, so the budget must measure the gap between deliveries.
+    let interrupt = SourceInterrupt::new(CAPACITY);
+    let channel = Arc::new(ByteChannel::new(Arc::clone(&interrupt)));
+    let generation = channel.generation();
+    let stall = Duration::from_millis(300);
+
+    let feeder = {
+        let channel = Arc::clone(&channel);
+        std::thread::spawn(move || {
+            let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+                Ok(rt) => rt,
+                Err(error) => panic!("a current-thread runtime must build: {error}"),
+            };
+            for _ in 0..6 {
+                std::thread::sleep(Duration::from_millis(150));
+                rt.block_on(channel.push(generation, b"x"));
+            }
+        })
+    };
+    let mut seen = 0;
+    let mut buffer = [0u8; 4];
+    for _ in 0..6 {
+        match channel.read(&mut buffer, &NoHook, stall) {
+            ReadOutcome::Bytes(n) => seen += n,
+            other => panic!("a trickle was reported as a stall: {other:?}"),
+        }
+    }
+    assert_eq!(seen, 6);
+    if feeder.join().is_err() {
+        panic!("the feeder thread panicked");
+    }
+}
+
+#[test]
 fn a_stall_deadline_that_elapses_fails_rather_than_returning_eof() {
-    let interrupt = SourceInterrupt::new();
-    let channel = ByteChannel::new(1024, Arc::clone(&interrupt));
+    let interrupt = SourceInterrupt::new(CAPACITY);
+    let channel = ByteChannel::new(Arc::clone(&interrupt));
     let outcome = channel.read(&mut [0u8; 16], &NoHook, Duration::from_millis(100));
     assert_eq!(
         outcome,
@@ -1338,21 +1680,32 @@ Expected: FAIL — `unresolved import continuo::http::channel`.
 
 - [ ] **Step 3: Implement the channel and the interrupt**
 
-Add `pub mod channel;` to `src/http/mod.rs`, and create `src/http/channel.rs`:
+Add `pub mod channel;` to `src/http/mod.rs`, and create `src/http/channel.rs`.
+
+**One lock, not three.** The first draft of this task gave `SourceInterrupt` its
+own mutex, condvar and `Notify`, separate from the channel's — and it was
+broken: `retire()` notified the *interrupt's* `Notify` while `push()` awaited
+the *channel's*, so a retirement woke the synchronous reader and left the
+producer parked and the fetch running. The fix is structural. `SourceInterrupt`
+owns the single lock that the buffer, both level flags and the generation all
+live behind, and owns all three wake channels; `ByteChannel` is a thin handle
+over the same `Arc`. There is then exactly one lock in the mechanism, so there
+is no lock-ordering question, no way to notify the wrong primitive, and no lost
+wake.
 
 ```rust
 //! The bounded encoded-byte channel between one asynchronous fetch task and
 //! the synchronous decoder, plus the out-of-band interrupt that reaches both.
 //!
-//! Two wake mechanisms, because the two sides have opposite obligations: the
-//! reader is a thread that must not spin, so it waits on a `Condvar`; the
-//! producer is a Tokio task that must not block a runtime worker, so it waits
-//! on a `Notify`. Both re-check their predicate under the *same* `Mutex` that
-//! the notifier holds when it changes it, which is what makes a lost wake
-//! impossible (§8).
+//! Three wake channels, because three different kinds of waiter must be
+//! reachable: the decoder thread (a `Condvar` — it must not spin), the
+//! producer task inside `push` (a `Notify` — it must not block a runtime
+//! worker), and the fetch task's own header and body awaits (a second
+//! `Notify` — a retirement has to close the request, not merely stop feeding
+//! it). All three hang off one `Mutex`, and every flag change is made under
+//! that `Mutex` before notifying, which is what makes a lost wake impossible.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -1374,7 +1727,6 @@ pub trait WaitHook: Send + Sync {
     fn service(&self);
 }
 
-/// How a fetch ended.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Outcome {
     /// The body ended exactly where it said it would.
@@ -1392,57 +1744,33 @@ pub enum ReadOutcome {
     Failed(RemoteFailure),
 }
 
-/// The out-of-band wake shared by the application, the worker and every source
-/// wait. `retire` is an edge that ends a generation; `freeze` is a *level*,
-/// because a pause persists and a read that blocks after the edge passed would
-/// otherwise never see it (G2).
-#[derive(Debug, Default)]
-pub struct SourceInterrupt {
-    retired: AtomicBool,
-    frozen: AtomicBool,
-    /// Held whenever either flag changes, so a waiter that re-checks under the
-    /// channel lock cannot miss the change.
-    gate: Mutex<()>,
-    wake: Condvar,
-    notify: Notify,
+#[derive(Debug)]
+struct State {
+    bytes: VecDeque<u8>,
+    capacity: usize,
+    outcome: Option<Outcome>,
+    /// Bumped by `retire`. A push or a finish carrying an older value belongs
+    /// to a superseded response and is discarded before it can enter the
+    /// buffer.
+    generation: u64,
+    /// One-shot: this generation is over. `arm` clears it for the next one.
+    retired: bool,
+    /// A *level*, not an edge. A pause persists until a play, and a read that
+    /// blocks after the edge would have passed must still observe it (G2).
+    frozen: bool,
 }
 
-impl SourceInterrupt {
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self::default())
-    }
-
-    pub fn retire(&self) {
-        self.set(&self.retired, true);
-    }
-
-    pub fn arm(&self) {
-        self.set(&self.retired, false);
-    }
-
-    pub fn freeze(&self) {
-        self.set(&self.frozen, true);
-    }
-
-    pub fn thaw(&self) {
-        self.set(&self.frozen, false);
-    }
-
-    pub fn is_retired(&self) -> bool {
-        self.retired.load(Ordering::Acquire)
-    }
-
-    pub fn is_frozen(&self) -> bool {
-        self.frozen.load(Ordering::Acquire)
-    }
-
-    fn set(&self, flag: &AtomicBool, value: bool) {
-        let guard = lock(&self.gate);
-        flag.store(value, Ordering::Release);
-        drop(guard);
-        self.wake.notify_all();
-        self.notify.notify_waiters();
-    }
+/// The out-of-band wake shared by the application, the worker, every source
+/// wait and the fetch task.
+#[derive(Debug)]
+pub struct SourceInterrupt {
+    state: Mutex<State>,
+    reader_wake: Condvar,
+    producer_wake: Notify,
+    /// Wakes the fetch task's header and body awaits. Waking the reader alone
+    /// leaves the request open and the server still streaming into a buffer
+    /// nobody will drain.
+    fetch_wake: Notify,
 }
 
 /// A poisoned lock means a thread already panicked while holding it; there is
@@ -1454,62 +1782,143 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     }
 }
 
-#[derive(Debug)]
-struct Inner {
-    bytes: VecDeque<u8>,
-    capacity: usize,
-    outcome: Option<Outcome>,
-}
-
-#[derive(Debug)]
-pub struct ByteChannel {
-    inner: Mutex<Inner>,
-    reader_wake: Condvar,
-    producer_wake: Notify,
-    interrupt: Arc<SourceInterrupt>,
-    /// Bumped by `retire`. A push or a finish tagged with an older value is a
-    /// superseded response and is discarded before it can enter the buffer.
-    generation: AtomicU64,
-}
-
-impl ByteChannel {
-    pub fn new(capacity: usize, interrupt: Arc<SourceInterrupt>) -> Self {
-        Self {
-            inner: Mutex::new(Inner {
+impl SourceInterrupt {
+    pub fn new(capacity: usize) -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(State {
                 bytes: VecDeque::with_capacity(capacity.min(1 << 16)),
                 capacity: capacity.max(1),
                 outcome: None,
+                generation: 1,
+                retired: false,
+                frozen: false,
             }),
             reader_wake: Condvar::new(),
             producer_wake: Notify::new(),
-            interrupt,
-            generation: AtomicU64::new(1),
-        }
-    }
-
-    pub fn generation(&self) -> u64 {
-        self.generation.load(Ordering::Acquire)
-    }
-
-    pub fn buffered(&self) -> usize {
-        lock(&self.inner).bytes.len()
+            fetch_wake: Notify::new(),
+        })
     }
 
     /// End the current generation: drop the buffer and any pending outcome,
-    /// wake both sides, and return the generation a new fetch must carry.
+    /// and wake all three kinds of waiter. Returns the generation a new fetch
+    /// must carry.
     pub fn retire(&self) -> u64 {
-        let next = {
-            let mut inner = lock(&self.inner);
-            inner.bytes.clear();
-            inner.outcome = None;
-            self.generation.fetch_add(1, Ordering::AcqRel) + 1
+        let generation = {
+            let mut state = lock(&self.state);
+            state.bytes.clear();
+            state.outcome = None;
+            state.retired = true;
+            state.generation += 1;
+            state.generation
         };
+        self.wake_all();
+        generation
+    }
+
+    /// Clear the retirement so a new generation may run. Does not rewind the
+    /// generation counter: a superseded response must stay superseded.
+    pub fn arm(&self) {
+        lock(&self.state).retired = false;
+        self.wake_all();
+    }
+
+    pub fn freeze(&self) {
+        lock(&self.state).frozen = true;
+        self.wake_all();
+    }
+
+    pub fn thaw(&self) {
+        lock(&self.state).frozen = false;
+        self.wake_all();
+    }
+
+    pub fn is_retired(&self) -> bool {
+        lock(&self.state).retired
+    }
+
+    pub fn is_frozen(&self) -> bool {
+        lock(&self.state).frozen
+    }
+
+    pub fn generation(&self) -> u64 {
+        lock(&self.state).generation
+    }
+
+    fn wake_all(&self) {
         self.reader_wake.notify_all();
         self.producer_wake.notify_waiters();
-        next
+        self.fetch_wake.notify_waiters();
+    }
+
+    /// Async cancellation for the fetch task. Resolves as soon as the current
+    /// generation is retired, and never resolves otherwise.
+    pub async fn cancelled(&self, generation: u64) {
+        loop {
+            // Create the future before testing, so a notify that lands between
+            // the test and the await is still delivered.
+            let notified = self.fetch_wake.notified();
+            {
+                let state = lock(&self.state);
+                if state.retired || state.generation != generation {
+                    return;
+                }
+            }
+            notified.await;
+        }
+    }
+
+    /// Suspend the caller for as long as playback is frozen.
+    ///
+    /// The fetch task awaits this *before* arming its stall timer, which is
+    /// what keeps paused time out of the stall budget (§8: "Time spent paused
+    /// or waiting for local buffer space does not count as a server stall").
+    pub async fn wait_while_frozen(&self) {
+        loop {
+            let notified = self.fetch_wake.notified();
+            {
+                let state = lock(&self.state);
+                if !state.frozen || state.retired {
+                    return;
+                }
+            }
+            notified.await;
+        }
+    }
+}
+
+/// A handle onto the interrupt's buffer. Holds no state of its own, so there is
+/// no second lock and no way for the two to disagree.
+#[derive(Clone, Debug)]
+pub struct ByteChannel(Arc<SourceInterrupt>);
+
+impl ByteChannel {
+    pub fn new(interrupt: Arc<SourceInterrupt>) -> Self {
+        Self(interrupt)
+    }
+
+    pub fn interrupt(&self) -> &Arc<SourceInterrupt> {
+        &self.0
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.0.generation()
+    }
+
+    pub fn buffered(&self) -> usize {
+        lock(&self.0.state).bytes.len()
+    }
+
+    pub fn retire(&self) -> u64 {
+        self.0.retire()
     }
 
     /// Wait for bytes, an ending or a retirement.
+    ///
+    /// `stall` is a budget of *active demand*, not a wall-clock deadline: only
+    /// slices spent unfrozen are charged against it, and any delivery resets
+    /// it. A fixed `Instant::now() + stall` computed once — which is what this
+    /// first did — expires during a long pause and fails the very next read
+    /// with a server stall the server never caused.
     ///
     /// Buffered bytes are always drained before a pending outcome is reported,
     /// so a body that ends mid-buffer still plays what it delivered.
@@ -1517,106 +1926,109 @@ impl ByteChannel {
         if out.is_empty() {
             return ReadOutcome::Bytes(0);
         }
-        let deadline = Instant::now() + stall;
-        let mut inner = lock(&self.inner);
+        let mut demanded = Duration::ZERO;
+        let mut state = lock(&self.0.state);
         loop {
-            if self.interrupt.is_retired() {
+            if state.retired {
                 return ReadOutcome::Retired;
             }
-            if !inner.bytes.is_empty() && !self.interrupt.is_frozen() {
-                let count = inner.bytes.len().min(out.len());
-                for slot in out.iter_mut().take(count) {
-                    // `pop_front` is `Some` for every one of `count` iterations
-                    // because `count <= bytes.len()` was just read under this
-                    // same guard and nothing else can drain it.
-                    *slot = inner.bytes.pop_front().unwrap_or(0);
+            if !state.frozen {
+                if !state.bytes.is_empty() {
+                    let count = state.bytes.len().min(out.len());
+                    for slot in out.iter_mut().take(count) {
+                        // `pop_front` is `Some` for each of `count` iterations:
+                        // `count <= bytes.len()` was read under this guard and
+                        // nothing else can drain it.
+                        *slot = state.bytes.pop_front().unwrap_or(0);
+                    }
+                    drop(state);
+                    self.0.producer_wake.notify_waiters();
+                    return ReadOutcome::Bytes(count);
                 }
-                drop(inner);
-                self.producer_wake.notify_waiters();
-                return ReadOutcome::Bytes(count);
+                if let Some(outcome) = state.outcome.clone() {
+                    return match outcome {
+                        Outcome::Eof => ReadOutcome::Eof,
+                        Outcome::Failed(failure) => ReadOutcome::Failed(failure),
+                    };
+                }
+                if demanded >= stall {
+                    return ReadOutcome::Failed(RemoteFailure::Timeout { phase: Phase::Stall });
+                }
             }
-            if !self.interrupt.is_frozen()
-                && let Some(outcome) = inner.outcome.clone()
-            {
-                return match outcome {
-                    Outcome::Eof => ReadOutcome::Eof,
-                    Outcome::Failed(failure) => ReadOutcome::Failed(failure),
-                };
-            }
-            // A freeze suspends the deadline as well as the read: §8 says time
-            // spent paused is not a server stall.
-            if !self.interrupt.is_frozen() && Instant::now() >= deadline {
-                return ReadOutcome::Failed(RemoteFailure::Timeout { phase: Phase::Stall });
-            }
-            let (guard, _) = match self.reader_wake.wait_timeout(inner, SLICE) {
+            let frozen_before = state.frozen;
+            let slice_start = Instant::now();
+            let (guard, _) = match self.0.reader_wake.wait_timeout(state, SLICE) {
                 Ok(pair) => pair,
                 Err(poisoned) => poisoned.into_inner(),
             };
-            inner = guard;
+            state = guard;
+            // Only unfrozen time is demand. A slice that began frozen is not
+            // charged, whatever the flag says by the time it ends.
+            if !frozen_before {
+                demanded += slice_start.elapsed();
+            }
             // Outside the predicate but inside the loop: the hook runs on every
             // slice, which is what keeps position and checkpoints current while
-            // the network is quiet (§8), and is also the signal a test uses to
-            // prove the wait was entered.
-            MutexGuard::unlocked(&mut inner, || service.service());
+            // the network is quiet (§8), what services a freeze (Task 9), and
+            // what a test uses to prove the wait was entered.
+            MutexGuard::unlocked(&mut state, || service.service());
         }
     }
 
     /// Push one chunk, waiting asynchronously for room.
     ///
-    /// Returns `false` when the generation was superseded, which is the fetch
-    /// task's signal to stop.
+    /// Returns `false` when the generation was superseded or retired, which is
+    /// the fetch task's signal to stop.
     pub async fn push(&self, generation: u64, chunk: &[u8]) -> bool {
         let mut offset = 0;
         while offset < chunk.len() {
             // Create the future *before* re-checking, so a notify that lands
             // between the check and the await is still delivered.
-            let notified = self.producer_wake.notified();
+            let notified = self.0.producer_wake.notified();
             let accepted = {
-                let mut inner = lock(&self.inner);
-                if self.generation() != generation {
+                let mut state = lock(&self.0.state);
+                if state.generation != generation || state.retired {
                     return false;
                 }
-                let room = inner.capacity.saturating_sub(inner.bytes.len());
+                let room = state.capacity.saturating_sub(state.bytes.len());
                 let take = room.min(chunk.len() - offset);
                 if take > 0 {
-                    inner.bytes.extend(&chunk[offset..offset + take]);
+                    state.bytes.extend(&chunk[offset..offset + take]);
                 }
                 take
             };
             if accepted > 0 {
                 offset += accepted;
-                self.reader_wake.notify_all();
+                self.0.reader_wake.notify_all();
                 continue;
-            }
-            if self.interrupt.is_retired() {
-                return false;
             }
             notified.await;
         }
-        self.generation() == generation
+        let state = lock(&self.0.state);
+        state.generation == generation && !state.retired
     }
 
     /// End the stream. A stale generation's outcome is discarded: a superseded
     /// response must not be able to report EOF into the live generation.
     pub fn finish(&self, generation: u64, outcome: Outcome) {
         {
-            let mut inner = lock(&self.inner);
-            if self.generation() != generation || inner.outcome.is_some() {
+            let mut state = lock(&self.0.state);
+            if state.generation != generation || state.retired || state.outcome.is_some() {
                 return;
             }
-            inner.outcome = Some(outcome);
+            state.outcome = Some(outcome);
         }
-        self.reader_wake.notify_all();
+        self.0.reader_wake.notify_all();
     }
 }
 ```
 
-**Note for the implementer.** `MutexGuard::unlocked` is `std::sync::MutexGuard::unlocked`, stable since 1.86. If the toolchain in use does not have it, replace the two lines with an explicit `drop(inner); service.service(); inner = lock(&self.inner);` — same semantics, one more line. Do not hold the channel lock across `service.service()`: the hook takes the transport lock, and holding both in one order here and the other order in the worker is a deadlock.
+**Note for the implementer.** `MutexGuard::unlocked` is `std::sync::MutexGuard::unlocked`, stable since 1.86. If the toolchain in use does not have it, replace the two lines with an explicit `drop(state); service.service(); state = lock(&self.0.state);` — same semantics, one more line. Do not hold the interrupt lock across `service.service()`: the hook takes the transport lock, and holding both in one order here and the other order in the worker is a deadlock.
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test --test http_channel 2>&1 | tail -30`
-Expected: PASS, 11 tests. If `a_retirement_wakes_a_blocked_read_within_one_second` is slow, the `SLICE` constant is the knob — but do not raise it above 50 ms, or the §8 bound stops holding with margin.
+Expected: PASS, 16 tests. If `a_retirement_wakes_a_blocked_read_within_one_second` is slow, the `SLICE` constant is the knob — but do not raise it above 50 ms, or the §8 bound stops holding with margin.
 
 Run: `cargo fmt --check && cargo clippy --locked --all-targets --all-features -- -D warnings`
 
@@ -1683,6 +2095,10 @@ impl Script {
     pub fn truncate_body_after(self, bytes: usize) -> Self;   // then close the socket
     pub fn stall_body_after(self, bytes: usize) -> Self;      // then wait for release()
     pub fn stall_headers(self) -> Self;                       // accept, never respond
+    /// Emit `bytes` every `gap`, forever. Every individual read stays inside a
+    /// generous stall budget, which is what makes an opening deadline checked
+    /// only *around* probing useless.
+    pub fn trickle(self, bytes: usize, gap: Duration) -> Self;
 }
 ```
 
@@ -2018,8 +2434,8 @@ fn service(limits: Limits) -> Arc<HttpService> {
 }
 
 fn open(service: &HttpService, origin: Url, start: u64) -> (Arc<ByteChannel>, Arc<SourceInterrupt>, Result<continuo::http::service::FetchAccepted, HeaderOutcome>) {
-    let interrupt = SourceInterrupt::new();
-    let channel = Arc::new(ByteChannel::new(1 << 20, Arc::clone(&interrupt)));
+    let interrupt = SourceInterrupt::new(Limits::default().buffer_bytes);
+    let channel = Arc::new(ByteChannel::new(Arc::clone(&interrupt)));
     let generation = channel.generation();
     let wait = service.fetch(
         FetchRequest { origin, start, established: None, operation: Operation::Open },
@@ -2219,8 +2635,8 @@ fn a_truncated_body_fails_rather_than_reporting_eof() {
 fn a_retirement_during_a_header_wait_wakes_it_without_releasing_the_server() {
     let server = TestServer::start(Script::serving(b"x".to_vec()).stall_headers());
     let service = service(Limits::default());
-    let interrupt = SourceInterrupt::new();
-    let channel = Arc::new(ByteChannel::new(1 << 20, Arc::clone(&interrupt)));
+    let interrupt = SourceInterrupt::new(Limits::default().buffer_bytes);
+    let channel = Arc::new(ByteChannel::new(Arc::clone(&interrupt)));
     let generation = channel.generation();
     let wait = service.fetch(
         FetchRequest {
@@ -2265,18 +2681,49 @@ Add `pub mod service;` to `src/http/mod.rs` and create `src/http/service.rs`. Th
 1. **Runtime.** `HttpService::spawn` builds `tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build()`, mapping the error to `RemoteFailure::Transport { operation: Operation::Open, detail }`. Store the runtime in the struct; its `Drop` shuts the runtime down.
 2. **Client.** `reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).connect_timeout(limits.connect).build()`. `Policy::none()` is required: §7's hop limit, loop detection, scheme check and downgrade refusal are ours, and reqwest's default policy implements none of them.
 3. **`fetch`** creates a `HeaderSlot`, clones what the task needs, and `runtime.spawn`s an async block. It returns `HeaderWait` immediately. It must not await anything on the calling thread.
-4. **The task** loops at most `limits.max_redirects + 1` times:
+4. **The task** loops at most `limits.max_redirects + 1` times. **Every await in it is raced against cancellation**, because a retirement has to close the request, not merely stop feeding it:
+   ```rust
+   macro_rules! cancellable {
+       ($fut:expr, $timeout:expr, $phase:expr) => {
+           tokio::select! {
+               biased;
+               () = interrupt.cancelled(generation) => return,
+               result = $fut => result,
+               () = tokio::time::sleep($timeout) => {
+                   slot.fail(RemoteFailure::Timeout { phase: $phase });
+                   return;
+               }
+           }
+       };
+   }
+   ```
    - Build the request: `Range: bytes=<start>-`, `Accept-Encoding: identity`, and `If-Range: <etag>` only when `if_range_value(&established.validator)` is `Some`.
-   - `tokio::time::timeout(limits.headers, client.execute(request))`. On elapse, `slot.fail(RemoteFailure::Timeout { phase: Phase::Headers })` and return.
+   - `cancellable!(client.execute(request), limits.headers, Phase::Headers)`.
    - On a 3xx with a `Location`, call `accept_redirect(&current, location, hops, &seen, limits)`; push `current` onto `seen`; continue. On `Err`, fail the slot.
    - Otherwise call `response::accept(status, &Headers::from_map(response.headers()), start, start == 0, established.as_ref())`. On `Err`, fail the slot. On `Ok`, `slot.accept(FetchAccepted { .. })` and fall through to the body.
-5. **The body** loops on `response.chunk()`, each call wrapped in `tokio::time::timeout(limits.stall, ..)`:
-   - `Ok(Some(bytes))` → `if !channel.push(generation, &bytes).await { return; }`. Track `delivered += bytes.len()`.
-   - `Ok(None)` → the body ended. If the accepted response declared a length and `delivered < declared`, `channel.finish(generation, Outcome::Failed(TruncatedBody { missing: declared - delivered }))`; otherwise `Outcome::Eof`.
+5. **The body** loops, and each pass does three things in this order:
+   ```rust
+   // Paused time is not a server stall (§8), so the timer is armed only after
+   // the freeze clears — not merely skipped while it is set.
+   interrupt.wait_while_frozen().await;
+   let next = cancellable!(response.chunk(), limits.stall, Phase::Stall);
+   ```
+   then handles `next`:
+   - `Ok(Some(bytes))` → push it in slices of at most `limits.chunk_bytes` (see 6), tracking `delivered += bytes.len()`. If `push` returns `false`, return: the generation was superseded.
+   - `Ok(None)` → the body ended. Compare `delivered` against the interval the accepted response advertised (`ByteRange::len()` for a 206, `Content-Length` for a 200):
+     - `delivered < advertised` → `Outcome::Failed(TruncatedBody { missing: advertised - delivered })`.
+     - `delivered > advertised` → `Outcome::Failed(InvalidRange { reason: RangeRejection::LengthMismatch })`. **A body longer than its header promised is as corrupt as a short one**: the excess bytes sit at offsets that belong to different media, and only checking for shortfall lets them through. The excess must also be refused *during* the loop, not only at its end, so an endless body cannot fill the buffer forever against a small advertised interval.
+     - equal, or nothing advertised → `Outcome::Eof`.
    - `Err(e)` → `Outcome::Failed(Transport { operation, detail: e.to_string() })`.
-   - Timeout → `Outcome::Failed(Timeout { phase: Phase::Stall })`.
    A body ending *before* a valid smaller interval is exhausted is `TruncatedBody`; a body ending exactly at the end of a smaller-than-total interval is `Eof` for that interval, and `HttpMediaSource` (Task 6) is what re-requests the next byte. §7: "A response that ends a smaller valid interval before the object ends requires another validated request at the next byte; it is not media EOF."
-6. **Chunk size.** Do not buffer beyond one `chunk()` result. reqwest's chunk sizes are its own; the application's bound is `ByteChannel`'s capacity plus the one chunk in hand, which is §8's stated shape. Document the library's own buffering separately in `docs/architecture.md` (Task 14) rather than claiming a process-memory total.
+6. **The transfer bound.** §8 promises "at most one bounded 64 KiB application transfer chunk" on top of the 1 MiB buffer, and `response.chunk()` alone does not deliver that: its size is whatever the transport yields. Enforce it explicitly — feed `push` in `limits.chunk_bytes` slices and drop the `Bytes` as soon as it is consumed:
+   ```rust
+   for slice in bytes.chunks(limits.chunk_bytes) {
+       if !channel.push(generation, slice).await { return; }
+   }
+   drop(bytes);
+   ```
+   `push` blocks on backpressure per slice, so the application never holds more than `buffer_bytes + chunk_bytes` of its own. The `Bytes` in hand while the loop runs is **library** buffering, which §8 explicitly separates from the application's bound ("document HTTP/TLS library buffering separately; the application buffer cap is not a claim about total process memory"). Where reqwest 0.13 exposes a read-buffer knob (`ClientBuilder::http1_max_buf_size`), set it to `limits.chunk_bytes.max(8192)` so the library's contribution is bounded too; if it is unavailable for the HTTP/2 path, say so in `docs/architecture.md` rather than claiming a total. H13 asserts `channel.buffered() <= limits.buffer_bytes` throughout, which is the half that is ours to promise.
 7. **`HeaderWait::wait`** is the same condvar loop `ByteChannel::read` uses: slice, run the hook, re-check the slot and the interrupt under the lock, honour the deadline.
 
 - [ ] **Step 4: Run to verify they pass**
@@ -2336,6 +2783,20 @@ pub struct SourceEvidence {
     pub byte_seekable: bool,
     /// Explicit live/ICY semantics were seen.
     pub live: bool,
+    /// Whether the *demuxer's* ability to seek in media time is established.
+    /// Byte access says nothing about it (§4), and `MediaSource` carries no
+    /// such evidence, so it can only come from a format this project has
+    /// already demonstrated or from a trial seek.
+    pub demuxer: DemuxerSeek,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DemuxerSeek {
+    /// Demonstrated. Local playback of the four shipped formats is M1 evidence
+    /// that `tests/decode_fixtures.rs` re-proves on every run.
+    Proven,
+    /// Not yet established. Publishes `Unknown`, verified on demand (§6).
+    Unproven,
 }
 impl std::io::Read for HttpMediaSource { … }
 impl std::io::Seek for HttpMediaSource { … }
@@ -2348,23 +2809,91 @@ impl symphonia::core::io::MediaSource for HttpMediaSource { … }
 |---|---|---|
 | `Bytes(n)`, `n >= 1` | `Ok(n)` | — |
 | `Eof` | `Ok(0)` | The only `Ok(0)` there is. |
-| `Retired` | `Err(io::Error::new(ErrorKind::Interrupted, RetiredMarker))` | Distinguishable after Symphonia wraps it. |
-| `Failed(f)` | `Err(io::Error::new(ErrorKind::Other, RemoteIoError(f)))` | Carries the typed failure through. |
+| `Retired` | `Err(io::Error::other(RemoteIoError(RemoteFailure::Cancelled)))` | See below. |
+| `Failed(f)` | `Err(io::Error::other(RemoteIoError(f)))` | Carries the typed failure through. |
 
-`ErrorKind::Interrupted` is a deliberate risk: `std::io::Read::read_exact` retries on it, and Symphonia's `MediaSourceStream` may too. Guard against that with a **latched** retirement — once retired, every subsequent `read` returns the same error without touching the channel, so a retry loop terminates on the next call rather than spinning. Assert that in a test.
-
-Both marker types are `pub` in this module so `prepare.rs` and the worker can recover them:
+**`ErrorKind::Interrupted` must not be used, and an earlier draft of this plan got it exactly backwards.** `symphonia-core-0.6.1/src/io/media_source_stream.rs:432` reads
 
 ```rust
-/// Recovers the typed failure from an `io::Error` that Symphonia may have
-/// wrapped in its own error type. Returns `None` for an ordinary I/O error.
-pub fn remote_cause(error: &(dyn std::error::Error + 'static)) -> Option<RemoteFailure>;
-/// True when this error is a retirement rather than a fault (§8: "errors and
-/// cancellation remain distinguishable even if Symphonia wraps the I/O error").
-pub fn is_retired(error: &(dyn std::error::Error + 'static)) -> bool;
+fn read_buf_exact(&mut self, mut buf: &mut [u8]) -> io::Result<()> {
+    while !buf.is_empty() {
+        match self.read(buf) {
+            Ok(0) => break,
+            Ok(count) => { buf = &mut buf[count..]; }
+            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    ...
 ```
 
-Both walk `error.source()` and downcast at each level.
+so an `Interrupted` is swallowed and the loop goes round again — and `std::io::Read::read_exact` does the same. Latching does not terminate that loop; it **guarantees** an infinite one, because every retry returns `Interrupted` forever. Use `ErrorKind::Other`, which both loops propagate on the first call. Latching stays, but for its real reason: a retired source must answer identically however many times it is asked, so a caller that retries for any other reason gets the same answer instead of racing the channel.
+
+`RemoteFailure` gains one variant for this, so the retirement travels as data rather than as an error kind:
+
+```rust
+    /// Not a fault: a stop, seek or shutdown retired the read that was in
+    /// flight. Distinguishable from every failure above, which is what §8
+    /// requires ("errors and cancellation remain distinguishable even if
+    /// Symphonia wraps the I/O error").
+    #[error("the read was cancelled")]
+    Cancelled,
+```
+
+**Recovering it after Symphonia wraps it needs explicit unwrapping, not `source()` traversal.** Two facts make the obvious implementation return `None` every time:
+
+- `symphonia_core::errors::Error` implements the **deprecated `cause()`** and not `source()` (`symphonia-core-0.6.1/src/errors.rs:82`), so `source()` falls through to the trait default and yields `None`. Its `IoError(io::Error)` is a plain enum variant, so the right move is a `match`, not a chain walk.
+- `io::Error::source()` returns the *payload's* source, not the payload. `get_ref()` is what returns the payload.
+
+So:
+
+```rust
+/// The typed failure inside an error, wherever it is hiding.
+///
+/// Neither unwrap here is optional. `symphonia_core::errors::Error` implements
+/// the deprecated `cause()` rather than `source()`, so a `source()`-only walk
+/// stops at it and finds nothing; and `io::Error::source()` yields the
+/// payload's source rather than the payload, which `get_ref()` is what returns.
+/// Task 10's whole control flow — retired versus failed versus EOF — rests on
+/// this function, so a silent `None` here is a stop that reads as a truncated
+/// track.
+pub fn remote_cause(error: &(dyn std::error::Error + 'static)) -> Option<RemoteFailure> {
+    // Symphonia's own error, by value.
+    if let Some(symphonia) = error.downcast_ref::<symphonia::core::errors::Error>() {
+        if let symphonia::core::errors::Error::IoError(io) = symphonia {
+            return remote_cause(io);
+        }
+        return None;
+    }
+    // An io::Error's custom payload.
+    if let Some(io) = error.downcast_ref::<std::io::Error>()
+        && let Some(inner) = io.get_ref()
+    {
+        if let Some(marker) = inner.downcast_ref::<RemoteIoError>() {
+            return Some(marker.0.clone());
+        }
+        return remote_cause(inner);
+    }
+    if let Some(marker) = error.downcast_ref::<RemoteIoError>() {
+        return Some(marker.0.clone());
+    }
+    // Only then fall back to the standard chain.
+    error.source().and_then(remote_cause)
+}
+
+/// True when this error is a retirement rather than a fault.
+pub fn is_retired(error: &(dyn std::error::Error + 'static)) -> bool {
+    matches!(remote_cause(error), Some(RemoteFailure::Cancelled))
+}
+
+/// The `io::Error` payload. Public so `prepare` and the worker can recover it.
+#[derive(Debug)]
+pub struct RemoteIoError(pub RemoteFailure);
+```
+
+`RemoteIoError` implements `Display` by delegating to the inner failure and `std::error::Error` with no `source`, so it is a leaf and the recursion terminates.
+
+Both functions take `&(dyn Error + 'static)`; call them as `remote_cause(&error)` on any `E: Error + 'static`, and on a `PlaybackError::Decode(symphonia_error)` as `remote_cause(symphonia_error)`.
 
 - [ ] **Step 1: Write the failing source tests**
 
@@ -2417,7 +2946,7 @@ fn open(server: &TestServer, interrupt: Arc<SourceInterrupt>) -> HttpMediaSource
 #[test]
 fn a_range_capable_source_reports_its_length_and_is_seekable() {
     let server = TestServer::start(Script::serving(body()));
-    let source = open(&server, SourceInterrupt::new());
+    let source = open(&server, SourceInterrupt::new(Limits::default().buffer_bytes));
     assert_eq!(source.byte_len(), Some(8192));
     assert!(source.is_seekable());
     assert_eq!(
@@ -2430,7 +2959,7 @@ fn a_range_capable_source_reports_its_length_and_is_seekable() {
 #[test]
 fn a_range_ignoring_source_is_not_seekable_but_still_has_a_length() {
     let server = TestServer::start(Script::serving(body()).without_ranges());
-    let source = open(&server, SourceInterrupt::new());
+    let source = open(&server, SourceInterrupt::new(Limits::default().buffer_bytes));
     assert!(!source.is_seekable());
     assert_eq!(source.byte_len(), Some(8192));
     server.shutdown();
@@ -2439,7 +2968,7 @@ fn a_range_ignoring_source_is_not_seekable_but_still_has_a_length() {
 #[test]
 fn reading_to_the_end_yields_the_body_and_then_a_single_clean_eof() {
     let server = TestServer::start(Script::serving(body()));
-    let mut source = open(&server, SourceInterrupt::new());
+    let mut source = open(&server, SourceInterrupt::new(Limits::default().buffer_bytes));
     let mut all = Vec::new();
     match source.read_to_end(&mut all) {
         Ok(_) => {}
@@ -2457,7 +2986,7 @@ fn reading_to_the_end_yields_the_body_and_then_a_single_clean_eof() {
 fn seeking_forward_issues_a_range_request_at_that_byte() {
     // H2's byte half.
     let server = TestServer::start(Script::serving(body()));
-    let mut source = open(&server, SourceInterrupt::new());
+    let mut source = open(&server, SourceInterrupt::new(Limits::default().buffer_bytes));
     match source.seek(SeekFrom::Start(4096)) {
         Ok(position) => assert_eq!(position, 4096),
         Err(error) => panic!("seeking must succeed: {error}"),
@@ -2480,7 +3009,7 @@ fn seeking_to_the_known_byte_eof_answers_locally_without_a_request() {
     // requesting it" — because the server would answer 416, and a 416 is not
     // completion.
     let server = TestServer::start(Script::serving(body()));
-    let mut source = open(&server, SourceInterrupt::new());
+    let mut source = open(&server, SourceInterrupt::new(Limits::default().buffer_bytes));
     let before = server.requests().len();
     match source.seek(SeekFrom::Start(8192)) {
         Ok(position) => assert_eq!(position, 8192),
@@ -2495,12 +3024,73 @@ fn seeking_to_the_known_byte_eof_answers_locally_without_a_request() {
 }
 
 #[test]
+fn a_retired_read_is_recovered_through_symphonias_own_error_type() {
+    // The two unwraps that a `source()`-only walk misses. Symphonia implements
+    // the deprecated `cause()`, and io::Error::source() yields the payload's
+    // source rather than the payload. Both are exercised here by wrapping the
+    // error exactly as the decoder does.
+    let failure = RemoteFailure::TruncatedBody { missing: 9 };
+    let io = std::io::Error::other(continuo::http::source::RemoteIoError(failure.clone()));
+    let wrapped = symphonia::core::errors::Error::IoError(io);
+    assert_eq!(remote_cause(&wrapped), Some(failure));
+
+    let cancelled = symphonia::core::errors::Error::IoError(std::io::Error::other(
+        continuo::http::source::RemoteIoError(RemoteFailure::Cancelled),
+    ));
+    assert!(is_retired(&cancelled), "a wrapped retirement was not recognised");
+
+    // A decode error that carries no remote cause must not be mistaken for one.
+    let decode = symphonia::core::errors::Error::DecodeError("bad frame");
+    assert_eq!(remote_cause(&decode), None);
+    assert!(!is_retired(&decode));
+}
+
+#[test]
+fn a_retirement_does_not_use_interrupted_and_does_not_spin_a_retry_loop() {
+    // symphonia-core-0.6.1 media_source_stream.rs:432 swallows Interrupted
+    // inside `while !buf.is_empty()`, and std's read_exact does the same, so an
+    // Interrupted that latches is an infinite loop rather than a terminating
+    // one. Drive the real buffered reader to prove the error propagates.
+    use symphonia::core::io::{MediaSourceStream, MediaSourceStreamOptions, ReadBytes};
+
+    let server = TestServer::start(Script::serving(body()).stall_body_after(16));
+    let interrupt = SourceInterrupt::new(Limits::default().buffer_bytes);
+    let source = open(&server, Arc::clone(&interrupt));
+    assert!(server.wait_until_stalled(Duration::from_secs(5)));
+    interrupt.retire();
+
+    let mut stream = MediaSourceStream::new(
+        Box::new(source),
+        MediaSourceStreamOptions { buffer_len: 64 * 1024 },
+    );
+    let started = Instant::now();
+    let mut sink = [0u8; 8192];
+    let error = match stream.read_buf_exact(&mut sink) {
+        Err(error) => error,
+        Ok(()) => panic!("a retired read filled the buffer"),
+    };
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "read_buf_exact spun for {:?}",
+        started.elapsed()
+    );
+    assert_ne!(
+        error.kind(),
+        std::io::ErrorKind::Interrupted,
+        "Interrupted is retried by both read_exact and symphonia's reader"
+    );
+    assert!(is_retired(&error), "the retirement was lost: {error}");
+    server.shutdown();
+}
+
+#[test]
 fn a_retired_read_is_distinguishable_from_an_error_and_stays_retired() {
     // §8: errors and cancellation remain distinguishable even after Symphonia
-    // wraps the I/O error — and a latched retirement means a `read_exact`
-    // retry loop terminates instead of spinning.
+    // wraps the I/O error. Latching is not what terminates a retry loop — the
+    // non-retryable error kind is — but a retired source must still answer
+    // identically however many times it is asked.
     let server = TestServer::start(Script::serving(body()).stall_body_after(16));
-    let interrupt = SourceInterrupt::new();
+    let interrupt = SourceInterrupt::new(Limits::default().buffer_bytes);
     let mut source = open(&server, Arc::clone(&interrupt));
     assert!(server.wait_until_stalled(Duration::from_secs(5)));
     interrupt.retire();
@@ -2509,7 +3099,10 @@ fn a_retired_read_is_distinguishable_from_an_error_and_stays_retired() {
     let first = source.read(&mut [0u8; 4096]);
     assert!(started.elapsed() < Duration::from_secs(1));
     match first {
-        Err(error) => assert!(is_retired(&error), "not recognised as a retirement: {error}"),
+        Err(error) => {
+            assert!(is_retired(&error), "not recognised as a retirement: {error}");
+            assert_ne!(error.kind(), std::io::ErrorKind::Interrupted);
+        }
         Ok(n) => panic!("expected a retirement, read {n} bytes"),
     }
     match source.read(&mut [0u8; 4096]) {
@@ -2522,7 +3115,7 @@ fn a_retired_read_is_distinguishable_from_an_error_and_stays_retired() {
 #[test]
 fn a_truncated_body_surfaces_as_a_typed_remote_failure_not_as_eof() {
     let server = TestServer::start(Script::serving(body()).truncate_body_after(1024));
-    let mut source = open(&server, SourceInterrupt::new());
+    let mut source = open(&server, SourceInterrupt::new(Limits::default().buffer_bytes));
     let mut sink = Vec::new();
     let error = match source.read_to_end(&mut sink) {
         Err(error) => error,
@@ -2539,7 +3132,7 @@ fn a_truncated_body_surfaces_as_a_typed_remote_failure_not_as_eof() {
 fn a_changed_strong_validator_on_a_seek_fails_as_resource_changed() {
     // H11. Same length, different ETag: only the validator catches it.
     let server = TestServer::start(Script::serving(body()).changing_etag_after(1));
-    let mut source = open(&server, SourceInterrupt::new());
+    let mut source = open(&server, SourceInterrupt::new(Limits::default().buffer_bytes));
     let outcome = source.seek(SeekFrom::Start(4096));
     let error = match outcome {
         Err(error) => error,
@@ -2555,7 +3148,7 @@ fn a_changed_strong_validator_on_a_seek_fails_as_resource_changed() {
 #[test]
 fn a_live_source_is_flagged_as_live_evidence() {
     let server = TestServer::start(Script::serving(body()).live());
-    let source = open(&server, SourceInterrupt::new());
+    let source = open(&server, SourceInterrupt::new(Limits::default().buffer_bytes));
     assert!(source.evidence().live);
     assert_eq!(source.evidence().byte_len, None);
     server.shutdown();
@@ -2564,7 +3157,7 @@ fn a_live_source_is_flagged_as_live_evidence() {
 #[test]
 fn the_probe_cap_stops_a_runaway_scan() {
     let server = TestServer::start(Script::serving(vec![0u8; 1 << 20]));
-    let mut source = open(&server, SourceInterrupt::new());
+    let mut source = open(&server, SourceInterrupt::new(Limits::default().buffer_bytes));
     source.set_probe_cap(Some(4096));
     let mut sink = Vec::new();
     let error = match source.read_to_end(&mut sink) {
@@ -2610,7 +3203,7 @@ Add `pub mod source;` to `src/http/mod.rs`, then write `src/http/source.rs` to t
 - [ ] **Step 4: Run to verify they pass**
 
 Run: `cargo test --test http_source 2>&1 | tail -30`
-Expected: PASS, 10 tests.
+Expected: PASS, 12 tests.
 
 Run: `cargo fmt --check && cargo clippy --locked --all-targets --all-features -- -D warnings`
 
@@ -2620,9 +3213,11 @@ Run: `cargo fmt --check && cargo clippy --locked --all-targets --all-features --
 git add src/http/mod.rs src/http/source.rs tests/http_source.rs
 git commit -m "feat(http): add HttpMediaSource over the byte channel
 
-Retirement latches, so a read_exact retry loop terminates rather than spinning
-on ErrorKind::Interrupted; remote_cause/is_retired recover the distinction
-after Symphonia wraps the io::Error (§8)."
+A retirement travels as RemoteFailure::Cancelled inside ErrorKind::Other, never
+Interrupted: symphonia read_buf_exact and std read_exact both swallow and retry
+Interrupted, so latching one is an infinite loop. remote_cause unwraps
+symphonia Error::IoError and io::Error::get_ref explicitly, because symphonia
+0.6.1 implements the deprecated cause() and source() alone finds nothing."
 ```
 
 ---
@@ -2650,6 +3245,17 @@ pub struct PrepareContext {
     pub hook: Arc<dyn WaitHook>,
     pub limits: Limits,
 }
+
+/// One absolute instant that every wait taken during opening is clamped
+/// against. Threaded down rather than checked around the outside, because
+/// opening is a sequence of individually-short waits and checking only between
+/// them lets a slow trickle run indefinitely.
+#[derive(Clone, Copy, Debug)]
+pub struct OpeningDeadline(pub Instant);
+impl OpeningDeadline {
+    /// `None` once elapsed.
+    pub fn remaining(&self) -> Option<Duration>;
+}
 pub fn prepare(location: &SourceLocation, context: &PrepareContext) -> Result<Prepared, PlaybackError>;
 ```
 
@@ -2670,7 +3276,7 @@ pub fn from_media_source(
 
 `PlaybackError` gains `#[error(transparent)] Remote(#[from] RemoteFailure)`.
 
-**§6's table, implemented exactly.** `capabilities_from(evidence, decoder_duration, demuxer_seekable)`:
+**§6's table, implemented exactly.** `capabilities_from(evidence, decoder_duration)`:
 
 | Evidence | Result |
 |---|---|
@@ -2681,14 +3287,21 @@ pub fn from_media_source(
 
 and, given `Finite`:
 
-| Byte access | Demuxer | `SeekSupport` |
+| Byte access | `evidence.demuxer` | `SeekSupport` |
 |---|---|---|
-| `byte_seekable` and the demuxer reports seekable | `Native` |
-| `byte_seekable` but demuxer seekability unproven | `Unknown` |
-| not `byte_seekable` | `Unsupported` |
-| the demuxer is known unseekable | `Unsupported` |
+| `byte_seekable` | `Proven` | `Native` |
+| `byte_seekable` | `Unproven` | `Unknown` |
+| not `byte_seekable` | either | `Unsupported` |
 
-`RestartAndDiscard` is never published (R1). "Demuxer reports seekable" comes from Symphonia's `FormatReader`: a reader whose track has a `time_base` and a known `num_frames` over a byte-seekable source is `Native`; anything else is `Unknown` until a probe seek verifies it, which Task 10 performs on demand. H17 is the test that a byte-seekable source with an unseekable demuxer is never falsely `Native`.
+`RestartAndDiscard` is never published (R1).
+
+**Do not infer `Proven` from track metadata.** An earlier draft read `Native` off a track carrying both `time_base` and `num_frames`. Those fields describe *timing* — how to convert a timestamp, and how many frames the track claims — and say nothing about whether the selected demuxer implements `seek`. `MediaSource` (`symphonia-core-0.6.1/src/io/mod.rs:42`) exposes only `is_seekable` and `byte_len`, `FormatReader` exposes no seekability query at all, and a reader that cannot seek says so only by answering `Error::SeekError(SeekErrorKind::Unseekable)` when asked. Asking is the only way to find out.
+
+So `Proven` has exactly two sources, both evidence rather than inference:
+- **Local files**, which pass `DemuxerSeek::Proven` because M1 already ships that guarantee for the four supported formats and `tests/decode_fixtures.rs` re-proves it on every run. This is what keeps local capabilities byte-identical.
+- **A trial seek**, performed by Task 10's `verify_seek_support`, which publishes `CapabilitiesChanged` with the answer.
+
+Every remote source therefore opens as `Unknown` and is verified on demand, which is what §6 asks for in as many words: "Until conclusive evidence exists, publish `Unknown`, and verify on demand." A resume seek at load time *is* that verification, so an ordinary resume costs no extra request. H17 is the test that a byte-seekable source is never advertised `Native` before something demonstrated it.
 
 - [ ] **Step 1: Write the failing preparation tests**
 
@@ -2728,7 +3341,7 @@ fn context() -> PrepareContext {
     };
     PrepareContext {
         http: Some(http),
-        interrupt: SourceInterrupt::new(),
+        interrupt: SourceInterrupt::new(Limits::default().buffer_bytes),
         hook: Arc::new(NoHook),
         limits: Limits::default(),
     }
@@ -2817,7 +3430,7 @@ fn a_local_file_prepares_through_the_same_path_with_no_http_service() {
     };
     let context = PrepareContext {
         http: None,
-        interrupt: SourceInterrupt::new(),
+        interrupt: SourceInterrupt::new(Limits::default().buffer_bytes),
         hook: Arc::new(NoHook),
         limits: Limits::default(),
     };
@@ -2833,7 +3446,7 @@ fn a_local_file_prepares_through_the_same_path_with_no_http_service() {
 fn an_http_url_without_a_service_is_refused_rather_than_silently_ignored() {
     let context = PrepareContext {
         http: None,
-        interrupt: SourceInterrupt::new(),
+        interrupt: SourceInterrupt::new(Limits::default().buffer_bytes),
         hook: Arc::new(NoHook),
         limits: Limits::default(),
     };
@@ -2856,6 +3469,32 @@ fn opening_that_exceeds_the_probe_byte_cap_fails_cancellably() {
     };
     assert!(
         matches!(error, PlaybackError::Remote(RemoteFailure::ProbeLimitExceeded { limit: 1024 })),
+        "{error}"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn a_slow_trickle_cannot_outlast_the_opening_deadline() {
+    // Every individual read stays inside `stall`, so a deadline checked only
+    // after probing returns never fires and opening runs indefinitely. The
+    // deadline has to be inside each wait, not around all of them.
+    let server =
+        TestServer::start(Script::from_fixture("sine-5s.flac").trickle(1, Duration::from_millis(50)));
+    let mut context = context();
+    context.limits.open = Duration::from_secs(1);
+    context.limits.stall = Duration::from_secs(30);
+    let started = std::time::Instant::now();
+    let error = match prepare(&remote(&server), &context) {
+        Err(error) => error,
+        Ok(_) => panic!("a trickling server opened despite the deadline"),
+    };
+    assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+    assert!(
+        matches!(
+            error,
+            PlaybackError::Remote(RemoteFailure::Timeout { phase: continuo::http::error::Phase::Open })
+        ),
         "{error}"
     );
     server.shutdown();
@@ -2891,7 +3530,7 @@ Add `pub mod prepare;` to `src/playback/mod.rs`. Add the `Remote` variant to `sr
     Remote(#[from] crate::http::error::RemoteFailure),
 ```
 
-In `src/playback/decode.rs`, extract the body of `open` after the `MediaSourceStream` construction into `from_media_source`, and give `DecodedSource` two new fields — `evidence: SourceEvidence` and `demuxer_seekable: bool` — set from the supplied evidence and from whether the reader's default track carries both a `time_base` and `num_frames`. Replace `capabilities()` with:
+In `src/playback/decode.rs`, extract the body of `open` after the `MediaSourceStream` construction into `from_media_source`, and give `DecodedSource` one new field, `evidence: SourceEvidence`, taken from the caller. Add a setter `pub fn note_demuxer_proven(&mut self)` for Task 10's trial seek to call. Replace `capabilities()` with:
 
 ```rust
     /// Capabilities the decoder can establish *on its own*. The engine combines
@@ -2904,27 +3543,29 @@ In `src/playback/decode.rs`, extract the body of `open` after the `MediaSourceSt
             } else {
                 Continuity::Unresolved
             },
-            seek: match (self.evidence.byte_seekable, self.demuxer_seekable) {
-                (true, true) => SeekSupport::Native,
-                (true, false) => SeekSupport::Unknown,
+            seek: match (self.evidence.byte_seekable, self.evidence.demuxer) {
+                (true, DemuxerSeek::Proven) => SeekSupport::Native,
+                (true, DemuxerSeek::Unproven) => SeekSupport::Unknown,
                 (false, _) => SeekSupport::Unsupported,
             },
         }
     }
 ```
 
-**This changes local behaviour and must not.** A local file was unconditionally `SeekSupport::Native`. Keep that: a local `SourceEvidence` sets `byte_seekable: true`, and for the four shipped local formats the reader carries `time_base` and `num_frames`, so `demuxer_seekable` is true and the answer is still `Native`. Verify with `cargo test --test decode_fixtures --test capabilities` before moving on; if a fixture comes back `Unknown`, the `demuxer_seekable` predicate is wrong, not the fixture.
+**This changes local behaviour and must not.** A local file was unconditionally `SeekSupport::Native`. Keep that: `DecodedSource::open` passes `SourceEvidence { byte_len: Some(file length), byte_seekable: true, live: false, demuxer: DemuxerSeek::Proven }`, so the answer is still `Native` by the first row of the table. Verify with `cargo test --test decode_fixtures --test capabilities` before moving on; a fixture coming back `Unknown` means `open` is not passing `Proven`.
 
 `prepare` then:
 1. `SourceLocation::LocalPath(path)` → canonicalize, `AbsolutePath::new`, `DecodedSource::open`.
-2. `SourceLocation::Http(url)` → `context.http.as_ref().ok_or(RemoteFailure::InvalidSource { input: redact_url(url.as_str()), reason: "no HTTP service in this session" })`, then `HttpMediaSource::open`, `set_probe_cap(Some(limits.probe_bytes))`, wrap in `MediaSourceStream::new(Box::new(source), MediaSourceStreamOptions { buffer_len: 64 * 1024 })`, hint from the URL path's extension, `from_media_source`, then `set_probe_cap(None)` — the cap bounds *opening*, not playback. Getting the cap off afterwards needs the source back, so keep an `Arc`-free handle: give `HttpMediaSource` a `Arc<AtomicU64>` cap that `prepare` clones before boxing, and clear it through that clone.
+2. `SourceLocation::Http(url)` → `context.http.as_ref().ok_or(RemoteFailure::InvalidSource { input: redact_url(url.as_str()), reason: "no HTTP service in this session" })`, then `HttpMediaSource::open`, `set_probe_cap(Some(limits.probe_bytes))`, wrap in `MediaSourceStream::new(Box::new(source), MediaSourceStreamOptions { buffer_len: 64 * 1024 })`, hint from the URL path's extension, `from_media_source`, then clear both the probe cap and the opening deadline — each bounds *opening*, not playback. Getting them off afterwards needs the source back after it has been boxed, so give `HttpMediaSource` an `Arc<OpeningLimits>` (an `AtomicU64` cap plus an `AtomicBool` "opening is over") that `prepare` clones before boxing and clears through that clone.
 3. Reject `Continuity::Indefinite` (from `evidence.live`) as `UnsupportedLiveMedia` and `Continuity::Unresolved` as `ContinuityUndetermined`, before returning (R3).
-4. The whole of 2 runs under a `limits.open` deadline: record `Instant::now()` at entry and check it after the header wait and after the probe, failing with `Timeout { phase: Phase::Open }`.
+4. **One absolute opening deadline, propagated into every wait.** Checking `Instant::now()` after the probe returns is not enough, and an earlier draft did exactly that: each individual read can sit comfortably inside `limits.stall` while a server trickles a byte every few seconds, so no read ever times out and opening runs indefinitely. `prepare` computes `OpeningDeadline(Instant::now() + limits.open)` once and passes it into `HttpMediaSource::open`, which stores it and clamps *every* wait it takes to `min(deadline.remaining()?, limits.stall)` — the header wait, every `Read::read` taken during probing, and every seek's header wait. `remaining()` returning `None` is `Timeout { phase: Phase::Open }`.
+
+   Once `prepare` clears the deadline, ordinary playback reads are bounded only by `limits.stall`, which is §8's rule that ordinary playback has no whole-response deadline.
 
 - [ ] **Step 4: Run to verify they pass**
 
 Run: `cargo test --test prepare --test decode_fixtures --test capabilities 2>&1 | tail -30`
-Expected: PASS — 9 new, and every existing decode/capability test unchanged.
+Expected: PASS — 10 new, and every existing decode/capability test unchanged.
 
 Run: `cargo fmt --check && cargo clippy --locked --all-targets --all-features -- -D warnings && cargo test --locked 2>&1 | tail -5`
 
@@ -3262,28 +3903,113 @@ impl TransportCore {
 
 ```rust
 // src/playback/wait.rs
-/// What a blocked source read services on the worker's behalf: spans into the
-/// timeline, and the keep-latest progress snapshot.
+/// What a blocked source read services on the worker's behalf.
+///
+/// Three jobs, and no others: drain spans into the timeline, publish the
+/// keep-latest progress snapshot, and act on the freeze level — park the
+/// output when a pause arrives, release it when a play does, and announce
+/// each.
 ///
 /// It holds no decoder and no source. §8 states "must not re-enter decoder
 /// reads or seeks" as a rule; here it is a property of the type.
-pub struct WaitService { /* Arc<Mutex<Option<TransportCore>>>, Arc<Mutex<Progress>>, Arc<Mutex<SessionFacts>> */ }
+pub struct WaitService { /* see fields below */ }
 impl WaitService {
-    pub fn new(transport: Arc<Mutex<Option<TransportCore>>>, progress: Arc<Mutex<Progress>>, facts: Arc<Mutex<SessionFacts>>, clock: Arc<dyn Fn() -> Nanos + Send + Sync>) -> Arc<Self>;
+    pub fn new(
+        transport: Arc<Mutex<Option<TransportCore>>>,
+        progress: Arc<Mutex<Progress>>,
+        facts: Arc<Mutex<SessionFacts>>,
+        interrupt: Arc<SourceInterrupt>,
+        events: Sender<PlaybackEvent>,
+        outbox: Arc<Mutex<VecDeque<PlaybackEvent>>>,
+        backlog_empty: Arc<AtomicBool>,
+        clock: Arc<dyn Fn() -> Nanos + Send + Sync>,
+    ) -> Arc<Self>;
+    /// Drained by the worker at the top of every loop pass, into
+    /// `pending_events`, before anything else can emit.
+    pub fn take_outbox(&self) -> Vec<PlaybackEvent>;
 }
 impl WaitHook for WaitService { fn service(&self); }
 
 /// The scalars `service()` needs that change with the session rather than with
 /// the transport.
-pub struct SessionFacts { pub session_rev: u64, pub media: Option<MediaId>, pub position: Duration, pub degraded: bool, pub playing: bool }
+pub struct SessionFacts {
+    pub session_rev: u64,
+    pub media: Option<MediaId>,
+    pub position: Duration,
+    pub degraded: bool,
+    pub playing: bool,
+    /// Set by the hook when it parks for a freeze, cleared when it releases.
+    /// The worker reads it to know the transport is parked without having
+    /// dispatched the `Pause` itself.
+    pub frozen_by_hook: bool,
+}
 ```
+
+**Why the hook, and not the worker, has to do this (G2/#3).** §9 requires pause to work during a stalled read, and requires it to do so *without returning a destructive read error to the demuxer* — so the read stays pending inside Symphonia, and the worker stays inside `pump_audio` and never reaches its command loop. Nothing else is running. If the hook only published progress, the output would keep draining the ring while the listener believed playback was paused, and `StateChanged{Paused}` would never be emitted at all. So `service()` gains a freeze arm:
+
+```rust
+fn service(&self) {
+    let frozen = self.interrupt.is_frozen();
+    let mut facts = lock(&self.facts);
+    if frozen && !facts.frozen_by_hook {
+        // Park the callback. Everything else — the ring, the decoder, the
+        // pending read — is left exactly as it is, which is what makes
+        // resuming a single release (§9).
+        if self.park() {
+            facts.frozen_by_hook = true;
+            facts.playing = false;
+            self.announce(PlaybackEvent::StateChanged {
+                session_rev: facts.session_rev,
+                state: PlaybackState::Paused,
+            });
+        }
+    } else if !frozen && facts.frozen_by_hook {
+        self.release();
+        facts.frozen_by_hook = false;
+        facts.playing = true;
+        self.announce(PlaybackEvent::StateChanged {
+            session_rev: facts.session_rev,
+            state: PlaybackState::Playing,
+        });
+    }
+    drop(facts);
+    self.publish_progress();
+}
+```
+
+`park()` takes the transport lock and calls `handshake.park(timeline, &mut pump, DEADLINE)`, returning whether it was acknowledged; a park that times out leaves `frozen_by_hook` false so the worker's own `pause()` handles the recovery when the read finally returns.
+
+**Ordering, which is the subtle part.** `announce` may not simply `try_send`: the worker's `pending_events` backlog might be non-empty, and jumping it would deliver `Paused` ahead of events emitted before it. The worker therefore maintains `backlog_empty: Arc<AtomicBool>` — set whenever `pending_events` is empty, cleared whenever it is not — and `announce` reads it:
+
+```rust
+fn announce(&self, event: PlaybackEvent) {
+    // Ordering first: the worker's backlog is ahead of anything emitted here,
+    // and a Paused delivered in front of it would misreport the sequence.
+    if self.backlog_empty.load(Ordering::Acquire)
+        && lock(&self.outbox).is_empty()
+        && self.events.len() + RESERVED_EVENT_SLOTS < EVENT_CAPACITY
+    {
+        if self.events.try_send(event).is_ok() {
+            return;
+        }
+    } else {
+        lock(&self.outbox).push_back(event);
+        return;
+    }
+    lock(&self.outbox).push_back(event);
+}
+```
+
+The outbox is drained by the worker into `pending_events` at the top of its next pass — which happens as soon as the read returns, so nothing is lost, only delayed in the case where ordering forbids the shortcut. `crossbeam_channel::Sender` is `Sync` and `try_send` takes `&self`, so the hook can hold a clone.
 
 **The refactor, concretely.** In `Worker`:
 - `transport: Option<Transport>` becomes `transport: Arc<Mutex<Option<TransportCore>>>` plus `pcm: Option<rtrb::Producer<f32>>`, `link: Option<Arc<OutputLink>>` and `config: Option<NegotiatedOutput>` as plain worker fields. Only `handshake`, `timeline`, `anchor` and `sample_rate` need to be shared; the PCM producer is `!Sync` and stays on the worker, which is also correct — the hook must never push audio.
 - `timeline: Timeline` leaves `Worker`.
 - `anchor: Duration` leaves `Worker` (it lives in `TransportCore`); `Worker::reset_generation_state` sets it through the lock.
 - Every site that today writes `self.transport.as_mut()` and `&mut self.timeline` together — `run()` step 2, `open_transport`, `reinstall`, `prime_and_run`, `capture_position`, `pause`, `check_end_of_track` — takes the lock for the duration of that one operation and releases it.
-- `publish_progress` becomes a thin wrapper that updates `SessionFacts` and calls the same `WaitService::service()` the hook calls. One implementation, two callers, which is what makes "the hook does exactly what the loop does" a fact rather than a comment.
+- `publish_progress` becomes a thin wrapper that updates `SessionFacts` and calls the same `WaitService::service()` the hook calls. One implementation, two callers, which is what makes "the hook does exactly what the loop does" a fact rather than a comment — including the freeze arm, so a pause that arrives while the worker is *not* blocked is handled by the same code.
+- `run()` gains, as the very first thing in step 4: drain `service.take_outbox()` into the front of `pending_events`, and maintain `backlog_empty` after every mutation of `pending_events`. Draining before `flush_events` is what keeps a hook-emitted `Paused` in order with everything around it.
+- `pause()` becomes idempotent with respect to the hook: if `facts.frozen_by_hook` is already set, the transport is parked and `StateChanged{Paused}` is already emitted, so it only sets `self.state = Paused` without re-emitting. Likewise `play()` checks the flag before releasing.
 - **`pump_audio` must not hold the transport lock across `source.next_planar()`.** Structure it as: lock → compute `free`, push staging, read `pushed_total` → drop the lock → decode. A single `let free = { … };` block is enough. Getting this wrong deadlocks the moment a remote read blocks, and no local test would catch it.
 
 - [ ] **Step 1: Write the failing wait-service test**
@@ -3305,6 +4031,29 @@ use continuo::playback::output::Nanos;
 use continuo::playback::timeline::PositionQuality;
 use continuo::playback::wait::{SessionFacts, WaitService};
 
+/// The four wiring arguments that only the freeze tests care about, in the
+/// inert configuration: nothing frozen, an empty backlog, a channel nobody
+/// reads. A bare helper, so it handles its own error rather than unwrapping.
+fn inert() -> (
+    Arc<continuo::http::channel::SourceInterrupt>,
+    crossbeam_channel::Sender<PlaybackEvent>,
+    Arc<Mutex<std::collections::VecDeque<PlaybackEvent>>>,
+    Arc<std::sync::atomic::AtomicBool>,
+) {
+    let (tx, rx) = crossbeam_channel::bounded(64);
+    // Leak the receiver into the returned sender's lifetime by keeping it
+    // alive here would be wrong; instead the caller keeps it. These tests do
+    // not read events, so a disconnected channel is fine and try_send simply
+    // fails, which `announce` already handles by using the outbox.
+    drop(rx);
+    (
+        continuo::http::channel::SourceInterrupt::new(1024),
+        tx,
+        Arc::new(Mutex::new(std::collections::VecDeque::new())),
+        Arc::new(std::sync::atomic::AtomicBool::new(true)),
+    )
+}
+
 #[test]
 fn servicing_publishes_the_position_the_timeline_reports() {
     let transport = Arc::new(Mutex::new(None));
@@ -3320,11 +4069,17 @@ fn servicing_publishes_the_position_the_timeline_reports() {
         position: Duration::from_secs(9),
         degraded: false,
         playing: true,
+        frozen_by_hook: false,
     }));
+    let (interrupt, events, outbox, backlog_empty) = inert();
     let service = WaitService::new(
         Arc::clone(&transport),
         Arc::clone(&progress),
         Arc::clone(&facts),
+        interrupt,
+        events,
+        outbox,
+        backlog_empty,
         Arc::new(|| Nanos(0)),
     );
 
@@ -3338,6 +4093,103 @@ fn servicing_publishes_the_position_the_timeline_reports() {
     // With no transport the retained position stands: a blocked read must not
     // rewind the position to zero just because there is nothing to sample.
     assert_eq!(published.position, Duration::from_secs(9));
+}
+
+#[test]
+fn servicing_a_freeze_parks_the_output_and_announces_paused() {
+    // §9: pause must work during a stalled read. The worker is inside
+    // pump_audio and will not reach its command loop until the read returns,
+    // so if the hook does not do this, nothing does — the output keeps
+    // draining and Paused is never emitted (#3).
+    let (events_tx, events_rx) = crossbeam_channel::bounded(64);
+    let interrupt = SourceInterrupt::new(1024);
+    let outbox = Arc::new(Mutex::new(std::collections::VecDeque::new()));
+    let backlog_empty = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let facts = Arc::new(Mutex::new(SessionFacts {
+        session_rev: 3,
+        media: None,
+        position: Duration::from_secs(7),
+        degraded: false,
+        playing: true,
+        frozen_by_hook: false,
+    }));
+    let service = WaitService::new(
+        Arc::new(Mutex::new(None)),
+        Arc::new(Mutex::new(Progress {
+            session_rev: 3,
+            media: None,
+            position: Duration::from_secs(7),
+            quality: PositionQuality::Exact,
+        })),
+        Arc::clone(&facts),
+        Arc::clone(&interrupt),
+        events_tx,
+        Arc::clone(&outbox),
+        Arc::clone(&backlog_empty),
+        Arc::new(|| Nanos(0)),
+    );
+
+    interrupt.freeze();
+    service.service();
+    match events_rx.try_recv() {
+        Ok(PlaybackEvent::StateChanged { session_rev: 3, state: PlaybackState::Paused }) => {}
+        other => panic!("expected StateChanged{{Paused}}, got {other:?}"),
+    }
+    // Idempotent: a second slice must not re-announce.
+    service.service();
+    assert!(events_rx.try_recv().is_err(), "the freeze was announced twice");
+
+    interrupt.thaw();
+    service.service();
+    match events_rx.try_recv() {
+        Ok(PlaybackEvent::StateChanged { session_rev: 3, state: PlaybackState::Playing }) => {}
+        other => panic!("expected StateChanged{{Playing}}, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_hook_announcement_goes_to_the_outbox_when_the_workers_backlog_is_not_empty() {
+    // Jumping a non-empty backlog would deliver Paused ahead of events emitted
+    // before it. The outbox is drained into pending_events at the top of the
+    // worker's next pass, so nothing is lost — only ordered.
+    let (events_tx, events_rx) = crossbeam_channel::bounded(64);
+    let interrupt = SourceInterrupt::new(1024);
+    let outbox = Arc::new(Mutex::new(std::collections::VecDeque::new()));
+    let backlog_empty = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let service = WaitService::new(
+        Arc::new(Mutex::new(None)),
+        Arc::new(Mutex::new(Progress {
+            session_rev: 1,
+            media: None,
+            position: Duration::ZERO,
+            quality: PositionQuality::Exact,
+        })),
+        Arc::new(Mutex::new(SessionFacts {
+            session_rev: 1,
+            media: None,
+            position: Duration::ZERO,
+            degraded: false,
+            playing: true,
+            frozen_by_hook: false,
+        })),
+        Arc::clone(&interrupt),
+        events_tx,
+        Arc::clone(&outbox),
+        backlog_empty,
+        Arc::new(|| Nanos(0)),
+    );
+
+    interrupt.freeze();
+    service.service();
+    assert!(events_rx.try_recv().is_err(), "the hook jumped a non-empty backlog");
+    let drained = service.take_outbox();
+    assert!(
+        matches!(
+            drained.as_slice(),
+            [PlaybackEvent::StateChanged { state: PlaybackState::Paused, .. }]
+        ),
+        "{drained:?}"
+    );
 }
 
 #[test]
@@ -3355,8 +4207,19 @@ fn servicing_with_no_transport_is_harmless_and_repeatable() {
         position: Duration::from_secs(3),
         degraded: false,
         playing: false,
+        frozen_by_hook: false,
     }));
-    let service = WaitService::new(transport, Arc::clone(&progress), facts, Arc::new(|| Nanos(0)));
+    let (interrupt, events, outbox, backlog_empty) = inert();
+    let service = WaitService::new(
+        transport,
+        Arc::clone(&progress),
+        facts,
+        interrupt,
+        events,
+        outbox,
+        backlog_empty,
+        Arc::new(|| Nanos(0)),
+    );
     for _ in 0..100 {
         service.service();
     }
@@ -3479,43 +4342,88 @@ Pause does **not** get a bit: it is a level on `SourceInterrupt` (G2), because a
    }
    ```
    `is_retired_read` walks the error chain with `http::source::is_retired`. `retire_remote_source` drops `self.source` when the current `SourceLocation` is `Http`, and keeps `self.descriptor` so `restore()` can reopen.
-3. A decode error carrying a `RemoteFailure` fails the session with the typed cause instead of warning and reporting EOF:
+3. A decode error over a **remote** source fails the session; only a local one keeps M1's warn-and-drain behaviour:
    ```rust
-   Err(error) => match remote_cause_of(&error) {
+   Err(error) => match (remote_cause(&error), self.source_is_remote()) {
        // §7: never reinterpret a status failure, a malformed range, a timeout
        // or a truncated body as clean source EOF.
-       Some(failure) => self.fail_with(format!("{failure}"), Some(failure)),
-       None => { self.source_eof = true; self.warn(format!("decoding stopped early: {error}")); }
-   }
-   ```
-4. `do_stop` gains, after `capture_and_teardown()`: `self.source_interrupt.retire(); self.retire_remote_source();` — §9's "retire fetch, wake reads, discard transport and remote decoder; keep identity/source/position".
-5. `Worker` gains `descriptor: Option<SourceLocation>`, set by `load`, cleared by `shutdown`. `restore()` gains a reopen branch before its `source.is_none()` guard:
-   ```rust
-   if self.source.is_none()
-       && let Some(location) = self.descriptor.clone()
-   {
-       self.source_interrupt.arm();
-       match prepare(&location, &self.prepare_context()) {
-           Ok(prepared) => {
-               // A source that cannot seek cannot restore a nonzero position,
-               // and starting at zero silently would be exactly the reset the
-               // milestone's invariant forbids (§9).
-               if self.position > Duration::ZERO
-                   && prepared.capabilities.seek == SeekSupport::Unsupported
-               {
-                   self.emit_capabilities(prepared.capabilities);
-                   self.reject_seek("this server cannot resume; the position is kept".into());
-                   self.set_state(PlaybackState::Stopped);
-                   return;
-               }
-               self.emit_capabilities(prepared.capabilities);
-               self.source = Some(prepared.source);
-           }
-           Err(error) => { self.fail_from(error); return; }
+       (Some(failure), _) => self.fail_with(format!("{failure}"), Some(failure)),
+       // H8: "malformed audio cannot become successful completion". A body
+       // that transferred perfectly and decoded to garbage has no remote
+       // cause at all, so keying on one alone lets exactly the case H8 names
+       // drain to EndOfTrack and mark the episode complete. A remote attempt
+       // that cannot finish decoding is a failed attempt, whatever the
+       // transport did.
+       (None, true) => self.fail_with(
+           format!("decoding failed: {error}"),
+           None,
+       ),
+       // Local files keep M1's contract: a decode error late in a file the
+       // listener already heard most of drains what it has rather than
+       // discarding the session. `tests/decode_fixtures.rs` pins this.
+       (None, false) => {
+           self.source_eof = true;
+           self.warn(format!("decoding stopped early: {error}"));
        }
    }
    ```
-6. `seek_to` gains a capability gate before the stopped-seek branch, so §10's "reject unsupported stopped seeks *before* `SeekTargetStored`" holds:
+   `source_is_remote()` reads `self.descriptor`, which `load` sets and `shutdown` clears.
+4. `do_stop` gains, after `capture_and_teardown()`: `self.source_interrupt.retire(); self.retire_remote_source();` — §9's "retire fetch, wake reads, discard transport and remote decoder; keep identity/source/position".
+5. `Worker` gains `descriptor: Option<SourceLocation>`, set by `load`, cleared by `shutdown`. Reopening is **one method**, not a branch inside `restore()`, because three callers need it and an earlier draft gave it only to `restore` — leaving `seek_to` to hit its `self.source.is_none()` guard and reject every seek taken after a stop or a cancelled seek had retired the decoder:
+   ```rust
+   /// Reopen a remote source the worker retired, so a caller that needs a
+   /// decoder has one. `Ok(false)` means nothing had to be done.
+   ///
+   /// Called by `restore` (play after stop), by `seek_to` (a seek arriving
+   /// while stopped, or after a previous seek's retirement dropped the
+   /// decoder), and by `restart`. Giving it to only one of them is what makes
+   /// a stopped seek fail with "nothing is loaded" on a source that is very
+   /// much loaded.
+   fn ensure_source_open(&mut self) -> Result<bool, PlaybackError> {
+       if self.source.is_some() {
+           return Ok(false);
+       }
+       let Some(location) = self.descriptor.clone() else {
+           return Ok(false);
+       };
+       self.source_interrupt.arm();
+       let prepared = prepare(&location, &self.prepare_context())?;
+       self.capabilities = prepared.capabilities;
+       self.emit_capabilities(prepared.capabilities);
+       self.source = Some(prepared.source);
+       Ok(true)
+   }
+   ```
+   `restore()` calls it before its `source.is_none()` guard, and then applies §9's resume rule:
+   ```rust
+   match self.ensure_source_open() {
+       Ok(_) => {}
+       Err(error) => { self.fail_from(error); return; }
+   }
+   // A source that cannot seek cannot restore a nonzero position, and
+   // starting at zero silently would be exactly the reset the milestone's
+   // invariant forbids (§9).
+   if self.position > Duration::ZERO && self.capabilities.seek == SeekSupport::Unsupported {
+       self.reject_seek("this server cannot resume; the position is kept".into());
+       self.set_state(PlaybackState::Stopped);
+       return;
+   }
+   ```
+6. `seek_to` gains a reopen and a capability gate, in that order, before its existing `source.is_none()` guard. **The reopen has to come first**: after a stop or a retired seek there is no decoder, and the current guard would reject the seek as "nothing is loaded" on a source whose identity, descriptor and position the worker is still holding.
+   ```rust
+   // A remote source the worker retired is reopened here, not treated as
+   // absent. `ensure_source_open` is a no-op when a decoder is already live,
+   // so the local path is unchanged.
+   if let Err(error) = self.ensure_source_open() {
+       self.reject_seek(format!("{error}"));
+       return;
+   }
+   if self.source.is_none() {
+       self.reject_seek("nothing is loaded".into());
+       return;
+   }
+   ```
+   then the capability gate, so §10's "reject unsupported stopped seeks *before* `SeekTargetStored`" holds:
    ```rust
    match self.capabilities.seek {
        SeekSupport::Unsupported => { self.reject_seek("this source cannot seek".into()); return; }
@@ -3538,7 +4446,8 @@ Pause does **not** get a bit: it is a level on `SourceInterrupt` (G2), because a
        return;
    }
    ```
-8. `restart()` arms the interrupt and, for a remote source, reopens from zero rather than seeking — §9's "Restart: explicitly open from zero".
+8. `restart()` calls `ensure_source_open()` and, for a remote source, reopens from zero rather than seeking — §9's "Restart: explicitly open from zero".
+9. `Worker` gains `capabilities: MediaCapabilities`, set by `load` and by `ensure_source_open`, so the gates in 5 and 6 read one field rather than reaching into the source.
 
 - [ ] **Step 1: Write the failing engine-remote tests**
 
@@ -3558,6 +4467,43 @@ mod support;
 // 8. quit_while_paused_wakes_every_source_wait                           (H10)
 // 9. a_truncated_tail_cannot_become_end_of_track                         (H8/H9)
 // 10. a_capability_change_carries_the_current_session_rev                (H14)
+// 11. a_seek_after_a_stop_reopens_rather_than_reporting_nothing_is_loaded (#7)
+// 12. a_seek_after_a_retired_seek_reopens_and_lands                       (#7)
+// 13. corrupt_audio_over_a_complete_body_fails_and_never_ends             (H8/#6)
+```
+
+Test 13 is the one the plan would otherwise have shipped broken, so write it explicitly:
+
+```rust
+#[test]
+fn corrupt_audio_over_a_complete_body_fails_and_never_ends() {
+    // H8: "malformed audio cannot become successful completion". The transfer
+    // is perfect — full Content-Length, clean EOF, valid ETag — and the bytes
+    // are garbage. Keying the failure on a RemoteFailure alone lets this drain
+    // to EndOfTrack and mark the episode complete, destroying the checkpoint.
+    let mut body = match std::fs::read(fixture_path("sine-5s.flac")) {
+        Ok(body) => body,
+        Err(error) => panic!("the fixture must exist: {error}"),
+    };
+    // Corrupt the middle, leaving the header intact so it still opens.
+    let middle = body.len() / 2;
+    for byte in &mut body[middle..middle + 4096] {
+        *byte = 0xFF;
+    }
+    let server = TestServer::start(Script::serving(body));
+
+    let mut engine = TestEngine::start();
+    engine.load_remote(&server.url("/audio.flac"));
+    engine.play_until_terminal(Duration::from_secs(10));
+
+    assert_eq!(engine.state(), PlaybackState::Failed, "corrupt audio was reported as {:?}", engine.state());
+    assert!(
+        !engine.saw_end_of_track(),
+        "EndOfTrack was emitted for a recording that never decoded through"
+    );
+    engine.finish();
+    server.shutdown();
+}
 ```
 
 Write each one out in full following the pattern already established in `tests/engine_contract.rs`: `TestEngine::start()`, `engine.load_remote(server.url("/audio.flac"))`, assertions with the harness clock frozen, `engine.finish()`. Every cancellation test first proves the wait was entered — `server.wait_until_stalled(Duration::from_secs(5))` for a body stall, `server.requests()` growing for a header stall — before it interrupts. Sleeping and hoping is what §12 forbids.
@@ -4239,6 +5185,8 @@ Two things §12 asks for that are **not** in a task, deliberately, with the reas
 - **Configuration of the §8 limits.** §8 says "exposing configuration is deferred", so `Limits` is injectable for tests and has no CLI or file surface.
 
 **Placeholder scan.** No step says "add error handling", "handle edge cases", "similar to Task N", or "write tests for the above". Three places give prose obligations rather than a full literal body — Task 4's server, Task 5's fetch task, Task 13's acceptance files — because each is several hundred lines whose every branch is already pinned by a named test above it. Each lists its obligations as a numbered or tabular checklist, and each obligation has a test that fails if it is missed.
+
+**Claims checked against the crates rather than from memory.** Four of review round 1's thirteen defects were assertions this document made about other people's code, and all four were wrong. What replaced them, and where each was verified: reqwest 0.13.5's feature list (its own manifest) and `Response::chunk` (`src/async_impl/response.rs:310`); symphonia-core 0.6.1's `Error` impl (`src/errors.rs:82`), its `read_buf_exact` retry (`src/io/media_source_stream.rs:425`), and the `MediaSource` trait's surface (`src/io/mod.rs:42`). Anything this plan asserts about a dependency should be re-checked the same way before it is relied on, rather than carried forward on the strength of appearing here.
 
 **Type consistency.** Names used across task boundaries, checked against their definitions:
 `Limits` (1) → 5, 6, 7. `RemoteFailure`, `Operation`, `Phase`, `RangeRejection`, `RedirectRejection`, `redact_url` (1) → 2, 5, 6, 7, 8, 12. `Headers`, `Accepted`, `ByteRange`, `Validator`, `Established`, `accept`, `accept_redirect`, `if_range_value`, `validator_from`, `is_live`, `parse_content_range` (2) → 5, 6. `ByteChannel`, `SourceInterrupt`, `WaitHook`, `Outcome`, `ReadOutcome` (3) → 5, 6, 7, 9, 10. `TestServer`, `Script`, `RecordedRequest` (4) → 5, 6, 7, 12, 13. `HttpService`, `FetchRequest`, `FetchAccepted`, `HeaderWait`, `HeaderOutcome` (5) → 6, 7, 10, 12. `HttpMediaSource`, `SourceEvidence`, `remote_cause`, `is_retired` (6) → 7, 10. `Prepared`, `PrepareContext`, `prepare` (7) → 10, 12. `ResumeCandidate`, `ResumeDecision`, `decide_resume`, `ResumeIntent`, `Admission`, `StartDisposition`, `RestartEstablished`, `CapabilitiesChanged`, `SeekCancelled` (8) → 10, 11, 12. `TransportCore`, `WaitService`, `SessionFacts` (9) → 10. Every one is defined before its first use, and every producer/consumer pair spells it the same way.
