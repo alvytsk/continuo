@@ -11,7 +11,7 @@ use continuo::playback::event::{PlaybackEvent, Progress};
 use continuo::playback::state::PlaybackState;
 use continuo::playback::timeline::PositionQuality;
 use continuo::playback::volume::Volume;
-use continuo::session::{Action, Session};
+use continuo::session::{Action, ResumeDecision, Session, decide_resume};
 
 mod support;
 use support::media;
@@ -531,6 +531,14 @@ fn a_stopped_seek_clears_the_completion_its_target_supersedes() {
     let entry = final_state.entry_for(&media("a")).unwrap();
     assert_eq!(entry.position, Duration::from_secs(30));
     assert!(!entry.completed);
+
+    // The other half of the round trip: read back through the resume
+    // decision, the target is what the listener gets, not what the earlier
+    // `completed: true` would have discarded.
+    assert_eq!(
+        decide_resume(Some(entry), Some(Duration::from_secs(240))),
+        ResumeDecision::Resume(Duration::from_secs(30))
+    );
 }
 
 // ------------------------------------------- the establishment gate (D20)

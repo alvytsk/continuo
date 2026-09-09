@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use crate::clock::ClockSample;
 use crate::media::id::MediaId;
-use crate::persistence::model::PersistedState;
+use crate::persistence::model::{PersistedCheckpoint, PersistedState};
 use crate::persistence::writer::Urgency;
 use crate::playback::checkpoint::PlaybackCheckpoint;
 use crate::playback::event::{PlaybackEvent, Progress};
@@ -380,5 +380,184 @@ impl Session {
             state: self.state.clone(),
             urgency,
         }
+    }
+}
+
+/// What §11's table says about one persisted entry, and why.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResumeDecision {
+    /// No file, or no entry for this media.
+    NoEntry,
+    /// The entry is complete. D1 retains its position; the resume declines it.
+    Completed,
+    /// An entry that never got anywhere.
+    AtStart,
+    Resume(Duration),
+    /// `position == duration`: preserved in storage, not usable as a start.
+    DegenerateEnd,
+    /// `position > duration`: the file no longer describes this media.
+    StalePastEnd,
+    /// The duration is unknown, so the position is retained unvalidated.
+    Unvalidated(Duration),
+}
+
+impl ResumeDecision {
+    pub fn start_at(&self) -> Duration {
+        match self {
+            Self::Resume(position) | Self::Unvalidated(position) => *position,
+            Self::NoEntry
+            | Self::Completed
+            | Self::AtStart
+            | Self::DegenerateEnd
+            | Self::StalePastEnd => Duration::ZERO,
+        }
+    }
+}
+
+/// Applied against the duration from the probe `app::run` already performs, so
+/// no extra file is opened (§11). Completion is never inferred from
+/// `position >= duration`, and there is no near-end heuristic anywhere.
+pub fn decide_resume(
+    entry: Option<&PersistedCheckpoint>,
+    duration: Option<Duration>,
+) -> ResumeDecision {
+    let Some(entry) = entry else {
+        return ResumeDecision::NoEntry;
+    };
+    if entry.completed {
+        return ResumeDecision::Completed;
+    }
+    if entry.position.is_zero() {
+        return ResumeDecision::AtStart;
+    }
+    let Some(duration) = duration else {
+        return ResumeDecision::Unvalidated(entry.position);
+    };
+    match entry.position.cmp(&duration) {
+        std::cmp::Ordering::Less => ResumeDecision::Resume(entry.position),
+        std::cmp::Ordering::Equal => ResumeDecision::DegenerateEnd,
+        std::cmp::Ordering::Greater => ResumeDecision::StalePastEnd,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use time::OffsetDateTime;
+
+    /// Deliberately not called `entry`: the tests bind their subject to
+    /// `entry`, and a helper of the same name would be shadowed out of reach
+    /// the moment a test needed a second one.
+    fn stored(secs: u64, completed: bool) -> PersistedCheckpoint {
+        PersistedCheckpoint {
+            position: Duration::from_secs(secs),
+            completed,
+            touch_seq: 1,
+            updated_at: OffsetDateTime::UNIX_EPOCH,
+        }
+    }
+
+    fn secs(value: u64) -> Option<Duration> {
+        Some(Duration::from_secs(value))
+    }
+
+    #[test]
+    fn no_entry_starts_at_the_beginning() {
+        assert_eq!(decide_resume(None, secs(300)), ResumeDecision::NoEntry);
+        assert_eq!(decide_resume(None, secs(300)).start_at(), Duration::ZERO);
+    }
+
+    #[test]
+    fn a_completed_entry_declines_the_resume_without_losing_its_position() {
+        let entry = stored(300, true);
+        assert_eq!(
+            decide_resume(Some(&entry), secs(300)),
+            ResumeDecision::Completed
+        );
+        assert_eq!(
+            decide_resume(Some(&entry), secs(300)).start_at(),
+            Duration::ZERO
+        );
+        assert_eq!(
+            entry.position,
+            Duration::from_secs(300),
+            "the decision declines the resume, but must not touch the stored position"
+        );
+        // And a completed entry short of the end declines just the same:
+        // completion is a fact the engine reported, never one inferred here.
+        let short = stored(120, true);
+        assert_eq!(
+            decide_resume(Some(&short), secs(300)),
+            ResumeDecision::Completed
+        );
+        assert_eq!(short.position, Duration::from_secs(120));
+    }
+
+    #[test]
+    fn an_ordinary_position_inside_the_media_is_the_start() {
+        let entry = stored(93, false);
+        assert_eq!(
+            decide_resume(Some(&entry), secs(300)),
+            ResumeDecision::Resume(Duration::from_secs(93))
+        );
+    }
+
+    #[test]
+    fn a_position_of_zero_is_a_start_rather_than_a_resume() {
+        let entry = stored(0, false);
+        assert_eq!(
+            decide_resume(Some(&entry), secs(300)),
+            ResumeDecision::AtStart
+        );
+    }
+
+    #[test]
+    fn a_position_exactly_at_the_end_is_degenerate_not_a_start() {
+        let entry = stored(300, false);
+        assert_eq!(
+            decide_resume(Some(&entry), secs(300)),
+            ResumeDecision::DegenerateEnd
+        );
+        assert_eq!(
+            decide_resume(Some(&entry), secs(300)).start_at(),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn a_position_past_the_end_is_stale_state() {
+        let entry = stored(400, false);
+        assert_eq!(
+            decide_resume(Some(&entry), secs(300)),
+            ResumeDecision::StalePastEnd
+        );
+        assert_eq!(
+            decide_resume(Some(&entry), secs(300)).start_at(),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn an_unknown_duration_keeps_the_position_unvalidated() {
+        let entry = stored(93, false);
+        assert_eq!(
+            decide_resume(Some(&entry), None),
+            ResumeDecision::Unvalidated(Duration::from_secs(93))
+        );
+        assert_eq!(
+            decide_resume(Some(&entry), None).start_at(),
+            Duration::from_secs(93)
+        );
+    }
+
+    #[test]
+    fn completion_outranks_every_position_rule() {
+        // A completed entry past the end is still declined as completed, not
+        // reported as stale: the two say different things about the file.
+        let entry = stored(400, true);
+        assert_eq!(
+            decide_resume(Some(&entry), secs(300)),
+            ResumeDecision::Completed
+        );
     }
 }
