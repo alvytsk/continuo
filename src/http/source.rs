@@ -172,7 +172,7 @@ impl HttpMediaSource {
                 // Every non-success path out of `open` retires the
                 // generation it began (Ruling 3): `begin()`/`retire()` are
                 // only ever paired on this thread today (see
-                // `SourceInterrupt::read`'s own note to the same effect), so
+                // `SourceInterrupt::begin`'s own note to the same effect), so
                 // there is nothing concurrent here to clobber.
                 interrupt.retire();
                 return Err(match failure {
