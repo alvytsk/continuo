@@ -142,7 +142,7 @@ impl PersistedState {
     /// The only place a `touch_seq` is ever assigned (D4). Loading, reading and
     /// restoring never touch one.
     ///
-    /// R9: the cap is a guard, not a hope. If a fresh entry arrives at
+    /// The cap is a guard, not a hope (D2). If a fresh entry arrives at
     /// `MAX_ENTRIES` and eviction cannot find a victim — unreachable while
     /// `MAX_ENTRIES > 1`, since the current entry is the only protected one and
     /// the incoming media is by definition not yet in the map — the incoming
@@ -179,7 +179,7 @@ impl PersistedState {
 
     /// The lowest `touch_seq` among entries that are neither current nor the
     /// one arriving. Returns whether a victim was found and removed; `record`
-    /// treats a `false` result as the cap guard firing (R9).
+    /// treats a `false` result as the cap guard firing.
     fn evict_one(&mut self, incoming: &MediaId) -> bool {
         let victim = self
             .checkpoints
@@ -209,8 +209,8 @@ mod tests {
         }
     }
 
-    /// R9's guard: `evict_one` must report "no victim" rather than evicting the
-    /// current entry, when the current entry is the only one in the map. This
+    /// `evict_one` must report "no victim" rather than evict the current entry,
+    /// when the current entry is the only one in the map. This
     /// state is unreachable through `record` at `MAX_ENTRIES = 512` (the
     /// current entry is the only protected one, so 511 candidates always
     /// remain), so the guard is pinned directly against the private helper.

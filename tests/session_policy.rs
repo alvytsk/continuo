@@ -597,8 +597,9 @@ fn a_launch_that_never_establishes_writes_no_checkpoint() {
 }
 
 /// §11 maps `position == duration` to a start of zero while retaining the
-/// position, with `completed` false — so R16's completed guard is not what
-/// covers this one. `Loaded` reports that zero before the device is opened, and
+/// position, with `completed` false — so the guard that skips a completed
+/// outgoing entry is not what covers this one. `Loaded` reports that zero
+/// before the device is opened, and
 /// a switch would otherwise carry it out as the outgoing media's final word.
 #[test]
 fn a_switch_away_from_a_media_that_never_established_records_nothing_for_it() {

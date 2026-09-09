@@ -86,7 +86,7 @@ fn fixture(name: &str) -> AbsolutePath {
 
 /// A `MediaId` for a local file that need not exist, for tests that only care
 /// about identity. Shared across the persistence and session test files
-/// rather than duplicated in each (R20).
+/// rather than duplicated in each.
 pub fn media(name: &str) -> MediaId {
     // A bare helper, so it handles its own error: the lint exemption stops at
     // the `#[test]` boundary.
