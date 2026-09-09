@@ -223,9 +223,13 @@ impl Script {
         self
     }
 
-    /// Emit `bytes` every `gap`, forever. Every individual read stays inside a
-    /// generous stall budget, which is what makes an opening deadline checked
-    /// only *around* probing useless.
+    /// Pace the scripted body: emit `bytes` at a time, `gap` apart.
+    ///
+    /// The point is that every individual read stays comfortably inside a
+    /// stall budget while an *overall* deadline expires — which is what makes
+    /// an opening deadline checked only around probing, rather than inside
+    /// every wait, useless. The body still ends: pacing does not make it
+    /// endless, and `.live()` or `.unresolved()` is what does.
     pub fn trickle(mut self, bytes: usize, gap: Duration) -> Self {
         self.trickle = Some((bytes, gap));
         self
@@ -498,6 +502,9 @@ fn write_206(
     if let Some(etag) = current_etag(script, ordinal) {
         header.push_str(&format!("ETag: {etag}\r\n"));
     }
+    if script.multipart {
+        header.push_str("Content-Type: multipart/byteranges; boundary=x\r\n");
+    }
     match &script.content_range_override {
         Some(value) => header.push_str(&format!("Content-Range: {value}\r\n")),
         None => header.push_str(&format!("Content-Range: bytes {first}-{last}/{len}\r\n")),
@@ -701,6 +708,15 @@ fn handle_connection(
             .map(|value| value as usize)
             .unwrap_or(len.saturating_sub(1))
             .min(len.saturating_sub(1));
+        // A reversed interval (`bytes=5-2`) is unsatisfiable, the same as a
+        // start past the end — and slicing `first..=last` would panic
+        // otherwise. `content_range_override` stages a malformed *response*
+        // on purpose; this is a malformed incoming *request*, so it is
+        // rejected the ordinary way.
+        if last < first {
+            write_416(stream, len);
+            return;
+        }
         let range = RangeSlice { first, last, len };
         write_206(stream, script, range, ordinal, gate, bytes_written);
         return;

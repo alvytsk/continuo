@@ -108,3 +108,24 @@ fn a_redirect_chain_ends_at_the_media() {
     assert!(third.ends_with("final"), "{third}");
     server.shutdown();
 }
+
+#[test]
+fn a_multipart_range_response_carries_the_multipart_content_type() {
+    let server = TestServer::start(Script::serving(b"0123456789".to_vec()).multipart_range());
+    let response = raw(&server, "/audio", "Range: bytes=3-5\r\n");
+    assert!(response.starts_with("HTTP/1.1 206"), "{response}");
+    assert!(
+        response.contains("Content-Type: multipart/byteranges; boundary=x"),
+        "{response}"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn a_reversed_range_is_answered_with_416_rather_than_panicking() {
+    let server = TestServer::start(Script::serving(b"0123456789".to_vec()));
+    let response = raw(&server, "/audio", "Range: bytes=5-2\r\n");
+    assert!(response.starts_with("HTTP/1.1 416"), "{response}");
+    assert!(response.contains("Content-Range: bytes */10"), "{response}");
+    server.shutdown();
+}
