@@ -25,7 +25,7 @@ use crate::persistence::PersistenceError;
 use crate::persistence::model::PersistedState;
 use crate::persistence::store::{LoadReason, StateStore};
 use crate::persistence::writer::{ShutdownOutcome, StateSink, Urgency, WriterHandle};
-use crate::playback::command::{PlaybackCommand, ResumeIntent};
+use crate::playback::command::{Admission, PlaybackCommand, ResumeIntent};
 use crate::playback::engine::EngineHandle;
 use crate::playback::error::PlaybackError;
 use crate::playback::event::PlaybackEvent;
@@ -238,16 +238,13 @@ fn handle_keys(engine: &EngineHandle, mirror: &Mirror, raw: bool) -> bool {
         Ok(true) => match crossterm::event::read() {
             Ok(Event::Key(key)) => match to_command(key, mirror) {
                 Some(PlaybackCommand::Shutdown) => true,
-                // Stop travels out of band. The ordinary command queue stops
-                // being read while an event backlog exists, and a queued
-                // Stop cannot interrupt a refinement already running, so
-                // pressing `s` would not stop anything when it matters most.
-                Some(PlaybackCommand::Stop) => {
-                    engine.interrupt_stop();
-                    false
-                }
                 Some(command) => {
-                    engine.commands().send(command).ok();
+                    route_command(
+                        engine,
+                        mirror.state == PlaybackState::Playing,
+                        mirror.position,
+                        command,
+                    );
                     false
                 }
                 None => false,
@@ -259,6 +256,90 @@ fn handle_keys(engine: &EngineHandle, mirror: &Mirror, raw: bool) -> bool {
         },
         Ok(false) => false,
         Err(_) => true,
+    }
+}
+
+/// Sends one decoded key command to the `EngineHandle` action §8 actually
+/// built for it — the out-of-band `submit_pause`/`submit_play`/`submit_seek`,
+/// or the non-blocking `submit` for everything else — rather than the
+/// blocking `commands().send` every command but `Stop`/`Shutdown` used to
+/// travel on (IMPORTANT 2, final review). `Shutdown` never reaches here:
+/// `handle_keys` decides to end the loop itself and has nothing left to route.
+///
+/// `pub`, alongside the rest of this crate's engine-facing surface
+/// (`EngineHandle`, `PlaybackCommand`), so a test can drive the exact routing
+/// a keypress takes with no tty and no crossterm event in the loop at all —
+/// `handle_keys` itself cannot be driven headlessly, since
+/// `crossterm::event::read()` needs a real terminal. `playing` and `position`
+/// are the two `Mirror` fields this routing actually reads, taken separately
+/// so `Mirror` itself can stay private.
+pub fn route_command(
+    engine: &EngineHandle,
+    playing: bool,
+    position: Duration,
+    command: PlaybackCommand,
+) {
+    match command {
+        // Loop control, decided by `handle_keys` itself before this is ever
+        // called - nothing to route.
+        PlaybackCommand::Shutdown => {}
+        // Out of band, like `Shutdown`. The ordinary command queue stops
+        // being read while an event backlog exists, and a queued Stop cannot
+        // interrupt a refinement already running, so pressing `s` would not
+        // stop anything when it matters most.
+        PlaybackCommand::Stop => engine.interrupt_stop(),
+        // `TogglePause`'s direction has to be decided here rather than left
+        // for the worker's own `dispatch` to read off `self.state`: routing
+        // through `submit_pause`/`submit_play` means picking one of the two
+        // *before* it is queued, since only the one actually chosen also
+        // freezes or thaws the source interrupt a blocked read is waiting on
+        // (§9). The mirror is this thread's freshest view of which playback
+        // means "toggle" answers to; a worker that has since moved on treats
+        // the resulting `Pause`/`Play` as the no-op it already is for a state
+        // it is not in; the freeze/thaw level is the part that actually has
+        // to be right, and the mirror lags the worker by at most one drain
+        // cycle - the same staleness every other read of it in this file
+        // already lives with.
+        PlaybackCommand::TogglePause => {
+            report_admission(if playing {
+                engine.submit_pause()
+            } else {
+                engine.submit_play()
+            });
+        }
+        PlaybackCommand::Play => report_admission(engine.submit_play()),
+        PlaybackCommand::Pause => report_admission(engine.submit_pause()),
+        // An arrow-key seek is resolved to an absolute target here, against
+        // the mirror's position, so it can travel through `submit_seek` -
+        // the one path that publishes the SEEK bit and retires the fetch a
+        // stale read would otherwise keep running against (IMPORTANT 2).
+        PlaybackCommand::SeekBy(delta) => {
+            report_admission(engine.submit_seek(seek_target(position, delta)));
+        }
+        other => report_admission(engine.submit(other)),
+    }
+}
+
+/// The absolute target an arrow-key seek asks for. `submit_seek` takes a
+/// `Duration`, not a delta, so this is the same clamp-at-zero arithmetic
+/// `engine.rs`'s own `SeekBy` dispatch performs, computed here instead
+/// against the mirror's position now that the CLI resolves the target rather
+/// than handing the worker a signed step to resolve against `self.position`.
+fn seek_target(position: Duration, delta: i64) -> Duration {
+    let step = Duration::from_secs(delta.unsigned_abs());
+    if delta >= 0 {
+        position.saturating_add(step)
+    } else {
+        position.saturating_sub(step)
+    }
+}
+
+/// §8: queue saturation must be visible, never silently dropped. `Gone`
+/// means the worker has already shut down - nothing to warn about, since the
+/// run is ending anyway.
+fn report_admission(admission: Admission) {
+    if admission == Admission::Busy {
+        tracing::warn!("command queue is busy; the key press had no effect");
     }
 }
 
@@ -638,6 +719,11 @@ impl Mirror {
                 self.position = position;
                 self.quality = PositionQuality::Exact;
                 self.state = PlaybackState::Loading;
+                // MINOR (final review): a fresh load starts with nothing
+                // buffering. Display-only and unreachable under one load per
+                // run, but leaving a stale `true` standing is a real bug,
+                // not only a limitation.
+                self.buffering = false;
             }
             PlaybackEvent::StateChanged { session_rev, state } => {
                 self.session_rev = session_rev;
@@ -1303,6 +1389,36 @@ mod tests {
             mirror.position,
             Duration::from_secs(42),
             "unrelated to capability evidence"
+        );
+    }
+
+    /// Minor (final review): a stale `buffering` from whatever the mirror was
+    /// showing before must not survive into a fresh `Loaded` - display-only
+    /// and unreachable under one load per run, but a real bug rather than
+    /// only a limitation.
+    #[test]
+    fn a_fresh_load_clears_a_stale_buffering_flag() {
+        let mut mirror = Mirror {
+            buffering: true,
+            ..Mirror::default()
+        };
+        mirror.apply(PlaybackEvent::Loaded {
+            session_rev: 3,
+            media: local("/music/sonata.flac"),
+            metadata: MediaMetadata {
+                title: None,
+                duration: Some(Duration::from_secs(300)),
+            },
+            capabilities: MediaCapabilities {
+                continuity: Continuity::Finite,
+                seek: SeekSupport::Native,
+            },
+            position: Duration::ZERO,
+            disposition: StartDisposition::Fresh,
+        });
+        assert!(
+            !mirror.buffering,
+            "a fresh load must clear a stale buffering flag"
         );
     }
 }
