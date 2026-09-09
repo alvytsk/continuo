@@ -4,10 +4,11 @@
 
 use std::time::Duration;
 
-use continuo::playback::command::PlaybackCommand;
-use continuo::playback::event::PlaybackEvent;
+use continuo::playback::command::{PlaybackCommand, ResumeIntent};
+use continuo::playback::event::{PlaybackEvent, StartDisposition};
 use continuo::playback::state::PlaybackState;
 use continuo::playback::volume::Volume;
+use continuo::resume::ResumeCandidate;
 
 mod support;
 use support::TestEngine;
@@ -419,4 +420,47 @@ fn a_failed_load_keeps_the_position_that_was_asked_for() {
         position, start_at,
         "a failed load lost the requested resume position"
     );
+}
+
+// ----------------------------------------------- resume intent and disposition
+
+#[test]
+fn a_load_that_resumes_reports_a_resumed_disposition() {
+    let mut engine = TestEngine::start(TRACK);
+    engine.load_with_resume(
+        support::fixture(TRACK),
+        ResumeIntent::Candidate(ResumeCandidate {
+            position: Duration::from_secs(2),
+            completed: false,
+        }),
+    );
+    let loaded = engine.await_loaded();
+    assert_eq!(loaded.disposition, StartDisposition::Resumed);
+    assert!(loaded.position >= Duration::from_secs(2));
+}
+
+#[test]
+fn a_load_of_a_completed_entry_replays_from_zero_and_says_so() {
+    let mut engine = TestEngine::start(TRACK);
+    engine.load_with_resume(
+        support::fixture(TRACK),
+        ResumeIntent::Candidate(ResumeCandidate {
+            position: Duration::from_secs(2),
+            completed: true,
+        }),
+    );
+    let loaded = engine.await_loaded();
+    assert_eq!(loaded.disposition, StartDisposition::CompletedReplay);
+    assert_eq!(loaded.position, Duration::ZERO);
+}
+
+#[test]
+fn an_explicit_restart_announces_that_it_established() {
+    // G1. Without this event `Session` cannot tell a restart from any other
+    // establishment, and §10's protection can never be lifted.
+    let mut engine = TestEngine::start(TRACK);
+    engine.play_for(Duration::from_millis(200));
+    engine.send(PlaybackCommand::Restart);
+    let established = engine.await_restart_established();
+    assert_eq!(established, Duration::ZERO);
 }

@@ -19,6 +19,7 @@ use continuo::playback::command::PlaybackCommand;
 use continuo::playback::decode::DecodedSource;
 use continuo::playback::state::PlaybackState;
 use continuo::playback::volume::Volume;
+use continuo::resume::ResumeCandidate;
 use continuo::session::{Action, CAPTURE_INTERVAL, Session, decide_resume};
 
 mod support;
@@ -184,7 +185,10 @@ fn a_stop_and_a_quit_resume_where_playback_reached() {
     );
     assert!(!entry.completed);
 
-    let decision = decide_resume(state.entry_for(&track_id()), Some(TRACK_DURATION));
+    let decision = decide_resume(
+        state.entry_for(&track_id()).map(ResumeCandidate::from),
+        Some(TRACK_DURATION),
+    );
     assert!(decision.start_at() >= Duration::from_secs(2));
 }
 
@@ -359,7 +363,10 @@ fn a_finished_track_is_completed_and_reopens_at_zero_with_its_position_kept() {
         entry.position
     );
 
-    let decision = decide_resume(state.entry_for(&track_id()), Some(TRACK_DURATION));
+    let decision = decide_resume(
+        state.entry_for(&track_id()).map(ResumeCandidate::from),
+        Some(TRACK_DURATION),
+    );
     assert_eq!(
         decision.start_at(),
         Duration::ZERO,
@@ -411,7 +418,7 @@ fn a_position_past_the_end_survives_a_launch_whose_device_refuses_to_open() {
         .cloned()
         .expect("the stale entry");
     assert_eq!(
-        decide_resume(Some(&kept), Some(TRACK_DURATION)).start_at(),
+        decide_resume(Some(ResumeCandidate::from(&kept)), Some(TRACK_DURATION)).start_at(),
         Duration::ZERO,
         "§11 opens a position past the end at zero"
     );
@@ -482,7 +489,10 @@ fn a_position_past_the_end_is_refused_as_a_start() {
     store.write(&state).unwrap();
 
     let reloaded = reload(dir.path());
-    let decision = decide_resume(reloaded.entry_for(&track_id()), Some(TRACK_DURATION));
+    let decision = decide_resume(
+        reloaded.entry_for(&track_id()).map(ResumeCandidate::from),
+        Some(TRACK_DURATION),
+    );
     assert_eq!(decision.start_at(), Duration::ZERO);
 
     // And the engine can be started from that decision without complaint.

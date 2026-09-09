@@ -16,14 +16,16 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, RecvError, Sender, TrySendError, select};
 
+use crate::http::error::RemoteFailure;
 use crate::media::id::{AbsolutePath, MediaId};
 use crate::media::source::SourceLocation;
+use crate::resume::{ResumeDecision, decide_resume};
 
 use super::callback::CallbackCore;
-use super::command::PlaybackCommand;
+use super::command::{PlaybackCommand, ResumeIntent};
 use super::decode::DecodedSource;
 use super::error::PlaybackError;
-use super::event::{PlaybackEvent, Progress, ShutdownReport};
+use super::event::{PlaybackEvent, Progress, ShutdownReport, StartDisposition};
 use super::handshake::Handshake;
 use super::link::OutputLink;
 use super::output::cpal_output::{CpalOutput, OutputFault};
@@ -38,7 +40,7 @@ const SHUTDOWN: u8 = 2;
 const TICK: Duration = Duration::from_millis(10);
 const DEADLINE: Duration = Duration::from_millis(250);
 /// Ordinary events may not occupy these; terminal outcomes may.
-const RESERVED_EVENT_SLOTS: usize = 8;
+const RESERVED_EVENT_SLOTS: usize = 9;
 const EVENT_CAPACITY: usize = 64;
 const PENDING_CAP: usize = 128;
 
@@ -47,16 +49,22 @@ const PENDING_CAP: usize = 128;
 //
 //   stop interrupt        1  StateChanged{Stopped}
 //   a serviced fault      2  Failed + StateChanged, or DeviceRecovered + StateChanged
-//   a dispatched command  3  Load is the widest: StateChanged{Loading},
-//                            Loaded, StateChanged{Paused}
+//   a dispatched command  4  Load is the widest: StateChanged{Loading}, Loaded,
+//                            CapabilitiesChanged, StateChanged{Paused}
 //   end of track          2  EndOfTrack + StateChanged{Ended}
 //                        --
-//                         8  <= RESERVED_EVENT_SLOTS
+//                         9  <= RESERVED_EVENT_SLOTS
 //
 // Those four are not mutually exclusive in a single pass, so the union is the
 // bound rather than the maximum of them. Command admission closes while a
 // backlog exists, and `service_faults` defers a fault whose events would not
 // fit, so neither source can outrun the drain.
+//
+// `RestartEstablished` and `SeekCancelled` both belong to commands narrower
+// than `Load` (their own event plus a `StateChanged`, at most 2), so neither
+// raises the bound. The resume-unavailable warning does not add a fifth to
+// the dispatched-command row either: it rides on `Loaded.disposition` rather
+// than an event of its own.
 const COMMAND_CAPACITY: usize = 1024;
 const SPAN_CAPACITY: usize = 64;
 /// How much audio the PCM ring holds. Large enough that one loop iteration
@@ -568,6 +576,15 @@ impl Worker {
     }
 
     fn fail(&mut self, message: String) {
+        self.fail_with(message, None);
+    }
+
+    /// `fail`'s general form. A remote failure carries a typed `cause`
+    /// alongside `message`, so a policy can act on what went wrong rather
+    /// than only read a string a human wrote; M1's local failures have none,
+    /// which is why `fail` is still the entry point every local call site
+    /// uses (Ruling 1).
+    fn fail_with(&mut self, message: String, cause: Option<RemoteFailure>) {
         if self.state == PlaybackState::Failed {
             // A repeating fatal fault must not re-announce the same failure
             // every iteration.
@@ -578,6 +595,7 @@ impl Worker {
         self.emit(PlaybackEvent::Failed {
             session_rev,
             message,
+            cause,
         });
         self.set_state(PlaybackState::Failed);
     }
@@ -1118,8 +1136,8 @@ impl Worker {
             PlaybackCommand::Load {
                 media,
                 source,
-                start_at,
-            } => self.load(media, source, start_at),
+                resume,
+            } => self.load(media, source, resume),
             PlaybackCommand::Play => self.play(),
             PlaybackCommand::Pause => self.pause(),
             PlaybackCommand::TogglePause => match self.state {
@@ -1154,17 +1172,22 @@ impl Worker {
         }
     }
 
-    fn load(&mut self, media: MediaId, source: SourceLocation, start_at: Duration) {
+    fn load(&mut self, media: MediaId, source: SourceLocation, resume: ResumeIntent) {
         self.capture_and_teardown();
         self.source = None;
         self.session_rev += 1;
         self.media = Some(media.clone());
         self.requested_target = None;
-        // Pin the requested start BEFORE opening: if the load fails, Failed must
-        // carry the position that was asked for so a retry can resume there.
-        // Zeroing here loses it for every failure path below.
-        self.position = start_at;
-        self.anchor = start_at;
+        // A caller-decided start is already the position that will be asked
+        // for, so it is pinned BEFORE opening: if the load fails, Failed must
+        // carry it so a retry can resume there. Zeroing here loses it for
+        // every failure path below. A `Candidate` has no position to pin yet -
+        // deciding one needs the duration only the decoder can report, so it
+        // waits until the source has actually opened, below.
+        if let ResumeIntent::StartAt(target) = resume {
+            self.position = target;
+            self.anchor = target;
+        }
         self.degraded = false;
         self.set_state(PlaybackState::Loading);
 
@@ -1189,6 +1212,34 @@ impl Worker {
                 return;
             }
         };
+
+        // A `Candidate` is decided now, against the duration this decoder just
+        // reported - the same rule `decide_resume` applies wherever a
+        // duration is in hand (G3), so a worker-resolved resume and an
+        // application-resolved one can never land somewhere the checkpoint
+        // never said. Task 10 adds the `ResumeUnavailable` branch, for a
+        // positive candidate a non-seekable source cannot establish.
+        let (start_at, disposition) = match resume {
+            ResumeIntent::StartAt(target) => (target, StartDisposition::Fresh),
+            ResumeIntent::Candidate(candidate) => {
+                let decision = decide_resume(Some(candidate), decoded.metadata().duration);
+                let target = decision.start_at();
+                self.position = target;
+                self.anchor = target;
+                let disposition = match decision {
+                    ResumeDecision::Completed => StartDisposition::CompletedReplay,
+                    ResumeDecision::Resume(_) | ResumeDecision::Unvalidated(_) => {
+                        StartDisposition::Resumed
+                    }
+                    ResumeDecision::NoEntry
+                    | ResumeDecision::AtStart
+                    | ResumeDecision::DegenerateEnd
+                    | ResumeDecision::StalePastEnd => StartDisposition::Fresh,
+                };
+                (target, disposition)
+            }
+        };
+
         if start_at > Duration::ZERO {
             // Cancellable for the same reason `reseek` is: the worker must not
             // be blind to a stop or a shutdown for the length of a refinement.
@@ -1215,6 +1266,7 @@ impl Worker {
             metadata: decoded.metadata().clone(),
             capabilities: decoded.capabilities(),
             position,
+            disposition,
         });
         self.source = Some(decoded);
         match self.open_transport(false) {
@@ -1462,7 +1514,23 @@ impl Worker {
             }
         }
         match self.reinstall(true) {
-            Ok(()) => self.announce_playing(),
+            Ok(()) => {
+                // G1: `restart()` is the only establishment that discards a
+                // stored target and lands at zero with no `SeekCompleted`
+                // ever emitted (D17), so it needs an event of its own for a
+                // policy that has to tell an explicit restart apart from any
+                // other establishment (Task 11 lifts checkpoint protection on
+                // exactly this). Emitted only here, on the `Ok` arm: a
+                // cancelled or failed `reinstall` announced nothing to begin
+                // with, and must not announce a restart that did not land.
+                let session_rev = self.session_rev;
+                let position = self.position;
+                self.emit(PlaybackEvent::RestartEstablished {
+                    session_rev,
+                    position,
+                });
+                self.announce_playing();
+            }
             Err(error) if is_cancelled(&error) => {}
             Err(error) => self.fail(format!("cannot start the audio device: {error}")),
         }

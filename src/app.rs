@@ -17,7 +17,7 @@ use crate::persistence::PersistenceError;
 use crate::persistence::model::PersistedState;
 use crate::persistence::store::{LoadReason, StateStore};
 use crate::persistence::writer::{ShutdownOutcome, StateSink, Urgency, WriterHandle};
-use crate::playback::command::PlaybackCommand;
+use crate::playback::command::{PlaybackCommand, ResumeIntent};
 use crate::playback::decode::DecodedSource;
 use crate::playback::engine::EngineHandle;
 use crate::playback::error::PlaybackError;
@@ -25,7 +25,8 @@ use crate::playback::event::PlaybackEvent;
 use crate::playback::state::PlaybackState;
 use crate::playback::timeline::PositionQuality;
 use crate::playback::volume::Volume;
-use crate::session::{Action, ResumeDecision, Session, decide_resume};
+use crate::resume::ResumeCandidate;
+use crate::session::{Action, Session};
 
 const SEEK_STEP_SECS: i64 = 10;
 const VOLUME_STEP: f32 = 0.05;
@@ -64,23 +65,24 @@ pub fn run(cli: cli::Cli) -> Result<(), PlaybackError> {
         );
         return Ok(());
     }
-    // Kept before the probe is dropped: §11 validates a stored position against
-    // the duration this probe already reports, so the resume opens no file of
-    // its own.
-    let duration = probed.metadata().duration;
+    // This probe's own validation is all `run` needed from it; the worker
+    // reopens the same path once `Load` is sent, and it is the worker's own
+    // probe — the only one with a duration — that resolves whatever resume
+    // candidate persistence hands back (Ruling 5).
     drop(probed);
 
-    // Persistence opens before the engine: the start position is an argument to
-    // the load, and the restored volume is a command that precedes it.
+    // Persistence opens before the engine: the resume candidate is an
+    // argument to the load, and the restored volume is a command that
+    // precedes it.
     let media = MediaId::LocalFile(absolute.clone());
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let Persistence {
         mut session,
         mut writer,
-        start_at,
+        candidate,
         volume,
         persisting,
-    } = open_persistence(platform_store(&clock), &media, duration, &clock);
+    } = open_persistence(platform_store(&clock), &media, &clock);
 
     let engine = EngineHandle::spawn_cpal();
     // Dropped explicitly by the shutdown sequence, before the flush waits on
@@ -91,7 +93,7 @@ pub fn run(cli: cli::Cli) -> Result<(), PlaybackError> {
     for command in resume_commands(
         media,
         SourceLocation::LocalPath(absolute.as_path().to_path_buf()),
-        start_at,
+        candidate,
         volume,
     ) {
         engine.commands().send(command).ok();
@@ -182,20 +184,27 @@ pub fn run(cli: cli::Cli) -> Result<(), PlaybackError> {
 /// §11's initial command sequence. Volume first: the engine accepts it with no
 /// transport, and a transport created later adopts the stored gain — so the
 /// restored level is in force from the first buffer rather than after it.
-/// Nothing about the sequence is conditional; a session with no stored volume
-/// issues the same command with the default.
+/// Nothing about the sequence is conditional; a session with no stored
+/// candidate issues the same `Load`, with a start of zero.
 fn resume_commands(
     media: MediaId,
     source: SourceLocation,
-    start_at: Duration,
+    candidate: Option<ResumeCandidate>,
     volume: Volume,
 ) -> [PlaybackCommand; 3] {
+    // No entry is not itself a `Candidate`: the worker would decide `NoEntry`
+    // from it anyway (§11), so this is the same outcome without asking the
+    // worker to resolve a candidate that was never there.
+    let resume = match candidate {
+        Some(candidate) => ResumeIntent::Candidate(candidate),
+        None => ResumeIntent::StartAt(Duration::ZERO),
+    };
     [
         PlaybackCommand::SetVolume(volume),
         PlaybackCommand::Load {
             media,
             source,
-            start_at,
+            resume,
         },
         PlaybackCommand::Play,
     ]
@@ -216,7 +225,12 @@ impl StateSink for DisabledSink {
 struct Persistence {
     session: Session,
     writer: WriterHandle,
-    start_at: Duration,
+    /// The stored entry for this media, unresolved. Resolving it needs a
+    /// duration, and only the worker's own decode probe has one (Ruling 5) —
+    /// so `open_persistence` hands the raw candidate onward rather than
+    /// deciding a start position itself, which would mean opening the media
+    /// twice for the same answer `decide_resume` gives either time.
+    candidate: Option<ResumeCandidate>,
     volume: Volume,
     /// Whether anything this session submits can reach the disk. A disabled
     /// sink reports every write as a success, deliberately — the writer must
@@ -227,9 +241,9 @@ struct Persistence {
 
 /// The store on the platform's state path, or `None` when the platform offers
 /// no state directory at all. Path discovery is kept out of `open_persistence`
-/// so that everything downstream of it — the load classification, the resume
-/// decision, the sink selection — can be driven from a store in a tempdir, and
-/// so that `platform_path` keeps exactly one caller in the program (§13).
+/// so that everything downstream of it — the load classification and the sink
+/// selection — can be driven from a store in a tempdir, and so that
+/// `platform_path` keeps exactly one caller in the program (§13).
 fn platform_store(clock: &Arc<dyn Clock>) -> Option<StateStore> {
     match StateStore::platform_path() {
         Ok(path) => Some(StateStore::new(path, Arc::clone(clock))),
@@ -243,7 +257,6 @@ fn platform_store(clock: &Arc<dyn Clock>) -> Option<StateStore> {
 fn open_persistence(
     store: Option<StateStore>,
     media: &MediaId,
-    duration: Option<Duration>,
     clock: &Arc<dyn Clock>,
 ) -> Persistence {
     let (state, writable) = match &store {
@@ -278,27 +291,12 @@ fn open_persistence(
         None => (PersistedState::default(), false),
     };
 
-    let decision = decide_resume(state.entry_for(media), duration);
-    match decision {
-        ResumeDecision::NoEntry => tracing::debug!("no stored position for this media"),
-        ResumeDecision::Completed => tracing::info!("resume declined: this media is completed"),
-        ResumeDecision::AtStart => {}
-        ResumeDecision::Resume(position) => tracing::info!(?position, "resume position selected"),
-        ResumeDecision::DegenerateEnd => {
-            tracing::debug!("stored position is exactly the end; starting over");
-        }
-        ResumeDecision::StalePastEnd => {
-            tracing::warn!("stored position is past the end of this media");
-        }
-        ResumeDecision::Unvalidated(position) => {
-            tracing::info!(
-                ?position,
-                "duration unknown; stored position retained unvalidated"
-            );
-        }
-    }
-
-    let start_at = decision.start_at();
+    // No `ResumeDecision` is logged here any more: the decision needs a
+    // duration, this call site has none, and logging one taken with
+    // `duration: None` would misreport an ordinary resume as `Unvalidated`
+    // every time. The disposition the worker reports on `Loaded` is what a
+    // later task logs instead (Ruling 5).
+    let candidate = state.entry_for(media).map(ResumeCandidate::from);
     let volume = state.volume();
     let sink: Box<dyn StateSink> = match (store, writable) {
         (Some(store), true) => Box::new(store),
@@ -308,7 +306,7 @@ fn open_persistence(
     Persistence {
         session: Session::new(state),
         writer: WriterHandle::spawn(sink, Arc::clone(clock)),
-        start_at,
+        candidate,
         volume,
         persisting: writable,
     }
@@ -453,8 +451,20 @@ impl Mirror {
                 self.session_rev = session_rev;
                 self.volume = volume;
             }
+            // G1: the only one of these three the mirror has anything to show
+            // for. `restart()` lands at zero with no `SeekCompleted`, so this
+            // is where the mirror's position learns it landed at all.
+            PlaybackEvent::RestartEstablished {
+                session_rev,
+                position,
+            } => {
+                self.session_rev = session_rev;
+                self.position = position;
+            }
             PlaybackEvent::DeviceRecovered { session_rev }
             | PlaybackEvent::SeekRejected { session_rev, .. }
+            | PlaybackEvent::SeekCancelled { session_rev, .. }
+            | PlaybackEvent::CapabilitiesChanged { session_rev, .. }
             | PlaybackEvent::Warning { session_rev, .. }
             | PlaybackEvent::Failed { session_rev, .. } => {
                 self.session_rev = session_rev;
@@ -552,6 +562,7 @@ mod tests {
     use crate::media::capabilities::{Continuity, MediaCapabilities, SeekSupport};
     use crate::media::metadata::MediaMetadata;
     use crate::playback::checkpoint::PlaybackCheckpoint;
+    use crate::playback::event::StartDisposition;
 
     fn press(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::empty())
@@ -623,6 +634,7 @@ mod tests {
                 seek: SeekSupport::Native,
             },
             position: Duration::from_secs(93),
+            disposition: StartDisposition::Resumed,
         });
 
         assert_eq!(mirror.position, Duration::from_secs(93));
@@ -641,21 +653,29 @@ mod tests {
     /// check this.
     #[test]
     fn the_resume_sequence_restores_volume_before_it_loads() {
+        let candidate = ResumeCandidate {
+            position: Duration::from_secs(93),
+            completed: false,
+        };
         let commands = resume_commands(
             local("/music/sonata.flac"),
             SourceLocation::LocalPath("/music/sonata.flac".into()),
-            Duration::from_secs(93),
+            Some(candidate),
             Volume::new(0.25),
         );
 
         match &commands {
             [
                 PlaybackCommand::SetVolume(volume),
-                PlaybackCommand::Load { start_at, .. },
+                PlaybackCommand::Load { resume, .. },
                 PlaybackCommand::Play,
             ] => {
                 assert_eq!(*volume, Volume::new(0.25), "the stored gain, unchanged");
-                assert_eq!(*start_at, Duration::from_secs(93), "the decided start");
+                assert_eq!(
+                    *resume,
+                    ResumeIntent::Candidate(candidate),
+                    "the persisted candidate, carried onward for the worker to resolve"
+                );
             }
             other => panic!("volume must be issued before the load: {other:?}"),
         }
@@ -673,7 +693,7 @@ mod tests {
     }
 
     #[test]
-    fn a_stored_entry_decides_the_start_position_and_the_restored_volume() {
+    fn a_stored_entry_becomes_the_resume_candidate_and_the_restored_volume() {
         let dir = tempfile::tempdir().unwrap();
         let (store, clock) = store_at(&dir.path().join("state.json"));
         let media = local("/music/sonata.flac");
@@ -689,13 +709,15 @@ mod tests {
         );
         store.write(&stored).unwrap();
 
-        let persistence =
-            open_persistence(Some(store), &media, Some(Duration::from_secs(300)), &clock);
+        let persistence = open_persistence(Some(store), &media, &clock);
 
         assert_eq!(
-            persistence.start_at,
-            Duration::from_secs(93),
-            "the load starts where the entry left off"
+            persistence.candidate,
+            Some(ResumeCandidate {
+                position: Duration::from_secs(93),
+                completed: false,
+            }),
+            "the entry the file held, unresolved — only the worker's probe has a duration"
         );
         assert_eq!(persistence.volume, Volume::new(0.25));
         assert!(persistence.persisting);
@@ -724,8 +746,7 @@ mod tests {
         );
         store.write(&stored).unwrap();
 
-        let mut persistence =
-            open_persistence(Some(store), &media, Some(Duration::from_secs(300)), &clock);
+        let mut persistence = open_persistence(Some(store), &media, &clock);
         assert!(persistence.persisting);
 
         // The listener got another minute in, and the volume moved with them.
@@ -775,13 +796,11 @@ mod tests {
         let (store, clock) = store_at(&path);
         let media = local("/music/sonata.flac");
 
-        let mut persistence =
-            open_persistence(Some(store), &media, Some(Duration::from_secs(300)), &clock);
+        let mut persistence = open_persistence(Some(store), &media, &clock);
 
         assert!(!persistence.persisting);
         assert_eq!(
-            persistence.start_at,
-            Duration::ZERO,
+            persistence.candidate, None,
             "nothing is restored from a file this build cannot read"
         );
         assert_eq!(persistence.volume, Volume::FULL);

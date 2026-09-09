@@ -34,10 +34,10 @@ use crossbeam_channel::Sender;
 use continuo::media::id::{AbsolutePath, MediaId};
 use continuo::media::source::SourceLocation;
 use continuo::playback::callback::CallbackCore;
-use continuo::playback::command::PlaybackCommand;
+use continuo::playback::command::{PlaybackCommand, ResumeIntent};
 use continuo::playback::engine::EngineHandle;
 use continuo::playback::error::PlaybackError;
-use continuo::playback::event::{PlaybackEvent, Progress, ShutdownReport};
+use continuo::playback::event::{PlaybackEvent, Progress, ShutdownReport, StartDisposition};
 use continuo::playback::link::{OutputLink, Phase};
 use continuo::playback::output::cpal_output::OutputFault;
 use continuo::playback::output::test_output::TestOutput;
@@ -78,8 +78,11 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap()
 }
 
+/// Public so a test can build a path to hand `TestEngine::load_with_resume`
+/// directly, for a load whose resume intent `start`/`start_at`'s own
+/// `ResumeIntent::StartAt` cannot express.
 #[allow(clippy::unwrap_used)]
-fn fixture(name: &str) -> AbsolutePath {
+pub fn fixture(name: &str) -> AbsolutePath {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures")
         .join(name);
@@ -172,6 +175,13 @@ impl Driver {
     }
 }
 
+/// The fields of a `Loaded` event a resume test cares about, from
+/// `TestEngine::await_loaded`.
+pub struct Loaded {
+    pub position: Duration,
+    pub disposition: StartDisposition,
+}
+
 pub struct TestEngine {
     handle: Mutex<Option<EngineHandle>>,
     commands: Sender<PlaybackCommand>,
@@ -241,13 +251,7 @@ impl TestEngine {
             consumed_states: Mutex::new(0),
             draining: AtomicBool::new(true),
         };
-        let path = fixture(name);
-        engine.send(PlaybackCommand::Load {
-            media: MediaId::LocalFile(path.clone()),
-            source: SourceLocation::LocalPath(path.as_path().to_path_buf()),
-            start_at,
-        });
-        engine.await_state(PlaybackState::Paused);
+        engine.load_with_resume(fixture(name), ResumeIntent::StartAt(start_at));
         engine.send(PlaybackCommand::Play);
         engine.await_state(PlaybackState::Playing);
         engine
@@ -259,6 +263,21 @@ impl TestEngine {
         if self.commands.send(command).is_err() {
             panic!("the engine stopped accepting commands");
         }
+    }
+
+    /// Send `Load` for `path` under a caller-decided resume intent, and wait
+    /// for the source to open. `start_at` sends its own initial load through
+    /// here as `ResumeIntent::StartAt`; a test that needs a
+    /// `ResumeIntent::Candidate` - one only the worker's own decode probe can
+    /// resolve - calls this directly, loading a second time under an intent
+    /// `start`/`start_at` cannot express.
+    pub fn load_with_resume(&mut self, path: AbsolutePath, resume: ResumeIntent) {
+        self.send(PlaybackCommand::Load {
+            media: MediaId::LocalFile(path.clone()),
+            source: SourceLocation::LocalPath(path.as_path().to_path_buf()),
+            resume,
+        });
+        self.await_state(PlaybackState::Paused);
     }
 
     pub fn interrupt_stop(&mut self) {
@@ -569,6 +588,35 @@ impl TestEngine {
         }
     }
 
+    /// The next `Loaded` event's position and disposition, so a test can
+    /// assert on them without repeating `PlaybackEvent::Loaded { .. }`'s
+    /// destructuring at every call site.
+    pub fn await_loaded(&mut self) -> Loaded {
+        let event = self.await_event(|e| matches!(e, PlaybackEvent::Loaded { .. }));
+        let PlaybackEvent::Loaded {
+            position,
+            disposition,
+            ..
+        } = event
+        else {
+            unreachable!("await_event's predicate already matched Loaded")
+        };
+        Loaded {
+            position,
+            disposition,
+        }
+    }
+
+    /// The position an explicit restart's `RestartEstablished` reported. G1:
+    /// the only event a policy can key an explicit restart on.
+    pub fn await_restart_established(&mut self) -> Duration {
+        let event = self.await_event(|e| matches!(e, PlaybackEvent::RestartEstablished { .. }));
+        let PlaybackEvent::RestartEstablished { position, .. } = event else {
+            unreachable!("await_event's predicate already matched RestartEstablished")
+        };
+        position
+    }
+
     pub fn count_events(&mut self, predicate: impl Fn(&PlaybackEvent) -> bool) -> usize {
         // Give anything still in flight a moment to arrive.
         let until = Instant::now() + Duration::from_millis(200);
@@ -746,7 +794,7 @@ pub fn load_failure_on_device(name: &str, channels: u16) -> String {
     let sent = handle.commands().send(PlaybackCommand::Load {
         media: MediaId::LocalFile(path.clone()),
         source: SourceLocation::LocalPath(path.as_path().to_path_buf()),
-        start_at: Duration::ZERO,
+        resume: ResumeIntent::StartAt(Duration::ZERO),
     });
     if sent.is_err() {
         panic!("the engine stopped accepting commands");
@@ -795,7 +843,7 @@ pub fn failed_load_position(
         .send(PlaybackCommand::Load {
             media: id,
             source: SourceLocation::LocalPath(missing.to_path_buf()),
-            start_at,
+            resume: ResumeIntent::StartAt(start_at),
         })
         .expect("engine accepts the load");
     let deadline = Instant::now() + PATIENCE;
@@ -841,7 +889,7 @@ pub fn failed_device_session(name: &str, channels: u16, start_at: Duration) -> S
     let sent = handle.commands().send(PlaybackCommand::Load {
         media: MediaId::LocalFile(path.clone()),
         source: SourceLocation::LocalPath(path.as_path().to_path_buf()),
-        start_at,
+        resume: ResumeIntent::StartAt(start_at),
     });
     if sent.is_err() {
         panic!("the engine stopped accepting commands");

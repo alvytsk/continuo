@@ -1,0 +1,87 @@
+//! What §11's table says a resume should do, decided from a bare position and
+//! completion flag rather than from anything persistence owns.
+//!
+//! Deliberately persistence-free: nothing here imports `PersistedCheckpoint`
+//! or anything else from `crate::persistence`. That is what lets
+//! `crate::playback` — the worker, resolving a candidate against the
+//! duration only its own decode probe can report — depend on this module
+//! without the playback engine ever learning that persistence exists (G3).
+//! `crate::session` depends on it too, but only to convert a stored entry
+//! into a `ResumeCandidate` and to re-export the type and the function so
+//! `app::run` and the tests that predate this split keep their import paths
+//! (Ruling 4); the decision itself is made wherever a duration actually is,
+//! which since Ruling 5 is the worker alone. Whoever calls `decide_resume`
+//! gets the same answer for the same inputs, which is what keeps a
+//! worker-resolved resume and an application-resolved one from ever landing
+//! somewhere the checkpoint never said.
+
+use std::time::Duration;
+
+/// The two facts §11's table is a function of, however they were learned. A
+/// caller with a `PersistedCheckpoint` in hand converts it into one of these
+/// (`Session`'s `From` impl does exactly that); a caller with only a
+/// worker-reported target builds one directly.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResumeCandidate {
+    pub position: Duration,
+    pub completed: bool,
+}
+
+/// What §11's table says about one resume candidate, and why.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResumeDecision {
+    /// No candidate at all.
+    NoEntry,
+    /// The entry is complete. D1 retains its position; the resume declines it.
+    Completed,
+    /// An entry that never got anywhere.
+    AtStart,
+    Resume(Duration),
+    /// `position == duration`: preserved in storage, not usable as a start.
+    DegenerateEnd,
+    /// `position > duration`: the file no longer describes this media.
+    StalePastEnd,
+    /// The duration is unknown, so the position is retained unvalidated.
+    Unvalidated(Duration),
+}
+
+impl ResumeDecision {
+    pub fn start_at(&self) -> Duration {
+        match self {
+            Self::Resume(position) | Self::Unvalidated(position) => *position,
+            Self::NoEntry
+            | Self::Completed
+            | Self::AtStart
+            | Self::DegenerateEnd
+            | Self::StalePastEnd => Duration::ZERO,
+        }
+    }
+}
+
+/// Applied against whatever duration the caller already has in hand — the
+/// worker's own decode probe when resolving a `ResumeIntent::Candidate`, a
+/// literal in a test — so deciding never opens a second file on its own
+/// account. Completion is never inferred from `position >= duration`, and
+/// there is no near-end heuristic anywhere.
+pub fn decide_resume(
+    candidate: Option<ResumeCandidate>,
+    duration: Option<Duration>,
+) -> ResumeDecision {
+    let Some(candidate) = candidate else {
+        return ResumeDecision::NoEntry;
+    };
+    if candidate.completed {
+        return ResumeDecision::Completed;
+    }
+    if candidate.position.is_zero() {
+        return ResumeDecision::AtStart;
+    }
+    let Some(duration) = duration else {
+        return ResumeDecision::Unvalidated(candidate.position);
+    };
+    match candidate.position.cmp(&duration) {
+        std::cmp::Ordering::Less => ResumeDecision::Resume(candidate.position),
+        std::cmp::Ordering::Equal => ResumeDecision::DegenerateEnd,
+        std::cmp::Ordering::Greater => ResumeDecision::StalePastEnd,
+    }
+}

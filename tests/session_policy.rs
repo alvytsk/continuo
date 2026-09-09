@@ -7,10 +7,11 @@ use continuo::media::capabilities::{Continuity, MediaCapabilities, SeekSupport};
 use continuo::media::metadata::MediaMetadata;
 use continuo::persistence::model::PersistedState;
 use continuo::persistence::writer::Urgency;
-use continuo::playback::event::{PlaybackEvent, Progress};
+use continuo::playback::event::{PlaybackEvent, Progress, StartDisposition};
 use continuo::playback::state::PlaybackState;
 use continuo::playback::timeline::PositionQuality;
 use continuo::playback::volume::Volume;
+use continuo::resume::ResumeCandidate;
 use continuo::session::{Action, ResumeDecision, Session, decide_resume};
 
 mod support;
@@ -26,6 +27,10 @@ fn loaded(session_rev: u64, name: &str, position: Duration) -> PlaybackEvent {
             seek: SeekSupport::Native,
         },
         position,
+        // The policy under test here never reads `disposition`; every case
+        // that cares about resume behaviour lives in `resume_decision.rs` and
+        // `engine_contract.rs` instead.
+        disposition: StartDisposition::Fresh,
     }
 }
 
@@ -554,7 +559,10 @@ fn a_stopped_seek_clears_the_completion_its_target_supersedes() {
     // decision, the target is what the listener gets, not what the earlier
     // `completed: true` would have discarded.
     assert_eq!(
-        decide_resume(Some(entry), Some(Duration::from_secs(240))),
+        decide_resume(
+            Some(ResumeCandidate::from(entry)),
+            Some(Duration::from_secs(240))
+        ),
         ResumeDecision::Resume(Duration::from_secs(30))
     );
 }
@@ -582,6 +590,7 @@ fn a_launch_that_never_establishes_writes_no_checkpoint() {
         &PlaybackEvent::Failed {
             session_rev: 1,
             message: "cannot open the audio device".into(),
+            cause: None,
         },
         clock.sample(),
     );
@@ -620,6 +629,7 @@ fn a_switch_away_from_a_media_that_never_established_records_nothing_for_it() {
         &PlaybackEvent::Failed {
             session_rev: 1,
             message: "cannot open the audio device".into(),
+            cause: None,
         },
         clock.sample(),
     );

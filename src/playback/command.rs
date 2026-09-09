@@ -2,15 +2,30 @@ use std::time::Duration;
 
 use crate::media::id::MediaId;
 use crate::media::source::SourceLocation;
+use crate::resume::ResumeCandidate;
 
 use super::volume::Volume;
+
+/// How a load's start is decided. `Load` carries one of these rather than a
+/// bare `Duration` because a `Candidate` cannot be resolved into a position
+/// until a decoder has reported a duration to resolve it against — and only
+/// the worker has one (Ruling 5): hoisting the decision into `app::run` would
+/// mean opening the media twice, once to decide and once to play.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResumeIntent {
+    /// The application has already decided. Used by Restart and by tests.
+    StartAt(Duration),
+    /// Resolved by the worker after its single probe, using the same rules the
+    /// application would apply if it had a duration to apply them to.
+    Candidate(ResumeCandidate),
+}
 
 #[derive(Clone, Debug)]
 pub enum PlaybackCommand {
     Load {
         media: MediaId,
         source: SourceLocation,
-        start_at: Duration,
+        resume: ResumeIntent,
     },
     Play,
     Pause,
@@ -25,4 +40,13 @@ pub enum PlaybackCommand {
     SetVolume(Volume),
     Stop,
     Shutdown,
+}
+
+/// Whether a submission entered the queue. §8: saturation is visible, never a
+/// block on the application thread.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Admission {
+    Accepted,
+    Busy,
+    Gone,
 }

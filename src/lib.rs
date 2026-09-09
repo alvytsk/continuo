@@ -6,5 +6,6 @@ pub mod http;
 pub mod media;
 pub mod persistence;
 pub mod playback;
+pub mod resume;
 pub mod session;
 pub mod telemetry;
