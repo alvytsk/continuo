@@ -15,6 +15,10 @@ pub enum PlaybackEvent {
         media: MediaId,
         metadata: MediaMetadata,
         capabilities: MediaCapabilities,
+        /// Where the load actually landed after its refined seek to `start_at`.
+        /// Without it the application cannot report where a resume landed and
+        /// would render 00:00:00 after one (D8).
+        position: Duration,
     },
     StateChanged {
         session_rev: u64,
@@ -80,4 +84,14 @@ pub struct Progress {
     pub media: Option<MediaId>,
     pub position: Duration,
     pub quality: PositionQuality,
+}
+
+/// What a shutdown hands back: the position the worker captured on its way out,
+/// and every event that never reached the application — whether it was still in
+/// the worker's backlog or already in the channel when the interrupt landed
+/// (D14, D19).
+#[derive(Debug)]
+pub struct ShutdownReport {
+    pub progress: Progress,
+    pub events: Vec<PlaybackEvent>,
 }

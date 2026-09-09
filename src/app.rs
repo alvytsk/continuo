@@ -184,12 +184,13 @@ impl Mirror {
                 session_rev,
                 media,
                 metadata,
+                position,
                 ..
             } => {
                 self.session_rev = session_rev;
                 self.name = Some(display_name(&media));
                 self.duration = metadata.duration;
-                self.position = Duration::ZERO;
+                self.position = position;
                 self.quality = PositionQuality::Exact;
                 self.state = PlaybackState::Loading;
             }

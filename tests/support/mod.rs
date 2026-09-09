@@ -35,7 +35,7 @@ use continuo::playback::callback::CallbackCore;
 use continuo::playback::command::PlaybackCommand;
 use continuo::playback::engine::EngineHandle;
 use continuo::playback::error::PlaybackError;
-use continuo::playback::event::{PlaybackEvent, Progress};
+use continuo::playback::event::{PlaybackEvent, Progress, ShutdownReport};
 use continuo::playback::link::{OutputLink, Phase};
 use continuo::playback::output::cpal_output::OutputFault;
 use continuo::playback::output::test_output::TestOutput;
@@ -188,6 +188,15 @@ pub struct TestEngine {
 
 impl TestEngine {
     pub fn start(name: &str) -> Self {
+        let engine = Self::start_at(name, Duration::ZERO);
+        // The events a start-up emits are not what any test is looking at.
+        lock(&engine.inbox).clear();
+        engine
+    }
+
+    /// A start that resumes at `start_at`. Deliberately does **not** clear the
+    /// inbox: the `Loaded` it produces is the subject of the resume tests.
+    pub fn start_at(name: &str, start_at: Duration) -> Self {
         let device = Arc::new(Mutex::new(Device {
             output: TestOutput::new(CHANNELS, RATE, BUFFER_FRAMES, LATENCY),
             link: None,
@@ -234,13 +243,11 @@ impl TestEngine {
         engine.send(PlaybackCommand::Load {
             media: MediaId::LocalFile(path.clone()),
             source: SourceLocation::LocalPath(path.as_path().to_path_buf()),
-            start_at: Duration::ZERO,
+            start_at,
         });
         engine.await_state(PlaybackState::Paused);
         engine.send(PlaybackCommand::Play);
         engine.await_state(PlaybackState::Playing);
-        // The events a start-up emits are not what any test is looking at.
-        lock(&engine.inbox).clear();
         engine
     }
 
@@ -337,6 +344,32 @@ impl TestEngine {
     pub fn drop_event_receiver(&self) {
         if let Some(handle) = lock(&self.handle).as_mut() {
             handle.release_events();
+        }
+    }
+
+    /// Interrupt and join, handing back what the engine captured on its way
+    /// out. `Drop` then finds the handle already taken and skips its own join.
+    pub fn shutdown_report(&mut self) -> Option<ShutdownReport> {
+        let handle = lock(&self.handle).take()?;
+        handle.interrupt_shutdown();
+        Some(handle.join())
+    }
+
+    /// Block until the worker has taken every queued command.
+    ///
+    /// The shutdown interrupt is checked at the **top** of the worker's pass,
+    /// before it reads any command, so a test that sends and interrupts in the
+    /// same breath is asking about events that were never produced. Commands
+    /// are dispatched in the same pass they are received, so an empty channel
+    /// means the work is done — what is still open, deliberately, is whether
+    /// the events it produced have been flushed yet.
+    pub fn await_commands_taken(&mut self) {
+        let deadline = Instant::now() + PATIENCE;
+        while self.pending_commands() > 0 {
+            if Instant::now() >= deadline {
+                panic!("the worker never took the queued commands");
+            }
+            std::thread::sleep(Duration::from_millis(1));
         }
     }
 
