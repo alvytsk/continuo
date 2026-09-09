@@ -21,6 +21,8 @@
 
 #![allow(dead_code)]
 
+pub mod server;
+
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
