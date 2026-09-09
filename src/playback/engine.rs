@@ -269,21 +269,38 @@ impl Drop for EngineHandle {
     }
 }
 
-/// Everything belonging to one live output stream. It is a single struct
-/// because none of it may survive a teardown: the link, the acknowledgment
-/// protocol and both ring endpoints are recreated together or not at all.
-struct Transport {
-    link: Arc<OutputLink>,
+/// The transport state a blocked source read may service, behind one lock
+/// once Task 9 finishes wrapping it (step 2). For now, step 1, it is a plain
+/// field: introducing the type and moving `timeline`/`anchor` onto it is done
+/// on its own, separately from the `Arc<Mutex<...>>` wrap, so a regression is
+/// bisectable to whichever change caused it.
+///
+/// `pcm`, `link` and `config` do NOT move onto this struct: `TransportCore`
+/// only ever holds what a later wait hook needs (`handshake`, `timeline`,
+/// `anchor`, `sample_rate`), and `pcm` in particular is `rtrb::Producer<f32>`,
+/// which is `!Sync` and must stay on the worker regardless of this task's
+/// later steps.
+struct TransportCore {
     handshake: Handshake,
-    pcm: rtrb::Producer<f32>,
-    config: NegotiatedOutput,
+    timeline: Timeline,
+    /// Media position the current generation's frame counting starts from.
+    anchor: Duration,
+    // Not read until step 4, when `WaitService`'s shared recompute needs it
+    // to convert played frames back to a `Duration` without a second lookup
+    // into `Worker::config`, which the hook cannot reach. Carried from step 1
+    // regardless, alongside the other three fields the interface specifies,
+    // rather than added piecemeal later.
+    #[allow(dead_code)]
+    sample_rate: u32,
 }
 
 struct Worker {
     output: Box<dyn AudioOutput>,
     faults: Receiver<OutputFault>,
-    transport: Option<Transport>,
-    timeline: Timeline,
+    transport: Option<TransportCore>,
+    pcm: Option<rtrb::Producer<f32>>,
+    link: Option<Arc<OutputLink>>,
+    config: Option<NegotiatedOutput>,
     source: Option<DecodedSource>,
     converter: Option<Converter>,
     /// Interleaved output samples the ring has not accepted yet.
@@ -293,8 +310,6 @@ struct Worker {
     /// The logical resume point. Stop and recreation preserve it; load,
     /// restart and successful seeks establish a new one.
     position: Duration,
-    /// Media position that the current generation's frame counting starts from.
-    anchor: Duration,
     requested_target: Option<Duration>,
     media: Option<MediaId>,
     volume: Volume,
@@ -340,14 +355,15 @@ impl Worker {
             output,
             faults,
             transport: None,
-            timeline: Timeline::new(48_000),
+            pcm: None,
+            link: None,
+            config: None,
             source: None,
             converter: None,
             staging: Vec::new(),
             state: PlaybackState::Idle,
             session_rev: 0,
             position: Duration::ZERO,
-            anchor: Duration::ZERO,
             requested_target: None,
             media: None,
             volume: Volume::FULL,
@@ -396,7 +412,7 @@ impl Worker {
             // 2. Spans -> timeline -> keep-latest progress snapshot.
             self.collect_diagnostics();
             if let Some(transport) = self.transport.as_mut() {
-                transport.handshake.drain_spans(&mut self.timeline);
+                transport.handshake.drain_spans(&mut transport.timeline);
             }
             self.publish_progress();
 
@@ -607,7 +623,11 @@ impl Worker {
             return PositionQuality::Degraded;
         }
         match self.state {
-            PlaybackState::Playing | PlaybackState::Paused => self.timeline.quality(),
+            PlaybackState::Playing | PlaybackState::Paused => self
+                .transport
+                .as_ref()
+                .map(|t| t.timeline.quality())
+                .unwrap_or(PositionQuality::Exact),
             _ => PositionQuality::Exact,
         }
     }
@@ -619,11 +639,13 @@ impl Worker {
         // settles. Freezing the number at the instant of the park would report
         // a position slightly behind what the listener actually heard.
         if matches!(self.state, PlaybackState::Playing | PlaybackState::Paused)
-            && let Some(rate) = self.transport.as_ref().map(|t| t.config.sample_rate)
+            && let Some(rate) = self.config.as_ref().map(|c| c.sample_rate)
         {
             let now = self.output.now();
-            let played = self.timeline.played_frames(now);
-            self.position = self.anchor + frames_to_duration(played, rate);
+            if let Some(transport) = self.transport.as_mut() {
+                let played = transport.timeline.played_frames(now);
+                self.position = transport.anchor + frames_to_duration(played, rate);
+            }
         }
         let snapshot = Progress {
             session_rev: self.session_rev,
@@ -641,11 +663,13 @@ impl Worker {
     /// Read the link's counters before anything else can swap them away, and
     /// forward the span losses to the timeline that has to account for them.
     fn collect_diagnostics(&mut self) {
-        let Some(transport) = self.transport.as_ref() else {
+        let Some(link) = self.link.as_ref() else {
             return;
         };
-        let diagnostics = transport.link.take_diagnostics();
-        self.timeline.note_dropped(diagnostics.spans_dropped);
+        let diagnostics = link.take_diagnostics();
+        if let Some(transport) = self.transport.as_mut() {
+            transport.timeline.note_dropped(diagnostics.spans_dropped);
+        }
         self.lost_spans += u64::from(diagnostics.spans_dropped);
         // Underruns after the decoder has run dry are the expected sound of a
         // track ending, not a glitch worth reporting.
@@ -808,7 +832,7 @@ impl Worker {
         );
         self.output.open(&config, Arc::clone(&link), core)?;
 
-        self.timeline = Timeline::new(config.sample_rate);
+        let mut timeline = Timeline::new(config.sample_rate);
         self.converter = Some(Converter::new(
             source_rate,
             config.sample_rate,
@@ -818,20 +842,27 @@ impl Worker {
         let mut handshake = Handshake::new(Arc::clone(&link), span_rx);
         self.reset_generation_state();
         let generation = self.generation;
+        // The anchor this generation counts from: captured now, before the
+        // new `TransportCore` exists to hold it, and handed straight to its
+        // constructor below.
+        let anchor = self.position;
         let installed = {
-            let Self { timeline, .. } = self;
             let mut pump = || std::thread::sleep(PUMP_NAP);
-            handshake.install(generation, false, timeline, &mut pump, DEADLINE)
+            handshake.install(generation, false, &mut timeline, &mut pump, DEADLINE)
         };
         if installed.is_err() {
             self.output.close();
             return Err(PlaybackError::Timeout);
         }
-        self.transport = Some(Transport {
-            link,
+        self.link = Some(link);
+        self.pcm = Some(pcm_tx);
+        let sample_rate = config.sample_rate;
+        self.config = Some(config);
+        self.transport = Some(TransportCore {
             handshake,
-            pcm: pcm_tx,
-            config,
+            timeline,
+            anchor,
+            sample_rate,
         });
         self.prime_and_run(playing);
         Ok(())
@@ -871,19 +902,23 @@ impl Worker {
         }
         self.reset_generation_state();
         let generation = self.generation;
+        let anchor = self.position;
         let installed = {
-            let Self {
-                transport,
-                timeline,
-                ..
-            } = self;
-            let Some(transport) = transport.as_mut() else {
+            let Some(transport) = self.transport.as_mut() else {
                 return Ok(());
             };
+            // Set here, through the field, rather than at construction:
+            // unlike `open_transport`, this generation reuses an
+            // already-existing `TransportCore` rather than building a new one.
+            transport.anchor = anchor;
             let mut pump = || std::thread::sleep(PUMP_NAP);
-            transport
-                .handshake
-                .install(generation, false, timeline, &mut pump, DEADLINE)
+            transport.handshake.install(
+                generation,
+                false,
+                &mut transport.timeline,
+                &mut pump,
+                DEADLINE,
+            )
         };
         if installed.is_err() {
             return self.rebuild("handshake timeout", playing);
@@ -893,9 +928,14 @@ impl Worker {
     }
 
     /// Everything that a new generation invalidates, in one place.
+    ///
+    /// The anchor - `self.position` at the moment this generation starts
+    /// counting from - is not among them: it lives on `TransportCore` now, so
+    /// a caller building a brand-new one (`open_transport`) passes it straight
+    /// to the constructor, and `reinstall`, which reuses an existing one,
+    /// writes it back through the field itself, right after this returns.
     fn reset_generation_state(&mut self) {
         self.generation = self.generation.wrapping_add(1);
-        self.anchor = self.position;
         self.pushed_total = 0;
         self.staging.clear();
         self.source_eof = false;
@@ -915,14 +955,11 @@ impl Worker {
         if !playing {
             return;
         }
-        let Self {
-            transport,
-            timeline,
-            ..
-        } = self;
-        if let Some(transport) = transport.as_mut() {
+        if let Some(transport) = self.transport.as_mut() {
             let generation = transport.handshake.generation();
-            transport.handshake.start_running(generation, timeline);
+            transport
+                .handshake
+                .start_running(generation, &mut transport.timeline);
         }
     }
 
@@ -931,29 +968,27 @@ impl Worker {
     /// Returns `false` when the device did not answer, in which case the
     /// caller must fall back to the link's rescue record.
     fn capture_position(&mut self) -> bool {
-        let Some(rate) = self.transport.as_ref().map(|t| t.config.sample_rate) else {
+        let Some(rate) = self.config.as_ref().map(|c| c.sample_rate) else {
             return true;
         };
-        let anchor = self.anchor;
         let captured = {
             let Self {
-                transport,
-                timeline,
-                output,
-                ..
+                transport, output, ..
             } = self;
             let Some(transport) = transport.as_mut() else {
                 return true;
             };
+            let anchor = transport.anchor;
             let mut clock = || output.now();
             let mut pump = || std::thread::sleep(PUMP_NAP);
             transport
                 .handshake
-                .freeze_and_capture(timeline, &mut clock, &mut pump, DEADLINE)
+                .freeze_and_capture(&mut transport.timeline, &mut clock, &mut pump, DEADLINE)
+                .map(|frames| anchor + frames_to_duration(frames, rate))
         };
         match captured {
-            Ok(frames) => {
-                self.position = anchor + frames_to_duration(frames, rate);
+            Ok(position) => {
+                self.position = position;
                 true
             }
             Err(_) => false,
@@ -962,12 +997,21 @@ impl Worker {
 
     fn capture_and_teardown(&mut self) {
         let rate = self
-            .transport
+            .config
             .as_ref()
-            .map(|t| t.config.sample_rate)
+            .map(|c| c.sample_rate)
             .unwrap_or(48_000);
         let exact = self.capture_position();
-        let anchor = self.anchor;
+        // Read before `teardown` clears the `TransportCore` this comes from.
+        // Unused when `exact` is true (the common case) or when there was
+        // never a transport to begin with - the rescue branch below is the
+        // only place it matters, and it is reachable only when both a
+        // transport existed and its capture timed out.
+        let anchor = self
+            .transport
+            .as_ref()
+            .map(|t| t.anchor)
+            .unwrap_or(self.position);
         let generation = self.generation;
         let link = self.teardown();
         if exact {
@@ -991,7 +1035,10 @@ impl Worker {
         // what makes the link's rescue slot safe to read afterwards.
         self.output.close();
         retire_faults(&mut self.deferred_fault, &self.faults);
-        let link = self.transport.take().map(|transport| transport.link);
+        let link = self.link.take();
+        self.transport = None;
+        self.pcm = None;
+        self.config = None;
         self.converter = None;
         self.staging.clear();
         self.pushed_total = 0;
@@ -1023,14 +1070,17 @@ impl Worker {
 
     fn pump_audio(&mut self) {
         loop {
-            let Some(transport) = self.transport.as_mut() else {
+            let Some(config) = self.config.as_ref() else {
                 return;
             };
-            let channels = usize::from(transport.config.channels.max(1));
+            let channels = usize::from(config.channels.max(1));
+            let Some(pcm) = self.pcm.as_mut() else {
+                return;
+            };
             // Whole frames only, in a ring sized as a multiple of the channel
             // count: a partial frame here would emit one channel of a frame
             // while its siblings stayed silent.
-            let free = transport.pcm.slots() / channels * channels;
+            let free = pcm.slots() / channels * channels;
             let ready = self.staging.len() / channels * channels;
             let count = free.min(ready);
             if count > 0 {
@@ -1039,11 +1089,7 @@ impl Worker {
                 // can pop a left channel whose right sibling has not been
                 // written yet - a half frame, mid-push, even though `count` is a
                 // whole number of frames.
-                if transport
-                    .pcm
-                    .push_entire_slice(&self.staging[..count])
-                    .is_ok()
-                {
+                if pcm.push_entire_slice(&self.staging[..count]).is_ok() {
                     self.staging.drain(..count);
                     self.pushed_total += (count / channels) as u64;
                 }
@@ -1101,25 +1147,27 @@ impl Worker {
         if self.state != PlaybackState::Playing || !self.decoder_drained {
             return;
         }
-        let Some(rate) = self.transport.as_ref().map(|t| t.config.sample_rate) else {
+        let Some(rate) = self.config.as_ref().map(|c| c.sample_rate) else {
             return;
         };
         let now = self.output.now();
-        if self.timeline.played_frames(now) < self.pushed_total {
-            return;
-        }
-        self.position = self.anchor + frames_to_duration(self.pushed_total, rate);
-        {
-            let mut pump = || std::thread::sleep(PUMP_NAP);
-            let Self {
-                transport,
-                timeline,
-                ..
-            } = self;
-            if let Some(transport) = transport.as_mut() {
-                let _ = transport.handshake.park(timeline, &mut pump, DEADLINE);
+        let landed_anchor = {
+            let Some(transport) = self.transport.as_mut() else {
+                return;
+            };
+            if transport.timeline.played_frames(now) < self.pushed_total {
+                return;
             }
-        }
+            let mut pump = || std::thread::sleep(PUMP_NAP);
+            // The outcome is deliberately ignored: a timed-out park does not
+            // prevent EndOfTrack from being reported - the decoder has
+            // genuinely run dry either way.
+            let _ = transport
+                .handshake
+                .park(&mut transport.timeline, &mut pump, DEADLINE);
+            transport.anchor
+        };
+        self.position = landed_anchor + frames_to_duration(self.pushed_total, rate);
         let session_rev = self.session_rev;
         let position = self.position;
         self.emit(PlaybackEvent::EndOfTrack {
@@ -1158,8 +1206,8 @@ impl Worker {
             PlaybackCommand::Restart => self.restart(),
             PlaybackCommand::SetVolume(volume) => {
                 self.volume = volume;
-                if let Some(transport) = self.transport.as_ref() {
-                    transport.link.set_gain(volume.as_gain());
+                if let Some(link) = self.link.as_ref() {
+                    link.set_gain(volume.as_gain());
                 }
                 let session_rev = self.session_rev;
                 self.emit(PlaybackEvent::VolumeChanged {
@@ -1184,9 +1232,13 @@ impl Worker {
         // every failure path below. A `Candidate` has no position to pin yet -
         // deciding one needs the duration only the decoder can report, so it
         // waits until the source has actually opened, below.
+        //
+        // `self.position` alone is enough: no transport exists at this point
+        // (the teardown above just cleared it), and `open_transport` reads
+        // `self.position` as the new generation's anchor when it builds one,
+        // below.
         if let ResumeIntent::StartAt(target) = resume {
             self.position = target;
-            self.anchor = target;
         }
         self.degraded = false;
         self.set_state(PlaybackState::Loading);
@@ -1225,7 +1277,6 @@ impl Worker {
                 let decision = decide_resume(Some(candidate), decoded.metadata().duration);
                 let target = decision.start_at();
                 self.position = target;
-                self.anchor = target;
                 let disposition = match decision {
                     ResumeDecision::Completed => StartDisposition::CompletedReplay,
                     ResumeDecision::Resume(_) | ResumeDecision::Unvalidated(_) => {
@@ -1365,13 +1416,12 @@ impl Worker {
         }
         let parked = {
             let mut pump = || std::thread::sleep(PUMP_NAP);
-            let Self {
-                transport,
-                timeline,
-                ..
-            } = self;
-            match transport.as_mut() {
-                Some(transport) => transport.handshake.park(timeline, &mut pump, DEADLINE),
+            match self.transport.as_mut() {
+                Some(transport) => {
+                    transport
+                        .handshake
+                        .park(&mut transport.timeline, &mut pump, DEADLINE)
+                }
                 None => Ok(()),
             }
         };
