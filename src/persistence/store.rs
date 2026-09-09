@@ -254,7 +254,7 @@ impl StateStore {
         use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 
         if !dir.exists() {
-            return fs::DirBuilder::new()
+            fs::DirBuilder::new()
                 .recursive(true)
                 .mode(0o700)
                 .create(dir)
@@ -262,7 +262,12 @@ impl StateStore {
                     path: dir.to_path_buf(),
                     op: "create directory for",
                     source,
-                });
+                })?;
+            // Deliberately falling through to the check below rather than
+            // returning here: `mkdir`'s mode is masked by the process umask, so
+            // a directory this build just created is the one case an early
+            // return would leave unverified. D12's 0700 is asserted for every
+            // path through this function.
         }
 
         // D12 says the mode is set explicitly, and a create-time mode reaches

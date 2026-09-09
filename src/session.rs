@@ -533,6 +533,10 @@ mod tests {
             decide_resume(Some(&entry), secs(300)),
             ResumeDecision::AtStart
         );
+        // With no duration either: both decisions start at zero, so only the
+        // discriminant separates them — and the discriminant is what the
+        // application logs.
+        assert_eq!(decide_resume(Some(&entry), None), ResumeDecision::AtStart);
     }
 
     #[test]
@@ -581,6 +585,13 @@ mod tests {
         let entry = stored(400, true);
         assert_eq!(
             decide_resume(Some(&entry), secs(300)),
+            ResumeDecision::Completed
+        );
+        // And a completed entry at zero is completed, not a fresh start, for
+        // the same reason: the position rules are reached only after it.
+        let at_zero = stored(0, true);
+        assert_eq!(
+            decide_resume(Some(&at_zero), secs(300)),
             ResumeDecision::Completed
         );
     }

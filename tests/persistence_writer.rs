@@ -215,7 +215,7 @@ fn a_shutdown_that_is_not_acknowledged_detaches_rather_than_hanging() {
     assert!(matches!(writer.shutdown(), ShutdownOutcome::Unconfirmed));
     let elapsed = started.elapsed();
     assert!(
-        elapsed < Duration::from_secs(4),
+        elapsed < Duration::from_millis(2_500),
         "the 2 s bound must not be defeated by an unconditional join: took {elapsed:?}"
     );
 }

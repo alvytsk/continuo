@@ -119,6 +119,10 @@ fn should_warn(consecutive_failures: u32) -> bool {
     consecutive_failures == FAILURE_WARNING_THRESHOLD
 }
 
+/// The only report a persistence failure at quit ever produces, so discarding
+/// it silently would lose the session's last word on whether anything reached
+/// the disk.
+#[must_use]
 #[derive(Debug)]
 pub enum ShutdownOutcome {
     Written,
@@ -270,7 +274,17 @@ fn run(
             continue;
         };
 
+        // Unreachable as the program stands: `mark_written` only ever records a
+        // sequence this loop took out of the slot, `submit` hands out strictly
+        // increasing ones, and a snapshot is taken from the slot once. The guard
+        // is what makes keep-latest checkable rather than assumed (§9), so it
+        // says so when it fires instead of dropping a checkpoint in silence — a
+        // second producer, or a snapshot reinserted twice, would show up here.
         if lock(&shared.slot).is_stale(pending.submit_seq) {
+            tracing::debug!(
+                submit_seq = pending.submit_seq,
+                "dropping a state snapshot older than one already written"
+            );
             continue;
         }
 
@@ -397,7 +411,7 @@ mod tests {
     }
 
     #[test]
-    fn the_warning_fires_once_at_three_consecutive_failures() {
+    fn should_warn_fires_once_at_three_consecutive_failures() {
         assert!(!should_warn(1));
         assert!(!should_warn(2));
         assert!(should_warn(3));

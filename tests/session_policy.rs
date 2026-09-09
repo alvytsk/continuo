@@ -289,6 +289,24 @@ fn a_pause_that_interrupts_no_playback_raises_nothing() {
 }
 
 #[test]
+fn a_pause_after_a_stop_raises_nothing_either() {
+    // D13 raises a force from `Playing` only, and an established session
+    // reaches the same arm: a stop resolves its own force, and the `Paused` the
+    // engine settles into afterwards must not force a second checkpoint.
+    let (mut session, clock) = playing("a");
+    let _ = session.observe(&state_changed(2, PlaybackState::Stopped), clock.sample());
+    let _ = submitted(session.tick(&progress(2, "a", 93), clock.sample()));
+
+    assert!(is_none(&session.observe(
+        &state_changed(2, PlaybackState::Paused),
+        clock.sample()
+    )));
+    assert!(is_none(
+        &session.tick(&progress(2, "a", 93), clock.sample())
+    ));
+}
+
+#[test]
 fn a_stop_raises_a_force_that_the_tick_resolves() {
     let (mut session, clock) = playing("a");
     clock.advance(Duration::from_secs(2));
