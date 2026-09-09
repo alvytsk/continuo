@@ -2,6 +2,7 @@
 //! writer thread that owns the disk.
 
 pub mod model;
+pub mod store;
 
 use std::io;
 use std::path::PathBuf;
