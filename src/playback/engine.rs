@@ -839,9 +839,19 @@ impl Worker {
     /// (`CpalOutput::now()`'s `None` arm) when no stream is open, but nothing
     /// ever reads `device_clock` unless `facts.playing` is true, and that is
     /// only ever true when a transport - and so a stream - exists.
+    ///
+    /// `fetch_max`, not `store`, for the same reason `CallbackCore::fill`
+    /// uses it: this write and the callback's race on two different threads
+    /// with no ordering between them, so a plain `store` could let a
+    /// just-sampled-but-not-yet-stored older instant from one thread
+    /// overwrite a newer value the other already published, and the reader
+    /// would see position step backward. `fetch_max` only ever moves this
+    /// forward, which is correct for both writers *within one clock
+    /// domain* — the domain reset that must still win with a plain `store`
+    /// lives in `open_transport`, not here.
     fn publish_progress(&mut self) {
         self.device_clock
-            .store(self.output.now().0, Ordering::Relaxed);
+            .fetch_max(self.output.now().0, Ordering::Relaxed);
         {
             let mut facts = lock(&self.facts);
             facts.session_rev = self.session_rev;
@@ -1053,6 +1063,19 @@ impl Worker {
             // during that block (see `CallbackCore::fill`'s doc comment).
             Arc::clone(&self.device_clock),
         );
+        // Plain `store`, deliberately, not `fetch_max`: everywhere else in
+        // this file `fetch_max` is correct precisely because writer and
+        // reader stay inside one clock domain, but opening a stream *changes*
+        // the domain — a rebuilt `cpal::Stream` restarts its own
+        // `StreamInstant` near zero, and `CpalOutput::now()` returns
+        // `Nanos(0)` for the interval this call is about to close. A
+        // `fetch_max` here would latch the OLD domain's high-water mark
+        // forever, since every value the NEW domain ever produces is lower
+        // than it — freezing the reported position after every device
+        // rebuild, which is exactly the M1 recovery path the contract tests
+        // exist to protect. Do not "simplify" this to `fetch_max` to match
+        // the two steady-state writers above; it is not the same problem.
+        self.device_clock.store(0, Ordering::Relaxed);
         self.output.open(&config, Arc::clone(&link), core)?;
 
         let mut timeline = Timeline::new(config.sample_rate);
@@ -1956,6 +1979,62 @@ fn adopt_preserved(promised: Duration, actual: Duration) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Fix round 2: proves the exact `store`/`fetch_max` composition
+    /// `open_transport`, `CallbackCore::fill` and `Worker::publish_progress`
+    /// share for `device_clock`, in isolation.
+    ///
+    /// This is a mechanism-level test, not an integration one, and
+    /// deliberately so: driving it through a real `Worker` would need
+    /// `self.output.now()` to actually go backward across a rebuild — the
+    /// real symptom a missed reset produces — but `TestOutput`'s virtual
+    /// clock is one persistent, monotonically-advancing counter that `open`
+    /// never resets, unlike a real `cpal::Stream`'s `StreamInstant`, which
+    /// restarts near zero for every new stream. Every other position-
+    /// preservation test in this crate (`transport_recreation_preserves_position`
+    /// among them) depends on that exact continuity to assert exact values
+    /// across a rebuild, so making `TestOutput` model a per-stream domain
+    /// reset to reach this case here would risk destabilizing tests this
+    /// crate protects rather than proving the one this test exists for.
+    /// What is left provable this way is the mechanism itself: that a plain
+    /// `store` genuinely un-sticks a value `fetch_max` climbed, which is the
+    /// whole reason `open_transport` uses one rather than a `fetch_max(0,
+    /// ..)` that would be a silent no-op against any nonzero high-water mark.
+    #[test]
+    fn a_domain_reset_uses_a_plain_store_so_fetch_max_does_not_latch_the_old_high_water_mark() {
+        let device_clock = AtomicU64::new(0);
+
+        // The old domain climbs, exactly as the two steady-state `fetch_max`
+        // writers (`CallbackCore::fill`, `Worker::publish_progress`) do.
+        device_clock.fetch_max(1_000_000_000, Ordering::Relaxed); // 1s
+        device_clock.fetch_max(2_000_000_000, Ordering::Relaxed); // 2s
+        assert_eq!(device_clock.load(Ordering::Relaxed), 2_000_000_000);
+
+        // `open_transport` resets for the new domain with a plain `store`.
+        device_clock.store(0, Ordering::Relaxed);
+        assert_eq!(
+            device_clock.load(Ordering::Relaxed),
+            0,
+            "a plain store must win over the old domain's high-water mark"
+        );
+
+        // The new domain's own steady-state writers resume with `fetch_max`,
+        // reporting values far below the old domain's 2s mark - exactly what
+        // a freshly opened stream's `StreamInstant`s do.
+        device_clock.fetch_max(50_000_000, Ordering::Relaxed); // 50ms into the new stream
+        assert_eq!(
+            device_clock.load(Ordering::Relaxed),
+            50_000_000,
+            "the new domain's own values must be honoured, not clamped by the old domain"
+        );
+        // The counterfactual this guards: had the reset itself used
+        // `fetch_max(0, ..)` instead of `store`, it would have been a no-op
+        // against the 2s mark above, and the final assertion would instead
+        // see `device_clock` still reporting 2_000_000_000 - a position
+        // frozen at the old stream's last instant for the entire life of the
+        // new one, which is the exact regression Part 2 of this fix exists
+        // to prevent.
+    }
 
     #[test]
     fn retiring_faults_clears_the_deferred_slot_and_the_queue() {

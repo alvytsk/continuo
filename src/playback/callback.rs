@@ -67,7 +67,17 @@ impl CallbackCore {
     /// (`timeline.rs` relies on that ordering for its spans), and is what
     /// still stamps `SpanRecord::t0` below, exactly as before this split.
     pub fn fill(&mut self, out: &mut [f32], callback: Nanos, playback: Nanos) {
-        self.clock.store(callback.0, Ordering::Relaxed);
+        // `fetch_max`, not `store`: this and `Worker::publish_progress`'s own
+        // write race on two different threads with no ordering between them,
+        // so `store` can let an in-flight, already-superseded sample from one
+        // thread overwrite a newer one the other thread just published -
+        // `Relaxed` only orders each store against the *other* stores to this
+        // location, not against which thread observed the later instant.
+        // `fetch_max` makes the location move only forward within a domain,
+        // which is what a clock this steady-state actually needs; see
+        // `Worker::open_transport` for the one place a *lower* value must
+        // still win, because the domain itself just changed.
+        self.clock.fetch_max(callback.0, Ordering::Relaxed);
         self.flush_pending();
         let control = self.link.load_control();
         if control.generation != self.generation {
