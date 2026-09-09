@@ -701,6 +701,68 @@ mod tests {
         assert!(persistence.persisting);
     }
 
+    /// The sink selection is the whole feature in one line: swap the store for
+    /// `DisabledSink` and persistence silently never writes again. Nothing else
+    /// would notice — every other writer test drives a sink of its own — so this
+    /// is the one test that follows a submitted snapshot all the way to the
+    /// bytes on disk, through `impl StateSink for StateStore` and through the
+    /// `Written` arm of the flush report.
+    #[test]
+    fn a_submitted_snapshot_reaches_the_state_file_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let (store, clock) = store_at(&path);
+        let media = local("/music/sonata.flac");
+        let mut stored = PersistedState::default();
+        stored.record(
+            &PlaybackCheckpoint {
+                media: media.clone(),
+                position: Duration::from_secs(93),
+                updated_at: clock.sample().wall,
+            },
+            false,
+        );
+        store.write(&stored).unwrap();
+
+        let mut persistence =
+            open_persistence(Some(store), &media, Some(Duration::from_secs(300)), &clock);
+        assert!(persistence.persisting);
+
+        // The listener got another minute in, and the volume moved with them.
+        let mut advanced = PersistedState::default();
+        advanced.set_volume(Volume::new(0.5));
+        advanced.set_current_media(media.clone());
+        advanced.record(
+            &PlaybackCheckpoint {
+                media: media.clone(),
+                position: Duration::from_secs(150),
+                updated_at: clock.sample().wall,
+            },
+            false,
+        );
+        persistence.writer.submit(advanced, Urgency::Forced);
+
+        let outcome = persistence.writer.shutdown();
+        assert!(
+            matches!(outcome, ShutdownOutcome::Written),
+            "the store must acknowledge the final write: {outcome:?}"
+        );
+        assert!(matches!(
+            classify_flush(outcome, persistence.persisting),
+            FlushReport::Written
+        ));
+
+        let bytes = std::fs::read(&path).unwrap();
+        let written: PersistedState = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            written.entry_for(&media).unwrap().position,
+            Duration::from_secs(150),
+            "the file must hold the snapshot that was submitted, not the one it started with"
+        );
+        assert_eq!(written.volume(), Volume::new(0.5));
+        assert_eq!(written.current_media(), Some(&media));
+    }
+
     /// D3: a file this build cannot read is preserved in place and writing is
     /// off for the session. The sink the disable selects has to write nowhere,
     /// or the preservation is a claim rather than a fact.
