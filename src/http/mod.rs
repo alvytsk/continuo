@@ -8,3 +8,4 @@ pub mod channel;
 pub mod error;
 pub mod limits;
 pub mod response;
+pub mod service;
