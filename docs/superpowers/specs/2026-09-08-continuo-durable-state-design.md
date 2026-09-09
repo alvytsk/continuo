@@ -1,8 +1,8 @@
 # Continuo M2 — durable playback state (design)
 
 Status: approved, not implemented.
-Date: 2026-09-08. Revised the same day after design review; §18 records
-what changed and what was declined.
+Date: 2026-09-08. Revised the same day after design review, and again on
+2026-09-09 after a third review; §18 records what changed and what was declined.
 Supersedes nothing. Refines `docs/architecture.md` §6 with the decisions that
 section deferred to M2.
 
@@ -48,7 +48,8 @@ These are load-bearing for the design and were verified, not assumed.
 | `publish_progress` is called unconditionally on **every** worker loop pass, in **all** states; only recomputation from the timeline is gated on `Playing \| Paused`. The loop ticks every 10 ms (`TICK`). | `engine.rs:367`, `engine.rs:571`, `engine.rs:37` |
 | A seek taken while **stopped** stores `requested_target` and emits `SeekTargetStored`, but does **not** move `self.position`. The target is validated later, in `restore()`. | `engine.rs:1328`, `engine.rs` `fn restore` |
 | `Play` from `Ended` refuses to restart implicitly and only warns, so no spurious `Playing` can follow an `EndOfTrack`. | `engine.rs:1193` |
-| `restore()` emits `SeekCompleted` and then `announce_playing()`, so `Restart` reaches `Playing` through a completed seek. | `engine.rs` `fn restore` |
+| `restore()` — the `Play` path out of `Stopped`/`Paused` — adopts any stored target, emits `SeekCompleted`, then `announce_playing()`. | `engine.rs` `fn restore` |
+| `Restart` dispatches to `restart()`, **not** `restore()`. `restart()` clears `requested_target`, seeks to zero and reaches `Playing` through `announce_playing()` alone: no `SeekCompleted` is ever emitted for it. And `set_state` is a no-op when the state is unchanged, so a `Restart` taken while already `Playing` emits **nothing at all**. | `engine.rs:1103`, `engine.rs` `fn restart`, `engine.rs:529`, `engine.rs:536` |
 | `PlaybackCheckpoint` exists (`media`, `position`, `updated_at`) and is unused by runtime code — only a serde round-trip test. Ready to reuse as-is. | `playback/checkpoint.rs`, `tests/domain_values.rs` |
 | `PlaybackEvent::Loaded` carries no position, and `app.rs:192` zeroes position on `Loaded`. | `playback/event.rs`, `app.rs:192` |
 | Within one worker pass the order is: interrupts → `publish_progress` → `flush_events` → dispatch one command. `emit` only ever appends to `pending_events`; it never sends to the channel directly. So an event produced by a command becomes visible to the app on the *following* pass, after that pass has already published progress for the state the command established. | `engine.rs` `fn run`, `fn emit`, `fn flush_events` |
@@ -60,6 +61,9 @@ These are load-bearing for the design and were verified, not assumed.
 | `load()` ends with `set_state(PlaybackState::Paused)`, so **every** launch emits a `StateChanged{Paused}` that no user asked for, before the queued `Play` is dispatched one pass later. | `engine.rs:1181` |
 | `rebuild()` bumps `session_rev` and emits `DeviceRecovered` on a successful recovery, and the position is continuous across it (`adopt_preserved` on the reseek). A revision bump therefore does **not** imply the media changed. | `engine.rs:701`, `engine.rs` `fn rebuild` |
 | `emit` drops non-terminal events once `pending_events` reaches `PENDING_CAP`. `DeviceRecovered` is non-terminal, so a revision bump can be invisible to the app until some later event carries the new number. | `engine.rs:432`, `engine.rs:42` |
+| The worker's shutdown path never flushes: `run()` step 1 calls `shutdown()` and returns, and `shutdown()` does not call `flush_events()`. Whatever stands in `pending_events` at that moment is discarded, not delivered. | `engine.rs:353`, `engine.rs` `fn shutdown`, `fn flush_events` |
+| `app::run` breaks the loop on `Shutdown` **before** that iteration's event drain, so events already sitting in the channel when `q` is pressed are never observed. An event produced by a command becomes sendable one pass (10 ms) later — well inside one poll window. | `app.rs:80`, `app.rs:101`, `engine.rs:37` |
+| The event channel holds `EVENT_CAPACITY` = 64; `pending_events` holds up to `PENDING_CAP` = 128. A shutdown flush through the channel alone therefore cannot be lossless, and it cannot block: the app is inside `join` and no longer draining. | `engine.rs:41`, `engine.rs:42`, `engine.rs:145` |
 | `render(&mirror)?` propagates out of `app::run` from inside the loop, skipping the post-loop `interrupt_shutdown` / `join`. It is the only exit that does. | `app.rs:122`, `app.rs:131-133` |
 
 ## 4. Mismatches between the M2 brief and the repository (repository wins)
@@ -110,8 +114,10 @@ stands for a future UI seek bar.
 | D14 | Shutdown position | `engine.shutdown()` publishes once after `capture_position()`, and `EngineHandle::join` returns that final `Progress`. | Accepting the last pre-shutdown sample; an engine shutdown result/ack channel | Two one-line engine changes beat a new channel, keep the engine ignorant of persistence, and turn "final `Progress` sample" from a claim into a fact. `join` already establishes the happens-before |
 | D15 | Volume | Persisted as a bare `f32`; `VolumeChanged` marks state dirty at **ordinary** urgency; restored by a `SetVolume` issued **before** `Load` (§11). | Dropping `volume` from M2; forced urgency | §6 lists volume among the file's contents, so dropping it contradicts the architecture. Holding `-`/`+` emits a burst of `VolumeChanged`; ordinary urgency lets D5's coalescing absorb it, and shutdown forces the last one out |
 | D16 | Clock | The injected clock yields `ClockSample { monotonic: Instant, wall: OffsetDateTime }`. Deadlines and intervals use `monotonic`; `updated_at` uses `wall`. | A single wall clock; a single monotonic clock | A wall-clock step backwards must not stall the 5 s capture or the 2 s coalesce, and a monotonic instant cannot be written into an RFC 3339 field |
-| D17 | Outstanding stopped-seek target | The target from `SeekTargetStored` is retained by the session and **supersedes `Progress.position`** for that media until the engine adopts it (`SeekCompleted`, `Loaded` or `EndOfTrack`). | Persisting the target once and letting later triggers overwrite it | The engine deliberately does not move `self.position` for a stopped seek (§3), so any position-derived checkpoint that follows — in practice the shutdown force — writes the pre-seek position back over the target. Without this, D7 is defeated by the very sequence it exists for: stop, seek, quit |
+| D17 | Outstanding stopped-seek target | The target from `SeekTargetStored` is retained by the session and **supersedes `Progress.position`** for that media until the engine **resolves** it — `SeekCompleted`, `StateChanged{Playing}`, `Loaded` or `EndOfTrack`. | Persisting the target once and letting later triggers overwrite it; clearing on adoption alone (`SeekCompleted`, `Loaded`, `EndOfTrack`) | The engine deliberately does not move `self.position` for a stopped seek (§3), so any position-derived checkpoint that follows — in practice the shutdown force — writes the pre-seek position back over the target. Without this, D7 is defeated by the very sequence it exists for: stop, seek, quit. Resolution is not the same as adoption: `restart()` **discards** the target and starts at zero, announcing `Playing` with no `SeekCompleted` (§3). §12 already treats `Playing` for the current media as the observable establishment; D17 reuses that signal rather than inventing a second one |
 | D18 | Flush path | The engine shutdown and final-checkpoint sequence is reached by **every** exit from `app::run`, including a render error. | Leaving `render(&mirror)?` to return early, as M1 does | A terminal write failure is not a reason to skip the final checkpoint, and §9's sequence is only a guarantee if nothing can bypass it |
+| D19 | Shutdown event handoff | `Worker::run` returns its undelivered `pending_events`; `EngineHandle::join` joins the thread, then drains the event channel, and returns `ShutdownReport { progress, events }` — channel events first, worker backlog after. The app replays them through `Session::observe` **before** `shutdown_snapshot`. | Leaving the drain to the app loop; a best-effort `try_send` flush inside `fn shutdown`; a shutdown result channel | Two independent losses (§3): the worker discards `pending_events` when the shutdown interrupt fires, and `app::run` breaks before its own drain. Either can swallow the `SeekTargetStored` that D7 and D17 exist for, or the `EndOfTrack` that sets `completed`, and the final `Progress` carries none of those facts. A channel flush cannot be lossless (64 slots against a 128-deep backlog) and must not block, because the app is inside `join`. The thread's own join value is lossless, ordered and already the happens-before D14 relies on |
+| D20 | Establishment gate on the shutdown force | The shutdown force records a checkpoint **for the current media** only once the session has observed, at the current revision, a `StateChanged{Playing}`, `SeekCompleted`, `SeekTargetStored` or `EndOfTrack`. `Loaded` clears the flag rather than setting it. `volume` and `current_media` are ungated. | An unconditional shutdown checkpoint; a guard written specifically for `completed` entries | §11 maps `completed == true`, `position == duration` and `position > duration` all to `start_at = 0` while retaining the position, and `load()` emits `Loaded` *before* opening the device — so a device-open failure ends at `Failed` with `Progress.position == 0`, and the shutdown force writes that zero over the retained position. §8's `Paused` gate blocks one overwrite of exactly that value; this blocks the other, and generalizes to any launch that quits before playback ever established |
 
 ## 7. Architecture
 
@@ -154,8 +160,14 @@ little working state, all of it derived from the event stream:
 - `pending_force: Option<(session_rev, Trigger)>` — set by `observe` for the
   events that force a checkpoint without carrying a position (D13).
 - `outstanding_target: Option<Duration>` — set by `SeekTargetStored`, cleared by
-  `SeekCompleted`, `Loaded` or `EndOfTrack`. While it is set it supersedes
-  `Progress.position` for the current media (D17).
+  `SeekCompleted`, `StateChanged{Playing}`, `Loaded` or `EndOfTrack`. While it is
+  set it supersedes `Progress.position` for the current media (D17). The
+  `Playing` clause is the one that covers `Restart`, which discards the target
+  and announces `Playing` without a `SeekCompleted` (§3).
+- `established: bool` — cleared by `Loaded`, set by the first
+  `StateChanged{Playing}`, `SeekCompleted`, `SeekTargetStored` or `EndOfTrack`
+  observed at the current revision. It gates the shutdown checkpoint for the
+  current media (D20) and nothing else.
 
 `pending_force` is keyed by the `session_rev` **the event itself carries** — stop
 and device recovery both bump it — and is resolved by the first `tick` sample
@@ -187,7 +199,8 @@ clone is a trivial `BTreeMap` copy on the app thread, nowhere near the audio pat
 | `VolumeChanged` | Ordinary | none — updates `volume`, touches no checkpoint (D15) |
 | `Loaded` for a **different** media | Forced | **one** snapshot: the outgoing entry is recorded from `last_sample` and `current_media` moves, in a single mutation submitted once |
 | `EndOfTrack` | Forced | event `position`, plus `completed = true` |
-| graceful shutdown | Forced | the `Progress` returned by `EngineHandle::join` (D14) — unless `outstanding_target` supersedes it (D17) |
+| graceful shutdown, `established` | Forced | the final `Progress` from `EngineHandle::join` (D14) — unless `outstanding_target` supersedes it (D17) |
+| graceful shutdown, not `established` | Forced | no checkpoint for the current media; `volume` and `current_media` are still written (D20) |
 
 **Why a pending force is not a delay.** §3 establishes the worker's pass order:
 a command's event is flushed on the pass *after* the one that applied it, and
@@ -223,9 +236,42 @@ still reads the pre-seek value, so the next position-derived checkpoint writes i
 back. While stopped that is exactly one checkpoint — the shutdown force — and it
 lands on the sequence D7 was written for: play to 93 s, `s`, `←`, quit. The
 session therefore keeps the target and persists it in place of
-`Progress.position` until the engine adopts it, at which point `SeekCompleted`,
-`Loaded` or `EndOfTrack` clears it and the canonical position is authoritative
-again.
+`Progress.position` until the engine **resolves** it, at which point
+`SeekCompleted`, `StateChanged{Playing}`, `Loaded` or `EndOfTrack` clears it and
+the canonical position is authoritative again.
+
+Resolving is not the same as adopting, which is why `StateChanged{Playing}` is in
+that set. `Restart` runs `restart()`, not `restore()`: it **discards**
+`requested_target`, seeks to zero and announces `Playing`, emitting no
+`SeekCompleted` (§3). Without the `Playing` clause, `stop → seek to Y → Restart →
+play → quit` persists Y — and not only at quit, because D17 supersedes
+`Progress.position` for as long as the target stands, so every ordinary
+checkpoint of the restarted playback persists Y too. A `Restart` taken while
+already `Playing` emits nothing at all (§3), which is sound here: a target can
+only be stored from `Idle` or `Stopped`, and both exits from `Stopped` —
+`restore()` and `restart()` — pass through `Playing`.
+
+**Why the shutdown checkpoint is gated on establishment (D20).** `load()` pins
+`self.position = start_at` *before* opening the decoder or the device, so a load
+that fails still reports the position that was asked for, and re-persisting it
+costs nothing. That holds only where `start_at` equals the position on disk. §11
+maps three rows to `start_at = 0` while a position is retained: `completed ==
+true`, `position == duration`, and `position > duration`. For those, a load that
+reaches `Loaded` and then fails to open the device ends at `Failed` with
+`Progress.position == 0`, while the session already knows the media and the
+revision. An ungated shutdown force writes that zero over the retained position —
+the same destruction §8's `Paused` gate exists to prevent, arriving by the other
+door.
+
+So the gate is not written for failed device opens in particular: the session
+records no checkpoint for the current media at shutdown until it has observed, at
+the current revision, either an establishment (`StateChanged{Playing}`) or an
+explicit position change (`SeekCompleted`, `SeekTargetStored` or `EndOfTrack`).
+`Loaded` does not establish — it is what *clears* the flag, for the same reason
+§12 refuses to clear `completed` on it. This also keeps launch-then-immediate-quit
+from spending a `touch_seq` and an `updated_at` on a checkpoint that records
+nothing the file did not already hold. `volume` and `current_media` stay ungated:
+neither is a position claim, and D15 already gives volume its own trigger.
 
 **Why the media switch is one snapshot, not a flush then a move.** A keep-latest
 slot cannot promise that an intermediate submission reaches disk — a second
@@ -268,12 +314,19 @@ replacement and still trips D11's warning at three.
 
 ```
 app  : engine.interrupt_shutdown(); commands.send(Shutdown)
-app  : let last = engine.join()      // audio is fully torn down here; the
-                                     // worker published its captured position
-                                     // before returning (D14)
-app  : session.shutdown_snapshot(&last, clock.sample()) -> forced submit
+app  : let report = engine.join()    // audio is fully torn down here; the worker
+                                     // published its captured position before
+                                     // returning (D14), and the report carries
+                                     // every event still undelivered (D19)
+app  : for event in report.events { session.observe(event) }
+                                     // reconciliation, not submission: any
+                                     // Action returned here is folded into the
+                                     // single snapshot below
+app  : session.shutdown_snapshot(&report.progress, clock.sample()) -> forced submit
                                      // uses outstanding_target over
-                                     // last.position when one stands (D17)
+                                     // progress.position when one stands (D17);
+                                     // writes no checkpoint for the current
+                                     // media when it never established (D20)
 app  : drop(raw_mode_guard)          // restore the terminal before waiting
 app  : writer.shutdown()             // sets Closing; further submits rejected
 write: take pending -> final write -> send result on ack (bounded 1) -> exit
@@ -290,11 +343,34 @@ render error must therefore be folded into the loop's outcome and broken on, lik
 the `Failed` path already is, so that no exit can skip the final checkpoint. This
 is the one place where the app change is a restructure rather than wiring.
 
+**The event handoff (D19).** The final `Progress` carries a position and a
+revision and nothing else — not the seek target a stopped seek stored, not the
+`completed` an `EndOfTrack` sets, not the last `VolumeChanged`. Those facts exist
+only as events, and §3 records two independent ways they are lost at quit: the
+worker discards `pending_events` when the shutdown interrupt fires, and
+`app::run` breaks before its own drain, leaving whatever the channel already
+holds unread. Both are reachable in one keystroke pair — `←` then `q` inside a
+single poll window — and both lose exactly the `SeekTargetStored` that D7 and D17
+were written for.
+
+Flushing through the channel at shutdown cannot fix it: the channel holds 64
+against a backlog of up to 128 (§3), and the flush must not block, because the
+app is inside `join` and has stopped draining. So the backlog travels out through
+the thread's own join value instead. `Worker::run` returns its undelivered
+`pending_events`; `EngineHandle::join` joins the worker — after which nothing can
+send again — drains the channel, and returns both, channel events first and
+backlog after, which is the order they were emitted in. The app replays them
+through `Session::observe` before building the final snapshot, so the snapshot is
+built from a session that has seen everything the run produced. This is only
+reconciliation: `observe` may return `Action::Submit`, and those are discarded,
+because the single forced submit that follows supersedes every one of them.
+
 CPAL teardown never waits on any of this — it has already completed inside
-`join` by the time the final snapshot is submitted. If `last.session_rev` does
-not match the revision the session learned from the event stream, the session
-falls back to `last_sample`; it never persists a position from a session it was
-not tracking.
+`join` by the time the final snapshot is submitted. If `report.progress.session_rev`
+does not match the revision the session learned from the event stream — including
+from the replayed backlog, which can carry the very event that advances it — the
+session falls back to `last_sample`; it never persists a position from a session
+it was not tracking.
 
 ## 10. State model
 
@@ -378,6 +454,11 @@ for the current media. `Loaded` alone does not clear it. Safe because `Play` fro
 `Ended` refuses to restart implicitly (§3), so no spurious `Playing` follows an
 `EndOfTrack`.
 
+The `Playing` half is load-bearing rather than a second opinion: the restart this
+rule exists to catch reaches `Playing` through `restart()`, which emits no
+`SeekCompleted` at all (§3). D17 and D20 lean on the same signal for the same
+reason, and the three should move together if it ever changes.
+
 ## 13. Store
 
 - **Path.** `directories::ProjectDirs::state_dir()` (Linux, honors
@@ -422,7 +503,7 @@ for the current media. `Loaded` alone does not clear it. Safe because `Play` fro
 | `src/persistence/store.rs` | `StateStore` — `load() -> LoadOutcome`, `write()`; atomic replace, permissions, quarantine |
 | `src/persistence/writer.rs` | `WriterHandle::{submit, shutdown}`, keep-latest slot, coalescing thread, ACK |
 | `src/persistence/mod.rs` | Re-exports, `PersistenceError` |
-| `src/session.rs` | `Session::{observe, tick, shutdown_snapshot}` — pure policy; tracked `session_rev`/`state`/`current_media`, `last_sample`, `pending_force`, `outstanding_target`, injected clock |
+| `src/session.rs` | `Session::{observe, tick, shutdown_snapshot}` — pure policy; tracked `session_rev`/`state`/`current_media`, `last_sample`, `pending_force`, `outstanding_target`, `established`, injected clock |
 | `src/clock.rs` | `Clock` trait yielding `ClockSample { monotonic, wall }`; real and fake implementations (D16) |
 
 `PlaybackCheckpoint` is the currency: `Session` builds one, `record(checkpoint,
@@ -436,7 +517,7 @@ restructure D18 requires: `render` no longer returns from `run` with `?`) ·
 (**additive** `TestEngine::start_at`; existing `start` untouched) · `Cargo.toml` ·
 `README.md` · `docs/architecture.md` §6.
 
-`src/playback/engine.rs` takes exactly three changes, none of which know that
+`src/playback/engine.rs` takes exactly four changes, none of which know that
 persistence exists:
 
 1. one line populating `Loaded { position }` (D8);
@@ -444,9 +525,15 @@ persistence exists:
    `capture_position` and `teardown`. With the transport already gone the
    recompute branch is skipped, so it publishes precisely the captured position
    (D14);
-3. `fn join(mut self)` returns `Progress` instead of `()`. Every existing call
-   site is the statement `handle.join();`, which compiles unchanged against a
-   returning function, so this stays additive in practice.
+3. `fn run` returns its undelivered `pending_events` instead of `()` — four
+   `return` sites, each yielding the backlog it was about to discard (D19);
+4. `fn join(mut self)` returns `ShutdownReport { progress: Progress, events:
+   Vec<PlaybackEvent> }` instead of `()`: join the worker, take the backlog from
+   the join value, then drain the event channel — a drain that is only safe
+   because the thread has already gone, which is the same happens-before D14
+   rests on (D19). Every existing call site is the statement `handle.join();`,
+   which compiles unchanged against a returning function, so this stays additive
+   in practice.
 
 **Explicitly unchanged.** The worker's decode/transport logic, `timeline`,
 `callback`, `handshake`, `link`, `decode`, `resample`, `output/*`,
@@ -470,7 +557,7 @@ dependency; `directories` is new; `tempfile` is a new dev-dependency.
 
 ## 16. Test strategy
 
-Roughly 28 new tests. Policy tests call `Session::observe`/`tick` synchronously
+Roughly 35 new tests. Policy tests call `Session::observe`/`tick` synchronously
 with a fake clock — no threads, no tempdirs, no sleeps. Store tests use
 `tempfile`. Resume contract tests pair `TestEngine` with a `StateStore` in a
 tempdir to stage session 1 → persist → session 2.
@@ -498,7 +585,12 @@ tempdir to stage session 1 → persist → session 2.
   the outgoing entry (from `last_sample`) and the new `current_media`; a
   `Progress` with a stale `session_rev` is ignored; `VolumeChanged` submits at
   ordinary urgency without touching a checkpoint; shutdown forces; a wall clock
-  that jumps backwards does not disturb the 5 s interval.
+  that jumps backwards does not disturb the 5 s interval; **a
+  `StateChanged{Playing}` clears `outstanding_target`, so the checkpoint after it
+  carries `Progress.position` and not the stale target** (D17); **the shutdown
+  snapshot writes no checkpoint for a media the session never saw establish, and
+  still writes `volume` and `current_media`** (D20); **`Loaded` clears
+  `established`, so a second load that fails cannot inherit the first's** (D20).
 - **Writer.** keep-latest replaces without extending the deadline; forced
   bypasses; an older `submit_seq` is dropped; a write error is retried; **a
   submission that lands while a failing write is in flight is not replaced by the
@@ -507,13 +599,24 @@ tempdir to stage session 1 → persist → session 2.
 - **Resume contract.** play → X → stop → persist → session 2 resumes X; the pause
   variant; the seek variant; **play → X → stop → stopped-seek to Y → quit →
   session 2 resumes Y, not X** (D17, the sequence the shutdown force used to
-  overwrite); **a render failure still writes the final checkpoint** (D18); `EndOfTrack` → completed → session 2 starts at 0 with
+  overwrite); **play → X → stop → stopped-seek to Y → `Restart` → play → quit →
+  session 2 resumes the restarted position, not Y** (D17, the sequence
+  `restart()` used to leave the target standing through); **a stopped-seek to Y
+  whose `SeekTargetStored` is still undelivered when the shutdown interrupt
+  fires still persists Y** (D19, driven by holding the event backlog and quitting
+  in the same iteration); **a `completed` entry reopened while the device
+  refuses to open keeps its retained position across the quit**, with the
+  `position > duration` row asserted the same way (D20); **a render failure still
+  writes the final checkpoint** (D18); `EndOfTrack` → completed → session 2 starts at 0 with
   the position retained; a stopped-seek target persists; `position > duration` →
   0 with a warning; `completed` cleared on `Playing` after a restart but not on
   `Loaded`; volume survives a restart and is in force before the first frame.
 - **Engine (new, additive).** `join` returns the position captured by
   `shutdown()`, and that position is at least the last one published before the
-  shutdown interrupt — the fact D14 rests on.
+  shutdown interrupt — the fact D14 rests on. `join` also returns every event the
+  run produced and the app never drained: one test stalls the drain, emits past
+  the point where the channel stops accepting, interrupts, and asserts the report
+  carries the whole backlog in emission order (D19).
 
 ## 17. Risks and deferred debt
 
@@ -539,11 +642,15 @@ tempdir to stage session 1 → persist → session 2.
   If M4's queue makes it reachable, the dropped force must be re-examined rather
   than inherited.
 - **`outstanding_target` has no engine-side counterpart.** D17 mirrors, in the
-  session, a `requested_target` the engine already holds. The two can only
-  disagree if the engine drops the target on a path that emits none of
-  `SeekCompleted`, `Loaded` or `EndOfTrack`; no such path exists in M1, but the
-  mirror is a duplication of state and should collapse into the engine reporting
-  its own outstanding target if a later milestone needs it for a seek bar.
+  session, a `requested_target` the engine already holds, and the mirror has
+  already drifted once: `restart()` drops the target while emitting none of
+  `SeekCompleted`, `Loaded` or `EndOfTrack`, which is why `StateChanged{Playing}`
+  had to join the clearing set. That fix closes the M1 paths, but it closes them
+  by enumeration — any future path that discards `requested_target` without
+  reaching one of those four events reopens the drift silently, because nothing
+  in the engine asserts the two agree. The duplication should collapse into the
+  engine reporting its own outstanding target as soon as a later milestone needs
+  it for a seek bar.
 - **Deferred to M3.** `SourceLocation::Http` remains unsupported by the engine;
   nothing in this design is shaped around remote media beyond `MediaId` already
   covering it.
@@ -575,3 +682,15 @@ had not traced.
 | D13 dropped a pending force on *any* newer revision, but `rebuild` bumps it on device recovery with the position continuous | D13: a newer revision re-keys the force; only `Loaded` drops it |
 | `render(&mirror)?` exits `app::run` without reaching §9's sequence | D18: every exit runs the flush path |
 | §7 understated the session's state, and a dropped `DeviceRecovered` could suspend checkpointing for the run | §7: the tracked fields are listed in full, and `session_rev` is adopted from every event |
+
+A third review found three more, all accepted. Two rest on a mistake in §3
+itself: the row claiming `Restart` reaches `Playing` through a completed seek
+described `restore()`, the `Play` path, and `Restart` does not go through it. A
+table that says it was verified rather than assumed is worth more than the
+decisions built on it, so the row is corrected and split in two.
+
+| Finding | Resolution |
+|---|---|
+| A restart leaves the persisted stopped-seek target standing, because `restart()` clears the target and announces `Playing` without a `SeekCompleted` | **Accepted**, cause confirmed at `engine.rs` `fn restart`. §12 had already named `StateChanged{Playing}` as the observable establishment for exactly this reason; D17 now uses the same signal rather than defining a second one. The §3 row that misdescribed `Restart` is corrected. The reported severity is if anything understated: D17 supersedes `Progress.position` while the target stands, so the stale target reaches every checkpoint after the restart, not only the shutdown one |
+| Shutdown builds the final snapshot from state that queued and worker-pending events never reached | **Accepted**, and it is two independent losses rather than one: the worker discards `pending_events` at the shutdown interrupt, and `app::run` breaks before its own drain. D19 returns the backlog through the thread's join value and drains the channel inside `join`, which is lossless and ordered; the suggested channel flush is neither, and would have to block against a full channel while the app sits in `join` |
+| A failed startup still overwrites a completed entry's retained position | **Accepted**, and widened. `load()` pins `start_at` before opening, so an *incomplete* entry survives a device-open failure unharmed; the loss is confined to the three §11 rows that map to `start_at = 0` while retaining a position — `completed`, `position == duration`, `position > duration`. D20 gates the shutdown checkpoint on establishment rather than special-casing `completed`, which also stops launch-then-immediate-quit from spending a `touch_seq` on a checkpoint that records nothing new |
