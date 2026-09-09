@@ -53,22 +53,6 @@ fn large_wav_body(repeats: usize) -> Vec<u8> {
     body
 }
 
-/// Blocks until `server` has recorded at least one request, or `patience`
-/// elapses — the same proof `engine_remote.rs` uses that a header-stalled
-/// wait was genuinely entered before cancelling it.
-fn wait_for_request(server: &TestServer, patience: Duration) -> bool {
-    let deadline = Instant::now() + patience;
-    loop {
-        if !server.requests().is_empty() {
-            return true;
-        }
-        if Instant::now() >= deadline {
-            return false;
-        }
-        std::thread::sleep(Duration::from_millis(2));
-    }
-}
-
 #[test]
 fn every_wait_wakes_and_stale_responses_cannot_repopulate() {
     // Case 1: a plain `Stop` — not a shutdown — wakes a body read blocked on
@@ -110,6 +94,7 @@ fn every_wait_wakes_and_stale_responses_cannot_repopulate() {
     // plateauing — and `Stop` reaches that wait too.
     {
         let body = large_wav_body(20);
+        let body_len = body.len();
         let server = TestServer::start(Script::serving(body));
         let mut engine = TestEngine::start_idle();
         engine.load_remote(&server.url("/audio.wav"));
@@ -132,6 +117,16 @@ fn every_wait_wakes_and_stale_responses_cannot_repopulate() {
                 "case 2: bytes_written never settled, so the producer never actually blocked"
             );
         }
+        // A plateau also happens when the whole body has already been
+        // written, in which case no producer ever blocked and `Stop` below
+        // would wake nothing. Settling well short of the body is what makes
+        // this the wait H9 is actually about.
+        let settled = server.bytes_written();
+        assert!(
+            settled < body_len,
+            "case 2: the whole body ({body_len} bytes) had already arrived at {settled}; \
+             the producer never actually blocked"
+        );
 
         engine.handle().submit_stop();
         engine.await_state(PlaybackState::Stopped);
@@ -157,15 +152,23 @@ fn every_wait_wakes_and_stale_responses_cannot_repopulate() {
         let port = server.port();
         server.shutdown();
 
-        let stalling =
-            TestServer::start_on(port, Script::from_fixture("sine-5s.flac").stall_headers());
+        // `stall_body_after`, not `stall_headers`: this case's whole point is
+        // that data released *after* retirement must not repopulate
+        // anything, and a header-stalled connection never sends a byte even
+        // once released (it just closes) — there would be nothing to prove
+        // arrived late. A body stall answers headers normally, so the seek's
+        // fetch is genuinely open with real bytes still pending behind it.
+        let stalling = TestServer::start_on(
+            port,
+            Script::from_fixture("sine-5s.flac").stall_body_after(4 << 10),
+        );
         assert_eq!(
             engine.handle().submit_seek(Duration::from_secs(3)),
             Admission::Accepted
         );
         assert!(
-            wait_for_request(&stalling, Duration::from_secs(5)),
-            "case 3: the seek's request never reached the server"
+            stalling.wait_until_stalled(Duration::from_secs(5)),
+            "case 3: the seek's read never blocked"
         );
 
         engine.handle().submit_stop();
@@ -178,15 +181,25 @@ fn every_wait_wakes_and_stale_responses_cannot_repopulate() {
             "case 3: the retired seek moved the position before its stale response even arrived"
         );
 
-        // Now let the stale generation's headers actually arrive, late.
+        // Now let the stale generation's remaining body actually arrive,
+        // late.
+        let written_before_release = stalling.bytes_written();
         assert!(
             stalling.release(),
             "case 3: the stale connection was not parked where it should have been"
         );
-        // Nothing here reads from `engine` for a moment, so this proves the
-        // late arrival landed on a retired generation that discards it
-        // rather than one this test happened not to look at yet.
-        std::thread::sleep(Duration::from_millis(200));
+        // Proof the released bytes actually went out over the wire, not a
+        // guess at how long that takes: a flat sleep here would let the
+        // assertion below pass whether or not the stale bytes ever reached
+        // the engine.
+        let released_deadline = Instant::now() + Duration::from_secs(5);
+        while stalling.bytes_written() == written_before_release {
+            assert!(
+                Instant::now() < released_deadline,
+                "case 3: the released stale connection never wrote anything more"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
         assert_eq!(
             engine.progress().position,
             before,

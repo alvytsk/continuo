@@ -105,9 +105,15 @@ fn redirects_preserve_identity_and_query_and_the_bad_ones_fail() {
     server.shutdown();
 
     // H6, failure half: a loop, an over-long chain and a non-HTTP scheme
-    // (which travels the same rejection path a downgrade does — pinned
-    // directly in `tests/http_fetch.rs`) must all fail opening, not merely
-    // fail to seek or play.
+    // must all fail opening, not merely fail to seek or play. The fourth
+    // case §12 names, an HTTPS-to-HTTP downgrade, is a distinct
+    // `RedirectRejection` this loopback server cannot stage for real (it
+    // never serves TLS) — it is unit-tested directly, real `Downgrade`
+    // variant and all, by `tests/http_response.rs::redirects_are_bounded_
+    // checked_and_never_downgraded`, and `tests/http_fetch.rs::an_https_
+    // to_http_downgrade_is_refused` pins the *service* wiring the same way
+    // this test's non-HTTP-scheme case does: a redirect to an unsupported
+    // scheme, standing in for what the loopback origin cannot serve.
     let looping = TestServer::start(Script::serving(b"x".to_vec()).redirect_loop());
     let error = match prepare(
         &SourceLocation::Http(url(&looping.url("/audio"))),

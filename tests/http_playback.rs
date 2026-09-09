@@ -1,7 +1,9 @@
-//! §12's acceptance evidence for H1, H2, H5, H13 and H17's first half, plus
-//! the M4A opening evidence §12's closing paragraph asks for. Every server is
-//! `127.0.0.1:<ephemeral>` and every engine runs over `TestOutput` — no
-//! public network, no real device.
+//! §12's acceptance evidence for H1, H2, H5 and H13, plus the M4A opening
+//! evidence §12's closing paragraph asks for (H17's first half — a
+//! byte-seekable source whose demuxer cannot seek — is not discharged here;
+//! see the task 13 report for why no fixture in this repository reaches it).
+//! Every server is `127.0.0.1:<ephemeral>` and every engine runs over
+//! `TestOutput` — no public network, no real device.
 
 mod support;
 
@@ -369,6 +371,15 @@ fn large_wav_body(repeats: usize) -> Vec<u8> {
     body
 }
 
+/// Headroom on top of `buffer_bytes + chunk_bytes` for what the kernel's own
+/// TCP socket buffers can absorb on a fast loopback connection before
+/// backpressure from a full `ByteChannel` ever reaches the server's writes —
+/// this machine's own `tcp_rmem` autotunes up to 32 MiB, so this is sized
+/// to that order of magnitude rather than guessed small. Named so the
+/// occupancy bound below reads as "ours plus the kernel's", not one
+/// unexplained number.
+const KERNEL_SOCKET_SLACK: usize = 16 << 20;
+
 #[test]
 fn occupancy_stays_bounded_and_starvation_silence_does_not_advance_position() {
     // H13, first half: a fast server and a consumer that never drains must
@@ -379,25 +390,33 @@ fn occupancy_stays_bounded_and_starvation_silence_does_not_advance_position() {
     // about the wire.
     //
     // The brief's own `Limits { buffer_bytes: 64 << 10, chunk_bytes: 8 << 10,
-    // .. }` does not reach this path: those two fields configure
-    // `HttpService`'s HTTP/2 flow-control windows (`http2_initial_stream_
-    // window_size` / `http2_initial_connection_window_size` in
-    // `src/http/service.rs`), and `TestServer` speaks plain HTTP/1.1 only —
-    // reqwest has no equivalent window knob for HTTP/1.1 (the comment beside
-    // those two calls says so directly). The channel's actual ring capacity
-    // (`SourceInterrupt`) is allocated once, for the worker's whole life, at
-    // `Limits::default().buffer_bytes` regardless of whatever `Limits` a
-    // later-attached `HttpService` carries (`EngineHandle::spawn_with` in
-    // `src/playback/engine.rs`) — so no per-test `Limits` can shrink the
-    // bound this suite can actually observe. Asserted here as a real but
-    // qualitative bound — settling well short of the whole body, backed by
-    // a body large enough that "well short" cannot be a coincidence of
-    // reopening it twice during a small file's own opening sequence (see H1
-    // and H5's fixtures, both of which are read in their entirety, more than
-    // once, before `Paused` — a fact this test's body size is chosen to
-    // swamp) — rather than a tight formula this code does not enforce for
-    // any transport this suite can drive.
-    let body = large_wav_body(20);
+    // .. }` does not reach this path: `buffer_bytes` configures
+    // `HttpService`'s HTTP/2 connection window (`http2_initial_connection_
+    // window_size`, `src/http/service.rs`), and `TestServer` speaks plain
+    // HTTP/1.1 only — reqwest has no equivalent window knob for HTTP/1.1
+    // (the comment beside that call says so directly). `chunk_bytes` *is*
+    // used regardless of transport, as the application-level chunk cap
+    // `chunk_cap` in the same file's transfer loop. The channel's real ring
+    // capacity (`SourceInterrupt`) is what `buffer_bytes` actually sizes —
+    // just allocated once, for the worker's whole life, from
+    // `Limits::default().buffer_bytes` in `EngineHandle::spawn_with`
+    // (`src/playback/engine.rs`), regardless of whatever `Limits` a
+    // later-attached `HttpService` carries. So the bound this suite can
+    // observe is `Limits::default()`'s own numbers, not the smaller ones a
+    // caller might pass to `HttpService::spawn`.
+    //
+    // `bytes_written` is the *server's* write count, not the channel's
+    // occupancy directly — `ByteChannel::push` genuinely blocks once
+    // `state.bytes.len()` reaches `buffer_bytes` (verified against
+    // `src/http/channel.rs`), but the kernel's own TCP send/receive buffers
+    // sit in front of that block and can absorb several megabytes more on a
+    // fast loopback connection before backpressure ever reaches the
+    // server's `write_all` (this machine's own `tcp_rmem` autotunes up to
+    // 32 MiB). `KERNEL_SOCKET_SLACK` names that margin explicitly as the
+    // kernel's, not this project's, and the body is sized well past it so a
+    // regression that actually removed the channel's cap (unbounded growth
+    // toward the whole body) would still be caught.
+    let body = large_wav_body(40);
     let body_len = body.len();
     let server = TestServer::start(Script::serving(body));
     let mut engine = TestEngine::start_idle();
@@ -421,10 +440,12 @@ fn occupancy_stays_bounded_and_starvation_silence_does_not_advance_position() {
         }
     }
     let settled = server.bytes_written();
+    let bound =
+        Limits::default().buffer_bytes + Limits::default().chunk_bytes + KERNEL_SOCKET_SLACK;
     assert!(
-        settled < body_len / 2,
-        "occupancy was not bounded: {settled} of {body_len} bytes had already arrived \
-         with nothing consuming them"
+        settled <= bound,
+        "occupancy grew past buffer_bytes + chunk_bytes + kernel slack: \
+         {settled} > {bound} (of a {body_len}-byte body)"
     );
 
     assert_eq!(engine.handle().submit_play(), Admission::Accepted);

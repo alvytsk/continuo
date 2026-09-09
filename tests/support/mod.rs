@@ -331,12 +331,10 @@ impl TestEngine {
     }
 
     /// `load_remote` against a dedicated `HttpService` built from `limits`
-    /// rather than the cached brisk one (H13: the occupancy bound is only
-    /// reachable in milliseconds under a small `buffer_bytes`/`chunk_bytes`,
-    /// which the shared brisk service does not use, and the starvation half
-    /// needs a `stall` deadline generous enough that draining the ring and
-    /// reading the frozen position afterwards cannot itself race the brisk
-    /// 500 ms one into a spurious `Failed`).
+    /// rather than the cached brisk one — H13's starvation half needs a
+    /// `stall` deadline generous enough that draining the ring and reading
+    /// the frozen position afterwards cannot itself race the brisk 500 ms
+    /// one into a spurious `Failed`.
     pub fn load_remote_with_limits(&mut self, url: &str, limits: Limits) {
         self.load_remote_inner(
             url,
@@ -347,10 +345,11 @@ impl TestEngine {
     }
 
     /// `load_remote`, but for a load this test expects to fail rather than
-    /// reach `Paused` (H17: a sequential-only source opening a tail-`moov`
-    /// file). The `HttpService` still has to be attached for the attempt to
-    /// mean anything — without one the load fails immediately as "no HTTP
-    /// service", which would prove nothing about the file itself.
+    /// reach `Paused` (§12's closing paragraph: a sequential-only source
+    /// opening a tail-`moov` file). The `HttpService` still has to be
+    /// attached for the attempt to mean anything — without one the load
+    /// fails immediately as "no HTTP service", which would prove nothing
+    /// about the file itself.
     pub fn load_remote_expecting_failure(&mut self, url: &str) {
         self.load_remote_inner(url, ResumeIntent::StartAt(Duration::ZERO), None, false);
     }

@@ -110,6 +110,7 @@ fn stop_closes_the_fetch_and_play_reopens_at_the_preserved_position() {
     engine.play_for(Duration::from_millis(200));
     let preserved = engine.progress().position;
 
+    let before = server.requests().len();
     engine.handle().submit_stop();
     engine.await_state(PlaybackState::Stopped);
     assert_eq!(
@@ -124,6 +125,10 @@ fn stop_closes_the_fetch_and_play_reopens_at_the_preserved_position() {
         engine.progress().position >= preserved,
         "the reopen did not resume at the preserved position: {:?} < {preserved:?}",
         engine.progress().position
+    );
+    assert!(
+        server.requests().len() > before,
+        "H3: play after stop did not open a new request"
     );
 
     engine.finish();

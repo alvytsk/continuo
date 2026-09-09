@@ -289,6 +289,15 @@ fn the_protection_survives_a_process_boundary() {
         clock: clock3,
     };
     rig3.pump();
+    // Establish and actually play, the same as session 2 — without this,
+    // session 3's `Session` never establishes, and D20's rule ("nothing
+    // established, so nothing overwrites the position") is what preserves
+    // the checkpoint below, not the protection this test exists to prove
+    // survives a second boundary.
+    assert_eq!(rig3.engine.handle().submit_play(), Admission::Accepted);
+    rig3.engine.await_state(PlaybackState::Playing);
+    rig3.engine.play_for(Duration::from_millis(300));
+    rig3.pump();
     rig3.quit();
     server3.shutdown();
 
