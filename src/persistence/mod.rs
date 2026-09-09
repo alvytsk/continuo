@@ -3,6 +3,7 @@
 
 pub mod model;
 pub mod store;
+pub mod writer;
 
 use std::io;
 use std::path::PathBuf;
