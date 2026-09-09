@@ -199,6 +199,19 @@ table rather than a design judgement.
   `to_string()`; the chain still would not carry a URL, since none of these
   detail strings do (consistent with keeping signed query strings and userinfo
   out of diagnostics).
+- **Two dead error variants, and `operation` context that is half-preserved.**
+  `Operation::Reopen` and `Operation::Complete` are constructed nowhere in this
+  codebase — every `FetchRequest` this project ever builds carries
+  `Operation::Open` or `Operation::Seek`, never the other two. `Phase::Connect`
+  is likewise constructed nowhere; reqwest's own connect timeout surfaces
+  through `Transport`, not `Timeout { phase: Connect }`. Relatedly,
+  `response::accept` (`src/http/response.rs`) does not use the `operation` a
+  `FetchRequest` actually carried at all — it derives `Operation::Open` versus
+  `Operation::Seek` for `RemoteFailure::Status` from `at_origin` instead, so
+  §11's "preserve operation context" is only half-delivered: the fact is
+  reconstructed from a different signal rather than carried through. Removing
+  the two dead variants, or rethreading `operation` through `accept` so it is
+  the one source of truth, is a design change this wave does not make.
 
 ## Capability evidence
 
@@ -272,6 +285,17 @@ table rather than a design judgement.
   network stall. It is sized only against the design's one-second wake bound
   (§8: "source waits wake within one second after stop, seek or shutdown"),
   not measured against real network stall behaviour on a real connection.
+- **`Limits::buffer_bytes` is not actually injectable** (`src/http/limits.rs`),
+  despite the struct's own doc comment and §8's "injectable for tests". Every
+  `SourceInterrupt::new` call site in production code (`EngineHandle::
+  assemble`, `src/playback/engine.rs`) reads `Limits::default().buffer_bytes`
+  directly rather than a caller-supplied `Limits` — the interrupt's buffer is
+  sized once, for the worker's whole life, before any per-session `Limits`
+  exists to read. Its only real consumer today is the HTTP/2 connection
+  window (`HttpService::spawn`), which does read the injected value. Fixing
+  the wiring — threading a per-load `Limits` into the one buffer that has to
+  outlive every source a worker ever opens — is a design change, not a fix
+  this wave makes; the field's doc comment now says what is actually true.
 - **`resolve_url` (`src/app.rs`) parses its input twice** — once directly with
   `Url::parse` (to check for embedded credentials before identity is ever
   built) and once again inside `NormalizedUrl::parse` (identity
@@ -279,17 +303,6 @@ table rather than a design judgement.
   the fetch URL as separate types with separate parsing rules, not an
   oversight; a shared internal parse would couple the two in a way the design
   deliberately avoids.
-
-## Engine
-
-- **`Mirror::apply`'s `Loaded` arm does not reset `buffering`**
-  (`src/app.rs`). `buffering` is set while a source read is blocked on the
-  network and should read false again once a fresh source has loaded, but the
-  `Loaded` arm never clears it. Harmless under the one-load-per-run pattern
-  every current test and manual scenario follows (a fresh process, or a
-  `buffering` that was already false), but a session that loads a second
-  remote source while the first left `buffering` set would show a stale
-  buffering indicator until the next event that does clear it.
 
 ## Plan deviations (§13)
 

@@ -19,6 +19,17 @@ pub struct Limits {
     /// Input the probe may consume before `ProbeLimitExceeded`.
     pub probe_bytes: u64,
     /// The encoded-byte buffer's capacity.
+    ///
+    /// Not actually injectable in the shipped wiring, despite the struct's own
+    /// doc comment and §8's "injectable for tests": every `SourceInterrupt::
+    /// new` call site in production code reads `Limits::default().buffer_bytes`
+    /// directly rather than the `Limits` a caller supplied (`EngineHandle::
+    /// assemble`, `src/playback/engine.rs`, is the one that matters — the
+    /// buffer is sized once, for the worker's whole life, before any
+    /// per-session `Limits` even exists to read). Its only real consumer is
+    /// the HTTP/2 connection window (`HttpService::spawn`), which *does* read
+    /// the injected value. See `docs/m1-known-debt.md`'s "HTTP transport"
+    /// section for why this is recorded as debt rather than fixed here.
     pub buffer_bytes: usize,
     /// One application transfer chunk, on top of `buffer_bytes`.
     pub chunk_bytes: usize,

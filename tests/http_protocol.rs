@@ -230,16 +230,17 @@ fn every_malformed_range_response_fails_without_committing_a_target() {
         // the restoration attempt hits the same malformed response) or a
         // `SeekRejected` if some case instead recovers cleanly - never a
         // `SeekCompleted` landing on the malformed response's bogus offset.
-        let outcome = engine.await_event(|e| {
+        // The predicate itself is the proof of that (fix round 2, MINOR: a
+        // `!matches!(_, SeekCompleted)` used to stand here too, vacuous
+        // against a value this same predicate already restricted to
+        // `Failed | SeekRejected` - the real evidence is `count_events` and
+        // the position assertion below).
+        engine.await_event(|e| {
             matches!(
                 e,
                 PlaybackEvent::Failed { .. } | PlaybackEvent::SeekRejected { .. }
             )
         });
-        assert!(
-            !matches!(outcome, PlaybackEvent::SeekCompleted { .. }),
-            "{name}: a malformed range response must never complete a seek"
-        );
         assert_eq!(
             engine.count_events(|e| matches!(e, PlaybackEvent::SeekCompleted { .. })),
             0,
