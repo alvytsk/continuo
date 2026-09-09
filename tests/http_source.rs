@@ -366,3 +366,38 @@ fn the_probe_cap_stops_a_runaway_scan() {
     );
     server.shutdown();
 }
+
+#[test]
+fn finishing_opening_lifts_the_probe_cap_for_ordinary_playback() {
+    // Fix round 1, IMPORTANT 1: `finish_opening` must clear the cap itself,
+    // not just the `opening` flag — `Read::read`'s probe-cap check is
+    // unconditional on `is_opening()`, and `consumed` only ever grows, so a
+    // cap left in place after opening fails every ordinary track whose total
+    // exceeds it, partway through playback. A body bigger than the cap read
+    // to completion, successfully, after `finish_opening()`, is the
+    // regression test for that.
+    let body = vec![0u8; 1 << 20];
+    let server = TestServer::start(Script::serving(body.clone()));
+    let interrupt = SourceInterrupt::new(Limits::default().buffer_bytes);
+    let (mut source, opening_limits) = match HttpMediaSource::open(
+        service(),
+        url(&server.url("/audio")),
+        interrupt,
+        Arc::new(NoHook),
+        Limits::default(),
+        generous_deadline(),
+    ) {
+        Ok(opened) => opened,
+        Err(error) => panic!("opening must succeed: {error}"),
+    };
+    opening_limits.set_probe_cap(Some(4096));
+    opening_limits.finish_opening();
+
+    let mut sink = Vec::new();
+    match source.read_to_end(&mut sink) {
+        Ok(_) => {}
+        Err(error) => panic!("a cap left in place after opening blocked playback: {error}"),
+    }
+    assert_eq!(sink, body, "well past the 4096-byte cap, read in full");
+    server.shutdown();
+}

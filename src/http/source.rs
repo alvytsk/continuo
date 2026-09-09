@@ -79,7 +79,13 @@ impl OpeningLimits {
     /// Lift both bounds. Ordinary playback reads are then bounded only by
     /// `limits.stall`, which is the rule that ordinary playback has no
     /// whole-response deadline.
+    ///
+    /// Both fields are cleared, not just `opening`: `Read::read`'s probe-cap
+    /// check is unconditional on `is_opening()`, and `consumed` only ever
+    /// grows, so a cap left in place after opening fails every ordinary
+    /// track whose total exceeds it, partway through playback.
     pub fn finish_opening(&self) {
+        self.probe_cap.store(u64::MAX, Ordering::Release);
         self.opening.store(false, Ordering::Release);
     }
 }
@@ -256,6 +262,12 @@ impl HttpMediaSource {
                     return Err(RemoteFailure::Cancelled);
                 }
                 ReadOutcome::Failed(failure) => {
+                    // Latched the same way `Retired` is: this call is leaving
+                    // the interrupt retired either way, so a second call
+                    // should discover that immediately at the top of this
+                    // function rather than re-entering the channel to find
+                    // out.
+                    self.retired = true;
                     self.interrupt.retire();
                     return Err(failure);
                 }
