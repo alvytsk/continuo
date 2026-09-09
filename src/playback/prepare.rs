@@ -125,17 +125,17 @@ fn open_http(url: &Url, context: &PrepareContext) -> Result<DecodedSource, Playb
     // Latching the failure at the read itself, before Symphonia gets a
     // chance to lose it, is the only place this project can reliably recover
     // *why* a remote probe failed.
-    let latched = Arc::new(Mutex::new(None));
+    let latch = Arc::new(FailureLatch::default());
     let latching = LatchingSource {
         inner: source,
-        latched: Arc::clone(&latched),
+        latch: Arc::clone(&latch),
     };
     let result = DecodedSource::from_media_source(Box::new(latching), hint, label, evidence);
     // Both the probe cap and the opening deadline bound *opening*, not
     // playback, so they come off here regardless of outcome: once this
     // returns, ordinary reads are bounded only by `limits.stall` (§8).
     opening_limits.finish_opening();
-    result.map_err(|error| promote_latched(error, &latched))
+    result.map_err(|error| promote_latched(error, &latch))
 }
 
 /// A poisoned lock means a thread already panicked while holding it; there is
@@ -147,36 +147,69 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     }
 }
 
-/// Wraps `HttpMediaSource`, latching the first [`RemoteFailure`] any read or
-/// seek produces before handing the (possibly since-mangled) error onward to
-/// Symphonia. See `open_http`'s comment for why this exists.
-struct LatchingSource {
-    inner: HttpMediaSource,
-    latched: Arc<Mutex<Option<RemoteFailure>>>,
-}
+/// The most recent [`RemoteFailure`] a read or seek produced, cleared the
+/// moment a later one succeeds.
+///
+/// Kept separate from `LatchingSource` so this exact rule — last failure
+/// wins, a success clears it — is unit-testable against fabricated
+/// `io::Result`s, with no real socket or `TestServer` involved: this project
+/// has no test server reachable from a `src/` unit test (`tests/support` is
+/// only visible to integration tests), and reliably provoking Symphonia's own
+/// *specific* recovery path (`probe_trailing`'s tolerated anchored-metadata
+/// read, `probe.rs:475-540`) through a real fixture is impractical — it fires
+/// only when trailing bytes happen to match a real tag format's marker. The
+/// state machine below is what actually has to be correct; testing it
+/// directly is more reliable than hoping to reproduce Symphonia's internals.
+///
+/// Last-failure-wins matters because `probe_trailing`'s own comment calls
+/// tolerating a failed anchored-metadata read "reasonable" — a stall
+/// Symphonia recovered from is not why it eventually gave up, and must not
+/// still be sitting in the latch by the time something else decides the
+/// outcome; an unrelated local failure downstream (an unsupported channel
+/// count, say) must not be misreported as that stale network fault.
+#[derive(Default)]
+struct FailureLatch(Mutex<Option<RemoteFailure>>);
 
-impl LatchingSource {
-    fn note(&self, error: &io::Error) {
-        if let Some(failure) = remote_cause(error) {
-            let mut slot = lock(&self.latched);
-            // First failure wins: once a source has failed, whatever it
-            // reports on the next call is not a *new* fact.
-            if slot.is_none() {
-                *slot = Some(failure);
+impl FailureLatch {
+    /// Fold one `io::Result` into the latch: a success clears it, a failure
+    /// with a recoverable remote cause replaces whatever was there.
+    fn observe<T>(&self, result: &io::Result<T>) {
+        match result {
+            Ok(_) => *lock(&self.0) = None,
+            Err(error) => {
+                if let Some(failure) = remote_cause(error) {
+                    *lock(&self.0) = Some(failure);
+                }
             }
         }
     }
+
+    fn get(&self) -> Option<RemoteFailure> {
+        lock(&self.0).clone()
+    }
+}
+
+/// Wraps `HttpMediaSource`, feeding every read and seek outcome into a
+/// [`FailureLatch`] before handing the (possibly since-mangled) error onward
+/// to Symphonia. See `open_http`'s comment for why this exists.
+struct LatchingSource {
+    inner: HttpMediaSource,
+    latch: Arc<FailureLatch>,
 }
 
 impl io::Read for LatchingSource {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
-        self.inner.read(out).inspect_err(|error| self.note(error))
+        let result = self.inner.read(out);
+        self.latch.observe(&result);
+        result
     }
 }
 
 impl io::Seek for LatchingSource {
     fn seek(&mut self, from: io::SeekFrom) -> io::Result<u64> {
-        self.inner.seek(from).inspect_err(|error| self.note(error))
+        let result = self.inner.seek(from);
+        self.latch.observe(&result);
+        result
     }
 }
 
@@ -192,13 +225,14 @@ impl MediaSource for LatchingSource {
 
 /// Override a decode failure with the latched remote cause, if one was
 /// recorded. A failure that never touched the network (an unrecognised local
-/// format, say) leaves the latch empty and passes through unchanged; an
-/// already-typed `PlaybackError::Remote` (a failure Symphonia happened not to
-/// mangle) is left alone too, since the latch can only agree with it.
-fn promote_latched(error: PlaybackError, latched: &Mutex<Option<RemoteFailure>>) -> PlaybackError {
+/// format, say), or one that did but was later superseded by a success,
+/// leaves the latch empty and passes through unchanged; an already-typed
+/// `PlaybackError::Remote` (a failure Symphonia happened not to mangle) is
+/// left alone too, since the latch can only agree with it.
+fn promote_latched(error: PlaybackError, latch: &FailureLatch) -> PlaybackError {
     match error {
         PlaybackError::Remote(failure) => PlaybackError::Remote(failure),
-        other => match lock(latched).clone() {
+        other => match latch.get() {
             Some(failure) => PlaybackError::Remote(failure),
             None => other,
         },
@@ -211,4 +245,80 @@ fn extension_from_url(url: &Url) -> Option<String> {
     let last_segment = url.path_segments()?.next_back()?;
     let (_, extension) = last_segment.rsplit_once('.')?;
     Some(extension.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::http::error::Phase;
+    use crate::http::source::RemoteIoError;
+
+    fn timeout(phase: Phase) -> io::Error {
+        io::Error::other(RemoteIoError(RemoteFailure::Timeout { phase }))
+    }
+
+    fn unsupported_input() -> PlaybackError {
+        PlaybackError::UnsupportedInput {
+            path: PathBuf::from("remote"),
+            reason: "5 channels; M1 supports mono and stereo".into(),
+        }
+    }
+
+    #[test]
+    fn a_failure_is_latched_and_then_promoted_over_a_decode_error() {
+        let latch = FailureLatch::default();
+        latch.observe::<()>(&Err(timeout(Phase::Stall)));
+        let promoted = promote_latched(unsupported_input(), &latch);
+        assert!(
+            matches!(
+                promoted,
+                PlaybackError::Remote(RemoteFailure::Timeout {
+                    phase: Phase::Stall
+                })
+            ),
+            "{promoted}"
+        );
+    }
+
+    #[test]
+    fn a_later_success_clears_an_earlier_latched_failure() {
+        let latch = FailureLatch::default();
+        latch.observe::<()>(&Err(timeout(Phase::Stall)));
+        assert_eq!(
+            latch.get(),
+            Some(RemoteFailure::Timeout {
+                phase: Phase::Stall
+            })
+        );
+        latch.observe(&Ok(()));
+        assert_eq!(latch.get(), None);
+    }
+
+    #[test]
+    fn a_transient_failure_recovered_before_an_unrelated_local_error_is_not_reported() {
+        // The scenario the review flagged: `probe_trailing` tolerates and
+        // continues past a failed anchored-metadata read, so a stall from
+        // that read must not outlive the success that follows it — and once
+        // it is cleared, an unrelated local decode failure must be reported
+        // as itself, not misclassified as the stale network fault.
+        let latch = FailureLatch::default();
+        latch.observe::<()>(&Err(timeout(Phase::Stall))); // transient …
+        latch.observe(&Ok(())); // … recovered …
+        let promoted = promote_latched(unsupported_input(), &latch); // … unrelated local failure.
+        assert!(
+            matches!(promoted, PlaybackError::UnsupportedInput { .. }),
+            "a stale, already-recovered remote failure was reported instead of the real local one: {promoted}"
+        );
+    }
+
+    #[test]
+    fn a_later_failure_replaces_an_earlier_one_still_latched() {
+        let latch = FailureLatch::default();
+        latch.observe::<()>(&Err(timeout(Phase::Stall)));
+        latch.observe::<()>(&Err(timeout(Phase::Open)));
+        assert_eq!(
+            latch.get(),
+            Some(RemoteFailure::Timeout { phase: Phase::Open })
+        );
+    }
 }

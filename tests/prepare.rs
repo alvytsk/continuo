@@ -138,24 +138,30 @@ fn an_explicit_live_source_is_refused_as_live() {
 }
 
 #[test]
-#[ignore = "unreachable as specified: sine-5s.flac's STREAMINFO always carries \
-    a total-sample count, so `metadata.duration` is `Some(..)` the instant the \
-    probe succeeds — regardless of `.unresolved()`, `.chunked()` or \
-    `.without_ranges()` — and §6's table (byte_len.is_none() but \
-    decoder_duration.is_some() => Finite, the same row `chunked_media_with_\
-    decoder_evidence_is_finite` exercises) then makes this Finite, never \
-    Unresolved. Verified empirically: evidence.byte_len is None and \
-    metadata.duration is Some(5s) either way. `ContinuityUndetermined` needs a \
-    fixture whose container does not self-declare a sample count (no such \
-    fixture exists in tests/fixtures today), or a design decision on how an \
-    open-ended transport should override decoder evidence the way `evidence.\
-    live` already does for live media (Ruling 4) — flagged for the controller \
-    rather than resolved unilaterally, since neither SourceEvidence (Task 6) \
-    nor §6's table as given carries that signal."]
 fn an_unresolved_source_is_refused_distinctly_from_a_live_one() {
     // H12, R3. Two different refusals, because they are two different facts.
-    let server = TestServer::start(Script::from_fixture("sine-5s.flac").unresolved());
-    let error = match prepare(&remote(&server), &context()) {
+    //
+    // Every FLAC fixture here self-declares its sample count in STREAMINFO, so
+    // `metadata.duration` comes back `Some(..)` the instant the probe succeeds
+    // regardless of transport framing — that route to `Finite` is exactly what
+    // `chunked_media_with_decoder_evidence_is_finite` exercises above, and it
+    // makes `Continuity::Unresolved` unreachable with a self-describing
+    // container. `sine.mp3` doesn't help either: ffmpeg's default mp3 mux
+    // writes a Xing header carrying the frame count. `sine-noxing.mp3` is
+    // built with `-write_xing 0` specifically so nothing in the container or
+    // the transport can establish a length — see `tests/fixtures/README.md`.
+    // `.chunked()` withholds `Content-Length`; `.without_ranges()` keeps the
+    // response a plain sequential 200 so byte length is never established via
+    // `Content-Range` either (verified empirically: without `.without_ranges()`
+    // the 206 path still supplies a total, which stays `Finite` via the
+    // table's first row).
+    let server = TestServer::start(
+        Script::from_fixture("sine-noxing.mp3")
+            .chunked()
+            .without_ranges(),
+    );
+    let location = SourceLocation::Http(url(&server.url("/audio.mp3")));
+    let error = match prepare(&location, &context()) {
         Err(error) => error,
         Ok(_) => panic!("an unresolved source must be refused"),
     };

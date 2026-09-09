@@ -26,3 +26,20 @@ the test thread next looked, both of which stretch under CPU contention. Half a
 second of media leaves no room for that; five seconds leaves an order of
 magnitude more than the worst drift observed. Tests that need a track to *end*
 keep using `sine.flac`, which is short on purpose.
+
+`sine-noxing.mp3` — 5 s, 440 Hz, 44100 Hz, stereo, MP3 with **no Xing/LAME
+header**:
+
+    ffmpeg -f lavfi -i "sine=frequency=440:sample_rate=44100:duration=5" \
+      -ac 2 -c:a libmp3lame -b:a 64k -write_xing 0 sine-noxing.mp3
+
+`-write_xing 0` is load-bearing, not cosmetic: ffmpeg's default mp3 mux writes
+a Xing/LAME header carrying the frame count, which symphonia reads back as
+`track.num_frames` — so a fixture regenerated with defaults would silently
+self-declare a duration again. This is the one fixture here whose entire
+purpose is *not* establishing a length: nothing in its container, and (served
+without `Content-Length` or `Content-Range`) nothing in its transport, can
+tell a reader how long it is. It exists to prove `Continuity::Unresolved` is
+reachable at all — every other fixture here (WAV's `data` chunk size, FLAC's
+STREAMINFO, an ordinary MP3's Xing header) self-declares a length one way or
+another, which made that refusal path untestable before this fixture existed.
