@@ -147,3 +147,182 @@ reasoning rather than rediscovering the finding.
   `Loaded` (`src/session.rs`), which is safe only because the establishment gate
   covers that window. The invariant it rests on — `playback == Playing` implies
   `established` — is asserted nowhere.
+
+# Milestone 3 — carried debt
+
+Findings from the M3 review that were judged fine to carry. None threatens the
+milestone's invariant (HTTP does not by itself make media finite, seekable,
+resumable, or live, and a resume point already reached is never quietly
+overwritten by a fallback run); each is here so the next milestone inherits the
+reasoning rather than rediscovering the finding. §12's acceptance coverage map
+lives separately, in `docs/m3-acceptance.md`, since it is a test-to-requirement
+table rather than a design judgement.
+
+## M4A over HTTP
+
+- **Resolved, not carried as debt: M4A opens over ranges and is refused
+  sequentially, both verified.** The design's fallback text anticipated this
+  being untested if ffmpeg were unavailable during acceptance work; ffmpeg 9.0.1
+  was available, so `tests/fixtures/sine-5s.m4a` (a genuine tail-`moov`
+  ISO-BMFF/AAC file, box layout confirmed by inspection, not accidentally
+  `faststart`) exercises both directions in
+  `tests/http_playback.rs::an_m4a_recording_opens_over_ranges`: it opens over a
+  range-capable server and fails to open over a range-less one, because a
+  tail-`moov` file needs byte seeking to open at all.
+
+## Error modelling
+
+- **`PlaybackEvent::Failed` still carries `message: String` beside its typed
+  `cause: Option<RemoteFailure>`.** M3 narrows M1's "stringly-typed failures"
+  finding rather than closing it: every remote fault now has a typed cause a
+  policy can match on, but `cause` is `None` for every local (non-remote)
+  fault, so those still carry only a string a human wrote. Closing this
+  fully would mean typing M1's local decoder/device faults too, which is
+  outside M3's scope.
+- **`RemoteFailure::InvalidSource.input` is a plain `String`**, with nothing in
+  the type system enforcing that it was redacted before being stored there.
+  Every construction site does redact (`redact_url` is called at each one,
+  verified by reading them), so the risk is latent rather than live, but a
+  newtype (`RedactedUrl` or similar) would make "this string cannot contain a
+  secret" a fact the compiler checks instead of a fact every call site has to
+  remember.
+- **`RemoteFailure::Display` interpolates `Debug` output into prose**
+  (`"the server answered HTTP {status} while {operation:?}"` reads as `"...
+  while Open"`, `"redirect refused: {reason:?}"` reads as `"... :
+  UnsupportedScheme"`). Functionally fine — nothing downstream parses these
+  strings — but it reads awkwardly wherever a human sees it directly (a status
+  line, a bare log line).
+- **`Transport.detail` (`src/http/error.rs`) carries only reqwest's one-line
+  kind string**, with no source chain and no URL. The design's "preserve
+  operation and source context" would be better served by appending the
+  underlying error's `source()` chain rather than only its top-level
+  `to_string()`; the chain still would not carry a URL, since none of these
+  detail strings do (consistent with keeping signed query strings and userinfo
+  out of diagnostics).
+
+## Capability evidence
+
+- **H17's first half is undischarged, and the reason is narrow.**
+  `symphonia-bundle-mp3`'s demuxer returns `SeekErrorKind::Unseekable` for a
+  track with no `num_frames` — exactly the case H17 wants — but only on the
+  `SeekMode::Coarse` branch (`preseek_coarse`), and `src/playback/decode.rs:290`
+  pins `seek_refined` to `SeekMode::Accurate`, whose `preseek_accurate` never
+  consults `num_frames` and just scans forward. So `DemuxerSeek::Unproven` →
+  `SeekSupport::Unknown` and the engine's matching refusal
+  (`verify_seek_support` rejecting a seek it could not demonstrate) are
+  **defensive rather than reachable**, given that one line. A future switch to
+  `Coarse` — for the trial seek specifically, not necessarily for ordinary
+  seeking — makes them reachable and makes the row testable. FLAC, WAV, and
+  `symphonia-format-isomp4` (checked for the M4A/ALAC case) were also read and
+  none has an analogous reachable refusal.
+- **`verify_seek_support`'s two possible outcomes are asymmetrically tested.**
+  `tests/engine_remote.rs::a_capability_change_carries_the_current_session_rev`
+  proves the `Unknown → Native` transition (a stopped seek's trial succeeds and
+  publishes `CapabilitiesChanged`). Its sibling, `Unknown → Unsupported`, has no
+  test — and, tied to the H17 finding above, the code does not currently
+  perform that transition either: on a failed trial, `verify_seek_support`
+  (`src/playback/engine.rs:2522`) returns `false` and the caller rejects the
+  seek, but `self.capabilities.seek` is left at `Unknown` rather than being
+  advanced to `Unsupported`, so a later seek attempt re-runs the same trial
+  rather than remembering the negative result. Harmless today because no
+  reachable fixture ever makes the trial fail (the same reason H17's first half
+  is undischarged), but worth fixing alongside whatever addresses H17, since a
+  reachable failure would otherwise cost a repeated network round trip on every
+  subsequent stopped seek.
+- **The domain-reset regression test is mechanism-level.**
+  `src/playback/engine.rs`'s own unit test
+  `a_domain_reset_uses_a_plain_store_so_fetch_max_does_not_latch_the_old_high_water_mark`
+  replays the `store`/`fetch_max`
+  sequence on a local `AtomicU64`; it would still pass if `open_transport`'s
+  plain `store` were reverted to `fetch_max` in the real code, which is the
+  exact regression its neighbouring comment warns against — the test proves the
+  *composition* is correct in isolation, not that the real call site still uses
+  it. A real test needs a multi-domain output harness (`TestOutput`'s clock
+  never goes backward, so it cannot stage the old domain's high-water mark
+  against a fresh one). The placement was verified instead by tracing every
+  path into `open_transport`.
+- **No regression test for a buffer-satisfied short seek** — one where
+  Symphonia satisfies the seek from `MediaSourceStream`'s own read-ahead
+  without ever reaching `HttpMediaSource::seek`. Structurally unreachable
+  today because `SeekSupport::Unknown` is only produced when the transport is
+  byte-seekable and the demuxer is unproven, and the engine's seek gate refuses
+  every source that would reach a playing-state seek without a real
+  `MediaSource::seek()` call to answer it first — but that reasoning is what
+  protects the invariant `open_transport`'s comment relies on, not a test.
+- **"Range-capable *and* live" is untestable through the current test
+  server.** `TestServer`'s `write_206` (`tests/support/server.rs`) structurally
+  cannot carry `icy-*` headers alongside a 206 response, so every live-source
+  test in this suite must also be range-less. The combination is real (a
+  range-capable server can still be an ICY live stream) and the refusal logic
+  does not special-case it away, but no fixture in this project can currently
+  demonstrate it end-to-end.
+
+## HTTP transport
+
+- **The HTTP/2 stream window is set from `chunk_bytes` (64 KiB) rather than
+  `buffer_bytes`** (`src/http/service.rs`), more conservative than a
+  single-stream connection needs — the connection window already carries the
+  1 MiB `buffer_bytes` cap, and a stream window narrower than the connection
+  window can force extra `WINDOW_UPDATE` round-trips under fast transfer. It
+  violates no documented bound (the total the design promises is unaffected),
+  just spends more protocol chatter than the loosest correct setting would.
+- **The `SLICE` constant in `src/http/channel.rs`** (20 ms) sets how often a
+  blocked reader's wait re-tests its predicate and the wait hook runs — and
+  therefore how current a checkpoint and published progress stay during a
+  network stall. It is sized only against the design's one-second wake bound
+  (§8: "source waits wake within one second after stop, seek or shutdown"),
+  not measured against real network stall behaviour on a real connection.
+- **`resolve_url` (`src/app.rs`) parses its input twice** — once directly with
+  `Url::parse` (to check for embedded credentials before identity is ever
+  built) and once again inside `NormalizedUrl::parse` (identity
+  normalization). This is an intentional consequence of keeping identity and
+  the fetch URL as separate types with separate parsing rules, not an
+  oversight; a shared internal parse would couple the two in a way the design
+  deliberately avoids.
+
+## Engine
+
+- **`Mirror::apply`'s `Loaded` arm does not reset `buffering`**
+  (`src/app.rs`). `buffering` is set while a source read is blocked on the
+  network and should read false again once a fresh source has loaded, but the
+  `Loaded` arm never clears it. Harmless under the one-load-per-run pattern
+  every current test and manual scenario follows (a fresh process, or a
+  `buffering` that was already false), but a session that loads a second
+  remote source while the first left `buffering` set would show a stale
+  buffering indicator until the next event that does clear it.
+
+## Plan deviations (§13)
+
+Changes made during implementation, recorded per the design's requirement that
+such changes be explicit rather than silent:
+
+- **`run_thawed` was built and then removed**, in favor of deleting the
+  fetch-loop freeze gate it existed to work around. **`wait_while_frozen` was
+  removed entirely** for the same reason — pausing is the output's job, not a
+  reason to stop a network read from making progress; gating the read only
+  starved work that legitimately still needed to happen while paused.
+- **`SourceEvidence` and `DemuxerSeek` live in `src/media/capabilities.rs`**,
+  not in the `http` module — both a local file and a remote one construct
+  them (`DecodedSource::open` builds local evidence with
+  `DemuxerSeek::Proven`), so an HTTP-flavoured location would make local
+  playback construct a network type to describe itself.
+- **`FetchAccepted` lives in `src/http/response.rs`**, beside the other
+  response-shaped types it is built from, rather than beside the fetch task
+  that produces it.
+- **The header handoff lives in `src/http/channel.rs`**, on the same lock and
+  condvar as the byte buffer and the interrupt state, rather than beside the
+  fetch task in `src/http/service.rs`. Every flag change and the header result
+  need the same lost-wake-proof synchronization the buffer already has, so
+  giving them their own separate lock would reintroduce the class of race the
+  shared lock exists to close.
+- **`OpeningDeadline` and `OpeningLimits` live in `src/http/source.rs`**,
+  where `HttpMediaSource::open` and every wait it takes during opening can
+  reach them directly, rather than in the service module that constructs the
+  service-wide `Limits`.
+- **Raw mode is entered before the worker loop and made optional, rather than
+  deferred.** The original plan's R5 described raw mode as entered only after
+  the first `Loaded`/`Failed`; what actually needed deferring was
+  *rendering*, not raw-mode entry. `RawModeGuard::enable` (`src/app.rs`)
+  returns `None` when there is no controlling terminal (`enable_raw_mode`
+  fails for want of a tty — the CI case), and a session that starts with no
+  tty reads no keys but still prints `Loading` and any failure normally.
