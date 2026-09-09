@@ -14,7 +14,7 @@ use symphonia::core::io::MediaSource;
 use url::Url;
 
 use super::channel::{ByteChannel, HeaderOutcome, ReadOutcome, SourceInterrupt, WaitHook};
-use super::error::{Operation, Phase, RemoteFailure};
+use super::error::{Operation, Phase, RemoteFailure, redact_url};
 use super::limits::Limits;
 use super::response::{self, Accepted, Established};
 use super::service::{FetchRequest, HttpService};
@@ -198,6 +198,24 @@ impl HttpMediaSource {
             validator: accepted.validator,
         };
 
+        // §11: source opening and its redirect count, in one line - every URL
+        // through `redact_url` first, since a signed query or userinfo must
+        // never reach a log line.
+        tracing::debug!(
+            url = %redact_url(origin.as_str()),
+            redirects = accepted.redirects,
+            "opened remote source"
+        );
+        // §11: capability evidence, separately from the line above - this is
+        // exactly `SourceEvidence`'s own fields, logged at the point they are
+        // first established rather than only inferred later from behaviour.
+        tracing::debug!(
+            byte_len = ?byte_len,
+            byte_seekable,
+            live,
+            "remote source capability evidence"
+        );
+
         let source = Self {
             service,
             origin,
@@ -255,7 +273,17 @@ impl HttpMediaSource {
                 .read(&mut scratch, self.hook.as_ref(), self.limits.stall)
             {
                 ReadOutcome::Bytes(_) => continue,
-                ReadOutcome::Eof => return Ok(()),
+                ReadOutcome::Eof => {
+                    // §11: source completion. This is the one place a finite
+                    // remote body is actually confirmed to have ended cleanly
+                    // - see this method's own doc comment for why "every byte
+                    // arrived" alone is not enough to log this early.
+                    tracing::debug!(
+                        url = %redact_url(self.origin.as_str()),
+                        "remote source confirmed complete"
+                    );
+                    return Ok(());
+                }
                 ReadOutcome::Retired => {
                     self.retired = true;
                     self.interrupt.retire();
@@ -380,6 +408,14 @@ impl std::io::Seek for HttpMediaSource {
         // `begin` both retires the old generation and opens the new one, so a
         // superseded response's bytes cannot enter the channel (H9).
         let generation = self.interrupt.begin();
+        // §11: the range operation itself - the byte offset re-requested, not
+        // the media-time seek that asked for it (`engine.rs`'s `seek_to` logs
+        // that half, in media time, once the refinement it drives lands).
+        tracing::debug!(
+            url = %redact_url(self.origin.as_str()),
+            start_byte = target,
+            "issuing range request"
+        );
         let request = FetchRequest {
             origin: self.origin.clone(),
             start: target,

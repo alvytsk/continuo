@@ -267,6 +267,15 @@ async fn run_fetch(
 
         match accept_redirect(&current, &location, redirects + 1, &seen, &limits) {
             Ok(target) => {
+                // §11: redirect count, one line per hop rather than a single
+                // total at the end - bounded by `limits.max_redirects`, never
+                // per-chunk, so this cannot grow into the per-frame noise §11
+                // rules out.
+                tracing::debug!(
+                    hop = redirects + 1,
+                    url = %redact_url(target.as_str()),
+                    "following redirect"
+                );
                 seen.push(current.clone());
                 current = target;
                 redirects += 1;
