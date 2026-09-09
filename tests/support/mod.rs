@@ -318,17 +318,78 @@ impl TestEngine {
     /// engine's lifetime; every later `load_remote` on this `TestEngine`
     /// reuses it.
     pub fn load_remote(&mut self, url: &str) {
-        let service = {
-            let mut http = lock(&self.http);
-            if http.is_none() {
-                let service = match HttpService::spawn(Limits::brisk()) {
+        self.load_remote_inner(url, ResumeIntent::StartAt(Duration::ZERO), None, true);
+    }
+
+    /// `load_remote` under a caller-decided `ResumeIntent`, for a resume test
+    /// whose second session needs `Candidate` rather than the fixed
+    /// `StartAt(ZERO)` `load_remote` always sends (H4, H5's protected
+    /// fallback). Shares the cached brisk `HttpService`, same as
+    /// `load_remote`.
+    pub fn load_remote_with_resume(&mut self, url: &str, resume: ResumeIntent) {
+        self.load_remote_inner(url, resume, None, true);
+    }
+
+    /// `load_remote` against a dedicated `HttpService` built from `limits`
+    /// rather than the cached brisk one (H13: the occupancy bound is only
+    /// reachable in milliseconds under a small `buffer_bytes`/`chunk_bytes`,
+    /// which the shared brisk service does not use, and the starvation half
+    /// needs a `stall` deadline generous enough that draining the ring and
+    /// reading the frozen position afterwards cannot itself race the brisk
+    /// 500 ms one into a spurious `Failed`).
+    pub fn load_remote_with_limits(&mut self, url: &str, limits: Limits) {
+        self.load_remote_inner(
+            url,
+            ResumeIntent::StartAt(Duration::ZERO),
+            Some(limits),
+            true,
+        );
+    }
+
+    /// `load_remote`, but for a load this test expects to fail rather than
+    /// reach `Paused` (H17: a sequential-only source opening a tail-`moov`
+    /// file). The `HttpService` still has to be attached for the attempt to
+    /// mean anything — without one the load fails immediately as "no HTTP
+    /// service", which would prove nothing about the file itself.
+    pub fn load_remote_expecting_failure(&mut self, url: &str) {
+        self.load_remote_inner(url, ResumeIntent::StartAt(Duration::ZERO), None, false);
+    }
+
+    /// Shared body for the `load_remote*` entry points above. `limits`:
+    /// `None` reuses (and lazily populates) the cached brisk service every
+    /// plain `load_remote` shares; `Some` always spawns a fresh service
+    /// under those limits and replaces the cached one with it, which is fine
+    /// because every test that asks for custom limits loads exactly once.
+    /// `await_paused`: false for a load this test expects to fail, so it
+    /// does not wait for a state the attempt is never going to reach.
+    fn load_remote_inner(
+        &mut self,
+        url: &str,
+        resume: ResumeIntent,
+        limits: Option<Limits>,
+        await_paused: bool,
+    ) {
+        let service = match limits {
+            Some(limits) => {
+                let service = match HttpService::spawn(limits) {
                     Ok(service) => service,
                     Err(error) => panic!("the test HttpService must start: {error}"),
                 };
-                *http = Some(service);
+                *lock(&self.http) = Some(Arc::clone(&service));
+                service
             }
-            #[allow(clippy::unwrap_used)] // just populated above if it was empty.
-            http.clone().unwrap()
+            None => {
+                let mut http = lock(&self.http);
+                if http.is_none() {
+                    let service = match HttpService::spawn(Limits::brisk()) {
+                        Ok(service) => service,
+                        Err(error) => panic!("the test HttpService must start: {error}"),
+                    };
+                    *http = Some(service);
+                }
+                #[allow(clippy::unwrap_used)] // just populated above if it was empty.
+                http.clone().unwrap()
+            }
         };
         if let Some(handle) = lock(&self.handle).as_ref() {
             handle.set_http(Some(service));
@@ -344,9 +405,11 @@ impl TestEngine {
         self.send(PlaybackCommand::Load {
             media,
             source: SourceLocation::Http(parsed),
-            resume: ResumeIntent::StartAt(Duration::ZERO),
+            resume,
         });
-        self.await_state(PlaybackState::Paused);
+        if await_paused {
+            self.await_state(PlaybackState::Paused);
+        }
     }
 
     /// The handle, for the submission methods (`submit_pause`, `submit_seek`
@@ -446,6 +509,18 @@ impl TestEngine {
             }
             std::thread::sleep(Duration::from_micros(200));
         }
+    }
+
+    /// Whether the device's most recently captured buffer holds any nonzero
+    /// sample — proof that real audio, not silence, reached the output. H1:
+    /// playback must be audible while a remote body is still arriving, not
+    /// merely "not failed".
+    pub fn captured_is_audible(&self) -> bool {
+        lock(&self.device)
+            .output
+            .captured()
+            .iter()
+            .any(|sample| *sample != 0.0)
     }
 
     pub fn inject_xruns(&mut self, count: usize) {
@@ -610,6 +685,19 @@ impl TestEngine {
     pub fn let_time_pass(&mut self, span: Duration) {
         self.advance_clock(span);
         self.settle();
+    }
+
+    /// Like `let_time_pass`, but does not settle behind a command round trip
+    /// afterward. `settle` needs the worker to take and answer a `SetVolume`,
+    /// which a worker legitimately blocked inside a live network read
+    /// (starvation, with nothing released to unblock it) cannot do — using
+    /// `let_time_pass` there would wait out `settle`'s own patience rather
+    /// than observe anything about the starved position. The position read
+    /// afterward is the raw published value the worker's last completed pass
+    /// left behind, which is exactly what "starvation does not advance it"
+    /// is a claim about.
+    pub fn let_time_pass_while_unresponsive(&mut self, span: Duration) {
+        self.advance_clock(span);
     }
 
     pub fn advance_past_output_latency(&mut self) {

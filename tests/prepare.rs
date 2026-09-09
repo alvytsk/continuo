@@ -101,6 +101,34 @@ fn a_range_ignoring_recording_is_finite_but_unseekable() {
 }
 
 #[test]
+fn an_unknown_duration_recording_still_opens_as_finite() {
+    // H12, §6's first table row: "Fixed response length or a valid range
+    // total, and supported audio -> Finite; duration may remain unknown."
+    // Every other Finite fixture in this file also has a decoder-reported
+    // duration (FLAC's STREAMINFO gives one unconditionally), which never
+    // exercises the "duration may remain unknown" half of that row on its
+    // own. `sine-noxing.mp3` has no Xing/LAME frame count for the decoder to
+    // report - `an_unresolved_source_is_refused_distinctly_from_a_live_one`
+    // below also withholds `Content-Length` via `.chunked()` to reach
+    // `Unresolved`; serving it sequentially instead (no chunking, no range
+    // total override) leaves the HTTP layer's own `Content-Length` as the
+    // only evidence of a bound, which is exactly what this row is about.
+    let server = TestServer::start(Script::from_fixture("sine-noxing.mp3").without_ranges());
+    let location = SourceLocation::Http(url(&server.url("/audio.mp3")));
+    let prepared = match prepare(&location, &context()) {
+        Ok(prepared) => prepared,
+        Err(error) => panic!("a length-bounded response must open as finite: {error}"),
+    };
+    assert_eq!(prepared.capabilities.continuity, Continuity::Finite);
+    assert!(
+        prepared.source.metadata().duration.is_none(),
+        "this fixture's whole point is a decoder that cannot report a duration: {:?}",
+        prepared.source.metadata().duration
+    );
+    server.shutdown();
+}
+
+#[test]
 fn chunked_media_with_decoder_evidence_is_finite() {
     // H12: no Content-Length, but the decoder establishes a recording length.
     let server = TestServer::start(Script::from_fixture("sine-5s.flac").chunked());
