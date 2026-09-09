@@ -42,9 +42,9 @@ struct Pending {
     submit_seq: u64,
 }
 
-/// One producer, one consumer, replace-on-submit: the newest snapshot wins
-/// structurally. `submit_seq` makes that checkable rather than assumed, and is
-/// never persisted (§9).
+/// Replace-on-submit, and the newest snapshot wins whoever asks: keep-latest is
+/// a property of the slot rather than of its callers. `submit_seq` is what makes
+/// that checkable rather than assumed, and is never persisted (§9).
 #[derive(Default)]
 struct Slot {
     pending: Option<Pending>,
@@ -53,6 +53,18 @@ struct Slot {
 
 impl Slot {
     fn submit(&mut self, state: PersistedState, urgency: Urgency, now: Instant, submit_seq: u64) {
+        // Sequence numbers are handed out before the lock is taken, so two
+        // producers can arrive in the wrong order. A submission that lost that
+        // race is dropped rather than allowed to regress what is pending: the
+        // one already in the slot is the newer snapshot and supersedes it, the
+        // same way a newer one supersedes a write that failed (§9).
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|pending| pending.submit_seq > submit_seq)
+        {
+            return;
+        }
         let deadline = match (&self.pending, urgency) {
             (_, Urgency::Forced) => now,
             // Anchored when the first snapshot entered an empty slot;
@@ -328,6 +340,22 @@ mod tests {
 
         let due = slot.take_due(at(base, 10)).expect("forced is due at once");
         assert_eq!(due.submit_seq, 2);
+    }
+
+    #[test]
+    fn a_submission_that_lost_the_race_never_displaces_a_newer_one() {
+        let base = Instant::now();
+        let mut slot = Slot::default();
+        // Two producers: the sequence number is taken before the lock, so the
+        // lower one can reach the slot second.
+        slot.submit(PersistedState::default(), Urgency::Forced, base, 6);
+        slot.submit(PersistedState::default(), Urgency::Forced, at(base, 1), 5);
+
+        assert_eq!(
+            slot.take_pending().map(|pending| pending.submit_seq),
+            Some(6),
+            "keep-latest holds however the producers interleave"
+        );
     }
 
     #[test]
