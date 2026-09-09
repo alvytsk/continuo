@@ -59,6 +59,8 @@ impl ByteRange {
     /// Checked, because `last` comes off the wire: `bytes 0-18446744073709551615/*`
     /// parses fine and overflows a bare `+ 1`, which in release mode wraps to
     /// zero and turns a hostile header into a silently empty interval.
+    // Fires even for a non-`usize` return; there is no empty `ByteRange`, since
+    // an inclusive interval always covers at least the byte it names.
     #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> Option<u64> {
         self.last.checked_sub(self.first)?.checked_add(1)
@@ -211,6 +213,16 @@ pub fn accept(
                 return Err(RemoteFailure::InvalidRange {
                     reason: RangeRejection::RangeIgnored,
                 });
+            }
+            // §7's best-effort rule cuts both ways: without a strong validator
+            // we may not claim to detect a same-length replacement, but a
+            // length that contradicts the total already established is
+            // evidence we do have, and ignoring it is how a reopened
+            // range-less source silently starts decoding different media.
+            if let (Some(declared), Some(known)) = (declared_len, established.and_then(|e| e.total))
+                && declared != known
+            {
+                return Err(RemoteFailure::ResourceChanged);
             }
             Ok(Accepted::Sequential { len: declared_len })
         }

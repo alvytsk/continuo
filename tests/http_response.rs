@@ -278,6 +278,46 @@ fn weak_and_last_modified_validators_are_compared_even_though_they_are_never_sen
 }
 
 #[test]
+fn a_reopened_origin_whose_length_contradicts_the_established_total_fails() {
+    // §7: "compare available length and validator metadata". A range-less
+    // source reopened at byte zero has no Content-Range to check, so the
+    // declared length is the only evidence there is — and a server with no
+    // validator headers offers nothing else.
+    let established = Established {
+        total: Some(8192),
+        validator: Validator {
+            strong_etag: None,
+            weak_etag: None,
+            last_modified: None,
+        },
+    };
+    assert_eq!(
+        accept(
+            200,
+            &headers(&[("content-length", "9000")]),
+            0,
+            true,
+            Some(&established)
+        ),
+        Err(RemoteFailure::ResourceChanged)
+    );
+    // The same length is not evidence of anything, and must still be accepted:
+    // §7 forbids claiming to detect same-length replacement.
+    assert_eq!(
+        accept(
+            200,
+            &headers(&[("content-length", "8192")]),
+            0,
+            true,
+            Some(&established)
+        ),
+        Ok(Accepted::Sequential { len: Some(8192) })
+    );
+    // And an unknown total on either side is no evidence either way.
+    assert!(accept(200, &headers(&[]), 0, true, Some(&established)).is_ok());
+}
+
+#[test]
 fn an_interval_that_cannot_fit_inside_its_total_is_rejected() {
     // `bytes 0-99/10` describes 100 bytes of a 10-byte object. Accepting it
     // installs bytes past the end of the recording at offsets nothing owns.
