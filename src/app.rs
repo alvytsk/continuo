@@ -1,6 +1,7 @@
 //! The `continuo play` application: argument-to-path resolution, terminal
 //! setup, and the key-driven status loop around [`EngineHandle`].
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -9,8 +10,13 @@ use crossterm::terminal::{Clear, ClearType};
 use crossterm::{cursor, execute};
 
 use crate::cli::{self, CliCommand};
+use crate::clock::{Clock, SystemClock};
 use crate::media::id::{AbsolutePath, MediaId};
 use crate::media::source::SourceLocation;
+use crate::persistence::PersistenceError;
+use crate::persistence::model::PersistedState;
+use crate::persistence::store::{LoadReason, StateStore};
+use crate::persistence::writer::{ShutdownOutcome, StateSink, Urgency, WriterHandle};
 use crate::playback::command::PlaybackCommand;
 use crate::playback::decode::DecodedSource;
 use crate::playback::engine::EngineHandle;
@@ -19,6 +25,7 @@ use crate::playback::event::PlaybackEvent;
 use crate::playback::state::PlaybackState;
 use crate::playback::timeline::PositionQuality;
 use crate::playback::volume::Volume;
+use crate::session::{Action, ResumeDecision, Session, decide_resume};
 
 const SEEK_STEP_SECS: i64 = 10;
 const VOLUME_STEP: f32 = 0.05;
@@ -57,21 +64,38 @@ pub fn run(cli: cli::Cli) -> Result<(), PlaybackError> {
         );
         return Ok(());
     }
+    // Kept before the probe is dropped: §11 validates a stored position against
+    // the duration this probe already reports, so the resume opens no file of
+    // its own.
+    let duration = probed.metadata().duration;
     drop(probed);
 
+    // Persistence opens before the engine: the start position is an argument to
+    // the load, and the restored volume is a command that precedes it.
+    let media = MediaId::LocalFile(absolute.clone());
+    let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+    let Persistence {
+        mut session,
+        mut writer,
+        start_at,
+        volume,
+        persisting,
+    } = open_persistence(&media, duration, &clock);
+
     let engine = EngineHandle::spawn_cpal();
-    let _raw = RawModeGuard::enable()?; // Drop restores the terminal on every exit path.
+    // Dropped explicitly by the shutdown sequence, before the flush waits on
+    // the disk; its `Drop` is what covers a panic.
+    let raw = RawModeGuard::enable()?;
     let mut mirror = Mirror::default();
 
-    engine
-        .commands()
-        .send(PlaybackCommand::Load {
-            media: MediaId::LocalFile(absolute.clone()),
-            source: SourceLocation::LocalPath(absolute.as_path().to_path_buf()),
-            start_at: Duration::ZERO,
-        })
-        .ok();
-    engine.commands().send(PlaybackCommand::Play).ok();
+    for command in resume_commands(
+        media,
+        SourceLocation::LocalPath(absolute.as_path().to_path_buf()),
+        start_at,
+        volume,
+    ) {
+        engine.commands().send(command).ok();
+    }
 
     let outcome = loop {
         match crossterm::event::poll(Duration::from_millis(100)) {
@@ -102,6 +126,8 @@ pub fn run(cli: cli::Cli) -> Result<(), PlaybackError> {
             if let PlaybackEvent::Failed { message, .. } = &event {
                 failure = Some(message.clone());
             }
+            // `observe` borrows the event, so the mirror still consumes it.
+            submit(&writer, session.observe(&event, clock.sample()));
             mirror.apply(event);
         }
         if let Some(message) = failure {
@@ -115,11 +141,17 @@ pub fn run(cli: cli::Cli) -> Result<(), PlaybackError> {
         // snapshot published a tick earlier; the guard correctly skips
         // rendering the snapshot for that tick.
         let progress = engine.progress();
+        submit(&writer, session.tick(&progress, clock.sample()));
         if progress.session_rev == mirror.session_rev {
             mirror.position = progress.position;
             mirror.quality = progress.quality;
         }
-        render(&mirror)?;
+        // A terminal write failure is not a reason to skip the final
+        // checkpoint, so it becomes the loop's outcome instead of returning
+        // from here and bypassing the flush path (D18).
+        if let Err(error) = render(&mirror) {
+            break Err(error);
+        }
     };
 
     // Out of band first, and in band only as a courtesy. The worker stops
@@ -130,12 +162,175 @@ pub fn run(cli: cli::Cli) -> Result<(), PlaybackError> {
     // guaranteed to be seen.
     engine.interrupt_shutdown();
     engine.commands().send(PlaybackCommand::Shutdown).ok();
-    engine.join();
+    let report = engine.join();
+
+    // The events the loop never drained are replayed through the policy before
+    // the snapshot is taken, so the snapshot comes from a session that has seen
+    // everything the run produced (D19).
+    writer.submit(
+        session.reconcile_shutdown(&report, clock.sample()),
+        Urgency::Forced,
+    );
+
+    // Restore the terminal before waiting on the disk, so the writer's bound is
+    // never spent with the terminal still raw.
+    drop(raw);
+    report_flush(writer.shutdown(), persisting);
     outcome
 }
 
-/// Installs raw mode and restores it on drop, so a `?` anywhere in the loop
-/// above — or a panic — cannot leave the terminal raw.
+/// §11's initial command sequence. Volume first: the engine accepts it with no
+/// transport, and a transport created later adopts the stored gain — so the
+/// restored level is in force from the first buffer rather than after it.
+/// Nothing about the sequence is conditional; a session with no stored volume
+/// issues the same command with the default.
+fn resume_commands(
+    media: MediaId,
+    source: SourceLocation,
+    start_at: Duration,
+    volume: Volume,
+) -> [PlaybackCommand; 3] {
+    [
+        PlaybackCommand::SetVolume(volume),
+        PlaybackCommand::Load {
+            media,
+            source,
+            start_at,
+        },
+        PlaybackCommand::Play,
+    ]
+}
+
+/// Writing is off for this session — an unsupported file, a quarantine that
+/// could not be performed, or no state directory at all. The session runs
+/// normally with in-memory state; only the disk write is suppressed, and the
+/// reason has already been logged once (D3).
+struct DisabledSink;
+
+impl StateSink for DisabledSink {
+    fn write(&self, _state: &PersistedState) -> Result<(), PersistenceError> {
+        Ok(())
+    }
+}
+
+struct Persistence {
+    session: Session,
+    writer: WriterHandle,
+    start_at: Duration,
+    volume: Volume,
+    /// Whether anything this session submits can reach the disk. A disabled
+    /// sink reports every write as a success, deliberately — the writer must
+    /// not count a disable as a failure (D11) — so this is what keeps the
+    /// shutdown log from claiming a write that never happened.
+    persisting: bool,
+}
+
+fn open_persistence(
+    media: &MediaId,
+    duration: Option<Duration>,
+    clock: &Arc<dyn Clock>,
+) -> Persistence {
+    let store = match StateStore::platform_path() {
+        Ok(path) => Some(StateStore::new(path, Arc::clone(clock))),
+        Err(error) => {
+            tracing::warn!(%error, "no state directory; this session will not be persisted");
+            None
+        }
+    };
+
+    let (state, writable) = match &store {
+        Some(store) => {
+            let outcome = store.load();
+            match &outcome.reason {
+                LoadReason::Loaded => tracing::debug!(path = ?store.path(), "state restored"),
+                LoadReason::Missing => tracing::debug!(path = ?store.path(), "no state yet"),
+                LoadReason::Quarantined { moved_to } => {
+                    tracing::warn!(
+                        ?moved_to,
+                        "state file was unreadable and has been moved aside"
+                    );
+                }
+                LoadReason::QuarantineFailed => {
+                    tracing::warn!(
+                        "state file is unreadable and could not be moved aside; not writing"
+                    );
+                }
+                LoadReason::UnsupportedVersion { found } => {
+                    tracing::warn!(
+                        found,
+                        "state file is from a newer build; preserving it and not writing"
+                    );
+                }
+                LoadReason::Unreadable => {
+                    tracing::warn!("state file could not be read; preserving it and not writing");
+                }
+            }
+            (outcome.state, outcome.writable)
+        }
+        None => (PersistedState::default(), false),
+    };
+
+    let decision = decide_resume(state.entry_for(media), duration);
+    match decision {
+        ResumeDecision::NoEntry => tracing::debug!("no stored position for this media"),
+        ResumeDecision::Completed => tracing::info!("resume declined: this media is completed"),
+        ResumeDecision::AtStart => {}
+        ResumeDecision::Resume(position) => tracing::info!(?position, "resume position selected"),
+        ResumeDecision::DegenerateEnd => {
+            tracing::debug!("stored position is exactly the end; starting over");
+        }
+        ResumeDecision::StalePastEnd => {
+            tracing::warn!("stored position is past the end of this media");
+        }
+        ResumeDecision::Unvalidated(position) => {
+            tracing::info!(
+                ?position,
+                "duration unknown; stored position retained unvalidated"
+            );
+        }
+    }
+
+    let start_at = decision.start_at();
+    let volume = state.volume();
+    let sink: Box<dyn StateSink> = match (store, writable) {
+        (Some(store), true) => Box::new(store),
+        _ => Box::new(DisabledSink),
+    };
+
+    Persistence {
+        session: Session::new(state),
+        writer: WriterHandle::spawn(sink, Arc::clone(clock)),
+        start_at,
+        volume,
+        persisting: writable,
+    }
+}
+
+fn submit(writer: &WriterHandle, action: Action) {
+    if let Action::Submit { state, urgency } = action {
+        writer.submit(state, urgency);
+    }
+}
+
+/// What the flush is reported as. A session whose writing is disabled reaches
+/// `Written` having written nothing, so the outcome alone must not be logged as
+/// a checkpoint that landed.
+fn report_flush(outcome: ShutdownOutcome, persisting: bool) {
+    if !persisting {
+        tracing::debug!("persistence is disabled for this session; no checkpoint was written");
+        return;
+    }
+    match outcome {
+        ShutdownOutcome::Written => tracing::debug!("final checkpoint written"),
+        ShutdownOutcome::Failed(error) => tracing::warn!(%error, "final checkpoint failed"),
+        ShutdownOutcome::Unconfirmed => tracing::warn!("final checkpoint UNCONFIRMED"),
+    }
+}
+
+/// Installs raw mode and restores it on drop. `run` drops it explicitly, so the
+/// writer's shutdown bound is never spent with the terminal still raw; the
+/// `Drop` covers a panic, which is the only way out of the loop above that does
+/// not reach that line.
 struct RawModeGuard;
 
 impl RawModeGuard {
@@ -323,6 +518,8 @@ fn format_hms(duration: Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::media::capabilities::{Continuity, MediaCapabilities, SeekSupport};
+    use crate::media::metadata::MediaMetadata;
 
     fn press(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::empty())
@@ -367,5 +564,68 @@ mod tests {
         // lowers it: an unshifted key exists for each.
         assert!(volume_after(KeyCode::Char('='), 0.5).is_some());
         assert!(volume_after(KeyCode::Char('-'), 0.5).is_some());
+    }
+
+    fn local(path: &str) -> MediaId {
+        match AbsolutePath::new(path.into()) {
+            Ok(path) => MediaId::LocalFile(path),
+            Err(error) => panic!("a literal absolute path must parse: {error}"),
+        }
+    }
+
+    /// The user-visible half of a resume: the listener sees the restored
+    /// position the moment the track opens, not after the first progress tick.
+    /// `Loaded` is the only event that carries it.
+    #[test]
+    fn a_resumed_position_is_shown_as_soon_as_the_track_opens() {
+        let mut mirror = Mirror::default();
+        mirror.apply(PlaybackEvent::Loaded {
+            session_rev: 3,
+            media: local("/music/sonata.flac"),
+            metadata: MediaMetadata {
+                title: None,
+                duration: Some(Duration::from_secs(300)),
+            },
+            capabilities: MediaCapabilities {
+                continuity: Continuity::Finite,
+                seek: SeekSupport::Native,
+            },
+            position: Duration::from_secs(93),
+        });
+
+        assert_eq!(mirror.position, Duration::from_secs(93));
+        assert_eq!(mirror.quality, PositionQuality::Exact);
+        assert!(
+            status_line(&mirror).contains("00:01:33"),
+            "the resumed position is on the first line drawn, not 00:00:00: {}",
+            status_line(&mirror)
+        );
+    }
+
+    /// §11: the restored level has to be in force from the first buffer, which
+    /// is only true if the volume command precedes the load. Pinned on the
+    /// sequence itself — two commands the engine applied in order leave no
+    /// trace of that order in the events it emits, so nothing downstream can
+    /// check this.
+    #[test]
+    fn the_resume_sequence_restores_volume_before_it_loads() {
+        let commands = resume_commands(
+            local("/music/sonata.flac"),
+            SourceLocation::LocalPath("/music/sonata.flac".into()),
+            Duration::from_secs(93),
+            Volume::new(0.25),
+        );
+
+        match &commands {
+            [
+                PlaybackCommand::SetVolume(volume),
+                PlaybackCommand::Load { start_at, .. },
+                PlaybackCommand::Play,
+            ] => {
+                assert_eq!(*volume, Volume::new(0.25), "the stored gain, unchanged");
+                assert_eq!(*start_at, Duration::from_secs(93), "the decided start");
+            }
+            other => panic!("volume must be issued before the load: {other:?}"),
+        }
     }
 }

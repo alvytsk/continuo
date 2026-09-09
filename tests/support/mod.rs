@@ -815,3 +815,57 @@ pub fn failed_load_position(
     handle.join();
     (state, progress.position)
 }
+
+/// A session whose device refuses to open: `Loaded` goes out, then negotiation
+/// rejects the channel count and the load fails. Hands back what `app::run`
+/// would have — every event, in order, and the final `Progress`.
+///
+/// Deliberately not a `TestEngine`: the engine never reaches `Paused` here, so
+/// there is no transport to drive and nothing for a driver thread to do.
+pub fn failed_device_session(name: &str, channels: u16, start_at: Duration) -> ShutdownReport {
+    let device = Arc::new(Mutex::new(Device {
+        output: TestOutput::new(channels, RATE, BUFFER_FRAMES, LATENCY),
+        link: None,
+    }));
+    // Held for the call's duration, so the worker's fault receiver stays live.
+    let (_faults, fault_rx) = crossbeam_channel::bounded(16);
+    let handle = EngineHandle::spawn_with(
+        Box::new(HarnessOutput {
+            device: Arc::clone(&device),
+        }),
+        fault_rx,
+    );
+    let path = fixture(name);
+    let sent = handle.commands().send(PlaybackCommand::Load {
+        media: MediaId::LocalFile(path.clone()),
+        source: SourceLocation::LocalPath(path.as_path().to_path_buf()),
+        start_at,
+    });
+    if sent.is_err() {
+        panic!("the engine stopped accepting commands");
+    }
+
+    let mut events = Vec::new();
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        while let Ok(event) = handle.events().try_recv() {
+            events.push(event);
+        }
+        if events
+            .iter()
+            .any(|event| matches!(event, PlaybackEvent::Failed { .. }))
+        {
+            break;
+        }
+        if Instant::now() >= deadline {
+            panic!("the load never failed; saw {events:?}");
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    handle.interrupt_shutdown();
+    let mut report = handle.join();
+    events.extend(std::mem::take(&mut report.events));
+    report.events = events;
+    report
+}

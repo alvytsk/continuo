@@ -17,7 +17,7 @@ use crate::media::id::MediaId;
 use crate::persistence::model::{PersistedCheckpoint, PersistedState};
 use crate::persistence::writer::Urgency;
 use crate::playback::checkpoint::PlaybackCheckpoint;
-use crate::playback::event::{PlaybackEvent, Progress};
+use crate::playback::event::{PlaybackEvent, Progress, ShutdownReport};
 use crate::playback::state::PlaybackState;
 
 /// The capture interval §6 requires while playing. With the writer's 2 s
@@ -358,6 +358,30 @@ impl Session {
             self.checkpoint_from_progress(sampled, now);
         }
         self.state.clone()
+    }
+
+    /// The whole of the shutdown handoff that belongs to the policy: replay the
+    /// events the application never drained, then take the forced snapshot
+    /// (D19). Both halves in one place, because each without the other is a
+    /// lost checkpoint — the replay is what makes the snapshot one taken from a
+    /// session that has seen everything the run produced.
+    ///
+    /// The replays are reconciliation rather than submission: whatever they
+    /// would have submitted on their own is superseded by the snapshot this
+    /// returns.
+    ///
+    /// The engine-facing half — the shutdown interrupt and the `join` that
+    /// produces the report — stays at the call site: it touches the handle,
+    /// not the policy.
+    pub fn reconcile_shutdown(
+        &mut self,
+        report: &ShutdownReport,
+        now: ClockSample,
+    ) -> PersistedState {
+        for event in &report.events {
+            let _ = self.observe(event, now);
+        }
+        self.shutdown_snapshot(&report.progress, now)
     }
 
     fn record_current(&mut self, position: Duration, now: ClockSample) {

@@ -104,6 +104,15 @@ The application will capture checkpoints periodically while playing and on pause
 
 Every snapshot will have `schema_version` from its first write. Malformed and unsupported-version files are preserved and reported rather than overwritten. `Unsupported` or `Undetermined` resume capability never deletes a checkpoint. Completed status is separate from position and is set after output drains. Replay-from-beginning requires explicit completed-status policy in M2. There is no near-end reset: stopping near the end preserves that logical position.
 
+M2 settles this: see `docs/superpowers/specs/2026-09-08-continuo-durable-state-design.md`
+for the decisions — completion semantics, the per-identity map and its cap,
+rejected-file handling, and the checkpoint triggers. Two refinements the
+implementation carries are not in that spec's media-switch table: a completed
+outgoing entry is not re-recorded, and an outstanding stopped-seek target
+supersedes the recorded position. Its components section calls
+`PlaybackCheckpoint` the currency, which holds for what the policy records; the
+resume path reads `PersistedCheckpoint` instead.
+
 ## 7. Diagnostics and errors
 
 Tracing is implemented in M0 and controlled through `RUST_LOG`, for example `RUST_LOG=continuo=debug cargo run --locked`. Logs go to stderr. Without `RUST_LOG` the default filter is `continuo=info`. An invalid filter, or a `RUST_LOG` value that is not valid Unicode, is reported as a startup failure and exits nonzero rather than being silently ignored. Later milestones must log source opened, redirects, range support, selected decoder, known duration, requested and actual seek results, playback state transitions, checkpoint writes, end of track, and output failures. Per-frame logging is forbidden.
