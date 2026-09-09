@@ -1534,18 +1534,22 @@ impl Worker {
             PlaybackState::Paused
                 if lock(&self.transport).is_some() && self.requested_target.is_none() =>
             {
+                // Facts before transport (Ruling 1), even though neither lock
+                // here is ever held while the other is taken: consistent
+                // order is one less thing a future reader has to check.
+                //
+                // If the hook parked for a freeze that has not yet thawed, an
+                // explicit `Play` from the application takes over: the flag
+                // no longer describes reality once this dispatch releases the
+                // transport itself (the counterpart to `pause`'s check of the
+                // same flag, below).
+                lock(&self.facts).frozen_by_hook = false;
                 {
                     let mut guard = lock(&self.transport);
                     if let Some(core) = guard.as_mut() {
                         core.handshake.release();
                     }
                 }
-                // If the hook parked for a freeze that has not yet thawed, an
-                // explicit `Play` from the application takes over: the flag
-                // no longer describes reality once this dispatch has released
-                // the transport itself (the counterpart to `pause`'s check of
-                // the same flag, below).
-                lock(&self.facts).frozen_by_hook = false;
                 self.set_state(PlaybackState::Playing);
             }
             PlaybackState::Loading | PlaybackState::Paused | PlaybackState::Stopped => {
