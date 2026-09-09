@@ -41,7 +41,9 @@ pub enum Outcome {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ReadOutcome {
-    /// Always at least one byte. Never zero — Symphonia reads zero as EOF.
+    /// Never zero for a non-empty request — a zero-length request is
+    /// answered with zero. Symphonia reads a zero-byte result as EOF, so a
+    /// nonzero request must never be answered with `Bytes(0)`.
     Bytes(usize),
     Eof,
     /// Stop, seek or shutdown retired this read. Not a failure and not EOF.
@@ -118,20 +120,24 @@ impl SourceInterrupt {
     }
 
     /// End the current generation: drop the buffer and any pending outcome,
-    /// and wake all three kinds of waiter. Returns the generation a new fetch
-    /// must carry.
-    pub fn retire(&self) -> u64 {
-        let generation = {
+    /// and wake all three kinds of waiter.
+    ///
+    /// Returns nothing, deliberately. `retire` bumps the generation but also
+    /// leaves `retired` set, so the bumped value is dead on arrival for
+    /// anyone who might try to carry it forward: `push` rejects it on the
+    /// retired check and `is_current` reports it superseded. Only `begin`'s
+    /// return value is a generation a caller may use — the next operation
+    /// calls `begin` for it, exactly as this module's own tests do.
+    pub fn retire(&self) {
+        {
             let mut state = lock(&self.state);
             state.bytes.clear();
             state.outcome = None;
             state.headers = None;
             state.retired = true;
             state.generation += 1;
-            state.generation
-        };
+        }
         self.wake_all();
-        generation
     }
 
     /// Open a new generation: bump the counter, clear the retirement, and
@@ -317,8 +323,8 @@ impl ByteChannel {
         lock(&self.0.state).bytes.len()
     }
 
-    pub fn retire(&self) -> u64 {
-        self.0.retire()
+    pub fn retire(&self) {
+        self.0.retire();
     }
 
     /// Wait for bytes, an ending or a retirement.
@@ -337,8 +343,16 @@ impl ByteChannel {
         }
         let mut demanded = Duration::ZERO;
         let mut state = lock(&self.0.state);
+        // Captured at entry, and re-tested on every pass. A read blocked
+        // across a `retire()` + `begin()` pair would otherwise wake into the
+        // *new* generation and hand the decoder bytes from a different byte
+        // offset — silent corruption rather than an error. Today that pair
+        // only ever runs on the decode thread, which is the thread already
+        // inside this call, but nothing enforces that and the failure mode is
+        // far too quiet to rest on a scheduling accident.
+        let entered = state.generation;
         loop {
-            if state.retired {
+            if state.retired || state.generation != entered {
                 return ReadOutcome::Retired;
             }
             // Deliberately *not* gated on `frozen`. A freeze pauses playback
@@ -350,11 +364,12 @@ impl ByteChannel {
             // holding back. What the freeze does gate is the stall budget.
             if !state.bytes.is_empty() {
                 let count = state.bytes.len().min(out.len());
-                for slot in out.iter_mut().take(count) {
-                    // `pop_front` is `Some` for each of `count` iterations:
-                    // `count <= bytes.len()` was read under this guard and
-                    // nothing else can drain it.
-                    *slot = state.bytes.pop_front().unwrap_or(0);
+                // A whole-batch `drain` rather than a per-byte `pop_front`:
+                // it lowers to a memcpy pair instead of `count` bounds-checked
+                // pops, and it removes any need for a byte-substituting hedge
+                // if that count were ever wrong.
+                for (slot, byte) in out.iter_mut().zip(state.bytes.drain(..count)) {
+                    *slot = byte;
                 }
                 drop(state);
                 self.0.producer_wake.notify_waiters();

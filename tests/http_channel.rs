@@ -47,7 +47,7 @@ fn runtime() -> tokio::runtime::Runtime {
 #[test]
 fn a_read_returns_the_bytes_the_producer_pushed() {
     let interrupt = SourceInterrupt::new(CAPACITY);
-    let channel = Arc::new(ByteChannel::new(Arc::clone(&interrupt)));
+    let channel = ByteChannel::new(Arc::clone(&interrupt));
     let generation = channel.generation();
     runtime().block_on(channel.push(generation, b"hello"));
 
@@ -64,11 +64,11 @@ fn a_read_never_reports_zero_bytes_for_an_empty_buffer() {
     // Symphonia reads `Ok(0)` as clean EOF. An empty buffer is not EOF, and
     // conflating them turns a stalled network into a silently truncated track.
     let interrupt = SourceInterrupt::new(CAPACITY);
-    let channel = Arc::new(ByteChannel::new(Arc::clone(&interrupt)));
+    let channel = ByteChannel::new(Arc::clone(&interrupt));
     let generation = channel.generation();
 
     let reader = {
-        let channel = Arc::clone(&channel);
+        let channel = channel.clone();
         std::thread::spawn(move || channel.read(&mut [0u8; 16], &NoHook, STALL))
     };
     // Give the reader time to be genuinely blocked, then satisfy it.
@@ -111,7 +111,7 @@ fn a_failure_stays_a_failure_and_never_becomes_eof() {
 #[test]
 fn buffered_bytes_are_drained_before_a_pending_outcome_is_reported() {
     let interrupt = SourceInterrupt::new(CAPACITY);
-    let channel = Arc::new(ByteChannel::new(Arc::clone(&interrupt)));
+    let channel = ByteChannel::new(Arc::clone(&interrupt));
     let generation = channel.generation();
     runtime().block_on(channel.push(generation, b"tail"));
     channel.finish(generation, Outcome::Eof);
@@ -130,11 +130,11 @@ fn a_retirement_wakes_a_blocked_read_within_one_second() {
     // H9, and §8's stated bound. The server is never released: the wake must
     // come from the interrupt, not from bytes arriving.
     let interrupt = SourceInterrupt::new(CAPACITY);
-    let channel = Arc::new(ByteChannel::new(Arc::clone(&interrupt)));
+    let channel = ByteChannel::new(Arc::clone(&interrupt));
     let hook = Arc::new(CountingHook::default());
 
     let reader = {
-        let channel = Arc::clone(&channel);
+        let channel = channel.clone();
         let hook = Arc::clone(&hook);
         std::thread::spawn(move || {
             let started = Instant::now();
@@ -172,7 +172,7 @@ fn a_freeze_never_errors_a_read_and_never_starves_one() {
     // are legitimate while playback is paused and both of which need bytes.
     // A pause parks the output; it does not starve the decoder.
     let interrupt = SourceInterrupt::new(CAPACITY);
-    let channel = Arc::new(ByteChannel::new(Arc::clone(&interrupt)));
+    let channel = ByteChannel::new(Arc::clone(&interrupt));
     let generation = channel.generation();
     interrupt.freeze();
     runtime().block_on(channel.push(generation, b"ready"));
@@ -189,13 +189,13 @@ fn a_freeze_never_errors_a_read_and_never_starves_one() {
 #[test]
 fn a_frozen_read_with_no_bytes_stays_pending_rather_than_erroring() {
     let interrupt = SourceInterrupt::new(CAPACITY);
-    let channel = Arc::new(ByteChannel::new(Arc::clone(&interrupt)));
+    let channel = ByteChannel::new(Arc::clone(&interrupt));
     let hook = Arc::new(CountingHook::default());
     let generation = channel.generation();
     interrupt.freeze();
 
     let reader = {
-        let channel = Arc::clone(&channel);
+        let channel = channel.clone();
         let hook = Arc::clone(&hook);
         std::thread::spawn(move || channel.read(&mut [0u8; 16], hook.as_ref(), STALL))
     };
@@ -219,12 +219,12 @@ fn a_frozen_read_with_no_bytes_stays_pending_rather_than_erroring() {
 fn a_retirement_reaches_a_frozen_read_too() {
     // Quitting while paused must still wake every source wait (H10).
     let interrupt = SourceInterrupt::new(CAPACITY);
-    let channel = Arc::new(ByteChannel::new(Arc::clone(&interrupt)));
+    let channel = ByteChannel::new(Arc::clone(&interrupt));
     let hook = Arc::new(CountingHook::default());
     interrupt.freeze();
 
     let reader = {
-        let channel = Arc::clone(&channel);
+        let channel = channel.clone();
         let hook = Arc::clone(&hook);
         std::thread::spawn(move || channel.read(&mut [0u8; 16], hook.as_ref(), STALL))
     };
@@ -247,13 +247,13 @@ fn a_retirement_reaches_a_frozen_read_too() {
 fn the_buffer_never_exceeds_its_capacity_and_the_producer_waits() {
     // H13. A fast server against a slow consumer must not accumulate.
     let interrupt = SourceInterrupt::new(CAPACITY);
-    let channel = Arc::new(ByteChannel::new(Arc::clone(&interrupt)));
+    let channel = ByteChannel::new(Arc::clone(&interrupt));
     let generation = channel.generation();
     let chunk = [7u8; 64];
 
     let runtime = runtime();
     let pushed = {
-        let channel = Arc::clone(&channel);
+        let channel = channel.clone();
         runtime.block_on(async move { channel.push(generation, &chunk).await })
     };
     assert!(pushed);
@@ -261,7 +261,7 @@ fn the_buffer_never_exceeds_its_capacity_and_the_producer_waits() {
 
     // A second push cannot fit; it must wait rather than grow the buffer.
     let producer = {
-        let channel = Arc::clone(&channel);
+        let channel = channel.clone();
         std::thread::spawn(move || {
             let rt = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -296,7 +296,7 @@ fn a_stale_generation_can_neither_push_bytes_nor_end_the_stream() {
     // H9's second half: a superseded response's bytes and its outcome must
     // both be rejected before they can enter the new generation.
     let interrupt = SourceInterrupt::new(CAPACITY);
-    let channel = Arc::new(ByteChannel::new(Arc::clone(&interrupt)));
+    let channel = ByteChannel::new(Arc::clone(&interrupt));
     let stale = channel.generation();
     channel.retire();
     let fresh = interrupt.begin();
@@ -353,13 +353,13 @@ fn a_retirement_wakes_a_blocked_producer_too() {
     // parked on its Notify and the fetch still running. A stop that does not
     // close the fetch is not a stop.
     let interrupt = SourceInterrupt::new(64);
-    let channel = Arc::new(ByteChannel::new(Arc::clone(&interrupt)));
+    let channel = ByteChannel::new(Arc::clone(&interrupt));
     let generation = channel.generation();
     assert!(runtime().block_on(channel.push(generation, &[1u8; 64])));
     assert_eq!(channel.buffered(), 64);
 
     let producer = {
-        let channel = Arc::clone(&channel);
+        let channel = channel.clone();
         std::thread::spawn(move || {
             let rt = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -376,6 +376,10 @@ fn a_retirement_wakes_a_blocked_producer_too() {
     // The buffer is full, so the producer is provably parked.
     std::thread::sleep(Duration::from_millis(50));
     assert_eq!(channel.buffered(), 64);
+    // `buffered() == 64` alone is equally true if the producer thread never
+    // even ran: prove it is actually parked on `producer_wake`, not merely
+    // that nobody has grown the buffer yet.
+    assert!(!producer.is_finished(), "the producer never parked");
     interrupt.retire();
 
     match producer.join() {
@@ -412,6 +416,10 @@ fn a_retirement_resolves_the_fetch_tasks_cancellation() {
         })
     };
     std::thread::sleep(Duration::from_millis(50));
+    // Without this, a waiter that only entered `cancelled` after `retire()`
+    // already returned would make the test pass green even with `fetch_wake`
+    // entirely dead — the immediate-return path below would mask it.
+    assert!(!woken.is_finished(), "the waiter never parked");
     interrupt.retire();
     match woken.join() {
         Ok(elapsed) => assert!(elapsed < Duration::from_secs(1), "woke after {elapsed:?}"),
@@ -458,14 +466,14 @@ fn paused_time_is_not_charged_against_the_stall_budget() {
     // through the pause and fails the very next read with a stall the server
     // never caused.
     let interrupt = SourceInterrupt::new(CAPACITY);
-    let channel = Arc::new(ByteChannel::new(Arc::clone(&interrupt)));
+    let channel = ByteChannel::new(Arc::clone(&interrupt));
     let generation = channel.generation();
     let hook = Arc::new(CountingHook::default());
     let stall = Duration::from_millis(300);
     interrupt.freeze();
 
     let reader = {
-        let channel = Arc::clone(&channel);
+        let channel = channel.clone();
         let hook = Arc::clone(&hook);
         std::thread::spawn(move || channel.read(&mut [0u8; 16], hook.as_ref(), stall))
     };
@@ -495,12 +503,12 @@ fn a_delivery_resets_the_stall_budget() {
     // whole transfer takes. §8: ordinary playback has no whole-response
     // deadline, so the budget must measure the gap between deliveries.
     let interrupt = SourceInterrupt::new(CAPACITY);
-    let channel = Arc::new(ByteChannel::new(Arc::clone(&interrupt)));
+    let channel = ByteChannel::new(Arc::clone(&interrupt));
     let generation = channel.generation();
     let stall = Duration::from_millis(300);
 
     let feeder = {
-        let channel = Arc::clone(&channel);
+        let channel = channel.clone();
         std::thread::spawn(move || {
             let rt = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -621,4 +629,34 @@ fn a_retirement_wakes_a_blocked_header_wait_within_one_second() {
         }
         Err(_) => panic!("the waiter thread panicked"),
     }
+}
+
+#[test]
+fn a_published_header_failure_is_returned_to_the_waiter() {
+    // The failure half of the header handoff: Task 5 depends on this path to
+    // report a rejected response rather than hanging or reporting success.
+    let interrupt = SourceInterrupt::new(CAPACITY);
+    let generation = interrupt.generation();
+    let failure = RemoteFailure::Status {
+        status: 404,
+        operation: Operation::Open,
+    };
+    interrupt.publish_headers(generation, Err(failure.clone()));
+    assert_eq!(
+        interrupt.wait_for_headers(generation, &NoHook, STALL),
+        Err(HeaderOutcome::Failed(failure))
+    );
+}
+
+#[test]
+fn a_header_wait_deadline_that_elapses_fails_rather_than_hanging() {
+    let interrupt = SourceInterrupt::new(CAPACITY);
+    let generation = interrupt.generation();
+    let outcome = interrupt.wait_for_headers(generation, &NoHook, Duration::from_millis(100));
+    assert_eq!(
+        outcome,
+        Err(HeaderOutcome::Failed(RemoteFailure::Timeout {
+            phase: continuo::http::error::Phase::Headers
+        }))
+    );
 }
