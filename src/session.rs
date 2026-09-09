@@ -35,9 +35,6 @@ pub enum Action {
 
 /// The position the policy would use for a checkpoint it can no longer sample.
 struct Sample {
-    /// Not read until Task 7's pending-force resolution reconciles a stale
-    /// sample against the revision it was taken under.
-    #[allow(dead_code)]
     session_rev: u64,
     media: MediaId,
     position: Duration,
@@ -50,12 +47,23 @@ pub struct Session {
     session_rev: u64,
     playback: PlaybackState,
     current_media: Option<MediaId>,
-    /// Tracked for the current media, so a checkpoint written before any
-    /// further event still carries the right completion.
+    /// Whether `current_media` is complete, so a checkpoint written before any
+    /// further event still carries the right completion. The pair moves through
+    /// `adopt_media` and nowhere else; every other write here changes the flag
+    /// for a media that is not moving.
     completed: bool,
     last_sample: Option<Sample>,
     /// Monotonic anchor for the 5 s rule; set when playback establishes.
     last_capture: Option<Instant>,
+    /// Raised by an event that forces a checkpoint but carries no position,
+    /// keyed by the revision that event carried (D13).
+    pending_force: Option<u64>,
+    /// A stopped seek's target, which supersedes `Progress.position` until the
+    /// engine resolves it (D17).
+    outstanding_target: Option<Duration>,
+    /// Whether playback established, or the position changed explicitly, since
+    /// the current media was loaded. Gates the shutdown checkpoint (D20).
+    established: bool,
 }
 
 impl Session {
@@ -70,22 +78,54 @@ impl Session {
             completed: false,
             last_sample: None,
             last_capture: None,
+            pending_force: None,
+            outstanding_target: None,
+            established: false,
         }
     }
 
     pub fn observe(&mut self, event: &PlaybackEvent, now: ClockSample) -> Action {
-        self.session_rev = event.session_rev();
+        let session_rev = event.session_rev();
+        self.session_rev = session_rev;
+        // A newer revision re-keys a pending force rather than dropping it:
+        // `rebuild` bumps the revision on device recovery with the position
+        // continuous across it, so the force is still answerable — and dropping
+        // it would lose a real pause for good, since no ordinary trigger fires
+        // while paused. `Loaded` is the one exception, retired in `on_loaded`.
+        if self.pending_force.is_some() {
+            self.pending_force = Some(session_rev);
+        }
 
         match event {
             PlaybackEvent::Loaded {
                 media, position, ..
             } => self.on_loaded(media, *position, now),
             PlaybackEvent::StateChanged { state, .. } => self.on_state(*state, now),
+            PlaybackEvent::SeekCompleted { .. } => {
+                self.resolve_target();
+                self.established = true;
+                self.completed = false;
+                self.pending_force = Some(session_rev);
+                Action::None
+            }
+            PlaybackEvent::SeekTargetStored { target, .. } => {
+                self.outstanding_target = Some(*target);
+                self.established = true;
+                // §12 has a seek clear completion, and a stopped seek is the
+                // same listener intent one step earlier: a target persisted
+                // beside `completed` would be thrown away by the resume it
+                // exists to steer.
+                self.completed = false;
+                self.record_current(*target, now);
+                self.submit(Urgency::Forced)
+            }
             PlaybackEvent::VolumeChanged { volume, .. } => {
                 self.state.set_volume(*volume);
                 self.submit(Urgency::Ordinary)
             }
             PlaybackEvent::EndOfTrack { position, .. } => {
+                self.resolve_target();
+                self.established = true;
                 self.completed = true;
                 self.record_current(*position, now);
                 self.submit(Urgency::Forced)
@@ -109,6 +149,17 @@ impl Session {
             position: progress.position,
         });
 
+        // The sample the pending force has been waiting for. §3's pass ordering
+        // makes it newer than the transition that raised the force, so this is
+        // a resolution rather than a delay (D13).
+        if self.pending_force == Some(progress.session_rev) {
+            self.pending_force = None;
+            self.last_capture = Some(now.monotonic);
+            let position = self.position_for(progress.position);
+            self.record_current(position, now);
+            return self.submit(Urgency::Forced);
+        }
+
         if self.playback != PlaybackState::Playing {
             return Action::None;
         }
@@ -124,12 +175,31 @@ impl Session {
     }
 
     fn on_state(&mut self, state: PlaybackState, now: ClockSample) -> Action {
+        let previous = self.playback;
         self.playback = state;
-        if state == PlaybackState::Playing {
-            // §12: a successful establishment after a completed state clears
-            // it. Persistence restoration alone does not.
-            self.completed = false;
-            self.last_capture = Some(now.monotonic);
+        match state {
+            PlaybackState::Playing => {
+                // The engine can resolve a stored target by *discarding* it:
+                // `restart()` clears it, seeks to zero and lands here with no
+                // SeekCompleted ever emitted (D17).
+                self.resolve_target();
+                self.established = true;
+                // §12: a successful establishment after a completed state
+                // clears it. Persistence restoration alone does not.
+                self.completed = false;
+                self.last_capture = Some(now.monotonic);
+            }
+            // A pause that interrupts no playback is not a checkpoint: every
+            // launch emits one before the queued Play is dispatched.
+            PlaybackState::Paused if previous == PlaybackState::Playing => {
+                self.pending_force = Some(self.session_rev);
+            }
+            // `do_stop` returns early from Idle, Stopped and Failed, so this
+            // event only exists when something was actually running.
+            PlaybackState::Stopped => {
+                self.pending_force = Some(self.session_rev);
+            }
+            _ => {}
         }
         Action::None
     }
@@ -141,40 +211,104 @@ impl Session {
     /// unnecessary, since the snapshot is the whole state.
     fn on_loaded(&mut self, media: &MediaId, position: Duration, now: ClockSample) -> Action {
         let switching = self.current_media.as_ref() != Some(media);
-        if !switching {
-            self.last_sample = Some(Sample {
-                session_rev: self.session_rev,
-                media: media.clone(),
-                position,
-            });
-            return Action::None;
-        }
 
-        // §3: `load()` overwrites the engine's position with `start_at` before
-        // anything publishes, so the outgoing media's final position is only
-        // reachable from what the session retained.
-        if let Some(previous) = self.last_sample.take() {
-            let completed = self.completed;
+        // Recorded before anything resets, and through `position_for`: a
+        // stopped seek's target is the outgoing media's real position, and
+        // clearing it first would write the pre-seek sample back over it. A
+        // completed entry is left alone entirely — `EndOfTrack` already
+        // recorded the position D1 retains, and `last_sample` can only be
+        // behind it.
+        let outgoing = if switching {
+            self.last_sample.take()
+        } else {
+            None
+        };
+        if let Some(previous) = outgoing
+            && !self.completed
+        {
+            // §3: `load()` overwrites the engine's own position with `start_at`
+            // before anything publishes, so this is the only place the outgoing
+            // media's final position still exists.
+            let position = self.position_for(previous.position);
             self.state.record(
                 &PlaybackCheckpoint {
                     media: previous.media,
-                    position: previous.position,
+                    position,
                     updated_at: now.wall,
                 },
-                completed,
+                false,
             );
         }
 
-        self.current_media = Some(media.clone());
-        self.state.current_media = Some(media.clone());
-        self.completed = self.state.completed_for(media);
+        // Only now: a force raised against the previous media cannot answer for
+        // this one, and none of these carry across a load.
+        self.pending_force = None;
+        self.resolve_target();
+        self.established = false;
+        self.last_capture = None;
+
+        let completed = self.state.completed_for(media);
+        self.adopt_media(media.clone(), completed);
         self.last_sample = Some(Sample {
             session_rev: self.session_rev,
             media: media.clone(),
             position,
         });
-        self.last_capture = None;
-        self.submit(Urgency::Forced)
+
+        if switching {
+            self.submit(Urgency::Forced)
+        } else {
+            Action::None
+        }
+    }
+
+    /// The only write path for the current media and its completion. Nothing in
+    /// the type system keeps two sibling fields in step, so this method exists
+    /// to make sure no edit can move `current_media` without deciding
+    /// `completed` in the same breath.
+    fn adopt_media(&mut self, media: MediaId, completed: bool) {
+        self.current_media = Some(media.clone());
+        self.state.current_media = Some(media);
+        self.completed = completed;
+    }
+
+    /// The engine has taken the stopped seek's target somewhere the sampled
+    /// position can be trusted again — by adopting it, or by discarding it.
+    fn resolve_target(&mut self) {
+        self.outstanding_target = None;
+    }
+
+    /// A stopped seek stores a target and leaves the engine's position where it
+    /// was, so any position-derived checkpoint that follows would write the
+    /// pre-seek value back over it (D17).
+    fn position_for(&self, sampled: Duration) -> Duration {
+        self.outstanding_target.unwrap_or(sampled)
+    }
+
+    /// The final snapshot. Records a checkpoint for the current media only once
+    /// something established since it was loaded (D20), and never a position
+    /// from a session the policy was not tracking.
+    pub fn shutdown_snapshot(&mut self, progress: &Progress, now: ClockSample) -> PersistedState {
+        let Some(media) = self.current_media.clone() else {
+            return self.state.clone();
+        };
+        if !self.established {
+            return self.state.clone();
+        }
+        let sampled = if progress.session_rev == self.session_rev {
+            Some(progress.position)
+        } else {
+            self.last_sample
+                .as_ref()
+                .filter(|sample| sample.session_rev == self.session_rev && sample.media == media)
+                .map(|sample| sample.position)
+        };
+        let Some(sampled) = sampled else {
+            return self.state.clone();
+        };
+        let position = self.position_for(sampled);
+        self.record_current(position, now);
+        self.state.clone()
     }
 
     fn record_current(&mut self, position: Duration, now: ClockSample) {
