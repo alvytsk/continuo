@@ -6,11 +6,13 @@ use symphonia::core::audio::GenericAudioBufferRef;
 use symphonia::core::codecs::audio::{AudioDecoder, AudioDecoderOptions};
 use symphonia::core::formats::probe::Hint;
 use symphonia::core::formats::{FormatOptions, FormatReader, SeekMode, SeekTo, TrackType};
-use symphonia::core::io::MediaSourceStream;
+use symphonia::core::io::{MediaSource, MediaSourceStream, MediaSourceStreamOptions};
 use symphonia::core::meta::{MetadataOptions, StandardTag};
 use symphonia::core::units::{TimeBase, Timestamp};
 
-use crate::media::capabilities::{Continuity, MediaCapabilities, SeekSupport};
+use crate::media::capabilities::{
+    Continuity, DemuxerSeek, MediaCapabilities, SeekSupport, SourceEvidence,
+};
 use crate::media::id::AbsolutePath;
 use crate::media::metadata::MediaMetadata;
 
@@ -38,6 +40,11 @@ pub struct DecodedSource {
     /// trimmed during seek refinement) that `next_planar` should hand out
     /// before pulling a new packet from the reader.
     pending: bool,
+    /// What the caller established about this source independent of the
+    /// decoder — byte length, byte seekability, liveness, and whether the
+    /// demuxer's own seek has been demonstrated. `capabilities()` folds this
+    /// with what the decoder alone can tell.
+    evidence: SourceEvidence,
 }
 
 // `FormatReader` and `AudioDecoder` are trait objects that do not implement
@@ -74,11 +81,40 @@ impl DecodedSource {
             path: owned.clone(),
             source,
         })?;
-        let mss = MediaSourceStream::new(Box::new(file), Default::default());
         let mut hint = Hint::new();
         if let Some(extension) = owned.extension().and_then(|e| e.to_str()) {
             hint.with_extension(extension);
         }
+        let evidence = SourceEvidence {
+            byte_len: Some(metadata_fs.len()),
+            byte_seekable: true,
+            live: false,
+            // Not an assumption: M1 already ships this guarantee for the four
+            // formats M1 supports, and `tests/decode_fixtures.rs` re-proves it
+            // on every run.
+            demuxer: DemuxerSeek::Proven,
+        };
+        Self::from_media_source(Box::new(file), hint, owned, evidence)
+    }
+
+    /// Open over any `MediaSource`, with the supplied evidence folded into the
+    /// capabilities the decoder alone cannot establish.
+    ///
+    /// `label` is the path (local) or redacted origin (remote) carried purely
+    /// for diagnostics — `UnsupportedInput`'s `path` field and this source's
+    /// own `path()` accessor.
+    pub fn from_media_source(
+        source: Box<dyn MediaSource>,
+        hint: Hint,
+        label: PathBuf,
+        evidence: SourceEvidence,
+    ) -> Result<Self, PlaybackError> {
+        let mss = MediaSourceStream::new(
+            source,
+            MediaSourceStreamOptions {
+                buffer_len: 64 * 1024,
+            },
+        );
         let mut reader = symphonia::default::get_probe()
             .probe(
                 &hint,
@@ -90,7 +126,7 @@ impl DecodedSource {
 
         let track = reader.default_track(TrackType::Audio).ok_or_else(|| {
             PlaybackError::UnsupportedInput {
-                path: owned.clone(),
+                path: label.clone(),
                 reason: "no audio track".into(),
             }
         })?;
@@ -108,13 +144,13 @@ impl DecodedSource {
             .as_ref()
             .and_then(|params| params.audio())
             .ok_or_else(|| PlaybackError::UnsupportedInput {
-                path: owned.clone(),
+                path: label.clone(),
                 reason: "no audio codec parameters".into(),
             })?;
         let sample_rate = params
             .sample_rate
             .ok_or_else(|| PlaybackError::UnsupportedInput {
-                path: owned.clone(),
+                path: label.clone(),
                 reason: "unknown sample rate".into(),
             })?;
         let channels = params
@@ -124,7 +160,7 @@ impl DecodedSource {
             .unwrap_or(0);
         if channels == 0 || channels > 2 {
             return Err(PlaybackError::UnsupportedInput {
-                path: owned,
+                path: label,
                 reason: format!("{channels} channels; M1 supports mono and stereo"),
             });
         }
@@ -141,7 +177,7 @@ impl DecodedSource {
         });
 
         Ok(Self {
-            path: owned,
+            path: label,
             reader,
             decoder,
             track_id,
@@ -152,6 +188,7 @@ impl DecodedSource {
             planes: vec![Vec::new(); usize::from(channels)],
             cursor: 0,
             pending: false,
+            evidence,
         })
     }
 
@@ -159,16 +196,35 @@ impl DecodedSource {
         &self.metadata
     }
 
-    /// Local files are finite and, for every format M1 ships, natively seekable.
+    /// Capabilities the decoder can establish *on its own*. The engine combines
+    /// these with transport evidence: HTTP range support alone does not prove
+    /// that a particular container can seek in media time (§4).
     pub fn capabilities(&self) -> MediaCapabilities {
         MediaCapabilities {
-            continuity: if self.metadata.duration.is_some() {
+            // Live evidence is checked *first*. A shoutcast server that also
+            // sends a Content-Length would otherwise come back Finite and be
+            // played as a recording — and `prepare` would never see the
+            // `Indefinite` it refuses live media on, so the refusal path would
+            // be unreachable.
+            continuity: if self.evidence.live {
+                Continuity::Indefinite
+            } else if self.evidence.byte_len.is_some() || self.metadata.duration.is_some() {
                 Continuity::Finite
             } else {
                 Continuity::Unresolved
             },
-            seek: SeekSupport::Native,
+            seek: match (self.evidence.byte_seekable, self.evidence.demuxer) {
+                (true, DemuxerSeek::Proven) => SeekSupport::Native,
+                (true, DemuxerSeek::Unproven) => SeekSupport::Unknown,
+                (false, _) => SeekSupport::Unsupported,
+            },
         }
+    }
+
+    /// Called once a trial seek (Task 10) demonstrates the demuxer can seek in
+    /// media time, promoting `SeekSupport::Unknown` to `Native`.
+    pub fn note_demuxer_proven(&mut self) {
+        self.evidence.demuxer = DemuxerSeek::Proven;
     }
 
     pub fn sample_rate(&self) -> u32 {
