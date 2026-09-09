@@ -35,7 +35,7 @@ use continuo::playback::callback::CallbackCore;
 use continuo::playback::command::PlaybackCommand;
 use continuo::playback::engine::EngineHandle;
 use continuo::playback::error::PlaybackError;
-use continuo::playback::event::{PlaybackEvent, Progress};
+use continuo::playback::event::{PlaybackEvent, Progress, ShutdownReport};
 use continuo::playback::link::{OutputLink, Phase};
 use continuo::playback::output::cpal_output::OutputFault;
 use continuo::playback::output::test_output::TestOutput;
@@ -82,6 +82,18 @@ fn fixture(name: &str) -> AbsolutePath {
         .join("tests/fixtures")
         .join(name);
     AbsolutePath::new(path.canonicalize().unwrap()).unwrap()
+}
+
+/// A `MediaId` for a local file that need not exist, for tests that only care
+/// about identity. Shared across the persistence and session test files
+/// rather than duplicated in each.
+pub fn media(name: &str) -> MediaId {
+    // A bare helper, so it handles its own error: the lint exemption stops at
+    // the `#[test]` boundary.
+    match AbsolutePath::new(format!("/music/{name}.flac").into()) {
+        Ok(path) => MediaId::LocalFile(path),
+        Err(error) => panic!("a literal absolute path must parse: {error}"),
+    }
 }
 
 struct Device {
@@ -176,6 +188,15 @@ pub struct TestEngine {
 
 impl TestEngine {
     pub fn start(name: &str) -> Self {
+        let engine = Self::start_at(name, Duration::ZERO);
+        // The events a start-up emits are not what any test is looking at.
+        lock(&engine.inbox).clear();
+        engine
+    }
+
+    /// A start that resumes at `start_at`. Deliberately does **not** clear the
+    /// inbox: the `Loaded` it produces is the subject of the resume tests.
+    pub fn start_at(name: &str, start_at: Duration) -> Self {
         let device = Arc::new(Mutex::new(Device {
             output: TestOutput::new(CHANNELS, RATE, BUFFER_FRAMES, LATENCY),
             link: None,
@@ -222,13 +243,11 @@ impl TestEngine {
         engine.send(PlaybackCommand::Load {
             media: MediaId::LocalFile(path.clone()),
             source: SourceLocation::LocalPath(path.as_path().to_path_buf()),
-            start_at: Duration::ZERO,
+            start_at,
         });
         engine.await_state(PlaybackState::Paused);
         engine.send(PlaybackCommand::Play);
         engine.await_state(PlaybackState::Playing);
-        // The events a start-up emits are not what any test is looking at.
-        lock(&engine.inbox).clear();
         engine
     }
 
@@ -325,6 +344,32 @@ impl TestEngine {
     pub fn drop_event_receiver(&self) {
         if let Some(handle) = lock(&self.handle).as_mut() {
             handle.release_events();
+        }
+    }
+
+    /// Interrupt and join, handing back what the engine captured on its way
+    /// out. `Drop` then finds the handle already taken and skips its own join.
+    pub fn shutdown_report(&mut self) -> Option<ShutdownReport> {
+        let handle = lock(&self.handle).take()?;
+        handle.interrupt_shutdown();
+        Some(handle.join())
+    }
+
+    /// Block until the worker has taken every queued command.
+    ///
+    /// The shutdown interrupt is checked at the **top** of the worker's pass,
+    /// before it reads any command, so a test that sends and interrupts in the
+    /// same breath is asking about events that were never produced. Commands
+    /// are dispatched in the same pass they are received, so an empty channel
+    /// means the work is done — what is still open, deliberately, is whether
+    /// the events it produced have been flushed yet.
+    pub fn await_commands_taken(&mut self) {
+        let deadline = Instant::now() + PATIENCE;
+        while self.pending_commands() > 0 {
+            if Instant::now() >= deadline {
+                panic!("the worker never took the queued commands");
+            }
+            std::thread::sleep(Duration::from_millis(1));
         }
     }
 
@@ -769,4 +814,58 @@ pub fn failed_load_position(
     handle.interrupt_shutdown();
     handle.join();
     (state, progress.position)
+}
+
+/// A session whose device refuses to open: `Loaded` goes out, then negotiation
+/// rejects the channel count and the load fails. Hands back what `app::run`
+/// would have — every event, in order, and the final `Progress`.
+///
+/// Deliberately not a `TestEngine`: the engine never reaches `Paused` here, so
+/// there is no transport to drive and nothing for a driver thread to do.
+pub fn failed_device_session(name: &str, channels: u16, start_at: Duration) -> ShutdownReport {
+    let device = Arc::new(Mutex::new(Device {
+        output: TestOutput::new(channels, RATE, BUFFER_FRAMES, LATENCY),
+        link: None,
+    }));
+    // Held for the call's duration, so the worker's fault receiver stays live.
+    let (_faults, fault_rx) = crossbeam_channel::bounded(16);
+    let handle = EngineHandle::spawn_with(
+        Box::new(HarnessOutput {
+            device: Arc::clone(&device),
+        }),
+        fault_rx,
+    );
+    let path = fixture(name);
+    let sent = handle.commands().send(PlaybackCommand::Load {
+        media: MediaId::LocalFile(path.clone()),
+        source: SourceLocation::LocalPath(path.as_path().to_path_buf()),
+        start_at,
+    });
+    if sent.is_err() {
+        panic!("the engine stopped accepting commands");
+    }
+
+    let mut events = Vec::new();
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        while let Ok(event) = handle.events().try_recv() {
+            events.push(event);
+        }
+        if events
+            .iter()
+            .any(|event| matches!(event, PlaybackEvent::Failed { .. }))
+        {
+            break;
+        }
+        if Instant::now() >= deadline {
+            panic!("the load never failed; saw {events:?}");
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    handle.interrupt_shutdown();
+    let mut report = handle.join();
+    events.extend(std::mem::take(&mut report.events));
+    report.events = events;
+    report
 }

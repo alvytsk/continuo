@@ -8,7 +8,7 @@ use std::{
 };
 use url::Url;
 
-#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct AbsolutePath(String);
 
 impl AbsolutePath {
@@ -51,7 +51,7 @@ impl AbsolutePath {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct NormalizedUrl(String);
 
 impl NormalizedUrl {
@@ -74,7 +74,7 @@ impl NormalizedUrl {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct FeedId(String);
 
 impl FeedId {
@@ -90,10 +90,10 @@ impl FeedId {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct EpisodeKey(EpisodeIdentity);
 
-#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 enum EpisodeIdentity {
     Guid(String),
     Url(NormalizedUrl),
@@ -124,7 +124,7 @@ impl EpisodeKey {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 #[serde(into = "String", try_from = "String")]
 pub enum MediaId {
     LocalFile(AbsolutePath),

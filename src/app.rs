@@ -1,6 +1,7 @@
 //! The `continuo play` application: argument-to-path resolution, terminal
 //! setup, and the key-driven status loop around [`EngineHandle`].
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -9,8 +10,13 @@ use crossterm::terminal::{Clear, ClearType};
 use crossterm::{cursor, execute};
 
 use crate::cli::{self, CliCommand};
+use crate::clock::{Clock, SystemClock};
 use crate::media::id::{AbsolutePath, MediaId};
 use crate::media::source::SourceLocation;
+use crate::persistence::PersistenceError;
+use crate::persistence::model::PersistedState;
+use crate::persistence::store::{LoadReason, StateStore};
+use crate::persistence::writer::{ShutdownOutcome, StateSink, Urgency, WriterHandle};
 use crate::playback::command::PlaybackCommand;
 use crate::playback::decode::DecodedSource;
 use crate::playback::engine::EngineHandle;
@@ -19,6 +25,7 @@ use crate::playback::event::PlaybackEvent;
 use crate::playback::state::PlaybackState;
 use crate::playback::timeline::PositionQuality;
 use crate::playback::volume::Volume;
+use crate::session::{Action, ResumeDecision, Session, decide_resume};
 
 const SEEK_STEP_SECS: i64 = 10;
 const VOLUME_STEP: f32 = 0.05;
@@ -57,21 +64,38 @@ pub fn run(cli: cli::Cli) -> Result<(), PlaybackError> {
         );
         return Ok(());
     }
+    // Kept before the probe is dropped: §11 validates a stored position against
+    // the duration this probe already reports, so the resume opens no file of
+    // its own.
+    let duration = probed.metadata().duration;
     drop(probed);
 
+    // Persistence opens before the engine: the start position is an argument to
+    // the load, and the restored volume is a command that precedes it.
+    let media = MediaId::LocalFile(absolute.clone());
+    let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+    let Persistence {
+        mut session,
+        mut writer,
+        start_at,
+        volume,
+        persisting,
+    } = open_persistence(platform_store(&clock), &media, duration, &clock);
+
     let engine = EngineHandle::spawn_cpal();
-    let _raw = RawModeGuard::enable()?; // Drop restores the terminal on every exit path.
+    // Dropped explicitly by the shutdown sequence, before the flush waits on
+    // the disk; its `Drop` is what covers a panic.
+    let raw = RawModeGuard::enable()?;
     let mut mirror = Mirror::default();
 
-    engine
-        .commands()
-        .send(PlaybackCommand::Load {
-            media: MediaId::LocalFile(absolute.clone()),
-            source: SourceLocation::LocalPath(absolute.as_path().to_path_buf()),
-            start_at: Duration::ZERO,
-        })
-        .ok();
-    engine.commands().send(PlaybackCommand::Play).ok();
+    for command in resume_commands(
+        media,
+        SourceLocation::LocalPath(absolute.as_path().to_path_buf()),
+        start_at,
+        volume,
+    ) {
+        engine.commands().send(command).ok();
+    }
 
     let outcome = loop {
         match crossterm::event::poll(Duration::from_millis(100)) {
@@ -102,6 +126,8 @@ pub fn run(cli: cli::Cli) -> Result<(), PlaybackError> {
             if let PlaybackEvent::Failed { message, .. } = &event {
                 failure = Some(message.clone());
             }
+            // `observe` borrows the event, so the mirror still consumes it.
+            submit(&writer, session.observe(&event, clock.sample()));
             mirror.apply(event);
         }
         if let Some(message) = failure {
@@ -115,11 +141,17 @@ pub fn run(cli: cli::Cli) -> Result<(), PlaybackError> {
         // snapshot published a tick earlier; the guard correctly skips
         // rendering the snapshot for that tick.
         let progress = engine.progress();
+        submit(&writer, session.tick(&progress, clock.sample()));
         if progress.session_rev == mirror.session_rev {
             mirror.position = progress.position;
             mirror.quality = progress.quality;
         }
-        render(&mirror)?;
+        // A terminal write failure is not a reason to skip the final
+        // checkpoint, so it becomes the loop's outcome instead of returning
+        // from here and bypassing the flush path (D18).
+        if let Err(error) = render(&mirror) {
+            break Err(error);
+        }
     };
 
     // Out of band first, and in band only as a courtesy. The worker stops
@@ -130,12 +162,205 @@ pub fn run(cli: cli::Cli) -> Result<(), PlaybackError> {
     // guaranteed to be seen.
     engine.interrupt_shutdown();
     engine.commands().send(PlaybackCommand::Shutdown).ok();
-    engine.join();
+    let report = engine.join();
+
+    // The events the loop never drained are replayed through the policy before
+    // the snapshot is taken, so the snapshot comes from a session that has seen
+    // everything the run produced (D19).
+    writer.submit(
+        session.reconcile_shutdown(&report, clock.sample()),
+        Urgency::Forced,
+    );
+
+    // Restore the terminal before waiting on the disk, so the writer's bound is
+    // never spent with the terminal still raw.
+    drop(raw);
+    report_flush(writer.shutdown(), persisting);
     outcome
 }
 
-/// Installs raw mode and restores it on drop, so a `?` anywhere in the loop
-/// above — or a panic — cannot leave the terminal raw.
+/// §11's initial command sequence. Volume first: the engine accepts it with no
+/// transport, and a transport created later adopts the stored gain — so the
+/// restored level is in force from the first buffer rather than after it.
+/// Nothing about the sequence is conditional; a session with no stored volume
+/// issues the same command with the default.
+fn resume_commands(
+    media: MediaId,
+    source: SourceLocation,
+    start_at: Duration,
+    volume: Volume,
+) -> [PlaybackCommand; 3] {
+    [
+        PlaybackCommand::SetVolume(volume),
+        PlaybackCommand::Load {
+            media,
+            source,
+            start_at,
+        },
+        PlaybackCommand::Play,
+    ]
+}
+
+/// Writing is off for this session — an unsupported file, a quarantine that
+/// could not be performed, or no state directory at all. The session runs
+/// normally with in-memory state; only the disk write is suppressed, and the
+/// reason has already been logged once (D3).
+struct DisabledSink;
+
+impl StateSink for DisabledSink {
+    fn write(&self, _state: &PersistedState) -> Result<(), PersistenceError> {
+        Ok(())
+    }
+}
+
+struct Persistence {
+    session: Session,
+    writer: WriterHandle,
+    start_at: Duration,
+    volume: Volume,
+    /// Whether anything this session submits can reach the disk. A disabled
+    /// sink reports every write as a success, deliberately — the writer must
+    /// not count a disable as a failure (D11) — so this is what keeps the
+    /// shutdown log from claiming a write that never happened.
+    persisting: bool,
+}
+
+/// The store on the platform's state path, or `None` when the platform offers
+/// no state directory at all. Path discovery is kept out of `open_persistence`
+/// so that everything downstream of it — the load classification, the resume
+/// decision, the sink selection — can be driven from a store in a tempdir, and
+/// so that `platform_path` keeps exactly one caller in the program (§13).
+fn platform_store(clock: &Arc<dyn Clock>) -> Option<StateStore> {
+    match StateStore::platform_path() {
+        Ok(path) => Some(StateStore::new(path, Arc::clone(clock))),
+        Err(error) => {
+            tracing::warn!(%error, "no state directory; this session will not be persisted");
+            None
+        }
+    }
+}
+
+fn open_persistence(
+    store: Option<StateStore>,
+    media: &MediaId,
+    duration: Option<Duration>,
+    clock: &Arc<dyn Clock>,
+) -> Persistence {
+    let (state, writable) = match &store {
+        Some(store) => {
+            let outcome = store.load();
+            match &outcome.reason {
+                LoadReason::Loaded => tracing::debug!(path = ?store.path(), "state restored"),
+                LoadReason::Missing => tracing::debug!(path = ?store.path(), "no state yet"),
+                LoadReason::Quarantined { moved_to } => {
+                    tracing::warn!(
+                        ?moved_to,
+                        "state file was unreadable and has been moved aside"
+                    );
+                }
+                LoadReason::QuarantineFailed => {
+                    tracing::warn!(
+                        "state file is unreadable and could not be moved aside; not writing"
+                    );
+                }
+                LoadReason::UnsupportedVersion { found } => {
+                    tracing::warn!(
+                        found,
+                        "state file is from a newer build; preserving it and not writing"
+                    );
+                }
+                LoadReason::Unreadable => {
+                    tracing::warn!("state file could not be read; preserving it and not writing");
+                }
+            }
+            (outcome.state, outcome.writable)
+        }
+        None => (PersistedState::default(), false),
+    };
+
+    let decision = decide_resume(state.entry_for(media), duration);
+    match decision {
+        ResumeDecision::NoEntry => tracing::debug!("no stored position for this media"),
+        ResumeDecision::Completed => tracing::info!("resume declined: this media is completed"),
+        ResumeDecision::AtStart => {}
+        ResumeDecision::Resume(position) => tracing::info!(?position, "resume position selected"),
+        ResumeDecision::DegenerateEnd => {
+            tracing::debug!("stored position is exactly the end; starting over");
+        }
+        ResumeDecision::StalePastEnd => {
+            tracing::warn!("stored position is past the end of this media");
+        }
+        ResumeDecision::Unvalidated(position) => {
+            tracing::info!(
+                ?position,
+                "duration unknown; stored position retained unvalidated"
+            );
+        }
+    }
+
+    let start_at = decision.start_at();
+    let volume = state.volume();
+    let sink: Box<dyn StateSink> = match (store, writable) {
+        (Some(store), true) => Box::new(store),
+        _ => Box::new(DisabledSink),
+    };
+
+    Persistence {
+        session: Session::new(state),
+        writer: WriterHandle::spawn(sink, Arc::clone(clock)),
+        start_at,
+        volume,
+        persisting: writable,
+    }
+}
+
+fn submit(writer: &WriterHandle, action: Action) {
+    if let Action::Submit { state, urgency } = action {
+        writer.submit(state, urgency);
+    }
+}
+
+/// What the flush is reported as, decided apart from the logging so that the
+/// one branch that exists to prevent a dishonest line can be asserted rather
+/// than read.
+enum FlushReport {
+    Written,
+    Failed(PersistenceError),
+    Unconfirmed,
+    /// Nothing was ever going to reach the disk this session.
+    Disabled,
+}
+
+/// A disabled sink reports every write as a success, deliberately — the writer
+/// must not count a deliberate disable as a failure (D11) — so a session that
+/// was not persisting reaches `Written` having written nothing. The outcome
+/// alone must therefore never be reported as a checkpoint that landed.
+fn classify_flush(outcome: ShutdownOutcome, persisting: bool) -> FlushReport {
+    if !persisting {
+        return FlushReport::Disabled;
+    }
+    match outcome {
+        ShutdownOutcome::Written => FlushReport::Written,
+        ShutdownOutcome::Failed(error) => FlushReport::Failed(error),
+        ShutdownOutcome::Unconfirmed => FlushReport::Unconfirmed,
+    }
+}
+
+fn report_flush(outcome: ShutdownOutcome, persisting: bool) {
+    match classify_flush(outcome, persisting) {
+        FlushReport::Written => tracing::debug!("final checkpoint written"),
+        FlushReport::Failed(error) => tracing::warn!(%error, "final checkpoint failed"),
+        FlushReport::Unconfirmed => tracing::warn!("final checkpoint UNCONFIRMED"),
+        FlushReport::Disabled => {
+            tracing::debug!("persistence is disabled for this session; no checkpoint was written");
+        }
+    }
+}
+
+/// Installs raw mode and restores it on drop. `run` drops it explicitly, so the
+/// writer's shutdown bound is never spent with the terminal still raw; the
+/// `Drop` covers a panic, which is the only way out of the loop above that does
+/// not reach that line.
 struct RawModeGuard;
 
 impl RawModeGuard {
@@ -184,12 +409,13 @@ impl Mirror {
                 session_rev,
                 media,
                 metadata,
+                position,
                 ..
             } => {
                 self.session_rev = session_rev;
                 self.name = Some(display_name(&media));
                 self.duration = metadata.duration;
-                self.position = Duration::ZERO;
+                self.position = position;
                 self.quality = PositionQuality::Exact;
                 self.state = PlaybackState::Loading;
             }
@@ -322,6 +548,10 @@ fn format_hms(duration: Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clock::FakeClock;
+    use crate::media::capabilities::{Continuity, MediaCapabilities, SeekSupport};
+    use crate::media::metadata::MediaMetadata;
+    use crate::playback::checkpoint::PlaybackCheckpoint;
 
     fn press(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::empty())
@@ -366,5 +596,225 @@ mod tests {
         // lowers it: an unshifted key exists for each.
         assert!(volume_after(KeyCode::Char('='), 0.5).is_some());
         assert!(volume_after(KeyCode::Char('-'), 0.5).is_some());
+    }
+
+    fn local(path: &str) -> MediaId {
+        match AbsolutePath::new(path.into()) {
+            Ok(path) => MediaId::LocalFile(path),
+            Err(error) => panic!("a literal absolute path must parse: {error}"),
+        }
+    }
+
+    /// The user-visible half of a resume: the listener sees the restored
+    /// position the moment the track opens, not after the first progress tick.
+    /// `Loaded` is the only event that carries it.
+    #[test]
+    fn a_resumed_position_is_shown_as_soon_as_the_track_opens() {
+        let mut mirror = Mirror::default();
+        mirror.apply(PlaybackEvent::Loaded {
+            session_rev: 3,
+            media: local("/music/sonata.flac"),
+            metadata: MediaMetadata {
+                title: None,
+                duration: Some(Duration::from_secs(300)),
+            },
+            capabilities: MediaCapabilities {
+                continuity: Continuity::Finite,
+                seek: SeekSupport::Native,
+            },
+            position: Duration::from_secs(93),
+        });
+
+        assert_eq!(mirror.position, Duration::from_secs(93));
+        assert_eq!(mirror.quality, PositionQuality::Exact);
+        assert!(
+            status_line(&mirror).contains("00:01:33"),
+            "the resumed position is on the first line drawn, not 00:00:00: {}",
+            status_line(&mirror)
+        );
+    }
+
+    /// §11: the restored level has to be in force from the first buffer, which
+    /// is only true if the volume command precedes the load. Pinned on the
+    /// sequence itself — two commands the engine applied in order leave no
+    /// trace of that order in the events it emits, so nothing downstream can
+    /// check this.
+    #[test]
+    fn the_resume_sequence_restores_volume_before_it_loads() {
+        let commands = resume_commands(
+            local("/music/sonata.flac"),
+            SourceLocation::LocalPath("/music/sonata.flac".into()),
+            Duration::from_secs(93),
+            Volume::new(0.25),
+        );
+
+        match &commands {
+            [
+                PlaybackCommand::SetVolume(volume),
+                PlaybackCommand::Load { start_at, .. },
+                PlaybackCommand::Play,
+            ] => {
+                assert_eq!(*volume, Volume::new(0.25), "the stored gain, unchanged");
+                assert_eq!(*start_at, Duration::from_secs(93), "the decided start");
+            }
+            other => panic!("volume must be issued before the load: {other:?}"),
+        }
+    }
+
+    /// A store in a tempdir. Nothing in these tests reaches `$HOME`:
+    /// `platform_path` is called by `run` and by nothing else, which is exactly
+    /// what hoisting it out of `open_persistence` buys.
+    fn store_at(path: &std::path::Path) -> (StateStore, Arc<dyn Clock>) {
+        let clock: Arc<dyn Clock> = Arc::new(FakeClock::new());
+        (
+            StateStore::new(path.to_path_buf(), Arc::clone(&clock)),
+            clock,
+        )
+    }
+
+    #[test]
+    fn a_stored_entry_decides_the_start_position_and_the_restored_volume() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, clock) = store_at(&dir.path().join("state.json"));
+        let media = local("/music/sonata.flac");
+        let mut stored = PersistedState::default();
+        stored.set_volume(Volume::new(0.25));
+        stored.record(
+            &PlaybackCheckpoint {
+                media: media.clone(),
+                position: Duration::from_secs(93),
+                updated_at: clock.sample().wall,
+            },
+            false,
+        );
+        store.write(&stored).unwrap();
+
+        let persistence =
+            open_persistence(Some(store), &media, Some(Duration::from_secs(300)), &clock);
+
+        assert_eq!(
+            persistence.start_at,
+            Duration::from_secs(93),
+            "the load starts where the entry left off"
+        );
+        assert_eq!(persistence.volume, Volume::new(0.25));
+        assert!(persistence.persisting);
+    }
+
+    /// The sink selection is the whole feature in one line: swap the store for
+    /// `DisabledSink` and persistence silently never writes again. Nothing else
+    /// would notice — every other writer test drives a sink of its own — so this
+    /// is the one test that follows a submitted snapshot all the way to the
+    /// bytes on disk, through `impl StateSink for StateStore` and through the
+    /// `Written` arm of the flush report.
+    #[test]
+    fn a_submitted_snapshot_reaches_the_state_file_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let (store, clock) = store_at(&path);
+        let media = local("/music/sonata.flac");
+        let mut stored = PersistedState::default();
+        stored.record(
+            &PlaybackCheckpoint {
+                media: media.clone(),
+                position: Duration::from_secs(93),
+                updated_at: clock.sample().wall,
+            },
+            false,
+        );
+        store.write(&stored).unwrap();
+
+        let mut persistence =
+            open_persistence(Some(store), &media, Some(Duration::from_secs(300)), &clock);
+        assert!(persistence.persisting);
+
+        // The listener got another minute in, and the volume moved with them.
+        let mut advanced = PersistedState::default();
+        advanced.set_volume(Volume::new(0.5));
+        advanced.set_current_media(media.clone());
+        advanced.record(
+            &PlaybackCheckpoint {
+                media: media.clone(),
+                position: Duration::from_secs(150),
+                updated_at: clock.sample().wall,
+            },
+            false,
+        );
+        persistence.writer.submit(advanced, Urgency::Forced);
+
+        let outcome = persistence.writer.shutdown();
+        assert!(
+            matches!(outcome, ShutdownOutcome::Written),
+            "the store must acknowledge the final write: {outcome:?}"
+        );
+        assert!(matches!(
+            classify_flush(outcome, persistence.persisting),
+            FlushReport::Written
+        ));
+
+        let bytes = std::fs::read(&path).unwrap();
+        let written: PersistedState = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            written.entry_for(&media).unwrap().position,
+            Duration::from_secs(150),
+            "the file must hold the snapshot that was submitted, not the one it started with"
+        );
+        assert_eq!(written.volume(), Volume::new(0.5));
+        assert_eq!(written.current_media(), Some(&media));
+    }
+
+    /// D3: a file this build cannot read is preserved in place and writing is
+    /// off for the session. The sink the disable selects has to write nowhere,
+    /// or the preservation is a claim rather than a fact.
+    #[test]
+    fn a_state_file_from_a_newer_build_disables_writing_and_is_left_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let newer = br#"{"schema_version":99,"current_media":null,"volume":0.5,"checkpoints":{}}"#;
+        std::fs::write(&path, newer).unwrap();
+        let (store, clock) = store_at(&path);
+        let media = local("/music/sonata.flac");
+
+        let mut persistence =
+            open_persistence(Some(store), &media, Some(Duration::from_secs(300)), &clock);
+
+        assert!(!persistence.persisting);
+        assert_eq!(
+            persistence.start_at,
+            Duration::ZERO,
+            "nothing is restored from a file this build cannot read"
+        );
+        assert_eq!(persistence.volume, Volume::FULL);
+
+        persistence
+            .writer
+            .submit(PersistedState::default(), Urgency::Forced);
+        let outcome = persistence.writer.shutdown();
+        assert!(
+            matches!(
+                classify_flush(outcome, persistence.persisting),
+                FlushReport::Disabled
+            ),
+            "a session that wrote nothing must not be reported as having written"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            newer,
+            "the preserved file must come out byte for byte as it went in"
+        );
+    }
+
+    #[test]
+    fn a_disabled_session_never_reports_a_written_checkpoint() {
+        // The sink answers `Ok` for a write it deliberately never performed, so
+        // the outcome on its own cannot tell the two apart.
+        assert!(matches!(
+            classify_flush(ShutdownOutcome::Written, false),
+            FlushReport::Disabled
+        ));
+        assert!(matches!(
+            classify_flush(ShutdownOutcome::Written, true),
+            FlushReport::Written
+        ));
     }
 }

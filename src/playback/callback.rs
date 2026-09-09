@@ -257,7 +257,9 @@ mod tests {
     fn freeze_acknowledges_only_after_the_pending_span_is_published() {
         // The callback may not acknowledge while a span is unpublished, so a
         // saturated span ring holds the acknowledgment back until the worker
-        // drains. Task 5 relies on this being the only thing that gates it.
+        // drains — and an unpublished span is the *only* thing that holds the
+        // acknowledgment back, which is what lets the worker treat a missing
+        // acknowledgment during a freeze as a span it still has to drain.
         let link = Arc::new(OutputLink::new());
         let (mut pcm_tx, pcm_rx) = rtrb::RingBuffer::<f32>::new(48_000);
         let (span_tx, mut span_rx) = rtrb::RingBuffer::<SpanRecord>::new(1);

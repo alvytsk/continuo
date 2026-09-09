@@ -7,6 +7,7 @@
 //! that adopts a target stored while stopped. Everything else — pausing,
 //! stopping, a device disappearing, a handshake timing out — preserves it.
 
+use std::any::Any;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
@@ -22,7 +23,7 @@ use super::callback::CallbackCore;
 use super::command::PlaybackCommand;
 use super::decode::DecodedSource;
 use super::error::PlaybackError;
-use super::event::{PlaybackEvent, Progress};
+use super::event::{PlaybackEvent, Progress, ShutdownReport};
 use super::handshake::Handshake;
 use super::link::OutputLink;
 use super::output::cpal_output::{CpalOutput, OutputFault};
@@ -111,7 +112,7 @@ pub struct EngineHandle {
     progress: Arc<Mutex<Progress>>,
     interrupt: Arc<AtomicU8>,
     wake: Sender<()>,
-    worker: Option<JoinHandle<()>>,
+    worker: Option<JoinHandle<Vec<PlaybackEvent>>>,
 }
 
 impl EngineHandle {
@@ -222,9 +223,34 @@ impl EngineHandle {
         self.worker.as_ref().is_none_or(JoinHandle::is_finished)
     }
 
-    pub fn join(mut self) {
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
+    /// Joins the worker, then drains what it left behind.
+    ///
+    /// The channel drain is safe only because the thread has already gone —
+    /// nothing can send again — and that is the same happens-before the final
+    /// `Progress` rests on. Channel first, backlog after: everything the worker
+    /// flushed was emitted before anything it could not.
+    pub fn join(mut self) -> ShutdownReport {
+        let backlog = match self.worker.take() {
+            Some(worker) => match worker.join() {
+                Ok(events) => events,
+                Err(panic) => {
+                    tracing::warn!(
+                        panic = %describe_panic(&panic),
+                        "the decode worker panicked; its shutdown backlog is lost"
+                    );
+                    Vec::new()
+                }
+            },
+            None => Vec::new(),
+        };
+        let mut events = Vec::new();
+        while let Ok(event) = self.stream.events.try_recv() {
+            events.push(event);
+        }
+        events.extend(backlog);
+        ShutdownReport {
+            progress: self.progress(),
+            events,
         }
     }
 }
@@ -344,7 +370,7 @@ impl Worker {
         }
     }
 
-    fn run(mut self) {
+    fn run(mut self) -> Vec<PlaybackEvent> {
         let commands = self.commands.clone();
         let wake = self.wake.clone();
         let liveness = self.liveness.clone();
@@ -353,7 +379,7 @@ impl Worker {
             let flags = self.interrupt.swap(0, Ordering::Acquire);
             if flags & SHUTDOWN != 0 {
                 self.shutdown();
-                return;
+                return Vec::from(self.pending_events);
             }
             if flags & STOP != 0 {
                 self.do_stop();
@@ -400,13 +426,13 @@ impl Worker {
                 // Nobody can drive this engine any more.
                 Some(Err(_)) => {
                     self.shutdown();
-                    return;
+                    return Vec::from(self.pending_events);
                 }
                 None => {}
             }
             if self.shutting_down {
                 self.shutdown();
-                return;
+                return Vec::from(self.pending_events);
             }
 
             // 7. Decode -> convert -> ring, with interruptible backpressure.
@@ -421,7 +447,7 @@ impl Worker {
             // channel occupancy, which says nothing about connectedness.
             if self.receivers_gone {
                 self.shutdown();
-                return;
+                return Vec::from(self.pending_events);
             }
         }
     }
@@ -958,10 +984,21 @@ impl Worker {
     }
 
     fn shutdown(&mut self) {
-        self.capture_position();
+        let captured_exactly = self.capture_position();
         self.teardown();
         self.source = None;
         self.state = PlaybackState::Idle;
+        if !captured_exactly {
+            // quality() checks `degraded` before it looks at `state`, so this is
+            // what keeps a capture that timed out from being published as
+            // Exact on the strength of `state` having just become `Idle`.
+            self.degraded = true;
+        }
+        // With the transport gone the recompute branch is skipped, so this
+        // publishes precisely the captured position (D14). Without it, the last
+        // Progress a reader can see is the one from the previous pass and the
+        // capture is unreachable.
+        self.publish_progress();
     }
 
     // ------------------------------------------------------------------ audio
@@ -1171,11 +1208,13 @@ impl Worker {
             }
         }
         let session_rev = self.session_rev;
+        let position = self.position;
         self.emit(PlaybackEvent::Loaded {
             session_rev,
             media,
             metadata: decoded.metadata().clone(),
             capabilities: decoded.capabilities(),
+            position,
         });
         self.source = Some(decoded);
         match self.open_transport(false) {
@@ -1488,6 +1527,19 @@ fn retire_faults(deferred: &mut Option<OutputFault>, faults: &Receiver<OutputFau
 
 fn frames_to_duration(frames: u64, rate: u32) -> Duration {
     Duration::from_secs_f64(frames as f64 / f64::from(rate.max(1)))
+}
+
+/// Best-effort text for a `std::thread::JoinHandle::join` panic payload. Panic
+/// payloads are almost always a `&'static str` or a `String`; anything else
+/// reports as opaque rather than being dropped silently.
+fn describe_panic(panic: &(dyn Any + Send)) -> String {
+    if let Some(message) = panic.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = panic.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "non-string panic payload".to_string()
+    }
 }
 
 /// Keep the promised value when the shortfall is sub-frame quantization, and

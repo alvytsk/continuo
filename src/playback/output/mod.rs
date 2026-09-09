@@ -5,7 +5,9 @@ use crate::playback::callback::CallbackCore;
 use crate::playback::error::PlaybackError;
 use crate::playback::link::OutputLink;
 
-// `pub mod test_output;` was added by Task 4 - do not re-declare it here.
+// `test_output` is compiled unconditionally rather than behind `cfg(test)`:
+// integration tests drive the engine through it from outside the crate, so it
+// has to be part of the public module tree declared here.
 pub mod cpal_output;
 pub mod test_output;
 
