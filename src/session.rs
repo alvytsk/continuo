@@ -249,32 +249,10 @@ impl Session {
     fn on_loaded(&mut self, media: &MediaId, position: Duration, now: ClockSample) -> Action {
         let switching = self.current_media.as_ref() != Some(media);
 
-        // Recorded before anything resets, and through `position_for`: a
-        // stopped seek's target is the outgoing media's real position, and
-        // clearing it first would write the pre-seek sample back over it. A
-        // completed entry is left alone entirely — `EndOfTrack` already
-        // recorded the position D1 retains, and `last_sample` can only be
-        // behind it.
-        let outgoing = if switching {
-            self.last_sample.take()
-        } else {
-            None
-        };
-        if let Some(previous) = outgoing
-            && !self.completed
-        {
-            // §3: `load()` overwrites the engine's own position with `start_at`
-            // before anything publishes, so this is the only place the outgoing
-            // media's final position still exists.
-            let position = self.position_for(previous.position);
-            self.state.record(
-                &PlaybackCheckpoint {
-                    media: previous.media,
-                    position,
-                    updated_at: now.wall,
-                },
-                false,
-            );
+        // First, while every per-media field still describes the media on its
+        // way out.
+        if switching {
+            self.record_outgoing(now);
         }
 
         // Only now: a force raised against the previous media cannot answer for
@@ -297,6 +275,44 @@ impl Session {
         } else {
             Action::None
         }
+    }
+
+    /// The entry for the media on its way out, written from the position the
+    /// session retained for it. §3: `load()` overwrites the engine's own
+    /// position with `start_at` before anything publishes, so `last_sample` is
+    /// the only place that position still exists.
+    ///
+    /// **Call this before the per-media fields reset.** `completed`,
+    /// `established` and `outstanding_target` are all read here, and all three
+    /// describe the outgoing media only until `on_loaded` resets them — read
+    /// afterwards they describe the incoming one, and the mistake would be
+    /// silent. They are read nowhere else in `on_loaded`.
+    ///
+    /// Two things make a retained sample not worth writing. A completed entry's
+    /// position is the one `EndOfTrack` recorded and the sample can only be
+    /// behind it (D1). And a sample for a media nothing established is the zero
+    /// §11 resumes at, not a position the engine ever validated — `load()`
+    /// reports `Loaded` before it opens the device, so switching away from a
+    /// launch that failed would otherwise carry that zero out as the media's
+    /// final word (D20).
+    fn record_outgoing(&mut self, now: ClockSample) {
+        let Some(previous) = self.last_sample.take() else {
+            return;
+        };
+        if self.completed || !self.established {
+            return;
+        }
+        // A stopped seek's target is the outgoing media's real position, and
+        // resolving it first would write the pre-seek sample back over it (D17).
+        let position = self.position_for(previous.position);
+        self.state.record(
+            &PlaybackCheckpoint {
+                media: previous.media,
+                position,
+                updated_at: now.wall,
+            },
+            false,
+        );
     }
 
     /// The only write path for the current media and its completion. Nothing in

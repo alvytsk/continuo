@@ -570,6 +570,44 @@ fn a_launch_that_never_establishes_writes_no_checkpoint() {
     assert!(final_state.completed_for(&media("a")));
 }
 
+/// §11 maps `position == duration` to a start of zero while retaining the
+/// position, with `completed` false — so R16's completed guard is not what
+/// covers this one. `Loaded` reports that zero before the device is opened, and
+/// a switch would otherwise carry it out as the outgoing media's final word.
+#[test]
+fn a_switch_away_from_a_media_that_never_established_records_nothing_for_it() {
+    let mut opening = PersistedState::default();
+    opening.record(
+        &continuo::playback::checkpoint::PlaybackCheckpoint {
+            media: media("a"),
+            position: Duration::from_secs(300),
+            updated_at: time::OffsetDateTime::UNIX_EPOCH,
+        },
+        false,
+    );
+
+    let clock = FakeClock::new();
+    let mut session = Session::new(opening);
+    let _ = session.observe(&loaded(1, "a", Duration::ZERO), clock.sample());
+    let _ = session.observe(
+        &PlaybackEvent::Failed {
+            session_rev: 1,
+            message: "cannot open the audio device".into(),
+        },
+        clock.sample(),
+    );
+
+    // The listener gives up on `a` and picks another track.
+    let (state, _) = submitted(session.observe(&loaded(2, "b", Duration::ZERO), clock.sample()));
+    let entry = state.entry_for(&media("a")).unwrap();
+    assert_eq!(
+        entry.position,
+        Duration::from_secs(300),
+        "nothing validated the zero the load reported, so the retained position stands"
+    );
+    assert!(!entry.completed);
+}
+
 /// A switch onto a completed entry, in an iteration where the engine's
 /// `StateChanged{Loading}` never arrived — `emit` drops non-terminal events at
 /// the backlog cap, which is exactly the pressure a switch is most likely
