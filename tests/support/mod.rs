@@ -30,8 +30,11 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::Sender;
+use url::Url;
 
-use continuo::media::id::{AbsolutePath, MediaId};
+use continuo::http::limits::Limits;
+use continuo::http::service::HttpService;
+use continuo::media::id::{AbsolutePath, MediaId, NormalizedUrl};
 use continuo::media::source::SourceLocation;
 use continuo::playback::callback::CallbackCore;
 use continuo::playback::command::{PlaybackCommand, ResumeIntent};
@@ -87,6 +90,18 @@ pub fn fixture(name: &str) -> AbsolutePath {
         .join("tests/fixtures")
         .join(name);
     AbsolutePath::new(path.canonicalize().unwrap()).unwrap()
+}
+
+/// The path of a fixture, for tests that need its bytes rather than an
+/// `AbsolutePath` - `TestServer::start(Script::serving(...))` among them. A
+/// bare helper, so it panics with the path on failure: a missing fixture is
+/// a repository error, not a test condition.
+pub fn fixture_path(name: &str) -> std::path::PathBuf {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(name);
+    path.canonicalize()
+        .unwrap_or_else(|error| panic!("fixture {path:?} must exist: {error}"))
 }
 
 /// A `MediaId` for a local file that need not exist, for tests that only care
@@ -196,6 +211,30 @@ pub struct TestEngine {
     /// engine has already passed through must not satisfy a later wait.
     consumed_states: Mutex<usize>,
     draining: AtomicBool,
+    /// Built lazily by `load_remote`'s first call, then kept for the
+    /// engine's lifetime.
+    http: Mutex<Option<Arc<HttpService>>>,
+    /// Whether an `EndOfTrack` was ever observed in this run. Latched
+    /// rather than derived from `inbox`, since `play_until_terminal` and
+    /// other draining helpers are free to consume events out of a test's
+    /// direct sight.
+    saw_end_of_track: AtomicBool,
+}
+
+/// A live borrow of the engine's `EngineHandle`, returned by `handle()`.
+/// See that method's doc comment for why this exists rather than a bare
+/// `&EngineHandle`.
+pub struct HandleRef<'a>(MutexGuard<'a, Option<EngineHandle>>);
+
+impl std::ops::Deref for HandleRef<'_> {
+    type Target = EngineHandle;
+
+    fn deref(&self) -> &EngineHandle {
+        match self.0.as_ref() {
+            Some(handle) => handle,
+            None => panic!("the engine handle is gone; the test outlived a shutdown"),
+        }
+    }
 }
 
 impl TestEngine {
@@ -209,6 +248,24 @@ impl TestEngine {
     /// A start that resumes at `start_at`. Deliberately does **not** clear the
     /// inbox: the `Loaded` it produces is the subject of the resume tests.
     pub fn start_at(name: &str, start_at: Duration) -> Self {
+        let mut engine = Self::bare();
+        engine.load_with_resume(fixture(name), ResumeIntent::StartAt(start_at));
+        engine.send(PlaybackCommand::Play);
+        engine.await_state(PlaybackState::Playing);
+        engine
+    }
+
+    /// The device and worker wired up, nothing loaded - `Idle`, ready for
+    /// `load_remote`. `start`/`start_at` need a local fixture immediately;
+    /// a remote test needs control over exactly when the load happens (and
+    /// needs to install an `HttpService` first), so it starts here rather
+    /// than through either of them. Rust has no argument-count overloading,
+    /// so this cannot be a zero-argument `start()` alongside `start(name)`.
+    pub fn start_idle() -> Self {
+        Self::bare()
+    }
+
+    fn bare() -> Self {
         let device = Arc::new(Mutex::new(Device {
             output: TestOutput::new(CHANNELS, RATE, BUFFER_FRAMES, LATENCY),
             link: None,
@@ -238,7 +295,7 @@ impl TestEngine {
                 })
                 .ok()
         };
-        let mut engine = Self {
+        Self {
             commands: handle.commands().clone(),
             wake: handle.wake().clone(),
             handle: Mutex::new(Some(handle)),
@@ -250,11 +307,58 @@ impl TestEngine {
             states: Mutex::new(Vec::new()),
             consumed_states: Mutex::new(0),
             draining: AtomicBool::new(true),
+            http: Mutex::new(None),
+            saw_end_of_track: AtomicBool::new(false),
+        }
+    }
+
+    /// Load an HTTP source. Builds an `HttpService` on first use (`Limits`
+    /// short enough that the cancellation tests do not spend real seconds
+    /// waiting on a deadline they intend to hit) and keeps it for the
+    /// engine's lifetime; every later `load_remote` on this `TestEngine`
+    /// reuses it.
+    pub fn load_remote(&mut self, url: &str) {
+        let service = {
+            let mut http = lock(&self.http);
+            if http.is_none() {
+                let service = match HttpService::spawn(Limits::brisk()) {
+                    Ok(service) => service,
+                    Err(error) => panic!("the test HttpService must start: {error}"),
+                };
+                *http = Some(service);
+            }
+            #[allow(clippy::unwrap_used)] // just populated above if it was empty.
+            http.clone().unwrap()
         };
-        engine.load_with_resume(fixture(name), ResumeIntent::StartAt(start_at));
-        engine.send(PlaybackCommand::Play);
-        engine.await_state(PlaybackState::Playing);
-        engine
+        if let Some(handle) = lock(&self.handle).as_ref() {
+            handle.set_http(Some(service));
+        }
+        let parsed = match Url::parse(url) {
+            Ok(parsed) => parsed,
+            Err(error) => panic!("test URL {url:?} must parse: {error}"),
+        };
+        let media = match NormalizedUrl::parse(url) {
+            Ok(normalized) => MediaId::RemoteUrl(normalized),
+            Err(error) => panic!("test URL {url:?} must normalize: {error}"),
+        };
+        self.send(PlaybackCommand::Load {
+            media,
+            source: SourceLocation::Http(parsed),
+            resume: ResumeIntent::StartAt(Duration::ZERO),
+        });
+        self.await_state(PlaybackState::Paused);
+    }
+
+    /// The handle, for the submission methods (`submit_pause`, `submit_seek`
+    /// …). A thin `Deref<Target = EngineHandle>` wrapper around a lock guard,
+    /// not a bare `&EngineHandle`: the handle lives behind the same `Mutex`
+    /// `drop_event_receiver` and shutdown already share (a `TestEngine` bound
+    /// without `mut`, as `a_disconnected_event_receiver_terminates_the_worker`
+    /// does, still has to be able to call `drop_event_receiver`), so nothing
+    /// here can hand back a bare reference that outlives the guard reading
+    /// it. `engine.handle().submit_pause()` reads exactly as if it had.
+    pub fn handle(&self) -> HandleRef<'_> {
+        HandleRef(lock(&self.handle))
     }
 
     // ------------------------------------------------------------- commands
@@ -548,7 +652,43 @@ impl TestEngine {
             if let PlaybackEvent::StateChanged { state, .. } = &event {
                 lock(&self.states).push(*state);
             }
+            if matches!(event, PlaybackEvent::EndOfTrack { .. }) {
+                self.saw_end_of_track.store(true, Ordering::Relaxed);
+            }
             lock(&self.inbox).push(event);
+        }
+    }
+
+    /// Whether an `EndOfTrack` was ever observed in this run.
+    pub fn saw_end_of_track(&self) -> bool {
+        self.pump_events();
+        self.saw_end_of_track.load(Ordering::Relaxed)
+    }
+
+    /// Run until `Ended`, `Failed` or `patience`, whichever comes first.
+    /// Drives the clock (`play_to_end`'s own ADVANCING mode) rather than
+    /// leaving it frozen: a frozen clock never lets the output consume what
+    /// `prime_and_run` already staged, so the ring stays full, `pump_audio`
+    /// never has to read another byte, and a truncated or corrupt tail is
+    /// never discovered at all - the very thing this exists to drive toward.
+    pub fn play_until_terminal(&mut self, patience: Duration) {
+        self.set_mode(ADVANCING);
+        let deadline = Instant::now() + patience;
+        loop {
+            self.pump_events();
+            if self.take_state(PlaybackState::Ended) || self.take_state(PlaybackState::Failed) {
+                self.set_mode(FROZEN);
+                return;
+            }
+            if Instant::now() >= deadline {
+                self.set_mode(FROZEN);
+                panic!(
+                    "playback never reached a terminal state within {patience:?}; it went \
+                     through {:?}",
+                    lock(&self.states)
+                );
+            }
+            std::thread::sleep(Duration::from_millis(2));
         }
     }
 
@@ -615,6 +755,44 @@ impl TestEngine {
             unreachable!("await_event's predicate already matched RestartEstablished")
         };
         position
+    }
+
+    /// Wait for `SeekCompleted` and return where it landed. Takes its own
+    /// patience rather than `PATIENCE`: a remote seek's refinement can
+    /// legitimately take longer than a local one's.
+    pub fn await_seek_completed(&mut self, patience: Duration) -> Duration {
+        let deadline = Instant::now() + patience;
+        loop {
+            self.pump_events();
+            {
+                let mut inbox = lock(&self.inbox);
+                if let Some(index) = inbox
+                    .iter()
+                    .position(|e| matches!(e, PlaybackEvent::SeekCompleted { .. }))
+                {
+                    let PlaybackEvent::SeekCompleted { actual, .. } = inbox.remove(index) else {
+                        unreachable!("the position above already matched SeekCompleted")
+                    };
+                    return actual;
+                }
+            }
+            if Instant::now() >= deadline {
+                panic!(
+                    "no SeekCompleted arrived within {patience:?}; saw {:?}",
+                    lock(&self.inbox)
+                );
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    /// Wind the engine down explicitly, rather than leaving it to `Drop` at
+    /// scope exit. Every `engine_remote` test ends with this before shutting
+    /// its `TestServer` down, so the worker's teardown - which may still be
+    /// touching the socket the server owns - completes before the socket
+    /// does.
+    pub fn finish(&mut self) {
+        let _ = self.shutdown_report();
     }
 
     pub fn count_events(&mut self, predicate: impl Fn(&PlaybackEvent) -> bool) -> usize {
