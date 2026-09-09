@@ -62,6 +62,25 @@ pub enum PlaybackEvent {
 }
 
 impl PlaybackEvent {
+    /// Every event carries the revision it was emitted under. A reader that
+    /// adopts it from **every** event — not only the ones it acts on — bounds
+    /// its exposure to a dropped `DeviceRecovered` to "until the next event of
+    /// any kind" (§7).
+    pub fn session_rev(&self) -> u64 {
+        match self {
+            Self::Loaded { session_rev, .. }
+            | Self::StateChanged { session_rev, .. }
+            | Self::SeekCompleted { session_rev, .. }
+            | Self::SeekTargetStored { session_rev, .. }
+            | Self::SeekRejected { session_rev, .. }
+            | Self::VolumeChanged { session_rev, .. }
+            | Self::EndOfTrack { session_rev, .. }
+            | Self::DeviceRecovered { session_rev }
+            | Self::Warning { session_rev, .. }
+            | Self::Failed { session_rev, .. } => *session_rev,
+        }
+    }
+
     /// Terminal outcomes may occupy the reserved tail of the event channel;
     /// ordinary events may not. An outcome the application cannot infer from
     /// anything later — the run ended, the device died, the session stopped —
