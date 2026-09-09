@@ -138,9 +138,9 @@ fn every_wait_wakes_and_stale_responses_cannot_repopulate() {
     // Case 3: a stale generation cannot repopulate the one that superseded
     // it. `engine_remote.rs`'s `a_seek_retired_by_a_stop_reports_cancelled_
     // and_commits_no_target` proves the cancellation itself; this extends
-    // it by actually releasing the retired connection's stalled headers —
-    // letting its data onto the wire for real — and then proving a fresh
-    // operation afterward is unaffected.
+    // it by actually releasing the retired connection's stalled body —
+    // letting its remaining bytes onto the wire for real — and then proving
+    // a fresh operation afterward is unaffected.
     {
         let server = TestServer::start(Script::from_fixture("sine-5s.flac"));
         let mut engine = TestEngine::start_idle();
