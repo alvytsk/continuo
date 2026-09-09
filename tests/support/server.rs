@@ -510,13 +510,24 @@ fn write_206(
         None => header.push_str(&format!("Content-Range: bytes {first}-{last}/{len}\r\n")),
     }
     let slice = &script.body[first..=last];
-    header.push_str(&format!("Content-Length: {}\r\n", slice.len()));
+    // `chunked()` on a ranged response omits `Content-Length` in favor of
+    // `Transfer-Encoding: chunked` — the one way this harness can produce a
+    // 206 whose advertised length (`Content-Range`, possibly overridden) is
+    // not cross-validated against what the server actually transmits, which
+    // is what lets a test drive both "more bytes than advertised" and "the
+    // chunked terminator never arrives" scenarios for real, rather than only
+    // at the unit level.
+    if script.chunked {
+        header.push_str("Transfer-Encoding: chunked\r\n");
+    } else {
+        header.push_str(&format!("Content-Length: {}\r\n", slice.len()));
+    }
     header.push_str("Connection: close\r\n\r\n");
 
     if stream.write_all(header.as_bytes()).is_err() {
         return;
     }
-    let mut writer = BodyWriter::new(script, false);
+    let mut writer = BodyWriter::new(script, script.chunked);
     let mut offset = 0;
     while offset < slice.len() {
         let take = writer.next_len(slice.len() - offset);

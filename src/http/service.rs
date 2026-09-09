@@ -66,9 +66,19 @@ impl HttpService {
         // reqwest's default redirect policy implements none of them. Letting
         // reqwest follow redirects on its own would silently bypass every
         // one of those rules.
+        //
+        // HTTP/2's receive window is the transport-level analogue of our own
+        // buffer cap: `http2_adaptive_window` defaults to `false`, so without
+        // setting these two explicitly a peer may buffer arbitrarily far
+        // ahead of what `Limits` promises. reqwest 0.13 has no equivalent
+        // knob for HTTP/1.1 (see docs/architecture.md).
+        let stream_window = u32::try_from(limits.chunk_bytes).unwrap_or(u32::MAX);
+        let connection_window = u32::try_from(limits.buffer_bytes).unwrap_or(u32::MAX);
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(limits.connect)
+            .http2_initial_stream_window_size(stream_window)
+            .http2_initial_connection_window_size(connection_window)
             .build()
             .map_err(|error| RemoteFailure::Transport {
                 operation: Operation::Open,
@@ -124,6 +134,15 @@ pub struct HeaderWait {
 
 impl HeaderWait {
     /// Cancellable by the same interrupt every read obeys.
+    ///
+    /// Returning `Err(HeaderOutcome::Failed(Timeout { .. }))` on this call's
+    /// own `deadline` does **not** retire the generation — nothing here does.
+    /// `HeaderWait` has no `Drop` either, so a caller that gives up on its
+    /// own deadline still leaves the spawned fetch task holding the
+    /// connection open, streaming into a buffer nobody will drain, until the
+    /// caller retires the generation itself. The caller owns that: it is the
+    /// one that knows whether it is about to retry, reopen at a different
+    /// byte, or give up for good.
     pub fn wait(
         &self,
         service: &dyn WaitHook,
@@ -290,6 +309,9 @@ async fn run_fetch(
     );
 
     let mut delivered: u64 = 0;
+    // Never zero: `bytes.chunks(0)` panics, and `Limits` is injectable with
+    // no validating constructor, so a caller-supplied zero must not reach it.
+    let chunk_cap = limits.chunk_bytes.max(1);
     loop {
         // Pinned once per chunk, polled across many timer slices. `&mut
         // chunk` in the select leaves the future in place when another
@@ -303,7 +325,7 @@ async fn run_fetch(
             // a pause arriving mid-await suspend the budget rather than
             // watch it run out (§8, "time spent paused ... does not count as
             // a server stall").
-            interrupt.wait_while_frozen().await;
+            interrupt.wait_while_frozen(generation).await;
             let slice = TICK.min(limits.stall - demanded);
             let started = Instant::now();
             tokio::select! {
@@ -327,24 +349,24 @@ async fn run_fetch(
             }
         };
 
-        // Whichever way the body ended — a clean `Ok(None)`, or an `Err`
-        // hyper raises because a declared `Content-Length` was not fully
-        // delivered before the connection closed — a known shortfall against
-        // the advertised interval is the same fault: `TruncatedBody`, not an
-        // opaque transport error and never `Eof`. A body longer than
-        // advertised is refused the same way it would be at the end, but
-        // that check runs after every pushed slice below so an endless body
-        // cannot fill the buffer forever first.
         let ended = match next {
             Ok(Some(bytes)) => {
-                for piece in bytes.chunks(limits.chunk_bytes) {
-                    if !channel.push(generation, piece).await {
+                let mut offset = 0usize;
+                while offset < bytes.len() {
+                    let (piece, exceeded) =
+                        clamp_to_advertised(chunk_cap, advertised, delivered, &bytes[offset..]);
+                    let took = piece.len();
+                    // Bytes past the advertised interval belong to different
+                    // media and must never reach a reader — clamped and
+                    // refused *before* the push, not pushed and checked
+                    // after, which would have already handed a decoder up to
+                    // `chunk_bytes` of the wrong recording.
+                    if !piece.is_empty() && !channel.push(generation, piece).await {
                         return;
                     }
-                    delivered += piece.len() as u64;
-                    if let Some(total) = advertised
-                        && delivered > total
-                    {
+                    delivered += took as u64;
+                    offset += took;
+                    if exceeded {
                         channel.finish(
                             generation,
                             Outcome::Failed(RemoteFailure::InvalidRange {
@@ -358,22 +380,167 @@ async fn run_fetch(
                 continue;
             }
             Ok(None) => None,
-            Err(error) => Some(error),
+            Err(error) => Some(transport_detail(error)),
         };
 
-        let outcome = match advertised {
-            Some(total) if delivered < total => Outcome::Failed(RemoteFailure::TruncatedBody {
-                missing: total - delivered,
-            }),
-            _ => match ended {
-                None => Outcome::Eof,
-                Some(error) => Outcome::Failed(RemoteFailure::Transport {
-                    operation,
-                    detail: transport_detail(error),
-                }),
-            },
-        };
-        channel.finish(generation, outcome);
+        channel.finish(
+            generation,
+            classify_body_end(advertised, delivered, operation, ended),
+        );
         return;
+    }
+}
+
+/// Clamp one raw piece of body to at most `chunk_cap` bytes and, when a
+/// total is advertised, to no more than what remains of it.
+///
+/// Pure and pinned by a direct unit test rather than only by what a real
+/// transport happens to be willing to hand a decoder: a `Content-Length`
+/// body can never legitimately overshoot what its own header promised — a
+/// standards-observing client enforces that as a hard cap itself, which two
+/// throwaway probes against hyper 1.11.1 confirmed (a body that fully
+/// satisfies its declared length never yields another chunk or an error, and
+/// a server that lies with a *shorter* `Content-Length` than it writes never
+/// hands the excess to `chunk()` at all). So this boundary — the second half
+/// of it, specifically, "flag and stop before pushing the excess" — cannot be
+/// driven by any conformant origin, and a unit test is the only sound way to
+/// pin it.
+///
+/// Returns the piece to push and whether the advertised total was reached or
+/// crossed by it, in which case nothing past `piece` may be processed.
+fn clamp_to_advertised(
+    chunk_cap: usize,
+    advertised: Option<u64>,
+    delivered: u64,
+    raw: &[u8],
+) -> (&[u8], bool) {
+    let want = chunk_cap.min(raw.len());
+    match advertised {
+        Some(total) => {
+            let remaining = total.saturating_sub(delivered);
+            if remaining == 0 {
+                return (&raw[..0], true);
+            }
+            // `remaining` is capped against `want`, itself a `usize`, before
+            // the cast back — it never truncates.
+            let allowed = remaining.min(want as u64) as usize;
+            (&raw[..allowed], allowed < want)
+        }
+        None => (&raw[..want], false),
+    }
+}
+
+/// Classify how the body loop's outstanding read ended, once it is known to
+/// have ended: how many bytes this response advertised (if any), how many
+/// were actually delivered, and — if an error ended it — its already-redacted
+/// detail text.
+///
+/// Pure, and unit-tested directly for the same reason as
+/// [`clamp_to_advertised`]: a real `Content-Length` body can only ever end in
+/// `Err` when short (confirmed empirically — see that function's doc), never
+/// in a clean `Ok(None)`, which makes the `delivered == total` side of this
+/// match — an error with nothing left owed — impossible to drive through a
+/// real socket. Merging the `Ok(None)` and `Err` signals here, rather than
+/// mapping every `Err` straight to `Transport`, is what makes a short body
+/// report `TruncatedBody` at all: a real HTTP/1.1 origin signals a shortfall
+/// as an `Err`, never as a clean `Ok(None)`.
+fn classify_body_end(
+    advertised: Option<u64>,
+    delivered: u64,
+    operation: Operation,
+    error: Option<String>,
+) -> Outcome {
+    match advertised {
+        Some(total) if delivered < total => Outcome::Failed(RemoteFailure::TruncatedBody {
+            missing: total - delivered,
+        }),
+        _ => match error {
+            None => Outcome::Eof,
+            Some(detail) => Outcome::Failed(RemoteFailure::Transport { operation, detail }),
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_piece_within_the_advertised_total_is_pushed_whole_and_not_flagged() {
+        let (piece, exceeded) = clamp_to_advertised(64, Some(10), 4, b"abcdef");
+        assert_eq!(piece, b"abcdef");
+        assert!(!exceeded);
+    }
+
+    #[test]
+    fn a_piece_that_would_cross_the_advertised_total_is_clamped_and_flagged() {
+        let (piece, exceeded) = clamp_to_advertised(64, Some(10), 8, b"abcdef");
+        assert_eq!(piece, b"ab", "only the two bytes still owed may be pushed");
+        assert!(exceeded);
+    }
+
+    #[test]
+    fn nothing_is_pushed_once_the_advertised_total_is_already_reached() {
+        let (piece, exceeded) = clamp_to_advertised(64, Some(10), 10, b"abcdef");
+        assert!(
+            piece.is_empty(),
+            "not one byte past the total may reach a reader"
+        );
+        assert!(exceeded);
+    }
+
+    #[test]
+    fn without_an_advertised_total_a_piece_is_bounded_only_by_the_chunk_cap() {
+        let (piece, exceeded) = clamp_to_advertised(4, None, 1_000_000, b"abcdefgh");
+        assert_eq!(piece, b"abcd");
+        assert!(!exceeded);
+    }
+
+    #[test]
+    fn a_shortfall_is_truncated_whether_or_not_an_error_carried_it() {
+        assert_eq!(
+            classify_body_end(Some(100), 40, Operation::Open, Some("reset".to_string())),
+            Outcome::Failed(RemoteFailure::TruncatedBody { missing: 60 })
+        );
+        // A real Content-Length body never signals a shortfall this way —
+        // the classifier must not depend on that to stay correct.
+        assert_eq!(
+            classify_body_end(Some(100), 40, Operation::Open, None),
+            Outcome::Failed(RemoteFailure::TruncatedBody { missing: 60 })
+        );
+    }
+
+    #[test]
+    fn an_error_once_the_advertised_total_is_fully_delivered_is_transport_not_truncation() {
+        assert_eq!(
+            classify_body_end(Some(100), 100, Operation::Open, Some("reset".to_string())),
+            Outcome::Failed(RemoteFailure::Transport {
+                operation: Operation::Open,
+                detail: "reset".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn an_error_with_nothing_advertised_is_transport() {
+        assert_eq!(
+            classify_body_end(None, 40, Operation::Open, Some("reset".to_string())),
+            Outcome::Failed(RemoteFailure::Transport {
+                operation: Operation::Open,
+                detail: "reset".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn a_clean_end_at_or_without_an_advertised_total_is_eof() {
+        assert_eq!(
+            classify_body_end(Some(100), 100, Operation::Open, None),
+            Outcome::Eof
+        );
+        assert_eq!(
+            classify_body_end(None, 40, Operation::Open, None),
+            Outcome::Eof
+        );
     }
 }
