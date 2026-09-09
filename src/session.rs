@@ -62,7 +62,11 @@ pub struct Session {
     /// engine resolves it (D17).
     outstanding_target: Option<Duration>,
     /// Whether playback established, or the position changed explicitly, since
-    /// the current media was loaded. Gates the shutdown checkpoint (D20).
+    /// the current media was loaded. It gates every checkpoint whose position
+    /// comes from `Progress` — a resolved force and the shutdown snapshot —
+    /// because such a position is one the engine never validated until
+    /// something established (D20). The two positions that arrive on events of
+    /// their own are exempt, and say so where they are recorded (D6).
     established: bool,
 }
 
@@ -108,6 +112,9 @@ impl Session {
                 self.pending_force = Some(session_rev);
                 Action::None
             }
+            // One of the two positions that never come from `Progress` (D6),
+            // so the establishment gate does not apply: the target is the
+            // listener's own, not a number the engine has yet to validate.
             PlaybackEvent::SeekTargetStored { target, .. } => {
                 self.outstanding_target = Some(*target);
                 self.established = true;
@@ -123,6 +130,8 @@ impl Session {
                 self.state.set_volume(*volume);
                 self.submit(Urgency::Ordinary)
             }
+            // The other one (D6): the end of the track is a position the engine
+            // reached, carried by the event that reports it.
             PlaybackEvent::EndOfTrack { position, .. } => {
                 self.resolve_target();
                 self.established = true;
@@ -154,6 +163,15 @@ impl Session {
         // a resolution rather than a delay (D13).
         if self.pending_force == Some(progress.session_rev) {
             self.pending_force = None;
+            // A `Progress` position taken before anything established is one
+            // the engine never validated: §11 resumes a completed entry at
+            // zero and `load()` reports `Loaded` before it opens the device, so
+            // a stop taken from the launch pause would write that zero over the
+            // position D1 retains. The force is answered by recording nothing —
+            // there is no validated position for the gate to suppress (D20).
+            if !self.established {
+                return Action::None;
+            }
             self.last_capture = Some(now.monotonic);
             let position = self.position_for(progress.position);
             self.record_current(position, now);

@@ -570,6 +570,41 @@ fn a_launch_that_never_establishes_writes_no_checkpoint() {
     assert!(final_state.completed_for(&media("a")));
 }
 
+/// The same failure as the shutdown force, one trigger earlier: §11 resumes a
+/// completed entry at zero, `load()` reports `Loaded` before it opens the
+/// device, and `do_stop` runs from the launch pause. The stop's force would
+/// otherwise write that unvalidated zero over the position D1 retains.
+#[test]
+fn a_stop_before_anything_establishes_writes_no_checkpoint() {
+    let mut opening = PersistedState::default();
+    opening.record(
+        &continuo::playback::checkpoint::PlaybackCheckpoint {
+            media: media("a"),
+            position: Duration::from_secs(240),
+            updated_at: time::OffsetDateTime::UNIX_EPOCH,
+        },
+        true,
+    );
+
+    let clock = FakeClock::new();
+    let mut session = Session::new(opening);
+    let _ = session.observe(&loaded(1, "a", Duration::ZERO), clock.sample());
+    // The launch pause nobody asked for, then a stop before the queued Play is
+    // dispatched.
+    let _ = session.observe(&state_changed(1, PlaybackState::Paused), clock.sample());
+    let _ = session.observe(&state_changed(1, PlaybackState::Stopped), clock.sample());
+
+    assert!(
+        is_none(&session.tick(&progress(1, "a", 0), clock.sample())),
+        "the force is answered by recording nothing, not by writing a position nothing validated"
+    );
+
+    let final_state = session.shutdown_snapshot(&progress(1, "a", 0), clock.sample());
+    let entry = final_state.entry_for(&media("a")).unwrap();
+    assert_eq!(entry.position, Duration::from_secs(240));
+    assert!(entry.completed);
+}
+
 #[test]
 fn a_launch_that_never_establishes_still_writes_volume_and_current_media() {
     let clock = FakeClock::new();
