@@ -570,6 +570,48 @@ fn a_launch_that_never_establishes_writes_no_checkpoint() {
     assert!(final_state.completed_for(&media("a")));
 }
 
+/// A switch onto a completed entry, in an iteration where the engine's
+/// `StateChanged{Loading}` never arrived — `emit` drops non-terminal events at
+/// the backlog cap, which is exactly the pressure a switch is most likely
+/// under. The session therefore sees `Loaded` while it still believes playback
+/// is running, and the ordinary capture that follows would be a `Progress`
+/// position for a media nothing has established.
+#[test]
+fn a_switch_onto_a_completed_entry_does_not_capture_its_unvalidated_zero() {
+    let mut opening = PersistedState::default();
+    opening.record(
+        &continuo::playback::checkpoint::PlaybackCheckpoint {
+            media: media("b"),
+            position: Duration::from_secs(240),
+            updated_at: time::OffsetDateTime::UNIX_EPOCH,
+        },
+        true,
+    );
+
+    let clock = FakeClock::new();
+    let mut session = Session::new(opening);
+    let _ = session.observe(&loaded(1, "a", Duration::ZERO), clock.sample());
+    let _ = session.observe(&state_changed(1, PlaybackState::Playing), clock.sample());
+    clock.advance(Duration::from_secs(5));
+    let _ = submitted(session.tick(&progress(1, "a", 93), clock.sample()));
+
+    // The switch, with no StateChanged in front of it.
+    let _ = submitted(session.observe(&loaded(2, "b", Duration::ZERO), clock.sample()));
+    assert!(
+        is_none(&session.tick(&progress(2, "b", 0), clock.sample())),
+        "nothing has established `b`, so the sample the engine reports for it is not a checkpoint"
+    );
+
+    let final_state = session.shutdown_snapshot(&progress(2, "b", 0), clock.sample());
+    let entry = final_state.entry_for(&media("b")).unwrap();
+    assert_eq!(
+        entry.position,
+        Duration::from_secs(240),
+        "§11 resumes a completed entry at zero while retaining the position D1 keeps"
+    );
+    assert!(entry.completed);
+}
+
 /// The same failure as the shutdown force, one trigger earlier: §11 resumes a
 /// completed entry at zero, `load()` reports `Loaded` before it opens the
 /// device, and `do_stop` runs from the launch pause. The stop's force would

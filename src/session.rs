@@ -163,18 +163,12 @@ impl Session {
         // a resolution rather than a delay (D13).
         if self.pending_force == Some(progress.session_rev) {
             self.pending_force = None;
-            // A `Progress` position taken before anything established is one
-            // the engine never validated: §11 resumes a completed entry at
-            // zero and `load()` reports `Loaded` before it opens the device, so
-            // a stop taken from the launch pause would write that zero over the
-            // position D1 retains. The force is answered by recording nothing —
-            // there is no validated position for the gate to suppress (D20).
-            if !self.established {
+            // The force is answered by recording nothing when the gate is shut:
+            // there is no validated position for it to checkpoint.
+            if !self.checkpoint_from_progress(progress.position, now) {
                 return Action::None;
             }
             self.last_capture = Some(now.monotonic);
-            let position = self.position_for(progress.position);
-            self.record_current(position, now);
             return self.submit(Urgency::Forced);
         }
 
@@ -187,9 +181,34 @@ impl Session {
         if !due {
             return Action::None;
         }
+        // `playback` can still read `Playing` here across a media switch, since
+        // the `StateChanged{Loading}` that precedes `Loaded` is an ordinary
+        // event the engine may drop under backlog. The gate is what makes the
+        // interval harmless in that window: nothing has established the
+        // incoming media, so its sampled position is not a checkpoint.
+        if !self.checkpoint_from_progress(progress.position, now) {
+            return Action::None;
+        }
         self.last_capture = Some(now.monotonic);
-        self.record_current(progress.position, now);
         self.submit(Urgency::Ordinary)
+    }
+
+    /// Checkpoint a position that came from `Progress`, and report whether one
+    /// was recorded. Every such position goes through here, which is what makes
+    /// the two rules that qualify them impossible to forget: an outstanding
+    /// stopped-seek target supersedes the sample (D17), and a sample taken
+    /// before anything established is one the engine never validated (D20) —
+    /// §11 resumes a completed entry at zero, and `load()` reports `Loaded`
+    /// before it opens the device, so an ungated sample writes that zero over
+    /// the position D1 retains. The two positions that arrive on events of their
+    /// own do not come through here and are not gated (D6).
+    fn checkpoint_from_progress(&mut self, sampled: Duration, now: ClockSample) -> bool {
+        if !self.established {
+            return false;
+        }
+        let position = self.position_for(sampled);
+        self.record_current(position, now);
+        true
     }
 
     fn on_state(&mut self, state: PlaybackState, now: ClockSample) -> Action {
@@ -303,16 +322,14 @@ impl Session {
         self.outstanding_target.unwrap_or(sampled)
     }
 
-    /// The final snapshot. Records a checkpoint for the current media only once
-    /// something established since it was loaded (D20), and never a position
-    /// from a session the policy was not tracking.
+    /// The final snapshot. `volume` and `current_media` are written whatever
+    /// happened; the position goes through the same gate every other sampled
+    /// position does, and is never taken from a session the policy was not
+    /// tracking.
     pub fn shutdown_snapshot(&mut self, progress: &Progress, now: ClockSample) -> PersistedState {
         let Some(media) = self.current_media.clone() else {
             return self.state.clone();
         };
-        if !self.established {
-            return self.state.clone();
-        }
         let sampled = if progress.session_rev == self.session_rev {
             Some(progress.position)
         } else {
@@ -321,11 +338,9 @@ impl Session {
                 .filter(|sample| sample.session_rev == self.session_rev && sample.media == media)
                 .map(|sample| sample.position)
         };
-        let Some(sampled) = sampled else {
-            return self.state.clone();
-        };
-        let position = self.position_for(sampled);
-        self.record_current(position, now);
+        if let Some(sampled) = sampled {
+            self.checkpoint_from_progress(sampled, now);
+        }
         self.state.clone()
     }
 
