@@ -269,6 +269,12 @@ impl Session {
         // interval harmless in that window: nothing has established the
         // incoming media, so its sampled position is not a checkpoint.
         if !self.checkpoint_from_progress(progress.position, now) {
+            // While protected (§10), this is the arm that answers every due
+            // tick: `last_capture` is not advanced below, so `due` stays true
+            // and this re-evaluates on every subsequent tick rather than once
+            // per `CAPTURE_INTERVAL`. Harmless — it is a plain comparison
+            // followed by two guard checks, with no write and no submission —
+            // just not the interval's usual cadence.
             return Action::None;
         }
         self.last_capture = Some(now.monotonic);
@@ -286,6 +292,18 @@ impl Session {
     /// own do not come through here and are not gated (D6).
     fn checkpoint_from_progress(&mut self, sampled: Duration, now: ClockSample) -> bool {
         if !self.established {
+            return false;
+        }
+        // Mirrors the `established` check just above rather than leaving this
+        // to `record_current`'s own gate: `record_current` would still refuse
+        // to write, but the caller (`tick`, `shutdown_snapshot`) would read a
+        // bare `true` as "recorded" and resubmit an unchanged state anyway —
+        // every capture interval, for as long as the run stays protected
+        // (§10). `CAPTURE_INTERVAL` exceeds the writer's coalescing window, so
+        // those would not merge: each is its own read-classify-replace write
+        // of byte-identical content. Returning `false` here is what makes the
+        // caller answer `Action::None` instead.
+        if self.protected.is_some() {
             return false;
         }
         let position = self.position_for(sampled);
