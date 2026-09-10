@@ -5,6 +5,7 @@ use std::time::Duration;
 use symphonia::core::audio::GenericAudioBufferRef;
 use symphonia::core::codecs::audio::{AudioDecoder, AudioDecoderOptions};
 use symphonia::core::formats::probe::Hint;
+use symphonia::core::formats::well_known::FORMAT_ID_MP3;
 use symphonia::core::formats::{FormatOptions, FormatReader, SeekMode, SeekTo, TrackType};
 use symphonia::core::io::{MediaSource, MediaSourceStream, MediaSourceStreamOptions};
 use symphonia::core::meta::{MetadataOptions, StandardTag};
@@ -23,6 +24,11 @@ use super::provenance::PositionProvenance;
 pub struct SeekOutcome {
     pub actual: Duration,
     pub refinement_truncated: bool,
+    /// Whether this landing is decoder-established or a byte-offset
+    /// estimate (§3) — follows the demuxer that actually ran `Coarse`, not
+    /// the `SeekMode` this call requests uniformly. See `seek_refined`'s own
+    /// comment for why.
+    pub provenance: PositionProvenance,
 }
 
 pub struct DecodedSource {
@@ -292,10 +298,13 @@ impl DecodedSource {
     /// `FormatReader::seek()` call — that is the wedge M3's manual
     /// acceptance found. `Coarse` computes a byte offset directly from the
     /// track's own duration arithmetic instead, at a measured cost of a few
-    /// KB rather than the whole prefix. The landing this produces is an
-    /// estimate, not a decoder-confirmed position (§5.2 of the design) —
-    /// every caller of this method must treat its result as
-    /// `PositionProvenance::Estimated`, unconditionally.
+    /// KB rather than the whole prefix.
+    ///
+    /// Whether the landing this produces is an estimate or a decoder-
+    /// confirmed position depends on which demuxer actually ran — see
+    /// `SeekOutcome::provenance` and this method's own computation of it,
+    /// just below the `seek()` call. It is *not* unconditionally
+    /// `Estimated`: `Coarse` only changes behaviour for MP3 (fix round 1).
     ///
     /// The reader can only seek to a packet boundary, so refinement is
     /// required for an exact landing regardless of mode; it is also what
@@ -320,6 +329,30 @@ impl DecodedSource {
                 },
             )
             .map_err(|source| PlaybackError::SeekFailed { target, source })?;
+        // Provenance follows the demuxer that actually ran `Coarse`, not the
+        // `SeekMode` this call requests uniformly (M3.1 Task 4, fix round 1).
+        // Across this crate's whole dependency tree, MP3's `MpaReader` is the
+        // *only* `FormatReader::seek` that reads its `mode` argument at all —
+        // FLAC's own seek (`symphonia-bundle-flac`) binary-searches on real
+        // per-frame sample numbers carried in the frame headers themselves,
+        // and every other format this crate supports (WAV, ISO-BMFF/AAC)
+        // ignores `mode` and always does the equivalent of `Accurate`. So a
+        // landing on any non-MP3 format is exactly as decoder-confirmed as
+        // it always was; only MP3's `preseek_coarse` estimates a byte offset
+        // from uniform-bitrate arithmetic, and only that estimate can be
+        // wrong by the amounts §5.2 measured (235 s on a 600 s file, with no
+        // way to tell from outside). Never conditioned on a Xing/Info tag or
+        // anything else sampled from the file - symphonia ignores the Xing
+        // TOC and does the same arithmetic regardless of whether one is
+        // present, so a tagged MP3 is `Estimated` exactly like an untagged
+        // one. Read from the reader's own `format_info()`, not from the
+        // file extension, the URL, or the transport, so this is exactly the
+        // demuxer that ran, not a guess about it.
+        let provenance = if self.reader.format_info().format == FORMAT_ID_MP3 {
+            PositionProvenance::Estimated
+        } else {
+            PositionProvenance::Established
+        };
         self.decoder.reset();
         // `actual_ts` is signed and MP3 readers report a NEGATIVE timestamp when
         // seeking into an encoder's delay region, so a bare `as u64` wraps to
@@ -365,6 +398,7 @@ impl DecodedSource {
         Ok(SeekOutcome {
             actual: self.position(),
             refinement_truncated: truncated,
+            provenance,
         })
     }
 

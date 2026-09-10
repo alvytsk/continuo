@@ -327,7 +327,10 @@ fn pause_stop_and_quit_are_serviced_during_a_seek() {
 
 #[test]
 fn an_estimated_landing_reports_estimated_provenance() {
-    // §3.1: a `Coarse` landing is unconditionally `Estimated`, and playing on
+    // §3.1: an MP3 `Coarse` landing is `Estimated` (fix round 1: this is
+    // MP3-specific, not every `Coarse` landing regardless of format - see
+    // `a_remote_mp3_seek_reports_estimated_and_a_local_flac_seek_reports_
+    // established` for the distinction pinned directly), and playing on
     // from it must keep reporting that — decoding forward never converts an
     // estimate into an establishment.
     let server = TestServer::start(Script::from_fixture(NOXING));
@@ -358,6 +361,53 @@ fn an_estimated_landing_reports_estimated_provenance() {
 
     engine.finish();
     server.shutdown();
+}
+
+#[test]
+fn a_remote_mp3_seek_reports_estimated_and_a_local_flac_seek_reports_established() {
+    // Fix round 1's real defect: `seek_bounded` originally marked *every*
+    // `Coarse` landing `Estimated`, but `Coarse` only changes behaviour for
+    // MP3. Across this crate's whole dependency tree, MP3's `MpaReader` is
+    // the only `FormatReader::seek` that reads its `mode` argument at all —
+    // FLAC's own seek binary-searches on real per-frame sample numbers
+    // carried in the frame headers, which is exactly why `Coarse` needs to
+    // estimate for MP3 (no such numbers exist in an MP3 frame) and does not
+    // for FLAC. Marking a FLAC landing `Estimated` would assert a loss of
+    // precision that provably did not occur — and matters downstream: §4
+    // forbids an estimated position from replacing an established
+    // checkpoint, so that mistake would freeze a local FLAC's checkpoint at
+    // its pre-seek value on every seek, a regression M1/M2 never had. Both
+    // sides pinned in one test so the distinction cannot regress to
+    // "unconditional" in either direction.
+    let server = TestServer::start(Script::from_fixture("sine-5s.mp3"));
+    let mut remote = TestEngine::start_idle();
+    remote.load_remote(&server.url("/audio.mp3"));
+    assert_eq!(remote.handle().submit_play(), Admission::Accepted);
+    remote.await_state(PlaybackState::Playing);
+    remote.play_for(Duration::from_millis(100));
+    assert_eq!(
+        remote.handle().submit_seek(Duration::from_millis(3_000)),
+        Admission::Accepted
+    );
+    let remote_landing = remote.await_seek_completed(Duration::from_secs(10));
+    assert_eq!(
+        remote_landing.provenance,
+        PositionProvenance::Estimated,
+        "a remote MP3 seek must report Estimated"
+    );
+    remote.finish();
+    server.shutdown();
+
+    let mut local = TestEngine::start("sine-5s.flac");
+    local.play_for(Duration::from_millis(100));
+    local.send(PlaybackCommand::SeekTo(Duration::from_secs(2)));
+    let local_landing = local.await_seek_completed(Duration::from_secs(10));
+    assert_eq!(
+        local_landing.provenance,
+        PositionProvenance::Established,
+        "a local FLAC seek must still report Established — Coarse changes nothing for it"
+    );
+    local.finish();
 }
 
 #[test]

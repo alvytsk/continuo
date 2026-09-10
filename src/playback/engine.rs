@@ -2848,15 +2848,18 @@ fn stop_or_shutdown(word: u8) -> bool {
 /// an inherited, possibly-already-expired one: nothing here remembers a
 /// deadline across calls.
 ///
-/// `SeekMode::Coarse` is what `seek_refined` performs now (`decode.rs`), so
-/// a landing through here is unconditionally reported
-/// `PositionProvenance::Estimated` (§3, §5.2) on success - never inferred
-/// from the target, the file, or which of the four callers reached it, per
-/// the design's rule against claiming an exactness this codebase cannot
-/// observe at seek time. A caller that must not manufacture a landing that
-/// never happened (`reseek`'s own no-op short-circuit, already at target) is
-/// the one place that deliberately does not call this at all - see its own
-/// comment.
+/// `SeekMode::Coarse` is what `seek_refined` performs now (`decode.rs`), but
+/// that mode swap only changes *behaviour* for MP3 - it is the only
+/// `FormatReader::seek` in this crate's dependency tree that reads `mode` at
+/// all (fix round 1). So the provenance this returns is **not** asserted
+/// here: it is read straight off `SeekOutcome::provenance`, which
+/// `seek_refined` itself computes from the reader's own `format_info()` -
+/// `Estimated` for MP3, `Established` for every other format this crate
+/// supports, exactly as it always reported before this task, never inferred
+/// from the target, a Xing/Info tag, or which of the four callers reached
+/// it. A caller that must not manufacture a landing that never happened
+/// (`reseek`'s own no-op short-circuit, already at target) is the one place
+/// that deliberately does not call this at all - see its own comment.
 fn seek_bounded(
     source: &mut DecodedSource,
     source_interrupt: &SourceInterrupt,
@@ -2870,7 +2873,13 @@ fn seek_bounded(
         stop_or_shutdown(local_interrupt.load(Ordering::Acquire))
     });
     source_interrupt.set_operation_deadline(None);
-    outcome.map(|outcome| (outcome, PositionProvenance::Estimated))
+    // Provenance comes from `SeekOutcome` itself, not asserted here: it
+    // follows the demuxer that actually ran `Coarse` (MP3 only - fix round
+    // 1), never asserted uniformly for every landing regardless of format.
+    outcome.map(|outcome| {
+        let provenance = outcome.provenance;
+        (outcome, provenance)
+    })
 }
 
 fn severity(fault: OutputFault) -> u8 {
