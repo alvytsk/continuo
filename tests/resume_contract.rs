@@ -10,21 +10,26 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use continuo::clock::{Clock, FakeClock};
+use continuo::media::capabilities::{Continuity, MediaCapabilities, SeekSupport};
 use continuo::media::id::{AbsolutePath, MediaId};
-use continuo::persistence::model::{PersistedCheckpoint, PersistedState};
+use continuo::media::metadata::MediaMetadata;
+use continuo::persistence::model::{PersistedCheckpoint, PersistedState, SCHEMA_VERSION};
 use continuo::persistence::store::StateStore;
 use continuo::persistence::writer::Urgency;
 use continuo::playback::checkpoint::PlaybackCheckpoint;
 use continuo::playback::command::PlaybackCommand;
 use continuo::playback::decode::DecodedSource;
+use continuo::playback::event::{PlaybackEvent, Progress, StartDisposition};
+use continuo::playback::provenance::PositionProvenance;
 use continuo::playback::state::PlaybackState;
+use continuo::playback::timeline::PositionQuality;
 use continuo::playback::volume::Volume;
 use continuo::resume::{RestartPreference, decide_resume, restart_preference, resume_candidate};
 use continuo::session::{Action, CAPTURE_INTERVAL, Session};
 
 mod support;
 
-use support::TestEngine;
+use support::{TestEngine, media};
 
 const TRACK: &str = "sine-5s.flac";
 /// The fixture's duration, which the probe would supply in `app::run`. The rig
@@ -588,4 +593,116 @@ fn a_stored_estimate_with_no_established_position_reports_none_for_it_after_a_re
             established: None,
         })
     );
+}
+
+// -------------------------------------------------------------- upgrade (R3)
+
+fn loaded_fresh_for(session_rev: u64, media: &MediaId, position: Duration) -> PlaybackEvent {
+    PlaybackEvent::Loaded {
+        session_rev,
+        media: media.clone(),
+        metadata: MediaMetadata::default(),
+        capabilities: MediaCapabilities {
+            continuity: Continuity::Finite,
+            seek: SeekSupport::Native,
+        },
+        position,
+        disposition: StartDisposition::Fresh,
+    }
+}
+
+fn state_changed_to(session_rev: u64, state: PlaybackState) -> PlaybackEvent {
+    PlaybackEvent::StateChanged { session_rev, state }
+}
+
+fn established_progress(session_rev: u64, media: &MediaId, secs: u64) -> Progress {
+    Progress {
+        session_rev,
+        media: Some(media.clone()),
+        position: Duration::from_secs(secs),
+        quality: PositionQuality::Exact,
+        provenance: PositionProvenance::Established,
+        buffering: false,
+    }
+}
+
+/// R3: `tests/persistence_store.rs`'s `a_v1_file_is_accepted_and_normalised_to_v2`
+/// and `the_upgrade_cycle_writes_v2_and_survives_a_reload` prove the migration
+/// at the `StateStore` level directly. What they cannot show is the one hop
+/// `open_persistence` (`engine.rs`) actually takes at every real launch: a
+/// `Session` built straight from the migrated `LoadOutcome`, writing back
+/// through the same store. This is that hop, proven end to end — a v1 file,
+/// read and written through a real `Session`, still ends up v2 on disk with
+/// both the old entry and a brand new one intact, and the store never
+/// stopped reporting itself writable.
+///
+/// Ablation: an `open_persistence` that gated writing on the file's
+/// *original* version rather than `LoadOutcome::writable` (the value the
+/// migration itself already resolved) would make every assertion below fail
+/// together — nothing but the untouched `a` entry would ever reach disk,
+/// since production would have picked `DisabledSink` for a session that
+/// started against a v1 file.
+#[test]
+fn a_session_opened_on_a_v1_file_keeps_persisting_as_v2_with_every_entry_intact() {
+    let dir = tempfile::tempdir().unwrap();
+    let v1 = br#"{
+        "schema_version": 1,
+        "current_media": "local:/music/a.flac",
+        "volume": 0.6,
+        "checkpoints": {
+            "local:/music/a.flac": {
+                "position": { "secs": 42, "nanos": 0 },
+                "completed": false,
+                "touch_seq": 7,
+                "updated_at": "1970-01-01T00:00:00Z"
+            }
+        }
+    }"#;
+    std::fs::write(dir.path().join("state.json"), v1).unwrap();
+
+    let (store, clock) = store_in(dir.path());
+    let outcome = store.load();
+    assert!(
+        outcome.writable,
+        "a v1 file that loads unwritable is the regression this row exists to catch"
+    );
+    let a = media("a");
+    let b = media("b");
+    let mut session = Session::new(outcome.state);
+
+    // Drive a second, unrelated media through the real `Session` — the
+    // production pairing `open_persistence` builds, not a direct
+    // `store.write` the way `persistence_store.rs` proves the migration.
+    let _ = session.observe(&loaded_fresh_for(1, &b, Duration::ZERO), clock.sample());
+    let _ = session.observe(&state_changed_to(1, PlaybackState::Playing), clock.sample());
+    clock.advance_monotonic(CAPTURE_INTERVAL + Duration::from_secs(1));
+    match session.tick(&established_progress(1, &b, 15), clock.sample()) {
+        Action::Submit { state, .. } => store.write(&state).unwrap(),
+        Action::None => panic!("the interval capture must have produced a write"),
+    }
+
+    let bytes = std::fs::read(dir.path().join("state.json")).unwrap();
+    let raw: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        raw["schema_version"], 2,
+        "the file on disk must claim v2 once a v2-aware Session has written through it: {raw}"
+    );
+
+    let reloaded = reload(dir.path());
+    assert_eq!(reloaded.schema_version(), SCHEMA_VERSION);
+    assert_eq!(
+        reloaded.entry_for(&a).and_then(|entry| entry.position),
+        Some(Duration::from_secs(42)),
+        "the v1 entry must survive the upgrade untouched"
+    );
+    assert_eq!(
+        reloaded.entry_for(&b).and_then(|entry| entry.position),
+        Some(Duration::from_secs(15)),
+        "the newly recorded entry must survive the round trip"
+    );
+    assert_eq!(reloaded.len(), 2, "no entry was lost across the upgrade");
+
+    // One further reload, through the store alone: the file is genuinely v2
+    // now, not merely accepted once and forgotten.
+    assert!(store.load().writable);
 }
