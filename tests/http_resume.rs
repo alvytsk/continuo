@@ -18,7 +18,7 @@ use continuo::persistence::store::StateStore;
 use continuo::playback::command::{Admission, ResumeIntent};
 use continuo::playback::event::StartDisposition;
 use continuo::playback::state::PlaybackState;
-use continuo::resume::ResumeCandidate;
+use continuo::resume::resume_candidate;
 use continuo::session::{Action, Session};
 
 use support::TestEngine;
@@ -139,7 +139,10 @@ fn a_second_session_resumes_from_the_flushed_checkpoint() {
     let mut engine2 = TestEngine::start_idle();
     engine2.load_remote_with_resume(
         &url,
-        ResumeIntent::Candidate(ResumeCandidate::from(&flushed)),
+        ResumeIntent::Candidate(
+            resume_candidate(flushed.position, flushed.completed)
+                .expect("session 1's checkpoint must carry an established position"),
+        ),
     );
     let loaded = engine2.await_loaded();
     match loaded.disposition {
@@ -230,7 +233,10 @@ fn the_protection_survives_a_process_boundary() {
     let mut engine2 = TestEngine::start_idle();
     engine2.load_remote_with_resume(
         &url,
-        ResumeIntent::Candidate(ResumeCandidate::from(&original)),
+        ResumeIntent::Candidate(
+            resume_candidate(original.position, original.completed)
+                .expect("session 1's checkpoint must carry an established position"),
+        ),
     );
     let loaded = engine2.await_loaded();
     match loaded.disposition {
@@ -273,7 +279,10 @@ fn the_protection_survives_a_process_boundary() {
     let mut engine3 = TestEngine::start_idle();
     engine3.load_remote_with_resume(
         &url,
-        ResumeIntent::Candidate(ResumeCandidate::from(&after_session_2)),
+        ResumeIntent::Candidate(
+            resume_candidate(after_session_2.position, after_session_2.completed)
+                .expect("session 2's checkpoint must carry an established position"),
+        ),
     );
     let loaded3 = engine3.await_loaded();
     match loaded3.disposition {

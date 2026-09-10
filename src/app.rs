@@ -579,10 +579,9 @@ fn open_persistence(
     // `duration: None` would misreport an ordinary resume as `Unvalidated`
     // every time. The disposition the worker reports on `Loaded` is what a
     // later task logs instead (Ruling 5).
-    // `resume_candidate` (§4.2), not `ResumeCandidate::from` directly: a
-    // freshly loaded entry may carry only an estimate with no established
-    // position at all, and that case must not collapse into a fabricated
-    // `AtStart`.
+    // `resume_candidate` (§4.2): a freshly loaded entry may carry only an
+    // estimate with no established position at all, and that case must not
+    // collapse into a fabricated `AtStart`.
     let candidate = state
         .entry_for(media)
         .and_then(|entry| resume_candidate(entry.position, entry.completed));

@@ -20,7 +20,7 @@ use continuo::persistence::store::StateStore;
 use continuo::playback::command::{Admission, ResumeIntent};
 use continuo::playback::event::{PlaybackEvent, StartDisposition};
 use continuo::playback::state::PlaybackState;
-use continuo::resume::ResumeCandidate;
+use continuo::resume::resume_candidate;
 use continuo::session::{Action, Session};
 
 use support::TestEngine;
@@ -300,7 +300,10 @@ fn a_range_less_server_plays_but_cannot_seek_or_resume() {
     let mut engine2 = TestEngine::start_idle();
     engine2.load_remote_with_resume(
         &url,
-        ResumeIntent::Candidate(ResumeCandidate::from(&before)),
+        ResumeIntent::Candidate(
+            resume_candidate(before.position, before.completed)
+                .expect("session 1's checkpoint must carry an established position"),
+        ),
     );
     let loaded = engine2.await_loaded();
     match loaded.disposition {

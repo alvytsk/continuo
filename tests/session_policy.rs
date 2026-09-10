@@ -13,7 +13,7 @@ use continuo::playback::provenance::PositionProvenance;
 use continuo::playback::state::PlaybackState;
 use continuo::playback::timeline::PositionQuality;
 use continuo::playback::volume::Volume;
-use continuo::resume::ResumeCandidate;
+use continuo::resume::resume_candidate;
 use continuo::session::{Action, CAPTURE_INTERVAL, ResumeDecision, Session, decide_resume};
 
 mod support;
@@ -653,7 +653,7 @@ fn a_stopped_seek_clears_the_completion_its_target_supersedes() {
     // `completed: true` would have discarded.
     assert_eq!(
         decide_resume(
-            Some(ResumeCandidate::from(entry)),
+            resume_candidate(entry.position, entry.completed),
             Some(Duration::from_secs(240).into())
         ),
         ResumeDecision::Resume(Duration::from_secs(30))

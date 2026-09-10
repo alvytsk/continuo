@@ -46,8 +46,8 @@ impl From<Duration> for KnownDuration {
 
 /// The two facts §11's table is a function of, however they were learned. A
 /// caller with a `PersistedCheckpoint` in hand converts it into one of these
-/// (`Session`'s `From` impl does exactly that); a caller with only a
-/// worker-reported target builds one directly.
+/// through [`resume_candidate`]; a caller with only a worker-reported target
+/// builds one directly.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ResumeCandidate {
     pub position: Duration,
@@ -57,7 +57,19 @@ pub struct ResumeCandidate {
 /// Builds the candidate `decide_resume` reasons about from a checkpoint's raw
 /// fields, without this module ever importing `PersistedCheckpoint` (G3): the
 /// caller — `open_persistence`, resolving whatever a freshly loaded file
-/// contains — hands over `position` and `completed` directly instead.
+/// contains, and every test that wants the same conversion production uses —
+/// hands over `position` and `completed` directly instead.
+///
+/// This is deliberately the *only* `PersistedCheckpoint` → `ResumeCandidate`
+/// conversion in the crate. An earlier version of this code also had an
+/// infallible `impl From<&PersistedCheckpoint> for ResumeCandidate` in
+/// `session.rs`, which defaulted an absent `position` to `Duration::ZERO`.
+/// It had no production caller — `open_persistence` always used this
+/// function instead — but it was still reachable by anyone who reached for
+/// the obvious `.into()`, and its default was exactly the "resume at start"
+/// loss this construction exists to prevent, with no diagnostic. Deleted
+/// rather than kept as a documented trap: a conversion that must not be
+/// called with an unverified entry is safer removed than annotated.
 ///
 /// An absent established position (design doc §4.2 — an entry that exists
 /// only to carry an estimate, with nothing ever established) is its own

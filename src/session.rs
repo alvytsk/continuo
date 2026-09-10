@@ -14,47 +14,30 @@ use std::time::{Duration, Instant};
 
 use crate::clock::ClockSample;
 use crate::media::id::MediaId;
-use crate::persistence::model::{PersistedCheckpoint, PersistedState};
+use crate::persistence::model::PersistedState;
 use crate::persistence::writer::Urgency;
 use crate::playback::checkpoint::PlaybackCheckpoint;
 use crate::playback::event::{PlaybackEvent, Progress, ShutdownReport, StartDisposition};
 use crate::playback::state::PlaybackState;
-use crate::resume::ResumeCandidate;
 // Re-exported so `src/app.rs` and `tests/resume_contract.rs` keep importing
 // these from `session` — the type and the function moved to `src/resume.rs`
 // so the playback worker could depend on them too (G3), without dragging
 // `crate::persistence` in behind them. The worker is `decide_resume`'s only
-// production caller now (Ruling 5); what stays here is the one conversion
-// below, from a persisted entry to the persistence-free shape it reasons
-// about.
+// production caller now (Ruling 5). Converting a stored `PersistedCheckpoint`
+// into the persistence-free shape `decide_resume` reasons about is
+// `resume::resume_candidate`'s job, not this module's — there used to be a
+// second, infallible conversion here (`impl From<&PersistedCheckpoint> for
+// ResumeCandidate`), but it had no production caller (`app.rs` always used
+// `resume_candidate` instead) and its `Duration::ZERO` fallback for an
+// absent `position` was exactly the "resume at start" loss this amendment
+// exists to prevent, reachable by anyone who reached for the obvious `.into()`
+// instead. Deleted rather than fixed in place: a function that must not be
+// called with an unverified entry is safer removed than documented.
 pub use crate::resume::{ResumeDecision, decide_resume};
 
 /// The capture interval §6 requires while playing. With the writer's 2 s
 /// coalescing window it bounds worst-case loss at 7 s.
 pub const CAPTURE_INTERVAL: Duration = Duration::from_secs(5);
-
-/// Persistence is a `session` concern, not a `resume` one: `resume` must not
-/// know `PersistedCheckpoint` exists (G3), so this is the one place a stored
-/// entry becomes the persistence-free shape `decide_resume` reasons about.
-///
-/// Infallible, and only honest for a checkpoint whose position is
-/// established: an absent `position` (design doc §4.2 — an entry that exists
-/// only to carry `estimated`) becomes `Duration::ZERO` here, which
-/// `decide_resume` cannot tell apart from a position genuinely established
-/// at zero. Every caller of this conversion resolves a checkpoint it already
-/// knows carries an established position. The one caller that must not make
-/// that assumption — `open_persistence`, resolving whatever a freshly loaded
-/// file happens to contain — uses [`crate::resume::resume_candidate`]
-/// instead, which treats a missing position as its own case rather than
-/// defaulting it to zero.
-impl From<&PersistedCheckpoint> for ResumeCandidate {
-    fn from(entry: &PersistedCheckpoint) -> Self {
-        Self {
-            position: entry.position.unwrap_or(Duration::ZERO),
-            completed: entry.completed,
-        }
-    }
-}
 
 #[derive(Debug)]
 pub enum Action {
