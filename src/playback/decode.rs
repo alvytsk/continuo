@@ -285,10 +285,25 @@ impl DecodedSource {
 
     /// Seek, then decode-and-discard forward to the exact frame.
     ///
-    /// Symphonia's accurate seek lands at or before the target because the
-    /// reader seeks to a packet boundary, so refinement is required for an exact
-    /// landing. `budget` bounds refinement for an *explicit* seek; pass `None`
-    /// for stop-resume and device recovery, which promise preservation.
+    /// `SeekMode::Coarse`, not `Accurate` (M3.1 Task 4): `Accurate`'s
+    /// `preseek_accurate` rewinds to the first packet and rescans forward
+    /// whenever a seek looks backward relative to the demuxer's own
+    /// read-ahead position, inside one uncancellable, unbounded
+    /// `FormatReader::seek()` call — that is the wedge M3's manual
+    /// acceptance found. `Coarse` computes a byte offset directly from the
+    /// track's own duration arithmetic instead, at a measured cost of a few
+    /// KB rather than the whole prefix. The landing this produces is an
+    /// estimate, not a decoder-confirmed position (§5.2 of the design) —
+    /// every caller of this method must treat its result as
+    /// `PositionProvenance::Estimated`, unconditionally.
+    ///
+    /// The reader can only seek to a packet boundary, so refinement is
+    /// required for an exact landing regardless of mode; it is also what
+    /// primes the bit reservoir a `Coarse` landing needs before its output
+    /// can be trusted (§5.2) — decoding and discarding forward to the target
+    /// already does this, with no mode-specific bookkeeping. `budget` bounds
+    /// refinement for an *explicit* seek; pass `None` for stop-resume and
+    /// device recovery, which promise preservation.
     pub fn seek_refined(
         &mut self,
         target: Duration,
@@ -298,7 +313,7 @@ impl DecodedSource {
         let seeked = self
             .reader
             .seek(
-                SeekMode::Accurate,
+                SeekMode::Coarse,
                 SeekTo::Time {
                     time: duration_to_time(target),
                     track_id: Some(self.track_id),

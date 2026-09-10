@@ -77,6 +77,20 @@ struct State {
     /// A *level*, not an edge. A pause persists until a play, and a read that
     /// blocks after the edge would have passed must still observe it (G2).
     frozen: bool,
+    /// An absolute deadline for one operation, checked inside `read`'s wait
+    /// loop regardless of `frozen` — see `SourceInterrupt::
+    /// set_operation_deadline`.
+    ///
+    /// Deliberately **not** cleared by `retire` or `begin`, unlike every
+    /// other field here: one `seek_refined` call can span more than one
+    /// generation internally (`HttpMediaSource::seek`'s own `Seek::seek`
+    /// impl calls `begin` every time it re-requests a byte range), and the
+    /// deadline has to bound the *whole* seek, not just the first byte-level
+    /// leg of it. Its one setter (the engine's seek routing) sets this
+    /// before the call and clears it back to `None` itself once the whole
+    /// call returns, success or failure alike — that is the only place this
+    /// field is ever written to `None` again.
+    operation_deadline: Option<Instant>,
 }
 
 /// The out-of-band wake shared by the application, the worker, every source
@@ -112,6 +126,7 @@ impl SourceInterrupt {
                 generation: 1,
                 retired: false,
                 frozen: false,
+                operation_deadline: None,
             }),
             reader_wake: Condvar::new(),
             producer_wake: Notify::new(),
@@ -184,6 +199,23 @@ impl SourceInterrupt {
     pub fn thaw(&self) {
         lock(&self.state).frozen = false;
         self.wake_all();
+    }
+
+    /// An absolute deadline for one operation, checked inside `read`'s wait
+    /// loop **regardless of the freeze level**.
+    ///
+    /// Distinct from the stall budget on purpose. The stall budget is
+    /// suspended while frozen — deliberately, so a pause is never reported as
+    /// a server stall — which means a paused, stalled read waits forever. A
+    /// deadline expressed as "remaining time, passed as a stall budget"
+    /// inherits that suspension and bounds nothing at all.
+    ///
+    /// `None` clears it. A wake is not needed to make a set or a clear take
+    /// effect: `read`'s wait loop re-checks every `SLICE` regardless, the
+    /// same way it already re-checks `frozen` and the stall budget without
+    /// being woken for either.
+    pub fn set_operation_deadline(&self, deadline: Option<Instant>) {
+        lock(&self.state).operation_deadline = deadline;
     }
 
     pub fn is_retired(&self) -> bool {
@@ -367,6 +399,19 @@ impl ByteChannel {
                 return ReadOutcome::Failed(RemoteFailure::Timeout {
                     phase: Phase::Stall,
                 });
+            }
+            // Checked regardless of `frozen`, unlike the stall budget just
+            // above (R1). A seek's own operation deadline must still expire a
+            // read blocked on a stalled server even while playback is
+            // paused: the stall budget's suspension while frozen is
+            // deliberate for ordinary playback (a pause must never be
+            // reported as a server stall), but inherited unchanged by a
+            // seek's wait it would let a paused, stalled seek hang forever —
+            // bounded on paper, wedged in fact.
+            if let Some(deadline) = state.operation_deadline
+                && Instant::now() >= deadline
+            {
+                return ReadOutcome::Failed(RemoteFailure::Timeout { phase: Phase::Seek });
             }
             let frozen_before = state.frozen;
             let slice_start = Instant::now();

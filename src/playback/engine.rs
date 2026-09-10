@@ -30,7 +30,7 @@ use crate::resume::{KnownDuration, ResumeDecision, decide_resume};
 
 use super::callback::CallbackCore;
 use super::command::{Admission, PlaybackCommand, ResumeIntent};
-use super::decode::DecodedSource;
+use super::decode::{DecodedSource, SeekOutcome};
 use super::error::PlaybackError;
 use super::event::{PlaybackEvent, Progress, ShutdownReport, StartDisposition};
 use super::handshake::Handshake;
@@ -541,6 +541,14 @@ struct Worker {
     /// The logical resume point. Stop and recreation preserve it; load,
     /// restart and successful seeks establish a new one.
     position: Duration,
+    /// Whether `position` is decoder-established or a byte-offset estimate
+    /// (§3, M3.1). Sticky: ordinary playback never changes it, and a seek
+    /// that performs no actual `seek_refined` call (`reseek`'s no-op, or a
+    /// load that never moves off zero) leaves it exactly as it was, never
+    /// resetting it to `Established` by default. `publish_progress` mirrors
+    /// this into `facts.provenance` on every pass, the same way it mirrors
+    /// `position` and `degraded`.
+    position_provenance: PositionProvenance,
     requested_target: Option<Duration>,
     media: Option<MediaId>,
     volume: Volume,
@@ -667,6 +675,7 @@ impl Worker {
             state: PlaybackState::Idle,
             session_rev: 0,
             position: Duration::ZERO,
+            position_provenance: PositionProvenance::Established,
             requested_target: None,
             media: None,
             volume: Volume::FULL,
@@ -1065,11 +1074,10 @@ impl Worker {
             facts.media = self.media.clone();
             facts.position = self.position;
             facts.degraded = self.degraded;
-            // Task 3 threads the axis through without yet producing an
-            // estimated landing anywhere in this worker (that is Task 4's
-            // `SeekMode::Coarse` work) — every position this worker
-            // establishes today is decoder-confirmed.
-            facts.provenance = PositionProvenance::Established;
+            // Mirrored, never derived from `degraded` or `playing` (§3.1's
+            // stickiness): playing on from an estimated landing must keep
+            // reporting it estimated for as long as the landing stands.
+            facts.provenance = self.position_provenance;
             // Paused counts as well as Playing: parking silences the
             // callback, but the frames it already handed to the device still
             // play out, so the position goes on rising for one output
@@ -1202,7 +1210,10 @@ impl Worker {
         self.capture_and_teardown();
         let target = self.position;
         match self.reseek(target) {
-            Ok(actual) => self.position = adopt_preserved(target, actual),
+            Ok((actual, provenance)) => {
+                self.position = adopt_preserved(target, actual);
+                self.position_provenance = provenance;
+            }
             Err(error) => {
                 if !is_cancelled(&error) {
                     self.fail(format!("cannot recover after {reason}: {error}"));
@@ -1843,6 +1854,12 @@ impl Worker {
         if let ResumeIntent::StartAt(target) = resume {
             self.position = target;
         }
+        // Reset for the new session, unconditionally: a stale `Estimated`
+        // left over from the session this load just tore down must not
+        // survive into one that never seeks at all (`start_at == 0` below).
+        // The resume seek further down is the only thing in this method that
+        // may set it back to `Estimated`.
+        self.position_provenance = PositionProvenance::Established;
         self.degraded = false;
         self.set_state(PlaybackState::Loading);
         // Set unconditionally, success or failure: a failed remote open still
@@ -1913,19 +1930,25 @@ impl Worker {
             // seek this source had not yet proven - read before the attempt,
             // since a successful seek below is exactly what promotes it.
             let was_unknown = self.capabilities.seek == SeekSupport::Unknown;
-            // Cancellable for the same reason `reseek` is: the worker must not
-            // be blind to a stop or a shutdown for the length of a refinement.
-            // Not the SEEK bit (Ruling 2): that bit only means "a seek was
-            // accepted", including this very one, and checking it here would
-            // make an ordinary explicit seek cancel its own first attempt the
-            // moment the interrupt word happens to still carry it.
-            let interrupt = Arc::clone(&self.interrupt);
-            let seek = decoded.seek_refined(start_at, None, &mut || {
-                stop_or_shutdown(interrupt.load(Ordering::Acquire))
-            });
+            // R2: this is one of `seek_refined`'s four call sites, routed
+            // through the shared `seek_bounded` so the deadline and the
+            // unconditional `Estimated` provenance apply here exactly as
+            // they do to every other caller - a launch resume at a stored
+            // position is exactly the case the field report's "two presses
+            // of the right arrow" generalises from.
+            let deadline = self.seek_deadline();
+            let seek = seek_bounded(
+                &mut decoded,
+                &self.source_interrupt,
+                &self.interrupt,
+                deadline,
+                start_at,
+                None,
+            );
             match seek {
-                Ok(outcome) => {
+                Ok((outcome, provenance)) => {
                     self.position = adopt_preserved(start_at, outcome.actual);
+                    self.position_provenance = provenance;
                     // A successful seek on a source whose demuxer seek
                     // support was still unproven IS the proof (§6). Recording
                     // it here means `Loaded`'s own `capabilities` already
@@ -2073,10 +2096,13 @@ impl Worker {
         let stored = self.requested_target.take();
         let target = stored.unwrap_or(self.position);
         let landed;
+        let landed_provenance;
         match self.reseek(target) {
-            Ok(actual) => {
+            Ok((actual, provenance)) => {
                 landed = actual;
+                landed_provenance = provenance;
                 self.position = adopt_preserved(target, actual);
+                self.position_provenance = provenance;
             }
             // A stop or a shutdown arrived mid-refinement. The preserved
             // position still stands; the interrupt is handled by the loop.
@@ -2102,9 +2128,7 @@ impl Worker {
                         requested,
                         actual,
                         refinement_truncated: false,
-                        // This path is `reseek`'s refined (Accurate) landing;
-                        // Task 4 is what introduces an estimated one.
-                        provenance: PositionProvenance::Established,
+                        provenance: landed_provenance,
                     });
                 }
             }
@@ -2319,7 +2343,11 @@ impl Worker {
         // short forward seek satisfies entirely from `MediaSourceStream`'s
         // own read-ahead buffer, with no `seek()` call at all - and nothing
         // would ever open a new fetch to replace it.
-        let interrupt = Arc::clone(&self.interrupt);
+        // R2: this is one of `seek_refined`'s four call sites, routed
+        // through the shared `seek_bounded` so the deadline applies here
+        // exactly as it does to the other three - this is the user's own
+        // seek, the case the field report is about.
+        let deadline = self.seek_deadline();
         let outcome = {
             let Some(source) = self.source.as_mut() else {
                 return;
@@ -2327,18 +2355,24 @@ impl Worker {
             // Not the SEEK bit: `submit_seek` sets it for exactly this
             // dispatch, and checking it here would make this seek cancel
             // its own first attempt.
-            source.seek_refined(target, Some(SEEK_BUDGET), &mut || {
-                stop_or_shutdown(interrupt.load(Ordering::Acquire))
-            })
+            seek_bounded(
+                source,
+                &self.source_interrupt,
+                &self.interrupt,
+                deadline,
+                target,
+                Some(SEEK_BUDGET),
+            )
         };
         match outcome {
-            Ok(outcome) => {
+            Ok((outcome, provenance)) => {
                 // `refinement_truncated` is false when refinement ran into the
                 // end of the media, so a short landing is checked separately.
                 let truncated = outcome.refinement_truncated
                     || outcome.actual.saturating_add(RESUME_TOLERANCE) < target;
                 let actual = outcome.actual;
                 self.position = actual;
+                self.position_provenance = provenance;
                 self.requested_target = None;
                 // §6: any demonstrated seek is proof, not only the trial
                 // `verify_seek_support` runs for a stopped one - an ordinary
@@ -2367,9 +2401,7 @@ impl Worker {
                     requested: target,
                     actual,
                     refinement_truncated: truncated,
-                    // `seek_refined` is today's only landing (Accurate);
-                    // Task 4 is what introduces an estimated one.
-                    provenance: PositionProvenance::Established,
+                    provenance,
                 });
             }
             // §8: an accepted seek always receives an outcome, even when a
@@ -2383,11 +2415,14 @@ impl Worker {
                     session_rev,
                     requested: target,
                 });
-                // Best-effort restoration at the preserved position. Whatever
-                // interrupt caused this cancellation is handled by the
-                // loop's next pass regardless of whether this succeeds.
-                if let Ok(actual) = self.reseek(preserved) {
+                // Best-effort restoration at the preserved position (§5.4): one
+                // fresh bounded attempt, never the expired deadline this seek
+                // may have just hit - `reseek` routes through `seek_bounded`
+                // too, so `self.seek_deadline()` is read again from scratch
+                // rather than any value carried over from above.
+                if let Ok((actual, provenance)) = self.reseek(preserved) {
                     self.position = adopt_preserved(preserved, actual);
+                    self.position_provenance = provenance;
                     let _ = self.reinstall(playing);
                 }
             }
@@ -2396,13 +2431,16 @@ impl Worker {
                 // arbitrary point inside the refinement, so the position has
                 // to be re-established explicitly, never assumed.
                 self.position = preserved;
+                // §5.4: the same fresh-deadline recovery as the cancelled arm
+                // above.
                 match self.reseek(preserved) {
                     // Cancelled again: the stop or shutdown that cancelled the
                     // seek is about to be handled, and it tears the decoder
                     // down anyway. The preserved position stands.
                     Err(restore_error) if is_cancelled(&restore_error) => {}
-                    Ok(actual) => {
+                    Ok((actual, provenance)) => {
                         self.position = adopt_preserved(preserved, actual);
+                        self.position_provenance = provenance;
                         if let Err(reinstall_error) = self.reinstall(playing) {
                             if !is_cancelled(&reinstall_error) {
                                 self.fail(format!(
@@ -2447,13 +2485,19 @@ impl Worker {
             // it is already at would only spend a network round trip
             // proving what opening it already established.
             self.position = Duration::ZERO;
+            // A fresh open at byte zero is exact - nothing was estimated,
+            // there was nothing to seek - so this is one of the two acts
+            // that clears a sticky `Estimated` (§4.4's `RestartEstablished`
+            // exit), not merely a position reset.
+            self.position_provenance = PositionProvenance::Established;
             self.requested_target = None;
         } else {
             // Validate first: the transport is only started once the decoder
             // has actually landed at zero.
             match self.reseek(Duration::ZERO) {
-                Ok(actual) => {
+                Ok((actual, provenance)) => {
                     self.position = actual;
+                    self.position_provenance = provenance;
                     self.requested_target = None;
                 }
                 Err(error) if is_cancelled(&error) => return,
@@ -2491,19 +2535,35 @@ impl Worker {
     /// left waiting for a refinement to finish. A cancelled one leaves the
     /// decoder at an arbitrary point, which is why every caller either
     /// re-establishes it or abandons the operation entirely.
-    fn reseek(&mut self, target: Duration) -> Result<Duration, PlaybackError> {
-        let interrupt = Arc::clone(&self.interrupt);
+    ///
+    /// R2: one of `seek_refined`'s four call sites, routed through
+    /// `seek_bounded` - stop→play (`restore`) and device recovery both reach
+    /// `seek_refined` only through here. The no-op short-circuit below is
+    /// deliberately *not* routed: nothing seeks, so nothing about
+    /// `self.position_provenance` should change, and the caller's own
+    /// `Ok((target, self.position_provenance))` says exactly that -
+    /// carrying it forward unchanged rather than manufacturing a landing
+    /// that never happened.
+    fn reseek(
+        &mut self,
+        target: Duration,
+    ) -> Result<(Duration, PositionProvenance), PlaybackError> {
+        let deadline = self.seek_deadline();
         let Some(source) = self.source.as_mut() else {
-            return Ok(target);
+            return Ok((target, self.position_provenance));
         };
         if source.position() == target {
-            return Ok(target);
+            return Ok((target, self.position_provenance));
         }
-        source
-            .seek_refined(target, None, &mut || {
-                stop_or_shutdown(interrupt.load(Ordering::Acquire))
-            })
-            .map(|outcome| outcome.actual)
+        seek_bounded(
+            source,
+            &self.source_interrupt,
+            &self.interrupt,
+            deadline,
+            target,
+            None,
+        )
+        .map(|(outcome, provenance)| (outcome.actual, provenance))
     }
 
     fn clamp_target(&self, requested: Duration) -> Duration {
@@ -2547,6 +2607,22 @@ impl Worker {
         if self.source_is_remote() {
             self.source = None;
         }
+    }
+
+    /// The deadline `seek_bounded` gives `SourceInterrupt::
+    /// set_operation_deadline` for one seek's underlying reader I/O (§5.3):
+    /// the same `limits.stall` figure ordinary reads are bounded to, now
+    /// enforced regardless of the freeze level rather than only while
+    /// unfrozen (R1's fix). Read fresh on every seek, exactly like
+    /// `prepare_context`'s own `limits` below - a service installed after
+    /// this worker started is honoured the next time a seek runs, not only
+    /// the next time a source opens. Inert for a local seek: nothing local
+    /// ever reads `source_interrupt`'s deadline.
+    fn seek_deadline(&self) -> Duration {
+        lock(&self.http)
+            .as_ref()
+            .map(|service| service.limits().stall)
+            .unwrap_or_default()
     }
 
     /// The ingredients `prepare` needs, read fresh on every call so a
@@ -2645,13 +2721,26 @@ impl Worker {
     /// seek".
     fn verify_seek_support(&mut self) -> Result<bool, PlaybackError> {
         let current = self.position;
-        let interrupt = Arc::clone(&self.interrupt);
+        // R2: the fourth of `seek_refined`'s four call sites, routed through
+        // `seek_bounded` so a stopped-seek validation is bounded exactly like
+        // an ordinary one - this trial goes over the network precisely
+        // because the source has never demonstrated a seek before, so an
+        // unbounded rescan here is the same wedge under a different name.
+        // Deliberately does not touch `self.position_provenance`: the trial
+        // lands back at `current` without ever changing `self.position`, so
+        // there is no landing here for provenance to describe.
+        let deadline = self.seek_deadline();
         let Some(source) = self.source.as_mut() else {
             return Ok(false);
         };
-        let outcome = source.seek_refined(current, None, &mut || {
-            stop_or_shutdown(interrupt.load(Ordering::Acquire))
-        });
+        let outcome = seek_bounded(
+            source,
+            &self.source_interrupt,
+            &self.interrupt,
+            deadline,
+            current,
+            None,
+        );
         match outcome {
             Ok(_) => {
                 if let Some(source) = self.source.as_mut() {
@@ -2732,6 +2821,56 @@ fn is_cancelled(error: &PlaybackError) -> bool {
 /// operation in progress must give up regardless of what it is.
 fn stop_or_shutdown(word: u8) -> bool {
     word & (STOP | SHUTDOWN) != 0
+}
+
+/// The one seat every `seek_refined` call goes through (R2 of M3.1 Task 4):
+/// `load`, `seek_to`, `reseek` (so `restore`/stop→play and `restart` reach it
+/// too) and `verify_seek_support` all call this rather than `DecodedSource::
+/// seek_refined` directly, so the deadline policy below cannot drift between
+/// them.
+///
+/// A free function rather than a `Worker` method: `load` calls this before
+/// `decoded` is installed as `self.source`, so `source` has to be a
+/// standalone parameter the caller already holds, and threading `self`
+/// through as well would force every caller to give up the disjoint
+/// `self.source`/`self.source_interrupt`/`self.interrupt` borrows the
+/// existing call sites already rely on.
+///
+/// Sets a fresh, operation-scoped deadline on `source_interrupt` for the
+/// duration of `seek_refined`'s own `reader.seek()` call and clears it back
+/// to `None` once that call returns, success or failure alike (§5.3) - one
+/// deadline, applied identically whether `source` is remote or local (inert
+/// for a local source, which never touches `source_interrupt`'s deadline at
+/// all) and identically across every caller, per the brief's rule against
+/// special-casing by transport. `deadline` is computed fresh by every caller
+/// from `Worker::seek_deadline()` immediately before this runs, which is
+/// what makes a recovery attempt's deadline a *fresh* one (§5.4) rather than
+/// an inherited, possibly-already-expired one: nothing here remembers a
+/// deadline across calls.
+///
+/// `SeekMode::Coarse` is what `seek_refined` performs now (`decode.rs`), so
+/// a landing through here is unconditionally reported
+/// `PositionProvenance::Estimated` (§3, §5.2) on success - never inferred
+/// from the target, the file, or which of the four callers reached it, per
+/// the design's rule against claiming an exactness this codebase cannot
+/// observe at seek time. A caller that must not manufacture a landing that
+/// never happened (`reseek`'s own no-op short-circuit, already at target) is
+/// the one place that deliberately does not call this at all - see its own
+/// comment.
+fn seek_bounded(
+    source: &mut DecodedSource,
+    source_interrupt: &SourceInterrupt,
+    local_interrupt: &AtomicU8,
+    deadline: Duration,
+    target: Duration,
+    budget: Option<Duration>,
+) -> Result<(SeekOutcome, PositionProvenance), PlaybackError> {
+    source_interrupt.set_operation_deadline(Some(Instant::now() + deadline));
+    let outcome = source.seek_refined(target, budget, &mut || {
+        stop_or_shutdown(local_interrupt.load(Ordering::Acquire))
+    });
+    source_interrupt.set_operation_deadline(None);
+    outcome.map(|outcome| (outcome, PositionProvenance::Estimated))
 }
 
 fn severity(fault: OutputFault) -> u8 {

@@ -21,6 +21,10 @@ pub enum Phase {
     Stall,
     /// The whole of opening and probing.
     Open,
+    /// One seek's own operation deadline (M3.1 Task 4), checked regardless
+    /// of the freeze level. Distinct from `Stall`, which is active-demand
+    /// time and is suspended while paused.
+    Seek,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

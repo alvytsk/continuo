@@ -941,15 +941,13 @@ fn a_seek_cancelled_while_reopening_from_stopped_reports_cancelled_not_rejected(
 // near-instantly (what an efficient short forward seek should cost) is not
 // confused with it.
 //
-// Run explicitly: `cargo test --test engine_remote -- --ignored
-// a_short_forward_seek`. Remove `#[ignore]` once the fix designed against
-// this diagnosis lands - at that point this becomes the regression test.
+// Fixed by M3.1 Task 4: `seek_refined` (`src/playback/decode.rs`) now seeks
+// `SeekMode::Coarse` rather than `Accurate`, which computes a byte offset
+// directly from the track's own duration arithmetic instead of asking the
+// demuxer to scan - see `docs/superpowers/specs/
+// 2026-09-10-continuo-estimated-seek-design.md` §5.2 for the measurements.
+// This is now the regression test for that fix.
 #[test]
-#[ignore = "known defect: SeekMode::Accurate's preseek_accurate rewinds to \
-            first_packet_pos and rescans whenever a seek's demuxer-relative \
-            position looks backward, with no cancellation or budget over \
-            FormatReader::seek; fix tracked in docs/m1-known-debt.md M3 \
-            capability-evidence (H17)"]
 fn a_short_forward_seek_on_a_no_index_mp3_rescans_the_whole_file_instead_of_landing_quickly() {
     let server = TestServer::start(
         Script::from_fixture("sine-noxing.mp3").trickle(2048, Duration::from_millis(80)),

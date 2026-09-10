@@ -34,14 +34,24 @@ fn stop_preserves_the_logical_position() {
 }
 
 #[test]
-fn an_ordinary_local_seek_reports_an_established_landing() {
-    // The M1 path is unchanged: a local file's refined seek lands where it
-    // says, and nothing about this milestone may make it claim otherwise.
+fn an_ordinary_local_seek_reports_an_estimated_landing() {
+    // Overturned by M3.1 Task 4, deliberately: `seek_refined` has exactly
+    // one `SeekMode` call site, shared by local and remote sources
+    // (`docs/superpowers/specs/2026-09-10-continuo-estimated-seek-design.md`
+    // §5.2), and it now seeks `Coarse` rather than `Accurate` to fix the
+    // remote wedge - "the local path changes too, and that is intended"
+    // (Task 4's brief). A local landing is no longer decoder-confirmed
+    // either: the design's rule against inferring exactness from context
+    // this codebase cannot observe at seek time ("never established because
+    // the file looked exact") applies here exactly as it does to a remote
+    // seek, with no special case for transport. Before this task this
+    // asserted `Established`; that assertion is exactly what this milestone
+    // overturns, and this test now pins the opposite.
     let mut engine = TestEngine::start(TRACK);
     engine.play_for(Duration::from_millis(200));
     engine.send(PlaybackCommand::SeekTo(Duration::from_secs(2)));
     let completed = engine.await_seek_completed(Duration::from_secs(10));
-    assert_eq!(completed.provenance, PositionProvenance::Established);
+    assert_eq!(completed.provenance, PositionProvenance::Estimated);
     engine.finish();
 }
 
