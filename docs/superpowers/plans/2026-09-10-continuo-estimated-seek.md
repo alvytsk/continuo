@@ -360,7 +360,14 @@ git commit -m "feat(playback): add the byte-offset seek estimator"
 - Modify: `src/playback/mod.rs`, `src/playback/event.rs`, `src/playback/wait.rs`, `src/playback/engine.rs`, `src/app.rs`
 - Test: `tests/provenance.rs` (new); mechanical updates wherever `Progress` is constructed
 
-**Interfaces:** `PositionProvenance { Established, Estimated }`, exactly as §3 defines it, plus `Progress.provenance` and `SeekCompleted.provenance`.
+**Interfaces:** `PositionProvenance { Established, Estimated }`, exactly as §3 defines it, plus `Progress.provenance`, `SeekCompleted.provenance`, **and the same axis on `MediaMetadata::duration` (§5.5)**.
+
+**Duration carries provenance too, and it is the more dangerous of the two.** The spike found that `estimate_num_mpeg_frames` samples only the first ~16 frames: on a VBR file that produced an estimated duration of 361 s for a true 600 s — 40 % short. Exact for CBR, which is why nothing has noticed. Two verified paths turn that into silent loss:
+
+- `src/resume.rs:85` returns `StalePastEnd` when `position > duration`, and `start_at()` maps it to zero. A listener 70 % through such a file **resumes at the beginning**, their checkpoint discarded as stale.
+- `clamp_target` clamps seeks to `metadata().duration`, so the tail is unreachable and a seek into it lands silently at the estimated ceiling.
+
+So `MediaMetadata::duration` records whether it was derived or observed, and §5.5's rule applies: **an estimated duration may inform display and must never drive a destructive decision.** `decide_resume` treats an estimated duration exactly as it treats an absent one — `ResumeDecision::Unvalidated`, which M2 already implements and which retains the stored position. `StalePastEnd` requires an *established* duration. `clamp_target` does not clamp to an estimated one.
 
 **The rule that matters, and the one a reviewer should check hardest:** provenance is a **second axis**, never merged into `PositionQuality`. `PositionQuality::Estimated` already exists and means something else entirely — how precisely we know what has been *heard*, reconstructed from callback spans, which is the ordinary state during playback. A `Degraded` position whose media time was decoder-established is still `Established`. The session policy reads provenance and never quality.
 
@@ -412,6 +419,33 @@ fn established_is_the_default_so_every_existing_path_keeps_its_meaning() {
     // M1 and M2 wrote positions the decoder confirmed. Anything that does not
     // opt into an estimate must keep reporting what it always reported.
     assert_eq!(PositionProvenance::default(), PositionProvenance::Established);
+}
+```
+
+Add to `tests/resume_decision.rs`, additively — these two are the ones that protect a real listener from losing a real position:
+
+```rust
+#[test]
+fn a_checkpoint_past_an_estimated_duration_is_retained_rather_than_declared_stale() {
+    // The spike measured a 361 s estimate for a 600 s VBR file. Under the old
+    // rule a listener 70 % in resumes at zero and their entry is discarded as
+    // stale — silent loss, from a number nothing ever measured.
+    let candidate = ResumeCandidate { position: Duration::from_secs(420), completed: false };
+    assert_eq!(
+        decide_resume(Some(candidate), estimated(Duration::from_secs(361))),
+        ResumeDecision::Unvalidated(Duration::from_secs(420))
+    );
+}
+
+#[test]
+fn a_checkpoint_past_an_established_duration_is_still_stale() {
+    // The M2 rule is unchanged where the duration was actually observed:
+    // a position past a known end really is a file that changed underneath us.
+    let candidate = ResumeCandidate { position: Duration::from_secs(420), completed: false };
+    assert_eq!(
+        decide_resume(Some(candidate), established(Duration::from_secs(361))),
+        ResumeDecision::StalePastEnd
+    );
 }
 ```
 

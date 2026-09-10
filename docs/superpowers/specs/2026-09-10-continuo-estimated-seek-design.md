@@ -496,6 +496,56 @@ wedge being fixed. If the fresh attempt also fails, the seek reports failure
 with the pre-seek position restored logically, and the source is retired so
 the next explicit action reopens cleanly.
 
+## 5.5 Estimated *duration*, and why it is more dangerous than an estimated position
+
+The spike surfaced this while measuring something else, and it is the sharpest
+finding in this amendment.
+
+`estimate_num_mpeg_frames` samples only the **first ~16 frames** to derive
+`num_frames`. On the VBR fixture that produced an estimated duration of
+361 s for a genuinely 600 s file — 40 % short. For CBR it is exact, which is
+why nothing has noticed: most podcasts, including the one that occasioned this
+work, are CBR.
+
+An under-estimated duration is not merely a cosmetic display error. Two paths
+turn it into silent loss, both verified:
+
+1. **`src/resume.rs:85` — a legitimate checkpoint is judged stale.**
+   `decide_resume` returns `StalePastEnd` when `position > duration`, and
+   `start_at()` maps that to zero. A listener 70 % through a VBR recording
+   whose duration is under-estimated by 40 % **resumes at the beginning**, and
+   the entry that would have saved them is discarded as stale. This is exactly
+   the class of loss §4 exists to prevent, arriving by a different door.
+2. **`clamp_target` — the tail becomes unreachable.** Seeks are clamped to
+   `metadata().duration`, so the last 40 % of such a file cannot be reached,
+   and a seek into it lands silently at the estimated ceiling rather than
+   failing. (A target past the ceiling is refused `OutOfRange` by both
+   `Coarse` and `Accurate` alike — a duration problem, not a seek-mode one,
+   and at least it fails loudly.)
+
+**The rule: an estimated duration may inform display, and must never drive a
+destructive decision.** Concretely:
+
+- `MediaMetadata::duration` carries its provenance, the same axis §3
+  introduces for position. A duration derived from `estimate_num_mpeg_frames`
+  is `Estimated`; one from a real index, container header or seek table is
+  `Established`.
+- `decide_resume` treats an **estimated** duration as it treats an absent one.
+  M2 already has the right answer for that case — `ResumeDecision::Unvalidated`
+  — which retains the stored position rather than discarding it. `StalePastEnd`
+  requires an established duration, because declaring a listener's checkpoint
+  stale is destructive and an estimate is not evidence enough to do it.
+- `clamp_target` does not clamp to an estimated duration. A seek beyond it is
+  attempted and allowed to fail honestly, which is better than landing
+  somewhere the listener did not ask for.
+- The status line already renders an unknown duration as `--:--:--`. An
+  estimated one is displayed, not hidden — but it must not be presented as
+  though it were measured.
+
+**This generalises §3.** Provenance is not a property of positions
+specifically; it is a property of every quantity this player derives rather
+than observes. Duration was simply the first other one to matter.
+
 ## 6. Acceptance
 
 - The parked reproduction passes, with `#[ignore]` removed.
@@ -524,6 +574,10 @@ the next explicit action reopens cleanly.
   their stored positions.
 - **Schema**: a v1 file loads under v2 with `estimated: None`; a v2 file read
   by a v1 build is preserved unwritten.
+- **Estimated duration**: a checkpoint past an *estimated* duration resumes at
+  the stored position rather than at zero; the same checkpoint past an
+  *established* duration is still `StalePastEnd`; a seek past an estimated
+  duration is attempted rather than silently clamped.
 
 ## 7. Review boundary
 
