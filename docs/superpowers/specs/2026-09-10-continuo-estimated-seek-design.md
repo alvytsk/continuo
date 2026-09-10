@@ -442,6 +442,80 @@ never clamped to `num_frames` — only an *explicit seek* past the (wrong)
 estimate is refused. At least this failure mode is loud and honest, unlike
 the mislanding above.
 
+**When does the large error actually occur? Only under a conjunction, and
+the reported bug does not meet it.** The mislanding above is not a property
+of `Coarse`. It is a property of `Coarse`'s *denominator*, and that
+denominator is `num_frames`, whose provenance this amendment already tracks.
+Two independent conditions must both hold to produce it:
+
+1. **No Xing/Info/VBRI tag**, so `num_frames` comes from
+   `estimate_num_mpeg_frames`'s ~16-frame sample — which is what made
+   `total_dur` 361 s against a true 600 s. This is the dominant term: a 40%
+   wrong denominator drives the byte estimate toward 100% of the *real* byte
+   length as the target approaches the *estimated* ceiling.
+2. **Genuinely variable bitrate**, so that even a correct denominator would
+   not make the uniform-bitrate arithmetic exact.
+
+With a tag present, condition 1 fails and the denominator is the encoder's
+own declared frame count. The residual error is then bounded by local
+bitrate deviation from the file average — zero for CBR, and for
+tagged VBR a fraction of the file rather than a third of it.
+
+**Measured against the file that actually wedged.** `rt_podcast900.mp3`
+(the Radio-T episode from the manual acceptance report) was checked
+directly over its own CDN with byte-range requests:
+
+| Property | Value | How |
+|---|---|---|
+| ID3v2.4 tag | 37,432 B, pushing the first frame past a naive 8 KB probe | header parse |
+| First frame | MPEG-1 Layer III, 128 kbps, 44.1 kHz | frame header at 37,432 |
+| `Info` tag | present at 37,453, `flags=0xf`, `frames=312238`, TOC present | tag parse |
+| LAME tag | present at 37,573 | tag parse |
+| Duration from `Info` | 8156.42 s (2:15:56) | `312238 × 1152 / 44100` |
+| Duration if uniform 128 kbps | 8156.45 s (2:15:56) | `(130540588 − 37432) × 8 / 128000` |
+| **Divergence** | **0.03 s over 2 h 16 m** | — |
+
+`Info` (rather than `Xing`) is the identifier LAME writes for a constant-
+bitrate file, and symphonia accepts both (`INFO_TAG_ID`, `demuxer.rs:736`).
+So on this file `num_frames` is the encoder's exact count, not an estimate,
+**and** the uniform-bitrate assumption is exact to within one frame across
+the whole recording. `Coarse` lands essentially exactly here. The wedge this
+amendment exists to fix is fixed, on the very file that exhibited it, with
+no accuracy cost at all.
+
+This does not soften the finding above — it locates it. The catastrophic
+case is real and must be designed for; it is simply not the common case,
+and it is not the reported one.
+
+**What this means structurally: the finding validates the provenance axis
+rather than undermining it.** §5.5 already rules that an estimated duration
+must never drive a destructive decision. A `Coarse` seek's landing *is*
+driven by the duration, so the rule reaches it directly, and the two cases
+fall out of the axis already specified:
+
+- **Duration established** (Xing/Info/VBRI): the denominator is the
+  encoder's. Landing is exact for CBR and bounded by bitrate variance for
+  VBR. Still reported `Estimated` — §3.4 promises no figure, and nothing at
+  seek time proves which of the two it is.
+- **Duration estimated** (no tag): the denominator may be wrong by tens of
+  percent, and the landing error has no useful ceiling below the file's own
+  length. The landing is not merely imprecise; it may name a different part
+  of the recording entirely.
+
+The design consequence is already written and needs no new mechanism: such a
+landing must not overwrite an established checkpoint (§4), must not drive a
+`StalePastEnd` verdict (§5.5), and must be shown as unreliable rather than
+as a number the listener can act on (§3.4).
+
+**Not adopted, recorded as future work.** A better duration estimate would
+collapse the dominant error term cheaply — sampling frame headers at ten
+points across the file costs ~40 KB against the 983 KB rescan this
+amendment removes, and would replace a 16-frame extrapolation with something
+defensible. Symphonia's discarded TOC would do better still if it were
+reachable. Neither is in scope here: this amendment removes a wedge, and
+widening it into duration-estimator work would be the same scope drift §5.5
+was just narrowed to avoid.
+
 **Does the decision survive all of this? Yes, on cost — not on accuracy.**
 `Coarse` is not switched out for shape A or B, because both would carry the
 identical duration-estimate vulnerability with none of Coarse's advantages
@@ -561,12 +635,24 @@ index exists. For MP3 specifically, `num_frames` is populated by exactly one
 of three code paths in `MpaReader::try_new` — a Xing/Info tag, a VBRI tag, or
 `estimate_num_mpeg_frames`'s bitrate arithmetic — and symphonia's public
 `Track` type carries no field distinguishing which one ran; the only trace
-is a `log::info!` line, which is not a stable API to branch on. Nor would
-distinguishing Xing/VBRI from the estimate actually buy anything: a
-Xing/VBRI tag is itself only a self-declared *total frame count*, not a
-byte-offset table — this spike's own evidence is that `Coarse` performs the
-identical byte arithmetic plus local frame-walk regardless of which path
-populated `num_frames`. None of the four containers M1 ships (WAV, FLAC,
+is a `log::info!` line, which is not a stable API to branch on. Distinguishing them would nonetheless buy something real, and an earlier
+draft of this section denied it on a false premise. That draft claimed a
+Xing/VBRI tag is "only a self-declared total frame count, not a byte-offset
+table". **That is wrong.** The Xing/Info tag carries an optional 100-entry
+byte-offset TOC (flags bit 2), and symphonia *parses* it —
+`XingInfoTag { toc: Option<[u8; 100]>, is_cbr: bool, .. }` at
+`demuxer.rs:749-757` — then discards it: the struct is `#[allow(dead_code)]`
+and only `num_frames` (`:439`) and `lame` (`:434`) are ever read. `toc`,
+`is_cbr`, `num_bytes` and `quality` are constructed at `:924` and never
+consumed by anything.
+
+So the correct statement is narrower and more useful: the TOC exists in the
+format and in many real files, but symphonia's binding does not expose or
+use it. That is a limitation of the binding, not of MP3, and it is the
+reason `Coarse` performs the same uniform-bitrate arithmetic regardless of
+which path populated `num_frames`. What the tag's *presence* does buy is
+described in the section immediately below, and it is the difference between
+an exact landing and a catastrophic one. None of the four containers M1 ships (WAV, FLAC,
 MP3, AAC/ISO-BMFF) expose a true random-access seek index through
 symphonia's public `FormatReader`/`Track` API that this codebase can
 observe. **The rule, therefore: `SeekSupport`/`MediaCapabilities` must
