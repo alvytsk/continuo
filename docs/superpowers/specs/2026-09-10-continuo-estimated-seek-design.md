@@ -123,7 +123,13 @@ the established field:
 
 ```rust
 pub struct PersistedCheckpoint {
-    pub position: Duration,        // established; unchanged meaning
+    /// The established position — decoder-confirmed, unchanged in meaning
+    /// from M2. `None` when nothing has ever established one for this media:
+    /// an entry that exists only to carry `estimated`. Distinct from
+    /// `Some(ZERO)`, which means established at the start; `decide_resume`
+    /// must not conflate them, since M2's `ResumeDecision::AtStart` already
+    /// means the second.
+    pub position: Option<Duration>,
     pub completed: bool,
     pub touch_seq: u64,
     pub updated_at: OffsetDateTime,
@@ -134,6 +140,9 @@ pub struct PersistedCheckpoint {
 }
 ```
 
+A v1 file's present `position` deserialises straight to `Some`, so the field
+change costs the migration nothing.
+
 ### 4.2 The write rules
 
 - With an established checkpoint present, estimated progress **never** writes
@@ -143,8 +152,16 @@ pub struct PersistedCheckpoint {
   bootstraps itself into `position`.
 - Established-checkpoint writes resume only once the absolute position is
   independently established again (§4.4).
-- `completed` is only ever set from a verified completion, which is by
-  construction established. An estimated timeline cannot complete a track.
+- **An estimated timeline *can* complete a track, but cannot promote its
+  timestamp.** An earlier draft claimed completion was "established by
+  construction". It is not: the engine computes the terminal position as the
+  anchor plus decoded frames, so an estimated anchor yields an estimated
+  terminal position. What a verified HTTP completion establishes is that the
+  *body* finished — not that the anchor was right. So `completed` may be set
+  from an estimated timeline, while the position written beside it goes to
+  `estimated` and never to `position`. Completion and position are separable
+  facts here, and conflating them is how an unconfirmed number would inherit a
+  confirmed one's authority.
 
 ### 4.3 Which location a restart selects
 
@@ -154,21 +171,32 @@ favour of an older established point would silently undo their last seek —
 the failure this ruling exists to prevent. The established point is retained
 as the fallback throughout, exactly as M3's range-less protection retains it.
 
-The resume reports `StartDisposition::ResumedEstimated { established }` so the
-application can say which location it used and what it kept.
+The resume reports `StartDisposition::ResumedEstimated { established: Option<Duration> }`
+so the application can say which location it used and what it kept —
+`None` for an estimate-only entry, which must be rendered without implying a
+fallback that does not exist.
 
 ### 4.4 When the preference clears
 
-`estimated` is discarded — and established writes resume — on any of:
+`estimated` is discarded — and established writes resume — on either of:
 
 - a **successful establishing seek**: one whose landing the decoder confirmed;
-- a **successfully established Restart** (M3's `RestartEstablished`);
-- **verified completion**.
+- a **successfully established Restart** (M3's `RestartEstablished`).
 
-It is *not* cleared by a capability change, by ordinary playback however long,
-or by a failed seek. Those are the same three exits M3's range-less protection
-uses, and for the same reason: only an act that re-establishes the absolute
-position earns the right to overwrite an established checkpoint.
+**Verified completion is not a third exit**, though M3's range-less protection
+uses it as one. The two cases differ: there, a completion is reached along a
+timeline whose positions were decoder-established throughout, so nothing
+unconfirmed survives it. Here the terminal position is the estimated anchor
+plus decoded frames, so a completion reached from an estimated timeline is
+itself estimated — it sets `completed`, and retains both estimated provenance
+and checkpoint protection. A completion reached from an *established* timeline
+clears as it always did, because there is nothing estimated to retain.
+
+`estimated` is *not* cleared by a capability change, by ordinary playback
+however long, by a failed seek, or by an estimated completion. The principle is
+unchanged and is what the exits are derived from: only an act that
+re-establishes the absolute position earns the right to overwrite an
+established checkpoint.
 
 ### 4.5 Schema
 
@@ -259,8 +287,17 @@ the next explicit action reopens cleanly.
   disturb provenance in either direction.
 - **Persistence**: an estimated position never overwrites an established
   `position`; with none present it persists only as `estimated`; restart
-  selects `estimated` when present and reports what it kept; the three exits
-  in §4.4 each clear it and each re-permit established writes.
+  selects `estimated` when present and reports what it kept, reporting
+  `established: None` for an estimate-only entry; **both** exits in §4.4 clear
+  it and re-permit established writes, and an estimated completion clears
+  neither.
+- **Completion under estimate**: an estimated timeline reaching EOF sets
+  `completed` while its terminal position goes to `estimated`, leaving any
+  established `position` untouched and protection in force.
+- **Upgrade**: a session started against an existing v1 file keeps persisting
+  — the file becomes v2, every entry survives, and the session was never
+  marked unwritable. Nothing in this amendment may cost an existing listener
+  their stored positions.
 - **Schema**: a v1 file loads under v2 with `estimated: None`; a v2 file read
   by a v1 build is preserved unwritten.
 

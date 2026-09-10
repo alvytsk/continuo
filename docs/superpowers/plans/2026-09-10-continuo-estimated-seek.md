@@ -598,7 +598,9 @@ Additive, in the existing files' style:
 
 - [ ] **Step 2–5: Run failing, implement, verify, commit**
 
-Bump `SCHEMA_VERSION`, add the field with `#[serde(skip_serializing_if = "Option::is_none", default)]`, and confirm the store's version handling needs no change beyond the constant — if it does, that is a finding worth reporting.
+Bump `SCHEMA_VERSION` to 2, change `position` to `Option<Duration>`, and add `estimated` with `#[serde(skip_serializing_if = "Option::is_none", default)]`.
+
+**The store's version handling must change, and that is the substance of this task.** `store.rs:107` currently rejects every unequal version, older included. Replace that equality check with: accept `SCHEMA_VERSION`, accept and **normalise** v1, reject everything else through the existing `UnsupportedVersion` path. Normalising means a v1 entry loads as a v2 entry — `position` as `Some`, `estimated` as `None` — and the *next write emits v2*. A migration that reads v1 but writes without updating the envelope produces a file claiming v1 that holds v2 data, which the next v1 build reads and quietly discards.
 
 ```bash
 git commit -m "feat(persistence): record an estimated location beside the established one"
@@ -620,11 +622,17 @@ git commit -m "feat(persistence): record an estimated location beside the establ
 
   So decide and implement, explicitly: an `EndOfTrack` reached from an estimated timeline **must not silently promote its timestamp**. Reaching the end of the body is real evidence the recording finished, so `completed` may legitimately be set — but the *position* written alongside it is still estimated and must go to `estimated`, not `position`. Say in a comment why completion and position are separable here. Test: estimated seek → EOF → inspect the persisted state, asserting `position` was not overwritten by the estimated terminal value.
 - Restart prefers `estimated` when present, falling back to `position`, and reports `StartDisposition::ResumedEstimated { established }` so the application can say what it used and what it kept.
-- `estimated` clears — and established writes resume — on exactly three things: an establishing seek, an established `Restart`, verified completion. **Not** on a capability change, not on elapsed playback however long, not on a failed seek.
+- `estimated` clears — and established writes resume — on exactly two things: an **establishing seek**, and an **established `Restart`**. Both re-establish the absolute position by decoder confirmation, which is the only thing that earns the right to overwrite an established checkpoint.
+
+  **Verified completion is deliberately not a third exit**, and this supersedes the earlier draft that listed it. Per the rule immediately above, an `EndOfTrack` reached from an estimated timeline sets `completed` but its terminal position is still `anchor + decoded frames` over an estimated anchor. Completion establishes that the *body* finished, not that the anchor was right — so an estimated completion **retains estimated provenance and retains checkpoint protection**. A completion reached from an *established* timeline clears as it always did, because there is nothing estimated to retain.
+
+  Not cleared by: a capability change, elapsed playback however long, a failed seek, or an estimated completion.
 
 - **`SeekTargetStored` needs its own rule (R5).** The write rules omitted it, and `Session` currently writes that unvalidated target straight through `record_current` *and* substitutes it for the sampled position at shutdown via `position_for`. Define the sequence: estimated seek → stop → a new stored target → quit. The newest intent must survive — it is the listener's most recent expressed wish — **without** overwriting the established checkpoint.
 
-  The compatibility question must be answered explicitly rather than discovered: existing tests in `tests/session_policy.rs` pin the current behaviour for *established* playback, where a stored target writes `position` directly. Decide whether a stored target inherits the provenance of the position it was computed from (the natural reading — a target 10 s past an estimated position is itself estimated), state that decision in a comment, and make sure the established path is bit-for-bit unchanged. If any existing assertion has to move, stop and report it.
+  **The decision is made, and this is the requirement, not a question to reopen: a stored target inherits the provenance of the position it was computed from.** A target ten seconds past an estimated position is itself estimated, and is written to `estimated`; a target computed from an established position is established, and writes `position` exactly as it does today. Implement that, and say why in a comment — a stored seek target is arithmetic on a position, and arithmetic cannot make an unconfirmed number confirmed.
+
+  The established path must be **bit-for-bit unchanged**: `tests/session_policy.rs` pins it, including `position_for`'s substitution of a stored target for the sampled position at shutdown. If any existing assertion has to move, stop and report it rather than editing it — that would mean this rule changed established behaviour, which it must not.
 
 - **When there is no established fallback (R8).** `StartDisposition::ResumedEstimated { established: Option<Duration> }` reports `None` for an estimate-only entry, and the application must render that case without implying a fallback exists. `decide_resume` takes both locations and must not treat an absent `position` as zero — "never established" and "established at the start" are different facts, and M2's `ResumeDecision::AtStart` already means the second one.
 
