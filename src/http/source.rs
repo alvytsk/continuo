@@ -308,20 +308,6 @@ impl HttpMediaSource {
         self.consumed
     }
 
-    /// Sets the deadline through to the interrupt, for one seek.
-    ///
-    /// A thin forward onto `SourceInterrupt::set_operation_deadline` — the
-    /// interrupt is what `read`'s wait loop actually consults, and it is
-    /// shared with every source this session ever opens, so a caller that
-    /// already holds that `Arc` (the engine, notably: `DecodedSource` boxes
-    /// this source away, but the same `Arc<SourceInterrupt>` it was opened
-    /// with stays live on the engine's own side) can set the deadline
-    /// directly without reaching through here at all. This exists for a
-    /// caller that holds only this source.
-    pub fn set_seek_deadline(&self, deadline: Option<Instant>) {
-        self.interrupt.set_operation_deadline(deadline);
-    }
-
     fn wait_budget(&self) -> Result<Duration, RemoteFailure> {
         wait_budget(&self.opening_limits, self.opening_deadline, &self.limits)
     }
