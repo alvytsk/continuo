@@ -187,7 +187,7 @@ fn a_stop_and_a_quit_resume_where_playback_reached() {
 
     let decision = decide_resume(
         state.entry_for(&track_id()).map(ResumeCandidate::from),
-        Some(TRACK_DURATION),
+        Some(TRACK_DURATION.into()),
     );
     assert!(decision.start_at() >= Duration::from_secs(2));
 }
@@ -365,7 +365,7 @@ fn a_finished_track_is_completed_and_reopens_at_zero_with_its_position_kept() {
 
     let decision = decide_resume(
         state.entry_for(&track_id()).map(ResumeCandidate::from),
-        Some(TRACK_DURATION),
+        Some(TRACK_DURATION.into()),
     );
     assert_eq!(
         decision.start_at(),
@@ -418,7 +418,11 @@ fn a_position_past_the_end_survives_a_launch_whose_device_refuses_to_open() {
         .cloned()
         .expect("the stale entry");
     assert_eq!(
-        decide_resume(Some(ResumeCandidate::from(&kept)), Some(TRACK_DURATION)).start_at(),
+        decide_resume(
+            Some(ResumeCandidate::from(&kept)),
+            Some(TRACK_DURATION.into())
+        )
+        .start_at(),
         Duration::ZERO,
         "§11 opens a position past the end at zero"
     );
@@ -491,7 +495,7 @@ fn a_position_past_the_end_is_refused_as_a_start() {
     let reloaded = reload(dir.path());
     let decision = decide_resume(
         reloaded.entry_for(&track_id()).map(ResumeCandidate::from),
-        Some(TRACK_DURATION),
+        Some(TRACK_DURATION.into()),
     );
     assert_eq!(decision.start_at(), Duration::ZERO);
 

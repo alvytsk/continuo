@@ -42,7 +42,8 @@ fn fetch_url_stays_separate_from_identity_and_unplayable_items_exist() {
     assert_eq!(
         MediaMetadata {
             title: None,
-            duration: None
+            duration: None,
+            duration_provenance: continuo::playback::provenance::PositionProvenance::Established
         }
         .duration,
         None

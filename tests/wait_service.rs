@@ -16,6 +16,7 @@ use continuo::playback::event::{PlaybackEvent, Progress};
 use continuo::playback::handshake::Handshake;
 use continuo::playback::link::OutputLink;
 use continuo::playback::output::{Nanos, SpanRecord};
+use continuo::playback::provenance::PositionProvenance;
 use continuo::playback::state::PlaybackState;
 use continuo::playback::timeline::{PositionQuality, Timeline};
 use continuo::playback::wait::{SessionFacts, WaitService};
@@ -57,6 +58,7 @@ fn servicing_publishes_the_position_the_timeline_reports() {
         media: None,
         position: Duration::ZERO,
         quality: PositionQuality::Exact,
+        provenance: PositionProvenance::Established,
         buffering: false,
     }));
     let facts = Arc::new(Mutex::new(SessionFacts {
@@ -65,6 +67,7 @@ fn servicing_publishes_the_position_the_timeline_reports() {
         position: Duration::from_secs(9),
         degraded: false,
         playing: true,
+        provenance: PositionProvenance::Established,
         frozen_by_hook: false,
     }));
     let (interrupt, events, outbox, backlog_empty) = inert();
@@ -107,6 +110,7 @@ fn servicing_a_freeze_parks_the_output_and_announces_paused() {
         position: Duration::from_secs(7),
         degraded: false,
         playing: true,
+        provenance: PositionProvenance::Established,
         frozen_by_hook: false,
     }));
     let service = WaitService::new(
@@ -116,6 +120,7 @@ fn servicing_a_freeze_parks_the_output_and_announces_paused() {
             media: None,
             position: Duration::from_secs(7),
             quality: PositionQuality::Exact,
+            provenance: PositionProvenance::Established,
             buffering: false,
         })),
         Arc::clone(&facts),
@@ -169,6 +174,7 @@ fn a_hook_announcement_goes_to_the_outbox_when_the_workers_backlog_is_not_empty(
             media: None,
             position: Duration::ZERO,
             quality: PositionQuality::Exact,
+            provenance: PositionProvenance::Established,
             buffering: false,
         })),
         Arc::new(Mutex::new(SessionFacts {
@@ -177,6 +183,7 @@ fn a_hook_announcement_goes_to_the_outbox_when_the_workers_backlog_is_not_empty(
             position: Duration::ZERO,
             degraded: false,
             playing: true,
+            provenance: PositionProvenance::Established,
             frozen_by_hook: false,
         })),
         Arc::clone(&interrupt),
@@ -213,6 +220,7 @@ fn servicing_with_no_transport_is_harmless_and_repeatable() {
         media: None,
         position: Duration::from_secs(3),
         quality: PositionQuality::Exact,
+        provenance: PositionProvenance::Established,
         buffering: false,
     }));
     let facts = Arc::new(Mutex::new(SessionFacts {
@@ -221,6 +229,7 @@ fn servicing_with_no_transport_is_harmless_and_repeatable() {
         position: Duration::from_secs(3),
         degraded: false,
         playing: false,
+        provenance: PositionProvenance::Established,
         frozen_by_hook: false,
     }));
     let (interrupt, events, outbox, backlog_empty) = inert();
@@ -279,6 +288,7 @@ fn servicing_a_blocked_read_advances_the_position_as_the_clock_advances() {
         media: None,
         position: Duration::ZERO,
         quality: PositionQuality::Exact,
+        provenance: PositionProvenance::Established,
         buffering: false,
     }));
     let facts = Arc::new(Mutex::new(SessionFacts {
@@ -287,6 +297,7 @@ fn servicing_a_blocked_read_advances_the_position_as_the_clock_advances() {
         position: Duration::ZERO,
         degraded: false,
         playing: true,
+        provenance: PositionProvenance::Established,
         frozen_by_hook: false,
     }));
     let (interrupt, events, outbox, backlog_empty) = inert();

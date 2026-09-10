@@ -45,6 +45,7 @@ use continuo::playback::link::{OutputLink, Phase};
 use continuo::playback::output::cpal_output::OutputFault;
 use continuo::playback::output::test_output::TestOutput;
 use continuo::playback::output::{AudioOutput, Nanos, NegotiatedOutput, OutputRequest};
+use continuo::playback::provenance::PositionProvenance;
 use continuo::playback::state::PlaybackState;
 use continuo::playback::volume::Volume;
 
@@ -195,6 +196,32 @@ impl Driver {
 pub struct Loaded {
     pub position: Duration,
     pub disposition: StartDisposition,
+}
+
+/// Where a `SeekCompleted` landed, and its provenance (§3), from
+/// `TestEngine::await_seek_completed`.
+///
+/// `PartialEq<Duration>`/`PartialOrd<Duration>` are implemented by hand,
+/// rather than deriving them against `Self`, so every existing call site
+/// that compares the old `Duration`-only return value (`landed >=
+/// Duration::from_secs(2)`, `{landed:?}`) keeps compiling unchanged; a test
+/// that cares about provenance reads `.provenance` explicitly instead.
+#[derive(Clone, Copy, Debug)]
+pub struct SeekLanding {
+    pub actual: Duration,
+    pub provenance: PositionProvenance,
+}
+
+impl PartialEq<Duration> for SeekLanding {
+    fn eq(&self, other: &Duration) -> bool {
+        self.actual == *other
+    }
+}
+
+impl PartialOrd<Duration> for SeekLanding {
+    fn partial_cmp(&self, other: &Duration) -> Option<std::cmp::Ordering> {
+        self.actual.partial_cmp(other)
+    }
 }
 
 pub struct TestEngine {
@@ -844,10 +871,10 @@ impl TestEngine {
         position
     }
 
-    /// Wait for `SeekCompleted` and return where it landed. Takes its own
-    /// patience rather than `PATIENCE`: a remote seek's refinement can
-    /// legitimately take longer than a local one's.
-    pub fn await_seek_completed(&mut self, patience: Duration) -> Duration {
+    /// Wait for `SeekCompleted` and return where it landed, and its
+    /// provenance. Takes its own patience rather than `PATIENCE`: a remote
+    /// seek's refinement can legitimately take longer than a local one's.
+    pub fn await_seek_completed(&mut self, patience: Duration) -> SeekLanding {
         let deadline = Instant::now() + patience;
         loop {
             self.pump_events();
@@ -857,10 +884,13 @@ impl TestEngine {
                     .iter()
                     .position(|e| matches!(e, PlaybackEvent::SeekCompleted { .. }))
                 {
-                    let PlaybackEvent::SeekCompleted { actual, .. } = inbox.remove(index) else {
+                    let PlaybackEvent::SeekCompleted {
+                        actual, provenance, ..
+                    } = inbox.remove(index)
+                    else {
                         unreachable!("the position above already matched SeekCompleted")
                     };
-                    return actual;
+                    return SeekLanding { actual, provenance };
                 }
             }
             if Instant::now() >= deadline {

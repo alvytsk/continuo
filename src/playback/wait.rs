@@ -28,6 +28,7 @@ use crate::media::id::MediaId;
 use super::engine::{DEADLINE, EVENT_CAPACITY, PUMP_NAP, RESERVED_EVENT_SLOTS, TransportCore};
 use super::event::{PlaybackEvent, Progress};
 use super::output::Nanos;
+use super::provenance::PositionProvenance;
 use super::state::PlaybackState;
 use super::timeline::PositionQuality;
 
@@ -67,6 +68,11 @@ pub struct SessionFacts {
     pub position: Duration,
     pub degraded: bool,
     pub playing: bool,
+    /// Whether `position` is decoder-established or a byte-offset estimate
+    /// (§3). Mirrored from the worker's own truth exactly like the fields
+    /// above; `publish_progress` copies it straight into `Progress`, never
+    /// derives it from `degraded` or `playing`.
+    pub provenance: PositionProvenance,
     /// Set by the hook when it parks for a freeze, cleared when it releases.
     /// The worker reads it to know the transport is parked without having
     /// dispatched the `Pause` itself.
@@ -240,6 +246,10 @@ impl WaitService {
                 media: facts.media.clone(),
                 position: facts.position,
                 quality,
+                // Read straight from facts, never derived: provenance is an
+                // orthogonal axis to quality, and this recompute must not
+                // touch it either way (§3.1's stickiness).
+                provenance: facts.provenance,
                 // Ruling 4: true exactly for the caller that exists *because*
                 // a source read is blocked - never derived from `quality`,
                 // which reports an unrelated fact (a timing base that jumped).
@@ -323,6 +333,7 @@ mod tests {
                 media: None,
                 position: Duration::ZERO,
                 quality: PositionQuality::Exact,
+                provenance: PositionProvenance::Established,
                 buffering: false,
             })),
             Arc::new(Mutex::new(SessionFacts {
@@ -331,6 +342,7 @@ mod tests {
                 position: Duration::ZERO,
                 degraded: false,
                 playing: false,
+                provenance: PositionProvenance::Established,
                 frozen_by_hook: false,
             })),
             SourceInterrupt::new(1024),

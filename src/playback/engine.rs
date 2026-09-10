@@ -25,7 +25,7 @@ use crate::http::source::{is_retired, remote_cause};
 use crate::media::capabilities::{Continuity, MediaCapabilities, SeekSupport};
 use crate::media::id::MediaId;
 use crate::media::source::SourceLocation;
-use crate::resume::{ResumeDecision, decide_resume};
+use crate::resume::{KnownDuration, ResumeDecision, decide_resume};
 
 use super::callback::CallbackCore;
 use super::command::{Admission, PlaybackCommand, ResumeIntent};
@@ -37,6 +37,7 @@ use super::link::OutputLink;
 use super::output::cpal_output::{CpalOutput, OutputFault};
 use super::output::{AudioOutput, Nanos, NegotiatedOutput, OutputRequest, SpanRecord};
 use super::prepare::{PrepareContext, prepare};
+use super::provenance::PositionProvenance;
 use super::resample::Converter;
 use super::state::PlaybackState;
 use super::timeline::{PositionQuality, Timeline};
@@ -205,6 +206,7 @@ impl EngineHandle {
             media: None,
             position: Duration::ZERO,
             quality: PositionQuality::Exact,
+            provenance: PositionProvenance::Established,
             buffering: false,
         }));
         let interrupt = Arc::new(AtomicU8::new(0));
@@ -622,6 +624,7 @@ impl Worker {
             position: Duration::ZERO,
             degraded: false,
             playing: false,
+            provenance: PositionProvenance::Established,
             frozen_by_hook: false,
         }));
         let backlog_empty = Arc::new(AtomicBool::new(true));
@@ -1061,6 +1064,11 @@ impl Worker {
             facts.media = self.media.clone();
             facts.position = self.position;
             facts.degraded = self.degraded;
+            // Task 3 threads the axis through without yet producing an
+            // estimated landing anywhere in this worker (that is Task 4's
+            // `SeekMode::Coarse` work) — every position this worker
+            // establishes today is decoder-confirmed.
+            facts.provenance = PositionProvenance::Established;
             // Paused counts as well as Playing: parking silences the
             // callback, but the frames it already handed to the device still
             // play out, so the position goes on rising for one output
@@ -1865,7 +1873,11 @@ impl Worker {
         let (start_at, disposition) = match resume {
             ResumeIntent::StartAt(target) => (target, StartDisposition::Fresh),
             ResumeIntent::Candidate(candidate) => {
-                let decision = decide_resume(Some(candidate), decoded.metadata().duration);
+                let known_duration = decoded.metadata().duration.map(|value| KnownDuration {
+                    value,
+                    provenance: decoded.metadata().duration_provenance,
+                });
+                let decision = decide_resume(Some(candidate), known_duration);
                 let target = decision.start_at();
                 // §10: a positive candidate a non-seekable source cannot
                 // establish. Starting at zero silently would be exactly the
@@ -2089,6 +2101,9 @@ impl Worker {
                         requested,
                         actual,
                         refinement_truncated: false,
+                        // This path is `reseek`'s refined (Accurate) landing;
+                        // Task 4 is what introduces an estimated one.
+                        provenance: PositionProvenance::Established,
                     });
                 }
             }
@@ -2351,6 +2366,9 @@ impl Worker {
                     requested: target,
                     actual,
                     refinement_truncated: truncated,
+                    // `seek_refined` is today's only landing (Accurate);
+                    // Task 4 is what introduces an estimated one.
+                    provenance: PositionProvenance::Established,
                 });
             }
             // §8: an accepted seek always receives an outcome, even when a

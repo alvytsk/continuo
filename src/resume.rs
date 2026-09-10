@@ -17,6 +17,33 @@
 
 use std::time::Duration;
 
+use crate::playback::provenance::PositionProvenance;
+
+/// A duration `decide_resume` reasons against, carrying whether it was
+/// derived from a real index/container header or extrapolated from a
+/// byte-rate estimate (§5.5). The distinction matters because an
+/// under-estimated duration is not evidence that a stored position is stale:
+/// `decide_resume` treats `Estimated` exactly as it treats an absent
+/// duration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct KnownDuration {
+    pub value: Duration,
+    pub provenance: PositionProvenance,
+}
+
+impl From<Duration> for KnownDuration {
+    /// For the callers this milestone must not change: an M1/M2-style
+    /// duration a decoder actually reported. Do not reach for this to
+    /// describe a value that came from `estimate_num_mpeg_frames` — construct
+    /// `KnownDuration` explicitly with `PositionProvenance::Estimated` there.
+    fn from(value: Duration) -> Self {
+        Self {
+            value,
+            provenance: PositionProvenance::Established,
+        }
+    }
+}
+
 /// The two facts §11's table is a function of, however they were learned. A
 /// caller with a `PersistedCheckpoint` in hand converts it into one of these
 /// (`Session`'s `From` impl does exactly that); a caller with only a
@@ -63,9 +90,15 @@ impl ResumeDecision {
 /// literal in a test — so deciding never opens a second file on its own
 /// account. Completion is never inferred from `position >= duration`, and
 /// there is no near-end heuristic anywhere.
+///
+/// An **estimated** duration is treated exactly as an absent one (§5.5):
+/// `StalePastEnd` requires an established duration, because declaring a
+/// listener's checkpoint stale is destructive and an estimate — which the
+/// spike measured 40% short on a genuinely VBR file — is not evidence enough
+/// to do it.
 pub fn decide_resume(
     candidate: Option<ResumeCandidate>,
-    duration: Option<Duration>,
+    duration: Option<KnownDuration>,
 ) -> ResumeDecision {
     let Some(candidate) = candidate else {
         return ResumeDecision::NoEntry;
@@ -79,7 +112,10 @@ pub fn decide_resume(
     let Some(duration) = duration else {
         return ResumeDecision::Unvalidated(candidate.position);
     };
-    match candidate.position.cmp(&duration) {
+    if duration.provenance == PositionProvenance::Estimated {
+        return ResumeDecision::Unvalidated(candidate.position);
+    }
+    match candidate.position.cmp(&duration.value) {
         std::cmp::Ordering::Less => ResumeDecision::Resume(candidate.position),
         std::cmp::Ordering::Equal => ResumeDecision::DegenerateEnd,
         std::cmp::Ordering::Greater => ResumeDecision::StalePastEnd,

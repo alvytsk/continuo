@@ -30,6 +30,7 @@ use crate::playback::engine::EngineHandle;
 use crate::playback::error::PlaybackError;
 use crate::playback::event::PlaybackEvent;
 use crate::playback::prepare::{PrepareContext, prepare};
+use crate::playback::provenance::PositionProvenance;
 use crate::playback::state::PlaybackState;
 use crate::playback::timeline::PositionQuality;
 use crate::playback::volume::Volume;
@@ -156,6 +157,7 @@ pub fn run(cli: cli::Cli) -> Result<(), PlaybackError> {
             if progress.session_rev == mirror.session_rev {
                 mirror.position = progress.position;
                 mirror.quality = progress.quality;
+                mirror.provenance = progress.provenance;
                 mirror.buffering = progress.buffering;
             }
             // A terminal write failure is not a reason to skip the final
@@ -674,6 +676,10 @@ struct Mirror {
     state: PlaybackState,
     position: Duration,
     quality: PositionQuality,
+    /// Whether `position` is decoder-established or a byte-offset estimate
+    /// (§3), read from `Progress`/`SeekCompleted` — never derived from
+    /// `quality`, which is an unrelated fact.
+    provenance: PositionProvenance,
     volume: Volume,
     /// §11: carried whole, rather than as a bare `SeekSupport`, so
     /// `status_line` can tell "unresolved" from "unsupported" apart. `None`
@@ -694,6 +700,7 @@ impl Default for Mirror {
             state: PlaybackState::Idle,
             position: Duration::ZERO,
             quality: PositionQuality::Exact,
+            provenance: PositionProvenance::Established,
             volume: Volume::default(),
             capabilities: None,
             buffering: false,
@@ -718,6 +725,11 @@ impl Mirror {
                 self.capabilities = Some(capabilities);
                 self.position = position;
                 self.quality = PositionQuality::Exact;
+                // `Loaded` does not yet carry its own provenance field
+                // (§3's interfaces are scoped to `Progress`, `SeekCompleted`
+                // and `MediaMetadata::duration`); every load in this
+                // milestone lands at a decoder-confirmed position.
+                self.provenance = PositionProvenance::Established;
                 self.state = PlaybackState::Loading;
                 // MINOR (final review): a fresh load starts with nothing
                 // buffering. Display-only and unreachable under one load per
@@ -868,11 +880,17 @@ fn render(mirror: &Mirror) -> Result<(), PlaybackError> {
 fn status_line(mirror: &Mirror) -> String {
     let name = mirror.name.as_deref().unwrap_or("(no media)");
     let position = format_hms(mirror.position);
-    let suffix = if mirror.quality == PositionQuality::Degraded {
-        " ~"
-    } else {
-        ""
-    };
+    // Two independent marks for two independent facts (§3): a degraded
+    // quality says the played-so-far estimate may be off, while `~est` says
+    // the absolute position itself was never decoder-confirmed. Neither
+    // implies the other, so both may appear together.
+    let mut suffix = String::new();
+    if mirror.quality == PositionQuality::Degraded {
+        suffix.push_str(" ~");
+    }
+    if mirror.provenance == PositionProvenance::Estimated {
+        suffix.push_str(" ~est");
+    }
     let duration = mirror
         .duration
         .map(format_hms)
@@ -980,6 +998,7 @@ mod tests {
             metadata: MediaMetadata {
                 title: None,
                 duration: Some(Duration::from_secs(300)),
+                duration_provenance: PositionProvenance::Established,
             },
             capabilities: MediaCapabilities {
                 continuity: Continuity::Finite,
@@ -1408,6 +1427,7 @@ mod tests {
             metadata: MediaMetadata {
                 title: None,
                 duration: Some(Duration::from_secs(300)),
+                duration_provenance: PositionProvenance::Established,
             },
             capabilities: MediaCapabilities {
                 continuity: Continuity::Finite,

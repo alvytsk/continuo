@@ -5,7 +5,8 @@
 
 use std::time::Duration;
 
-use continuo::resume::{ResumeCandidate, ResumeDecision, decide_resume};
+use continuo::playback::provenance::PositionProvenance;
+use continuo::resume::{KnownDuration, ResumeCandidate, ResumeDecision, decide_resume};
 
 fn stored(secs: u64, completed: bool) -> ResumeCandidate {
     ResumeCandidate {
@@ -14,8 +15,27 @@ fn stored(secs: u64, completed: bool) -> ResumeCandidate {
     }
 }
 
-fn secs(value: u64) -> Option<Duration> {
-    Some(Duration::from_secs(value))
+/// Every existing test in this file predates provenance and means an
+/// established duration - an M1/M2-style value a decoder actually reported.
+fn secs(value: u64) -> Option<KnownDuration> {
+    established(Duration::from_secs(value))
+}
+
+/// A duration extrapolated from a byte-rate estimate rather than observed
+/// (§5.5) - `decide_resume` must treat this exactly as it treats `None`.
+fn estimated(value: Duration) -> Option<KnownDuration> {
+    Some(KnownDuration {
+        value,
+        provenance: PositionProvenance::Estimated,
+    })
+}
+
+/// A duration from a real index, container header or seek table.
+fn established(value: Duration) -> Option<KnownDuration> {
+    Some(KnownDuration {
+        value,
+        provenance: PositionProvenance::Established,
+    })
 }
 
 #[test]
@@ -128,4 +148,33 @@ fn the_decision_is_the_same_whoever_applies_it() {
             }
         }
     }
+}
+
+#[test]
+fn a_checkpoint_past_an_estimated_duration_is_retained_rather_than_declared_stale() {
+    // The spike measured a 361 s estimate for a 600 s VBR file. Under the old
+    // rule a listener 70 % in resumes at zero and their entry is discarded as
+    // stale — silent loss, from a number nothing ever measured.
+    let candidate = ResumeCandidate {
+        position: Duration::from_secs(420),
+        completed: false,
+    };
+    assert_eq!(
+        decide_resume(Some(candidate), estimated(Duration::from_secs(361))),
+        ResumeDecision::Unvalidated(Duration::from_secs(420))
+    );
+}
+
+#[test]
+fn a_checkpoint_past_an_established_duration_is_still_stale() {
+    // The M2 rule is unchanged where the duration was actually observed:
+    // a position past a known end really is a file that changed underneath us.
+    let candidate = ResumeCandidate {
+        position: Duration::from_secs(420),
+        completed: false,
+    };
+    assert_eq!(
+        decide_resume(Some(candidate), established(Duration::from_secs(361))),
+        ResumeDecision::StalePastEnd
+    );
 }

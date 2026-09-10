@@ -9,6 +9,7 @@ use continuo::media::metadata::MediaMetadata;
 use continuo::persistence::model::PersistedState;
 use continuo::persistence::writer::Urgency;
 use continuo::playback::event::{PlaybackEvent, Progress, StartDisposition};
+use continuo::playback::provenance::PositionProvenance;
 use continuo::playback::state::PlaybackState;
 use continuo::playback::timeline::PositionQuality;
 use continuo::playback::volume::Volume;
@@ -78,6 +79,7 @@ fn progress(session_rev: u64, name: &str, secs: u64) -> Progress {
         media: Some(media(name)),
         position: Duration::from_secs(secs),
         quality: PositionQuality::Exact,
+        provenance: PositionProvenance::Established,
         buffering: false,
     }
 }
@@ -412,6 +414,7 @@ fn a_seek_persists_the_canonical_position_never_the_events_actual() {
         // A landing the M1 debt entry says can disagree with the position.
         actual: Duration::from_secs(59),
         refinement_truncated: false,
+        provenance: PositionProvenance::Established,
     };
     assert!(is_none(&session.observe(&seek, clock.sample())));
 
@@ -581,6 +584,7 @@ fn a_resumed_stopped_seek_clears_the_target_through_its_seek_completed() {
             requested: Duration::from_secs(30),
             actual: Duration::from_secs(30),
             refinement_truncated: false,
+            provenance: PositionProvenance::Established,
         },
         clock.sample(),
     );
@@ -636,7 +640,7 @@ fn a_stopped_seek_clears_the_completion_its_target_supersedes() {
     assert_eq!(
         decide_resume(
             Some(ResumeCandidate::from(entry)),
-            Some(Duration::from_secs(240))
+            Some(Duration::from_secs(240).into())
         ),
         ResumeDecision::Resume(Duration::from_secs(30))
     );
@@ -999,6 +1003,7 @@ fn an_established_seek_lifts_the_protection() {
             requested: Duration::from_secs(60),
             actual: Duration::from_secs(60),
             refinement_truncated: false,
+            provenance: PositionProvenance::Established,
         },
         clock.sample(),
     );

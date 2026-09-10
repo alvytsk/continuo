@@ -9,6 +9,7 @@ pub mod handshake;
 pub mod link;
 pub mod output;
 pub mod prepare;
+pub mod provenance;
 pub mod resample;
 pub mod state;
 pub mod timeline;

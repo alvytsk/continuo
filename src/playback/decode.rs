@@ -17,6 +17,7 @@ use crate::media::id::AbsolutePath;
 use crate::media::metadata::MediaMetadata;
 
 use super::error::PlaybackError;
+use super::provenance::PositionProvenance;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SeekOutcome {
@@ -184,7 +185,17 @@ impl DecodedSource {
             time_base,
             sample_rate,
             channels,
-            metadata: MediaMetadata { title, duration },
+            // Task 3 boundary: this probe does not yet distinguish a real
+            // index/container header from `estimate_num_mpeg_frames`'s
+            // ~16-frame extrapolation (symphonia's `Track` exposes no such
+            // flag) — that detection is Task 4's job, alongside
+            // `SeekMode::Coarse`. Every duration this decoder reports today
+            // keeps the meaning it always had.
+            metadata: MediaMetadata {
+                title,
+                duration,
+                duration_provenance: PositionProvenance::Established,
+            },
             planes: vec![Vec::new(); usize::from(channels)],
             cursor: 0,
             pending: false,

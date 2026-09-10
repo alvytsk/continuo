@@ -5,6 +5,7 @@ use crate::media::capabilities::MediaCapabilities;
 use crate::media::id::MediaId;
 use crate::media::metadata::MediaMetadata;
 
+use super::provenance::PositionProvenance;
 use super::state::PlaybackState;
 use super::timeline::PositionQuality;
 use super::volume::Volume;
@@ -51,6 +52,10 @@ pub enum PlaybackEvent {
         requested: Duration,
         actual: Duration,
         refinement_truncated: bool,
+        /// Whether `actual` is a decoder-confirmed landing or a byte-offset
+        /// estimate (§3). A real landing either way — playback continues
+        /// correctly from it — but not, when `Estimated`, a measurement.
+        provenance: PositionProvenance,
     },
     /// A seek accepted while stopped. Deliberately not `SeekCompleted`: the
     /// target is unvalidated until the decoder opens.
@@ -162,6 +167,11 @@ pub struct Progress {
     pub media: Option<MediaId>,
     pub position: Duration,
     pub quality: PositionQuality,
+    /// Whether `position` is decoder-established or a byte-offset estimate
+    /// (§3). Orthogonal to `quality`: a `Degraded` position whose media time
+    /// was established is still `Established` here, and the session policy
+    /// must read this field, never `quality`, to decide.
+    pub provenance: PositionProvenance,
     /// True exactly while a source read is blocked on the network and the
     /// hook, not the worker's own loop pass, is what is keeping progress
     /// alive (Ruling 4). Distinct from `quality == Degraded`, which reports a

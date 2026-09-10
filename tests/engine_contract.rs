@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use continuo::playback::command::{PlaybackCommand, ResumeIntent};
 use continuo::playback::event::{PlaybackEvent, StartDisposition};
+use continuo::playback::provenance::PositionProvenance;
 use continuo::playback::state::PlaybackState;
 use continuo::playback::volume::Volume;
 use continuo::resume::ResumeCandidate;
@@ -30,6 +31,18 @@ fn stop_preserves_the_logical_position() {
     engine.send(PlaybackCommand::Stop);
     engine.await_state(PlaybackState::Stopped);
     assert_eq!(engine.position(), before, "stop must not reset position");
+}
+
+#[test]
+fn an_ordinary_local_seek_reports_an_established_landing() {
+    // The M1 path is unchanged: a local file's refined seek lands where it
+    // says, and nothing about this milestone may make it claim otherwise.
+    let mut engine = TestEngine::start(TRACK);
+    engine.play_for(Duration::from_millis(200));
+    engine.send(PlaybackCommand::SeekTo(Duration::from_secs(2)));
+    let completed = engine.await_seek_completed(Duration::from_secs(10));
+    assert_eq!(completed.provenance, PositionProvenance::Established);
+    engine.finish();
 }
 
 #[test]
