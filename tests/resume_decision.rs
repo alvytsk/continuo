@@ -136,24 +136,6 @@ fn completion_outranks_every_position_rule() {
 }
 
 #[test]
-fn the_decision_is_the_same_whoever_applies_it() {
-    // G3: the worker resolves a Candidate with these rules and the application
-    // resolves a duration-known one with the same function. A divergence here
-    // is a resume that lands somewhere the checkpoint never said.
-    for secs_stored in [0u64, 93, 300, 400] {
-        for completed in [false, true] {
-            for duration in [None, secs(300)] {
-                let candidate = stored(secs_stored, completed);
-                assert_eq!(
-                    decide_resume(Some(candidate), duration),
-                    decide_resume(Some(candidate), duration),
-                );
-            }
-        }
-    }
-}
-
-#[test]
 fn a_checkpoint_past_an_estimated_duration_is_retained_rather_than_declared_stale() {
     // The spike measured a 361 s estimate for a 600 s VBR file. Under the old
     // rule a listener 70 % in resumes at zero and their entry is discarded as

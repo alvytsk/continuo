@@ -280,7 +280,8 @@ fn a_relaunch_selects_the_estimate_and_leaves_the_established_checkpoint_on_disk
     };
     let loaded3 = rig3.pump_until_loaded();
     assert_eq!(
-        loaded3.position, preference.target,
+        Some(loaded3.position),
+        after_session_2.estimated,
         "a relaunch must select the estimated location, not the established fallback"
     );
     match loaded3.disposition {
@@ -417,7 +418,11 @@ fn a_relaunch_resumes_an_estimate_only_entry_and_reports_no_established_fallback
         clock: clock2,
     };
     let loaded2 = rig2.pump_until_loaded();
-    assert_eq!(loaded2.position, preference.target);
+    assert_eq!(
+        Some(loaded2.position),
+        never_established.estimated,
+        "a relaunch must select the estimated location, not the established fallback"
+    );
     match loaded2.disposition {
         StartDisposition::ResumedEstimated { established: None } => {}
         other => panic!("expected ResumedEstimated{{established: None}}, got {other:?}"),

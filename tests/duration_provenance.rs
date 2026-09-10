@@ -116,16 +116,24 @@ fn synthetic_id3v24_tag(min_len: usize) -> Vec<u8> {
 #[test]
 #[allow(clippy::unwrap_used)]
 fn a_xing_header_behind_a_large_id3_tag_is_still_found() {
-    // §The 8 KB trap: a probe that reads only 8 KiB never reaches a frame
-    // header sitting behind a large enough tag and wrongly concludes
-    // `Absent`. This tag is well past that boundary but still comfortably
-    // inside the >=64 KiB this probe must read.
+    // NOTE: this does *not* pin the 8 KiB read floor — a probe shrunk to
+    // 8 KiB still passes this test (`detect`'s short-read case fails open
+    // to `None` -> `Established`, the same value asserted below, for the
+    // wrong reason). That floor is pinned directly by the private unit test
+    // `probe_vbr_header_finds_a_xing_tag_beyond_an_8kib_id3_tag`
+    // (`src/media/vbr_header.rs`), which asserts the `VbrHeader` value
+    // itself rather than the `PositionProvenance` it becomes. What this
+    // test does prove: a real Xing/Info tag sitting behind a tag well past
+    // the unconditional 4 KiB initial read (so `gather_evidence` must
+    // extend its read) but still comfortably inside the 64 KiB cap is
+    // found through the full `DecodedSource::open` pipeline, not just by
+    // `detect` in isolation.
     let sine_bytes = std::fs::read(fixture("sine.mp3").as_path()).unwrap();
     let audio = strip_id3(&sine_bytes);
     let mut combined = synthetic_id3v24_tag(20 * 1024);
     assert!(
         combined.len() > 16 * 1024,
-        "tag must exceed the 8 KiB (and the stated 16 KiB) trap"
+        "tag must be well past the unconditional 4 KiB initial read"
     );
     combined.extend_from_slice(audio);
 
@@ -138,7 +146,8 @@ fn a_xing_header_behind_a_large_id3_tag_is_still_found() {
     assert_eq!(
         source.metadata().duration_provenance,
         PositionProvenance::Established,
-        "an implementation that reads only 8 KiB would find no header here and report Estimated"
+        "a real Xing/Info tag well behind the initial 4 KiB read, but inside the 64 KiB probe, \
+         must still be found end to end"
     );
 }
 
