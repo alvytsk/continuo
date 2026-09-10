@@ -81,3 +81,52 @@ this container's demuxer can — every remote source starts at `Unknown` and
 is only promoted by a trial seek that actually lands (§6). The point of this
 fixture is narrower than that promotion: it proves the tail-`moov` file opens
 at all, which a sequential source cannot do.
+
+`sine-long-noxing.mp3` — 600 s (10 min), 440 Hz, 44100 Hz, mono, MP3 with
+**no Xing/LAME header**:
+
+    ffmpeg -f lavfi -i "sine=frequency=440:duration=600" -c:a libmp3lame -b:a 128k \
+      -write_xing 0 tests/fixtures/sine-long-noxing.mp3
+
+`sine-noxing.mp3`'s sibling, at a length long enough for the cost of a
+demuxer rescan to actually be measurable. Its whole existence is the M3.1
+spike (`2026-09-10-continuo-estimated-seek-design.md` §5.2): reproducing the
+seek wedge needs a forward-scan expensive enough to time, and `sine-noxing.
+mp3`'s 5 s gives a rescan nothing to walk across. `-write_xing 0` is
+load-bearing for the same reason it is on `sine-noxing.mp3` — regenerating
+with defaults writes back a Xing header carrying `num_frames`, which turns
+this back into an ordinary indexed file and silently defeats the fixture's
+purpose. Verified to carry no Xing/Info/VBRI marker anywhere in the file
+(`grep`-equivalent byte search for `Xing`/`Info`/`VBRI`, none found) and to
+still report `track.num_frames = Some(_)` on open — from
+`estimate_num_mpeg_frames`'s bitrate arithmetic, never from a real index,
+since nothing in this file provides one.
+
+`sine-long-vbr-noxing.mp3` — 600 s, 44100 Hz, mono, MP3, genuinely variable
+bitrate, **no Xing/LAME header**:
+
+    ffmpeg -f lavfi -i "anoisesrc=color=white:amplitude=1:sample_rate=44100:duration=300" \
+      -f lavfi -i "anullsrc=r=44100:cl=mono:d=300" \
+      -filter_complex "[0:a][1:a]concat=n=2:v=0:a=1[out]" -map "[out]" \
+      -c:a libmp3lame -q:a 0 -write_xing 0 tests/fixtures/sine-long-vbr-noxing.mp3
+
+`sine-long-noxing.mp3` is CBR (single bitrate throughout), which makes
+`estimate_num_mpeg_frames`'s byte-rate arithmetic *exact* — a fixture that
+cannot exercise the estimate's actual failure mode, only its cost. This one
+exists to requalify that spike's headline number: 300 s of white noise
+(dense, ~417 B/frame) followed by 300 s of digital silence (~104 B/frame) —
+about a 4x local bitrate ratio — chosen over a plain sine because a pure
+tone compresses to an almost perfectly constant frame size even under `-q:a`
+VBR (verified: a `sine`-only VBR attempt produced 22,967 of 22,970 frames at
+one single byte size) and would not exercise anything a CBR fixture does
+not. `-write_xing 0` is load-bearing for the same reason as on the other
+`-noxing` fixtures. Verified to carry no Xing/Info/VBRI marker. Because the
+sampled region (the first ~16 frames, all noise) is denser than the file's
+second half, `estimate_num_mpeg_frames` extrapolates a duration of ~361 s —
+*short* of the true 600 s — which is itself part of what this fixture is
+for: it demonstrates that `MpaReader::seek`'s bounds check rejects any
+target past the (wrong) estimated duration for *every* seek mode, not only
+`Coarse`, and that ordinary forward playback is unaffected (`next_packet_ts`
+advances from real frame durations, never clamped to `num_frames`). See
+`docs/superpowers/specs/2026-09-10-continuo-estimated-seek-design.md` §5.2
+for the measurements this fixture produced.
