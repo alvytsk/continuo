@@ -24,6 +24,7 @@ use crate::http::service::HttpService;
 use crate::http::source::{is_retired, remote_cause};
 use crate::media::capabilities::{Continuity, MediaCapabilities, SeekSupport};
 use crate::media::id::MediaId;
+use crate::media::metadata::MediaMetadata;
 use crate::media::source::SourceLocation;
 use crate::resume::{KnownDuration, ResumeDecision, decide_resume};
 
@@ -2509,7 +2510,7 @@ impl Worker {
         match self
             .source
             .as_ref()
-            .and_then(|source| source.metadata().duration)
+            .and_then(|source| established_duration(source.metadata()))
         {
             Some(duration) => requested.min(duration),
             None => requested,
@@ -2782,6 +2783,25 @@ fn adopt_preserved(promised: Duration, actual: Duration) -> Duration {
     }
 }
 
+/// An estimated duration is not a ceiling (§5.5): `clamp_target` must treat
+/// it exactly like an absent one, the same shape `decide_resume` uses for
+/// `KnownDuration`. Clamping to an estimate would silently relocate a seek
+/// the listener asked for; better to attempt it and let symphonia's own
+/// `max_ts` check refuse it honestly if it is genuinely out of range (that
+/// check precedes `SeekMode` dispatch and so applies identically either
+/// way — this does **not** make an under-estimated file's tail reachable,
+/// and that limitation is retained deliberately).
+///
+/// Factored out of `clamp_target` so this branch is provable in isolation:
+/// `DecodedSource` cannot report `Estimated` today (decode.rs's Xing/VBRI
+/// detection is Task 9's job), so nothing can drive this through a live
+/// `Worker` yet.
+fn established_duration(metadata: &MediaMetadata) -> Option<Duration> {
+    (metadata.duration_provenance == PositionProvenance::Established)
+        .then_some(metadata.duration)
+        .flatten()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2872,5 +2892,45 @@ mod tests {
         let mut deferred = None;
         retire_faults(&mut deferred, &rx);
         assert!(deferred.is_none());
+    }
+
+    // ---------------------------------------------------- established_duration
+    //
+    // `clamp_target`'s Estimated branch cannot be driven through a live
+    // `Worker` today: `DecodedSource` can only ever report `Established`
+    // until Task 9 wires real Xing/VBRI detection into `decode.rs` (a
+    // deliberate, tracked gap — not something to fix here). These two tests
+    // exercise the extracted decision directly instead, against a bare
+    // `MediaMetadata` literal, which needs no decoder at all. Together they
+    // are the two-sided proof the plan calls for: an implementation that
+    // simply deleted the clamp would fail the second one, and one that never
+    // implemented the skip at all would fail the first.
+
+    #[test]
+    fn an_estimated_duration_is_not_treated_as_a_ceiling() {
+        let metadata = MediaMetadata {
+            title: None,
+            duration: Some(Duration::from_secs(100)),
+            duration_provenance: PositionProvenance::Estimated,
+        };
+        assert_eq!(
+            established_duration(&metadata),
+            None,
+            "an estimated duration must not be usable as a clamp ceiling"
+        );
+    }
+
+    #[test]
+    fn an_established_duration_is_still_a_ceiling() {
+        let metadata = MediaMetadata {
+            title: None,
+            duration: Some(Duration::from_secs(100)),
+            duration_provenance: PositionProvenance::Established,
+        };
+        assert_eq!(
+            established_duration(&metadata),
+            Some(Duration::from_secs(100)),
+            "an established duration is the M1/M2 ceiling, unchanged"
+        );
     }
 }

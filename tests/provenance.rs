@@ -21,16 +21,13 @@ fn provenance_and_quality_are_independent_axes() {
     }
 }
 
-#[test]
-fn a_degraded_position_can_still_be_established() {
-    // A device fault says nothing about whether the media time was confirmed.
-    // Reading provenance off quality would call this estimated and refuse to
-    // checkpoint a position the decoder actually established.
-    let quality = PositionQuality::Degraded;
-    let provenance = PositionProvenance::Established;
-    assert_eq!(provenance, PositionProvenance::Established);
-    assert_eq!(quality, PositionQuality::Degraded);
-}
+// A degraded-quality-but-established-provenance test used to live here as
+// two self-asserting literals, which could not fail against any
+// implementation, including a broken one. It exercises the real publish
+// path instead now: `tests/wait_service.rs::
+// a_degraded_quality_does_not_imply_estimated_provenance` — that file
+// already has the `SessionFacts`/`WaitService` harness this needs, which
+// this file does not.
 
 #[test]
 fn established_is_the_default_so_every_existing_path_keeps_its_meaning() {

@@ -46,6 +46,32 @@ fn an_ordinary_local_seek_reports_an_established_landing() {
 }
 
 #[test]
+fn an_established_duration_still_clamps_a_seek() {
+    // M1/M2 behaviour, unchanged: a seek requested past a known (established)
+    // duration is clamped to it before the engine ever attempts anything.
+    // Stopped rather than playing, so this observes `clamp_target`'s output
+    // directly through `SeekTargetStored` without also depending on whether
+    // the decoder accepts a real seek to the exact last instant of the file
+    // (a separate, unrelated concern `SeekMode`/`max_ts` own). Without this
+    // test, an implementation that simply deleted the clamp entirely (rather
+    // than skipping it only for an estimated duration) would still look
+    // correct.
+    let mut engine = TestEngine::start(TRACK); // sine-5s.flac: 5s, established.
+    engine.send(PlaybackCommand::Stop);
+    engine.await_state(PlaybackState::Stopped);
+    engine.send(PlaybackCommand::SeekTo(Duration::from_secs(100)));
+    let event = engine.await_event(|e| matches!(e, PlaybackEvent::SeekTargetStored { .. }));
+    let PlaybackEvent::SeekTargetStored { target, .. } = event else {
+        unreachable!("await_event's predicate already matched SeekTargetStored")
+    };
+    assert_eq!(
+        target,
+        Duration::from_secs(5),
+        "a seek past a known duration must be clamped to it before being stored, not kept as-is"
+    );
+}
+
+#[test]
 fn play_from_stopped_resumes_at_the_preserved_position_without_resetting() {
     let mut engine = TestEngine::start(TRACK);
     engine.play_for(Duration::from_millis(200));

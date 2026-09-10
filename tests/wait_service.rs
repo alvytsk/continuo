@@ -94,6 +94,62 @@ fn servicing_publishes_the_position_the_timeline_reports() {
     assert_eq!(published.position, Duration::from_secs(9));
 }
 
+/// §3: `quality` and `provenance` are independent axes, and this is the one
+/// place that could accidentally couple them — `publish_progress` computes
+/// `quality` fresh on every publish, and provenance must still be read
+/// straight off `facts.provenance` rather than being inferred from the
+/// `quality` it just computed. `facts.degraded = true` here forces `Degraded`
+/// quality (with no transport, so nothing else can override it); provenance
+/// is set to `Established` independently. If a future change derived
+/// provenance from quality (e.g. "Degraded implies Estimated"), the
+/// published `provenance` would flip to `Estimated` and this assertion would
+/// fail.
+#[test]
+fn a_degraded_quality_does_not_imply_estimated_provenance() {
+    let transport: Arc<Mutex<Option<TransportCore>>> = Arc::new(Mutex::new(None));
+    let progress = Arc::new(Mutex::new(Progress {
+        session_rev: 0,
+        media: None,
+        position: Duration::ZERO,
+        quality: PositionQuality::Exact,
+        provenance: PositionProvenance::Established,
+        buffering: false,
+    }));
+    let facts = Arc::new(Mutex::new(SessionFacts {
+        session_rev: 1,
+        media: None,
+        position: Duration::from_secs(4),
+        degraded: true,
+        playing: true,
+        provenance: PositionProvenance::Established,
+        frozen_by_hook: false,
+    }));
+    let (interrupt, events, outbox, backlog_empty) = inert();
+    let service = WaitService::new(
+        Arc::clone(&transport),
+        Arc::clone(&progress),
+        Arc::clone(&facts),
+        interrupt,
+        events,
+        outbox,
+        backlog_empty,
+        Arc::new(|| Nanos(0)),
+    );
+
+    service.service();
+
+    let published = match progress.lock() {
+        Ok(guard) => guard.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    };
+    assert_eq!(published.quality, PositionQuality::Degraded);
+    assert_eq!(
+        published.provenance,
+        PositionProvenance::Established,
+        "provenance must be read from facts, never derived from quality"
+    );
+}
+
 #[test]
 fn servicing_a_freeze_parks_the_output_and_announces_paused() {
     // Section 9: pause must work during a stalled read. The worker is inside
