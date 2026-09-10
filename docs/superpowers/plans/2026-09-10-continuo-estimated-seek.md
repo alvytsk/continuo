@@ -251,15 +251,26 @@ fn provenance_and_quality_are_independent_axes() {
     }
 }
 
+// A device fault says nothing about whether the media time was confirmed.
+// Reading provenance off quality would call this estimated and refuse to
+// checkpoint a position the decoder actually established.
+//
+// **This test must exercise the production publish path**, not local
+// constants. An earlier draft of this plan specified it as
+// `let provenance = Established; assert_eq!(provenance, Established);`,
+// which asserts a literal against itself, cannot fail against any
+// implementation, and was duly transcribed and shipped. Build facts whose
+// state yields `PositionQuality::Degraded` with established provenance,
+// publish through `WaitService`, and assert on the emitted `Progress` —
+// so that deriving provenance from quality anywhere in that path fails it.
 #[test]
 fn a_degraded_position_can_still_be_established() {
-    // A device fault says nothing about whether the media time was confirmed.
-    // Reading provenance off quality would call this estimated and refuse to
-    // checkpoint a position the decoder actually established.
-    let quality = PositionQuality::Degraded;
-    let provenance = PositionProvenance::Established;
-    assert_eq!(provenance, PositionProvenance::Established);
-    assert_eq!(quality, PositionQuality::Degraded);
+    // Construct via the same helpers the other `wait_service` tests use.
+    let progress = publish_and_capture(facts_with_degraded_position_and(
+        PositionProvenance::Established,
+    ));
+    assert_eq!(progress.quality, PositionQuality::Degraded);
+    assert_eq!(progress.provenance, PositionProvenance::Established);
 }
 
 #[test]
@@ -269,6 +280,66 @@ fn established_is_the_default_so_every_existing_path_keeps_its_meaning() {
     assert_eq!(PositionProvenance::default(), PositionProvenance::Established);
 }
 ```
+
+**`clamp_target` is the second consumer, and it is easy to miss.** §5.5 gives
+it equal weight to `decide_resume`, and `src/playback/engine.rs:2508` clamps
+unconditionally against `metadata().duration` today:
+
+```rust
+fn clamp_target(&self, requested: Duration) -> Duration {
+    match self.source.as_ref().and_then(|source| source.metadata().duration) {
+        Some(duration) => requested.min(duration),
+        None => requested,
+    }
+}
+```
+
+Make it skip the clamp when `duration_provenance` is `Estimated` — the same
+shape `decide_resume` uses, treating an estimated duration exactly as it
+treats an absent one:
+
+```rust
+fn clamp_target(&self, requested: Duration) -> Duration {
+    match self.source.as_ref().and_then(|source| {
+        let metadata = source.metadata();
+        // An estimated duration is not a ceiling. Clamping to one silently
+        // relocates a seek the listener asked for; better to attempt it and
+        // let it fail honestly (§5.5). This does NOT make the tail reachable
+        // — symphonia's own `max_ts` check still refuses a target past its
+        // estimated ceiling, mode-independently, and that limitation is
+        // retained deliberately.
+        (metadata.duration_provenance == PositionProvenance::Established)
+            .then_some(metadata.duration)
+            .flatten()
+    }) {
+        Some(duration) => requested.min(duration),
+        None => requested,
+    }
+}
+```
+
+Add to `tests/engine_contract.rs`:
+
+```rust
+#[test]
+fn an_estimated_duration_does_not_clamp_a_seek() {
+    // The listener asked for a real position. An estimate that says it is
+    // past the end is not evidence enough to move the request.
+    // Assert on the target the engine actually attempts, not on where it
+    // lands — the seek is still allowed to fail, and under an estimated
+    // duration symphonia will often refuse it. Failing honestly is the
+    // intended outcome; landing somewhere unrequested is not.
+}
+
+#[test]
+fn an_established_duration_still_clamps_a_seek() {
+    // The M1/M2 behaviour, unchanged. Without this, an implementation that
+    // simply deletes the clamp passes the test above.
+}
+```
+
+The second test is not optional: it is what stops the first from being
+satisfied by removing the clamp entirely.
 
 Add to `tests/resume_decision.rs`, additively — these two are the ones that protect a real listener from losing a real position:
 
