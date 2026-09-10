@@ -250,11 +250,33 @@ served through `HttpMediaSource`/`TestServer` on loopback:
 Xing/VBRI) for the baseline/cost comparison, and
 `tests/fixtures/sine-long-vbr-noxing.mp3` (600 s, mono, genuinely variable
 bitrate — 300 s of white noise then 300 s of digital silence, no Xing/VBRI)
-to requalify the accuracy claim once a reviewer correctly pointed out that a
-CBR fixture cannot measure `Coarse`'s accuracy in general — only the case
-where its underlying arithmetic is exact. Both are generated per
+for the accuracy measurement. Both are generated per
 `tests/fixtures/README.md`. The throwaway experiments are not committed; the
 measurements below are what they produced.
+
+This section went through two corrections, both from the same review, and
+both are recorded because the corrections are as load-bearing as the final
+numbers:
+
+1. A CBR fixture cannot measure `Coarse`'s accuracy in general, only the
+   case where its underlying byte-rate arithmetic happens to be exact — the
+   VBR fixture above was added to fix this.
+2. The first VBR measurement was **circular**: it compared `Coarse`'s own
+   self-reported `actual_ts` against another self-reported `actual_ts`
+   (a fresh reader's `Accurate` seek). `MpaReader::seek`'s Step 2 loop stops
+   once its own — possibly mis-anchored — `next_packet_ts` counter reaches
+   within one frame of `required_ts`, *by construction*, regardless of
+   whether the underlying byte position is anywhere near the true target.
+   Two numbers both manufactured to converge on the same target will agree
+   with each other independent of whether they agree with reality; the
+   near-zero error that measurement reported was the tell, not the answer.
+   The real measurement — described below — parses every real MPEG frame
+   header directly from the fixture's own bytes to build an
+   independent byte-offset → true-cumulative-time map, locates which byte
+   `Coarse` actually landed on without asking symphonia anything about its
+   own position, and compares *that* against the target. The numbers below
+   are from that corrected measurement; the circular ones are not repeated
+   here because they were never evidence of anything.
 
 **Decision: neither A nor B. Use `SeekMode::Coarse`, unmodified.** The known-
 debt claim that Coarse refuses without a Xing header is false, verified both
@@ -262,9 +284,12 @@ by reading `symphonia-bundle-mp3-0.6.1/src/demuxer.rs:465-471` and by
 exercising it: with no Xing/VBRI tag and a byte-seekable source,
 `estimate_num_mpeg_frames` still populates `track.num_frames` from bitrate
 arithmetic, `preseek_coarse`'s `is_seekable` and `max_ts` guards are
-satisfied, and the seek lands. Coarse collapses the rest of §5 — no re-probe,
-no hand-rolled resync, no reservoir bookkeeping — because it reuses
-machinery `MpaReader::seek` already has for both modes.
+satisfied, and the seek lands. Coarse collapses most of the rest of §5 —
+no re-probe, no hand-rolled resync adapter, no *new* reservoir bookkeeping
+(the existing decode-and-discard refinement already handles it, see below)
+— because it reuses machinery `MpaReader::seek` already has for both modes.
+It does **not** collapse §5.1's accuracy premise, which the measurements
+below correct rather than confirm.
 
 **The baseline trap, defeated.** The demuxer's `next_packet_ts` was advanced
 to 120.007 s by pulling packets (not by decoding audio — encoded read-ahead
@@ -281,13 +306,20 @@ the connection thread race ahead of what the demuxer actually reads, bounded
 only by kernel socket buffering and this crate's 1 MiB channel capacity, not
 by logical necessity. Both are reported; only "consumed" is load-bearing):
 
-| Shape | New requests (offset) | Server wrote | Demuxer consumed | Wall clock | Landing |
+| Shape | New requests (offset) | Server wrote | Demuxer consumed | Wall clock | Self-reported landing |
 |---|---|---|---|---|---|
 | **Baseline** (`Accurate`, shipped today) | 1, at byte 44 (`first_packet_pos`) | 3.7–5.4 MB (noisy) | **983,040 B** | ~8–9 ms | ts=2,642,688 (59.925 s) |
 | Ground truth (fresh reader, first-ever `Accurate` seek — no rewind, honest forward scan from true start) | — | 3.1–5.5 MB (noisy) | **975,872 B** | ~7–8 ms | ts=2,642,688 (59.925 s) |
 | **C — `Coarse`** | 1, at byte 957,162 (the arithmetic estimate) | 0.3–1.4 MB (noisy) | **3,072 B** | <1 ms | ts=2,642,688 (59.925 s) |
 | A — re-probe at offset (target 300 s; corrected methodology, see below) | 1, at the estimated byte exactly | 0.6–2.0 MB (noisy) | n/a (bypasses `HttpMediaSource`'s read path differently — see note) | <1 ms | pts=0, relative (see timestamp-origin) |
 | B — byte-seek beneath a live reader | — | — | — | — | not implementable (see below) |
+
+"Self-reported landing" is exactly what it says — what the seek call itself
+returns. On this CBR fixture it happens to also be the *true* landing (see
+below), which is what makes the cost comparison on this row trustworthy; it
+is not, in general, safe to read a self-reported `actual_ts` as ground
+truth, and the rest of this section exists because an earlier draft did
+exactly that.
 
 Coarse's request always starts at its arithmetic estimate, never at
 `first_packet_pos`; on this **CBR** fixture its landing matches the
@@ -306,83 +338,158 @@ estimate's own error (here, ~1.6 KB before the walk finds sync, well under
 does not depend on CBR and is decisive regardless of what the accuracy
 measurement below shows.
 
-**Requalification: `Coarse`'s accuracy on genuinely variable content.**
-`sine-long-vbr-noxing.mp3` pairs 300 s of white noise (~417 B/frame) with
-300 s of digital silence (~104 B/frame), a ~4x local bitrate ratio, chosen
-because a pure sine tone compresses to an almost perfectly constant frame
-size even under VBR encoding (verified: a sine-only VBR attempt produced
-22,967 of 22,970 frames at one identical byte size — it would have measured
-nothing). Because the sampled region (`estimate_num_mpeg_frames` reads only
-the first ~16 frames) is denser than the file's second half, the estimated
-duration comes back as **361.04 s — short of the true 600 s.**
+**How the true landing was measured, non-circularly.** Every real MPEG
+frame header was parsed directly from each fixture's own bytes — the same
+per-frame arithmetic `estimate_num_mpeg_frames` and `preseek_coarse` use
+internally, just applied to every frame instead of a 16-frame sample and
+extrapolated — building a byte-offset → cumulative-sample-count map that
+depends on nothing symphonia reports. Both fixtures parse cleanly to their
+exact end byte with zero desyncs, which is what makes the map trustworthy.
+Locating *which* real frame a `Coarse` seek actually landed on could not
+use content matching: this VBR fixture has a long stretch of literal
+digital silence where every frame is byte-identical to every other one in
+that stretch (constant input encodes to constant output — no amount of
+context disambiguates it), and the CBR fixture's pure sine tone turns out
+to be exactly periodic at the byte level too (1,152 samples/frame and a
+2,205-sample sine period share a period of 245 frames = 6.4 s). Instead,
+`HttpMediaSource::consumed()` — the exact byte count it has read since
+opening, already used for cost above — sampled immediately before and after
+the seek gives the number of bytes the seek's own resync-and-walk consumed,
+independent of content; combined with the seek's own Range request's start
+byte, that locates the landing directly. (`MediaSourceStream`'s ring buffer
+has a hard minimum of 64 KiB, but its *adaptive read block size* resets to
+1 KiB on every seek and only doubles from there, so the overshoot this
+introduces stays within a fraction of a second even at 64 KiB capacity.)
 
-| Target | Ground truth | `Coarse` landing | Error |
-|---|---|---|---|
-| 10 s | 9.9265 s | 9.9265 s | 0 |
-| 30 s | 29.9363 s | 29.9363 s | 0 |
-| 100 s | 99.9445 s | 99.9445 s | 0 |
-| 200 s | 199.9412 s | 199.9412 s | 0 |
-| 280 s | 279.9282 s | 279.9282 s | 0 |
-| 295 s (5 s before the noise→silence cut) | 294.9224 s | 294.8963 s | −1 frame (−0.0261 s) |
-| 305 s (5 s after the cut) | 304.9012 s | 304.9012 s | 0 |
-| 320 s | 319.9216 s | 319.9216 s | 0 |
-| 350 s | 349.9102 s | 349.9102 s | 0 |
-| 360 s (near the estimated-duration ceiling) | 359.9151 s | 359.9151 s | 0 |
+**The true landing error is large, and grows toward the estimated
+ceiling — this is the finding that overturns round 2.**
 
-Landing error stayed within a **single frame (≤0.0261 s)** everywhere
-tested, including straddling the abrupt 4x bitrate step. This is larger than
-the CBR fixture's zero error, but far smaller than "so far off as to be
-unusable." The reason is `MAX_MPEG_FRAME_SIZE` (2,881 B) — the fixed
-backward margin `preseek_coarse` subtracts from its estimate before seeking
-is generous relative to this fixture's frame sizes (max 835 B observed), and
-the forward walk that follows self-corrects any remaining undershoot exactly
-(at the cost of a longer local scan, never an unbounded one back to
-`first_packet_pos`). An overshoot beyond that margin is the one case Step 2
-cannot fully correct (it only backtracks up to `MAX_REF_FRAMES = 4`), and it
-did not occur here even across a genuinely sharp rate change; it plausibly
-could for a much longer file or a much larger local rate disparity than this
-spike constructed, and no accuracy figure is promised for that case (§3.4
-already declines to promise one, for exactly this reason).
+| Target | True landing (time) | True error |
+|---|---|---|
+| 10 s | 10.397 s | 0.40 s |
+| 30 s | 31.216 s | 1.22 s |
+| 100 s | 104.020 s | 4.02 s |
+| 200 s | 208.379 s | 8.38 s |
+| 280 s | 291.370 s | 11.37 s |
+| 295 s | 326.922 s | 31.92 s |
+| 305 s | 368.222 s | 63.22 s |
+| 320 s | 430.132 s | 110.13 s |
+| 350 s | 554.005 s | 204.00 s |
+| 360 s (near the estimated ceiling) | 595.278 s | 235.28 s |
 
-**A sharper failure mode than inaccuracy: an underestimated duration refuses
-the seek outright, for every mode.** `MpaReader::seek` checks the target
-against `max_ts` — derived from `num_frames` — *before* branching on seek
-mode. A target past the estimated 361.04 s ceiling (400 s, verified real
-audio) was rejected with `SeekErrorKind::OutOfRange` for **both** `Coarse`
-and `Accurate` identically; this is not a Coarse-specific defect, it is what
-a wrong `num_frames` does to the shared bounds check. Ordinary forward
-playback is unaffected — `next_packet_ts` advances from real per-frame
-durations and is never clamped to `num_frames` — only an *explicit seek*
-past the (wrong) estimate is refused. This is a real limitation to carry
-into later tasks, but it fails the way §5.4 already wants failures to fail:
-loud and refused, never a silent wrong landing.
+At 360 s, asked to land a third of the way through the file, `Coarse`
+actually lands **at 595 s — five seconds from the true end of a 600 s
+recording** — while its own `SeekedTo::actual_ts` reports a plausible-
+looking value near 360 s. This is not a rounding error; it is the seek
+reporting a false position with no signal to the caller that anything is
+wrong. The CBR fixture, measured the same non-circular way, stays within
+~0.3 s throughout (consistent with measurement slack from the technique
+above, not a real algorithmic error) — confirming the earlier round's
+premise that CBR really is (near-)exact, while showing that VBR is nowhere
+close to the "≤0.0261 s" this section previously and wrongly reported.
 
-**Does the decision survive this? Yes.** Within the estimate's reachable
-range, `Coarse` never landed more than one frame off, even under a sharp,
-deliberately adversarial rate change — nowhere near "unusable." The one
-real defect this VBR run surfaces (an underestimated duration refusing valid
-late-file seeks) applies identically to `Accurate` and to duration
-reporting in general; it is not a reason to prefer a different shape, and
-choosing shape A or B would not avoid it either, since both would still
-need `num_frames`/duration for the byte-offset arithmetic in the first
-place. `Coarse` stands.
+**Why: `preseek_coarse` divides by the wrong denominator.** Its byte
+estimate is `(required_ts / total_dur) × audio_byte_len`, where
+`audio_byte_len` is the fixture's real, exact byte length, but `total_dur`
+is `num_frames`'s *estimated* duration (361.04 s here, against a true
+600 s — see §5.5). As `required_ts` approaches that wrong ceiling, the
+formula pushes the byte estimate toward 100% of the *real* (much longer)
+byte length — i.e. toward the true end of the file — regardless of what
+audible position the target actually names. `MpaReader::seek`'s Step 2 loop
+does not fix this: it walks forward from the (mis-anchored) estimate using
+its *own* `next_packet_ts` counter until that counter numerically reaches
+`required_ts` — a counter seeded from the same wrong ratio — so the walk
+converges the *self-report*, not the *landing*, which is exactly the
+circularity the first VBR measurement fell into.
 
-**Consequence for provenance, regardless of CBR or VBR.** Nothing observable
-at seek time distinguishes a CBR file (where the estimate happens to be
-exact) from a VBR one (where it is merely bounded) — the demuxer does not
-expose that fact, and this codebase must not try to infer it from, say, a
-small sample of frame sizes. **Every `Coarse` landing must be reported as
-`PositionProvenance::Estimated`, unconditionally.** A later reader must
-resist the temptation to mark a landing "established" because it happened
-to come from a CBR file; that judgement needs evidence this codebase does
-not have at the moment of the seek.
+**Does this reopen the shape question? No — because A and B share the
+identical vulnerability.** Shape A's own byte estimate (§5.1) is computed
+from the same `total_dur`/`audio_byte_len` ratio; it would misland by
+comparable amounts for the identical reason, with the added disadvantage of
+no Step 2 walk to at least land on a real frame boundary methodically.
+Shape B remains structurally unimplementable regardless (below). This is
+not a per-shape defect at all — it is what an under-sampled duration
+estimate does to *any* byte-offset arithmetic derived from it, and it
+would need to be fixed at that layer (a better duration estimate, or a
+bound on how far a byte offset may be trusted), not by picking a different
+seek mode. That is future work this spike did not scope.
 
-**Coarse is already reservoir-safe.** `MpaReader::seek`'s Step 2 loop is also
-where the reference-frame backtracking lives (the `main_data_begin` /
-`n_ref_frames` logic, up to `MAX_REF_FRAMES = 4`), and it runs identically
-after either preseek mode. Decoding five packets from the Coarse landing
-produced no decode errors, confirming this landing needs no discard — a
-property shape A does not get for free (below).
+**Is the error at least bounded? Yes, structurally, but not usefully.**
+`preseek_coarse`'s ratio is `required_ts / total_dur`, and `required_ts`
+can never exceed `total_dur` (`MpaReader::seek`'s own bounds check, next
+paragraph, guarantees this before the arithmetic ever runs) — so the byte
+estimate can never fall outside `[0, audio_byte_len]`: the seek cannot
+request a byte before the first packet or past the real end of file. But
+"bounded by the file's own length" is not a useful accuracy guarantee for a
+listener asking to land at a specific point — a third of the way through
+landing five seconds from the end demonstrates that concretely. **This is
+exactly what §3.4's "no accuracy figure is promised" was written to cover,
+and this measurement is the evidence that the clause is load-bearing, not
+a formality**: `Coarse` still wins on cost (3,072 B vs. 983,040 B, which
+does not depend on any of this), but nothing in this design may describe
+its landing as approximately correct.
+
+**A second, sharper failure mode found alongside this: an underestimated
+duration refuses the seek outright, for every mode.** `MpaReader::seek`
+checks the target against `max_ts` — derived from `num_frames` — *before*
+branching on seek mode. A target past the estimated 361.04 s ceiling
+(400 s, verified real audio exists there) was rejected with
+`SeekErrorKind::OutOfRange` for **both** `Coarse` and `Accurate`
+identically; this is not a Coarse-specific defect, it is what a wrong
+`num_frames` does to the shared bounds check. Ordinary forward playback is
+unaffected — `next_packet_ts` advances from real per-frame durations and is
+never clamped to `num_frames` — only an *explicit seek* past the (wrong)
+estimate is refused. At least this failure mode is loud and honest, unlike
+the mislanding above.
+
+**Does the decision survive all of this? Yes, on cost — not on accuracy.**
+`Coarse` is not switched out for shape A or B, because both would carry the
+identical duration-estimate vulnerability with none of Coarse's advantages
+(shape A adds a bespoke adapter and manual timestamp/reservoir bookkeeping
+on top; shape B is not implementable at all). The cost argument
+(3,072 B vs. 983,040 B for the rescan this whole amendment exists to
+remove) is completely unaffected by any of the above and remains decisive.
+What must change is how confidently this document, and the tasks after it,
+are allowed to talk about where a `Coarse` landing actually is: never as a
+number a listener can trust to be close, only as an estimate whose error
+has no practical ceiling below the file's own length.
+
+**Consequence for provenance, sharpened by this finding.** Nothing
+observable at seek time distinguishes a CBR file (where the estimate
+happens to be exact) from a VBR one (where the error can span a large
+fraction of the file) — the demuxer does not expose that fact, and this
+codebase must not try to infer it from, say, a small sample of frame sizes.
+**Every `Coarse` landing must be reported as `PositionProvenance::
+Estimated`, unconditionally**, and "estimated" here must be read as "may be
+in a substantially different part of the recording," not as "approximately
+right." A later reader must resist the temptation to mark a landing
+"established" because it happened to come from a CBR file; that judgement
+needs evidence this codebase does not have at the moment of the seek.
+
+**Coarse is not reservoir-safe "for free" — the earlier claim here was
+wrong, for the same reason the accuracy claim was.** "No decode errors"
+was the evidence for that claim, and MP3 decoders do not fail loudly on a
+violated bit reservoir — they produce successful-but-wrong output, so a
+lack of errors proves nothing. Decoding forward from a `Coarse` landing
+with a fresh decoder and diffing against a reference decoded continuously
+from the true start (found by the same non-circular localisation above,
+choosing a target whose true landing falls in non-repeating content so the
+comparison itself is meaningful) shows real, measurable corruption: on the
+CBR fixture, max sample error 0.119 (frame 0), 0.119 (frame 1), 0.036
+(frame 2), then exactly 0.000000 from frame 3 on; on the VBR fixture (true
+landing in the noise region), 1.336, 1.581, 0.732, then exactly 0.000000
+from frame 3 on. **`Coarse` needs the same 3-frame discard shape A needed**,
+consistent with `MAX_REF_FRAMES = 4` in both cases. The reason this does
+not cost Coarse anything new: `MpaReader::seek`'s reference-frame
+backtracking repositions the *byte stream* to a reservoir-safe reference
+frame before returning, but does not decode anything — priming the
+reservoir still requires decoding forward from `actual_ts` to the target,
+discarding as it goes. `DecodedSource::seek_refined` (`src/playback/
+decode.rs`) already does exactly this, unconditionally on seek mode, for
+`Accurate` today. Swapping its hard-coded `SeekMode::Accurate` for `Coarse`
+inherits this refinement with no new reservoir-specific code — the
+existing decode-and-discard-to-target loop does not know or care which
+preseek mode produced the frame it started from.
 
 **Shape A, corrected, and what it costs.** The first version of this
 measurement was wrong in an instructive way: wrapping an already
@@ -417,8 +524,13 @@ decoded continuously from the true file start through the same frame
 pts 13,230,720) quantifies the damage: max sample error 0.119 (frame 0),
 0.119 (frame 1), 0.031 (frame 2), then **0.000000 — bit-exact — from frame 3
 on**. So shape A needs **3 frames discarded**, consistent with
-`MAX_REF_FRAMES`. Coarse needs this reasoning not at all, because it never
-leaves `MpaReader::seek`'s own backtracking.
+`MAX_REF_FRAMES` — the same number `Coarse` needed above, for the same
+reason: neither shape decodes anything during the seek itself, so both
+land the caller on a byte-stream position that still requires decoding and
+discarding forward before its output can be trusted. The difference is
+where that discard has to be implemented: for `Coarse`, `seek_refined`'s
+existing loop already does it; shape A would need the same discard written
+again from scratch around its own bespoke reader.
 
 **Timestamp origin (load-bearing for Tasks 2 and 4): zero-based, not
 absolute.** A freshly built `MpaReader` sets `next_packet_ts = -delay` at
@@ -479,9 +591,17 @@ headers can be parsed out of it without touching the source at all. So a
 source deadline alone yields "deadline plus one buffer's worth of parsing",
 not a hard interrupt.
 
-This is the argument for §5.2's first shape: not calling `FormatReader::seek()`
-on this path removes the unbounded call rather than fencing it, and is the
-only option that makes the bound a real one.
+**Corrected per §5.2's actual resolution:** the shape chosen (`Coarse`) does
+still call `FormatReader::seek()` — it does not remove the call the way a
+re-probe shape would have. What it changes is how much work that one call
+does: §5.2's own measurements show `Coarse`'s resync-and-walk consuming a
+few KB and a handful of frames, never the unbounded rescan-from-
+`first_packet_pos` `Accurate` performs. So the call is not eliminated, but
+the amount of I/O behind it is small enough that the ordinary per-read
+`limits.stall` bound (already enforced inside `HttpMediaSource::read`)
+covers it in practice — there is no equivalent here to Accurate's "many
+cheap reads adding up to an unbounded total" failure mode, because Coarse's
+own walk is short by construction, not because the call disappeared.
 
 ### 5.4 Recovery
 
@@ -540,9 +660,34 @@ destructive decision.** Concretely:
   silently somewhere the listener did not ask for.
 
   **This does not make the tail seekable, and the amendment must not be read
-  as claiming it does.** Symphonia applies its own `max_ts` check and refuses
-  a target past its estimated ceiling — observed as `OutOfRange`, identically
-  under `Coarse` and `Accurate`. Removing the application-level clamp changes
+  as claiming it does.** Symphonia applies its own bounds check and refuses a
+  target past its estimated ceiling. Verified in
+  `symphonia-bundle-mp3-0.6.1/src/demuxer.rs`:
+
+  ```rust
+  // :250-262 — the ceiling is derived from the same bad estimate
+  let dur_ts = self.tracks[0].num_frames.map(Duration::from);
+  let max_ts = dur_ts.and_then(|dur| min_ts.checked_add(dur))
+                     .and_then(|dur| dur.checked_add(Duration::from(delay + padding)));
+
+  // :267-271 — refused before any mode dispatch
+  else if let Some(max_ts) = max_ts {
+      if required_ts > max_ts { return seek_error(SeekErrorKind::OutOfRange); }
+  }
+
+  // :291-295 — Coarse vs Accurate is only chosen *after* the check above
+  match mode {
+      SeekMode::Coarse if is_seekable => self.preseek_coarse(...)?,
+      SeekMode::Accurate => self.preseek_accurate(...)?,
+      _ => (),
+  };
+  ```
+
+  The refusal is mode-independent by construction — it precedes the branch —
+  so no choice of `SeekMode` can recover the tail. And `max_ts` descends from
+  `num_frames`, which for a no-Xing VBR file is exactly the ~16-frame
+  `estimate_num_mpeg_frames` guess that caused the problem: the ceiling is
+  wrong in the same direction and by the same amount as the duration. Removing the application-level clamp changes
   a silent mislanding into a visible refusal; it does not extend reach. The
   tail of an under-estimated VBR file stays unreachable, and that is a
   **retained limitation** of this change.
