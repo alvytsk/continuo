@@ -896,3 +896,152 @@ fn a_seek_cancelled_while_reopening_from_stopped_reports_cancelled_not_rejected(
     engine.finish();
     stalling.shutdown();
 }
+
+// Root cause, confirmed by reading `symphonia-bundle-mp3` 0.6.1's own source
+// (`~/.cargo/registry/.../symphonia-bundle-mp3-0.6.1/src/demuxer.rs`) after
+// an earlier pass at this investigation guessed wrong about the mechanism:
+// this engine pins every seek to `SeekMode::Accurate` (`src/playback/decode.rs:290`; see
+// `docs/m1-known-debt.md`'s M3 capability-evidence entry). `preseek_accurate`
+// only rewinds to `first_packet_pos` when `required_ts < self.next_packet_ts`
+// - it is conditional, not unconditional, and it does not consult whether an
+// Xing/VBRI index exists at all (the `Accurate` branch never reads
+// `num_frames`; only `Coarse` does). The trigger is that `next_packet_ts` is
+// the demuxer's own read-ahead position, which runs ahead of audible
+// playback by the PCM ring plus `MediaSourceStream`'s own read-ahead - so a
+// seek that is forward in audible terms can still be backward relative to
+// `next_packet_ts`, and that comparison is what fires the rewind. Once fired,
+// the forward rescan parses frame headers and skips frame bodies without
+// decoding them - cheap on a local disk, expensive over HTTP, because the
+// bytes still have to come across the byte channel in order. This test's
+// deliberately-tiny fixture and short forward step exist to make that rewind
+// trigger reliably and cheaply, not because a small step is somehow special;
+// on a real file the same comparison can just as easily fire tens of seconds
+// in, which is what the field report below hit.
+//
+// This is a live defect, not a testing limitation: the whole
+// rewind-and-rescan executes inside one uncancellable, unbounded call to
+// `FormatReader::seek`. `SEEK_BUDGET` (`engine.rs:114`, 5s) does not help -
+// it only bounds `seek_refined`'s own residual-alignment loop *after*
+// `reader.seek()` returns, so it never applies to the scan itself. While the
+// worker thread is parked inside that call it cannot dispatch queued
+// commands, which is why pause/resume appear dead and position captures go
+// `Degraded` during a long rescan.
+//
+// Manual-acceptance bug report this reproduces: a user seeking forward
+// (right-arrow, +10s) twice in quick succession on a real 2h15m podcast MP3
+// over a real CDN saw playback "stuck" (two range requests at the same byte,
+// 37849 - `first_packet_pos`, past a large ID3v2 cover-art tag - 160ms
+// apart, then ten seconds of silence before giving up), and pause/play
+// afterward never reached `Playing` again; `Stop` does recover it, because
+// it retires out-of-band and interrupts the scan, but Pause/Play do not.
+//
+// `sine-noxing.mp3` is 5.04s so the test runs in well under a second of real
+// time; `trickle` stands in for the CDN's finite throughput, slow enough
+// that redelivering nearly the whole file is measurable and landing
+// near-instantly (what an efficient short forward seek should cost) is not
+// confused with it.
+//
+// Run explicitly: `cargo test --test engine_remote -- --ignored
+// a_short_forward_seek`. Remove `#[ignore]` once the fix designed against
+// this diagnosis lands - at that point this becomes the regression test.
+#[test]
+#[ignore = "known defect: SeekMode::Accurate's preseek_accurate rewinds to \
+            first_packet_pos and rescans whenever a seek's demuxer-relative \
+            position looks backward, with no cancellation or budget over \
+            FormatReader::seek; fix tracked in docs/m1-known-debt.md M3 \
+            capability-evidence (H17)"]
+fn a_short_forward_seek_on_a_no_index_mp3_rescans_the_whole_file_instead_of_landing_quickly() {
+    let server = TestServer::start(
+        Script::from_fixture("sine-noxing.mp3").trickle(2048, Duration::from_millis(80)),
+    );
+    let mut engine = TestEngine::start_idle();
+    engine.load_remote(&server.url("/audio.mp3"));
+    assert_eq!(engine.handle().submit_play(), Admission::Accepted);
+    engine.await_state(PlaybackState::Playing);
+    // Close to the end of this 5.04s fixture, so a short forward step from
+    // here is unambiguously "a little further", not "still near the start".
+    engine.play_for(Duration::from_millis(3_600));
+    let before = engine.progress().position;
+    assert!(
+        before >= Duration::from_millis(3_000),
+        "playback did not reach near the fixture's end before the seek: {before:?}"
+    );
+
+    let requests_before_seek = server.requests().len();
+    let target = before + Duration::from_millis(300);
+    assert_eq!(engine.handle().submit_seek(target), Admission::Accepted);
+
+    // Prove the seek's own request actually reached the server (the
+    // project's own rule for any wait a test is about to reason about),
+    // before reading anything from `server.requests()` about it.
+    let request_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if server.requests().len() > requests_before_seek {
+            break;
+        }
+        assert!(
+            Instant::now() < request_deadline,
+            "the seek's own request never reached the server"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+
+    let seek_byte = server
+        .requests()
+        .into_iter()
+        .skip(requests_before_seek)
+        .find_map(|request| request.range())
+        .map(|(first, _)| first);
+    let Some(seek_byte) = seek_byte else {
+        panic!("the seek issued no ranged request at all");
+    };
+
+    // `sine-noxing.mp3` carries no ID3v2 tag (see `tests/fixtures/README.
+    // md`), so its `first_packet_pos` sits at, or a few bytes past, byte 0.
+    // The correct behaviour this asserts: a seek this close to where
+    // playback already sits should request a byte in that same
+    // neighbourhood (proportionally, ~3.9s of 5.04s in a 40_377-byte file
+    // is ~byte 31_000), not one back at the very start of the file. This
+    // currently fails - the request lands within a few bytes of 0 - which
+    // is the concrete, byte-level proof that every seek rescans from the
+    // top rather than continuing from where playback already reached.
+    let proportional_estimate =
+        (target.as_secs_f64() / Duration::from_millis(5_041).as_secs_f64() * 40_377.0) as u64;
+    assert!(
+        seek_byte + 8192 >= proportional_estimate,
+        "a seek {:?} past {before:?} requested byte {seek_byte}, near the \
+         file's very first byte, instead of somewhere near byte {proportional_estimate} \
+         (the current position's own neighbourhood) - the demuxer is \
+         rescanning from the top rather than continuing from where \
+         playback already reached",
+        target.saturating_sub(before)
+    );
+
+    // The wedge itself, asserted as the correct behaviour it currently
+    // violates: a step of only 300ms has no honest reason to take anywhere
+    // near as long as redelivering the whole file from scratch does -
+    // `a_forward_seek_installs_the_media_position_and_requests_that_byte`
+    // shows a comparable seek landing well inside a second with no trickle
+    // at all. 250ms is generous for an efficient short step and comfortably
+    // short of a from-scratch rescan of this fixture at this trickle rate,
+    // so `SeekCompleted` should already have arrived. It currently has not:
+    // the demuxer is still rescanning from the top.
+    let landing_deadline = Instant::now() + Duration::from_millis(250);
+    let landed = loop {
+        match engine.try_event() {
+            Some(event @ PlaybackEvent::SeekCompleted { .. }) => break Some(event),
+            Some(_) => continue,
+            None if Instant::now() >= landing_deadline => break None,
+            None => std::thread::sleep(Duration::from_millis(2)),
+        }
+    };
+    assert!(
+        landed.is_some(),
+        "a 300ms forward seek did not land within 250ms; the worker is \
+         still rescanning the whole file from byte {seek_byte} at the \
+         trickle's pace - this is the wedge from the bug report"
+    );
+
+    engine.finish();
+    server.shutdown();
+}

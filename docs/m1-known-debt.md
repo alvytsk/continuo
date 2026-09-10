@@ -228,6 +228,33 @@ table rather than a design judgement.
   seeking — makes them reachable and makes the row testable. FLAC, WAV, and
   `symphonia-format-isomp4` (checked for the M4A/ALAC case) were also read and
   none has an analogous reachable refusal.
+
+  **Update, from a since-investigated bug report:** the pin to
+  `SeekMode::Accurate` is not merely a testing-reachability limitation, as the
+  paragraph above implies — it is a live defect for HTTP sources.
+  `preseek_accurate` rewinds to `first_packet_pos` and forward-rescans
+  whenever `required_ts < self.next_packet_ts`; the trigger has nothing to do
+  with whether an Xing/VBRI index exists (the `Accurate` branch never reads
+  `num_frames`), and the rewind is conditional, not automatic on every seek.
+  `next_packet_ts` is the demuxer's own read-ahead position, which runs ahead
+  of audible playback by the PCM ring plus `MediaSourceStream`'s own
+  read-ahead, so a seek that is forward in audible terms can still be
+  backward relative to `next_packet_ts` and fire the rewind. The scan that
+  follows parses frame headers without decoding them — cheap locally,
+  expensive over HTTP, since the bytes still have to arrive in order through
+  the byte channel. The whole rewind-and-rescan runs inside one
+  uncancellable, unbounded call to `FormatReader::seek`; `SEEK_BUDGET`
+  (`engine.rs:114`) cannot bound it, because that budget only gates
+  `seek_refined`'s residual-alignment loop *after* `reader.seek()` already
+  returns, never the scan itself. `SeekMode::Coarse` is not a drop-in escape:
+  `preseek_coarse` refuses outright with `SeekErrorKind::Unseekable` whenever
+  `num_frames` is absent, which is exactly the file shape this defect hits.
+  Reproduced in `tests/engine_remote.rs::
+  a_short_forward_seek_on_a_no_index_mp3_rescans_the_whole_file_instead_of_landing_quickly`
+  (`#[ignore]`d — the reproduction is confirmed but the fix is a design
+  decision, not made here). A fix is designed separately; this entry is the
+  interim record until it lands, at which point the `#[ignore]` comes off and
+  that test becomes the regression test.
 - **`verify_seek_support`'s two possible outcomes are asymmetrically tested.**
   `tests/engine_remote.rs::a_capability_change_carries_the_current_session_rev`
   proves the `Unknown → Native` transition (a stopped seek's trial succeeds and
