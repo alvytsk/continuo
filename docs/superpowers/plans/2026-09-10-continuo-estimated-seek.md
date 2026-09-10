@@ -802,14 +802,20 @@ symphonia, deliberately and permanently (§5.5). Non-MP3 containers keep
 1. `an_mp3_with_a_xing_header_reports_established_duration` — `sine.mp3`.
 2. `an_mp3_without_a_xing_header_reports_estimated_duration` — `sine-noxing.mp3`. This is the one that fails today, because everything is `Established`.
 3. `a_long_vbr_mp3_without_a_header_reports_estimated_duration` — `sine-long-vbr-noxing.mp3`, the fixture whose duration symphonia gets 40% wrong.
-4. `a_xing_header_behind_a_large_id3_tag_is_still_found` — synthetic ID3v2.4 tag of at least 16 KiB prepended to `sine.mp3`. Assert `Established`. A implementation that reads only 8 KiB returns `Absent` and fails this; that is the point.
+4. `a_xing_header_behind_a_large_id3_tag_is_still_found` — synthetic ID3v2.4 tag of at least 16 KiB prepended to `sine.mp3`. **Assert the `VbrHeader` value directly (`Some(VbrHeader::XingInfo)`), as a unit test against `probe_vbr_header`, not `Established` end-to-end.** An earlier draft specified the end-to-end form and it was wrong: the `None`-never-`Absent` safety rule maps both "found the header" and "gave up safely and defaulted" to `Established`, so a probe that reads only 8 KiB passes it. Verified by mutation — shrinking `PROBE_LEN` to 8 KiB was caught by nothing until the direct assertion existed. This test is the only thing pinning the read floor; write it as the direct one.
+
+7. `a_xing_id_over_non_zero_side_info_is_not_a_tag` — build a valid MPEG1 Layer III frame header, write `Xing` at the correct side-info offset, and fill the side-info region with non-zero bytes. Expect `Absent`.
+
+   This mirrors `is_maybe_info_tag`'s final condition (`demuxer.rs:966-967`), which requires the side info to be zeroed. A real Xing/Info frame is a dummy whose side info is all zeroes, so the two agree on well-formed files; they diverge when those four ASCII bytes land at that offset by accident. There **symphonia rejects the tag and falls back to `estimate_num_mpeg_frames`, so the duration really is an estimate**, while a probe without this check reports `XingInfo` and marks it `Established` — the exact direction §5.5 forbids, re-enabling `StalePastEnd` against an estimated duration. The opposite error costs nothing by comparison. Apply the check to the Xing/Info branch only; symphonia has no VBRI equivalent, so do not invent one. Its region starts at `header_size()`, which is 6 rather than 4 when the protection bit indicates a CRC, even though the tag *offset* excludes the CRC.
+
+**Match symphonia, do not out-defend it.** The tag offset is `MPEG_HEADER_LEN + side_info_len` with the CRC deliberately excluded (`demuxer.rs:950-952`). The purpose of this probe is to predict what symphonia will conclude, so agreeing with it is the requirement and "fuller defensiveness" would be the bug.
 5. `a_flac_source_reports_established_duration` — `sine.flac`, proving non-MP3 containers are untouched.
 6. `an_estimated_duration_does_not_declare_a_checkpoint_stale` — **the end-to-end test that justifies the task.** Against `sine-long-vbr-noxing.mp3` (true 600 s, symphonia estimates ~361 s), a stored checkpoint at 400 s must produce `ResumeDecision::Unvalidated(400 s)`, not `StalePastEnd`. Assert the resulting decision *and* that the checkpoint still reads 400 s. Run the same case against a Xing-tagged fixture with a checkpoint genuinely past its real end and assert `StalePastEnd` still fires there — otherwise this test passes against an implementation that simply never declares anything stale.
 
 - [ ] **Step 2: Run and watch them fail**
 
 Run: `cargo test --test duration_provenance 2>&1 | tail -20`
-Expected: 2, 3, 4 and 6 fail; 1 and 5 pass (everything is `Established` today, which is right for those two by accident — say so in the report rather than counting them as evidence).
+Expected: 2, 3, 6 and 7 fail; 1 and 5 pass (everything is `Established` today, which is right for those two by accident — say so in the report rather than counting them as evidence). **Test 4 also passes before implementation**, because `probe_vbr_header` does not exist yet to be wrong; it earns its place by pinning the read floor under mutation, not by failing first.
 
 - [ ] **Step 3: Implement**
 
