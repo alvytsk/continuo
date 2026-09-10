@@ -9,20 +9,20 @@ mod support;
 
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use continuo::clock::{Clock, FakeClock};
 use continuo::media::id::{MediaId, NormalizedUrl};
 use continuo::persistence::model::PersistedState;
 use continuo::persistence::store::StateStore;
 use continuo::playback::command::{Admission, ResumeIntent};
-use continuo::playback::event::StartDisposition;
+use continuo::playback::event::{PlaybackEvent, StartDisposition};
 use continuo::playback::state::PlaybackState;
 use continuo::resume::resume_candidate;
 use continuo::session::{Action, Session};
 
-use support::TestEngine;
 use support::server::{Script, TestServer};
+use support::{Loaded, TestEngine};
 
 fn media_for(url: &str) -> MediaId {
     match NormalizedUrl::parse(url) {
@@ -63,6 +63,52 @@ impl RemoteRig {
             && let Err(error) = store.write(&state)
         {
             panic!("the tempdir must be writable: {error}");
+        }
+    }
+
+    /// Waits for the `Loaded` event a fresh `load_remote_with_resume` just
+    /// requested, and feeds *this* `session` every event on the way there —
+    /// `Loaded` included.
+    ///
+    /// Deliberately not `TestEngine::await_loaded`: that method removes the
+    /// matching event from the engine's own inbox once it finds it, so a
+    /// `Session` that only starts observing afterward never learns
+    /// `current_media` from it (`on_loaded`, `src/session.rs`, is the only
+    /// place that sets it). Every write this session could ever make is
+    /// gated on `current_media` being `Some` (`Session::tick`'s first
+    /// guard), so a rig built the other way would silently never write
+    /// anything again — an `after` checkpoint that matches `before` would
+    /// look like proof of persistence (or of protection) when it is really
+    /// proof that persistence never ran at all. This was exactly the defect
+    /// found in this file's two tests before this fix: `engine2/3
+    /// .await_loaded()` was called before the corresponding `RemoteRig`
+    /// existed, so `rig2`/`rig3`'s `pump`/`quit` calls could never have
+    /// written anything regardless of what checkpoint protection did.
+    fn pump_until_loaded(&mut self) -> Loaded {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            while let Some(event) = self.engine.try_event() {
+                let loaded = match &event {
+                    PlaybackEvent::Loaded {
+                        position,
+                        disposition,
+                        ..
+                    } => Some(Loaded {
+                        position: *position,
+                        disposition: *disposition,
+                    }),
+                    _ => None,
+                };
+                let action = self.session.observe(&event, self.clock.sample());
+                Self::write(&self.store, action);
+                if let Some(loaded) = loaded {
+                    return loaded;
+                }
+            }
+            if Instant::now() >= deadline {
+                panic!("no Loaded event arrived within 20s");
+            }
+            std::thread::sleep(Duration::from_millis(2));
         }
     }
 
@@ -136,6 +182,7 @@ fn a_second_session_resumes_from_the_flushed_checkpoint() {
     // built from what was typed, not the hop actually served from.
     let server2 =
         TestServer::start_on(port, Script::from_fixture("sine-5s.flac").redirect_chain(1));
+    let (store2, clock2) = RemoteRig::store_in(dir.path());
     let mut engine2 = TestEngine::start_idle();
     engine2.load_remote_with_resume(
         &url,
@@ -144,7 +191,17 @@ fn a_second_session_resumes_from_the_flushed_checkpoint() {
                 .expect("session 1's checkpoint must carry an established position"),
         ),
     );
-    let loaded = engine2.await_loaded();
+    let mut rig2 = RemoteRig {
+        engine: engine2,
+        session: Session::new(reload(dir.path())),
+        store: store2,
+        clock: clock2,
+    };
+    // `pump_until_loaded`, not `TestEngine::await_loaded`: the latter would
+    // consume the `Loaded` event before `rig2.session` ever saw it, leaving
+    // `current_media` unset and every write below silently inert regardless
+    // of whether resume actually worked.
+    let loaded = rig2.pump_until_loaded();
     match loaded.disposition {
         StartDisposition::Resumed => {}
         other => panic!("expected Resumed, got {other:?}"),
@@ -161,13 +218,20 @@ fn a_second_session_resumes_from_the_flushed_checkpoint() {
         "the redirect's first hop never reached the server: {requests:?}"
     );
 
-    let (store2, clock2) = RemoteRig::store_in(dir.path());
-    let mut rig2 = RemoteRig {
-        engine: engine2,
-        session: Session::new(reload(dir.path())),
-        store: store2,
-        clock: clock2,
-    };
+    // Establish and play on a little, then quit — proving session 2's own
+    // continued playback actually reaches the file through this rig, not
+    // only that it read the resumed position back correctly. Without this,
+    // the trailing assertion below would hold even if `rig2` never wrote
+    // anything at all (exactly the defect `pump_until_loaded`'s doc comment
+    // describes), since it would just be restating `flushed.completed`.
+    assert_eq!(rig2.engine.handle().submit_play(), Admission::Accepted);
+    rig2.engine.await_state(PlaybackState::Playing);
+    // `play_for` waits for the *absolute* position to reach its argument,
+    // not for a span of further playback — session 2 resumed past 300ms
+    // already, so the target has to be past where it resumed, not a bare
+    // 300ms, or this returns immediately without advancing anything.
+    rig2.engine
+        .play_for(loaded.position + Duration::from_millis(300));
     rig2.pump();
     rig2.quit();
 
@@ -176,6 +240,13 @@ fn a_second_session_resumes_from_the_flushed_checkpoint() {
         .cloned()
         .unwrap_or_else(|| panic!("the entry must still be filed under the original identity"));
     assert!(!after.completed);
+    assert!(
+        after.position.unwrap_or(Duration::ZERO)
+            >= flushed.position.unwrap() + Duration::from_millis(100),
+        "session 2's own continued playback never reached the file: flushed at {:?}, after at {:?}",
+        flushed.position,
+        after.position
+    );
 
     server2.shutdown();
 }
@@ -238,20 +309,22 @@ fn the_protection_survives_a_process_boundary() {
                 .expect("session 1's checkpoint must carry an established position"),
         ),
     );
-    let loaded = engine2.await_loaded();
-    match loaded.disposition {
-        StartDisposition::ResumeUnavailable { retained } => {
-            assert_eq!(retained, original.position.unwrap());
-        }
-        other => panic!("expected ResumeUnavailable, got {other:?}"),
-    }
     let mut rig2 = RemoteRig {
         engine: engine2,
         session: Session::new(reload(dir.path())),
         store: store2,
         clock: clock2,
     };
-    rig2.pump();
+    // `pump_until_loaded`, not `TestEngine::await_loaded`: see its doc
+    // comment — this is the fix for the exact defect that let this test
+    // pass with checkpoint protection entirely removed.
+    let loaded = rig2.pump_until_loaded();
+    match loaded.disposition {
+        StartDisposition::ResumeUnavailable { retained } => {
+            assert_eq!(retained, original.position.unwrap());
+        }
+        other => panic!("expected ResumeUnavailable, got {other:?}"),
+    }
     assert_eq!(rig2.engine.handle().submit_play(), Admission::Accepted);
     rig2.engine.await_state(PlaybackState::Playing);
     rig2.engine.play_for(Duration::from_millis(300));
@@ -284,20 +357,21 @@ fn the_protection_survives_a_process_boundary() {
                 .expect("session 2's checkpoint must carry an established position"),
         ),
     );
-    let loaded3 = engine3.await_loaded();
-    match loaded3.disposition {
-        StartDisposition::ResumeUnavailable { retained } => {
-            assert_eq!(retained, original.position.unwrap());
-        }
-        other => panic!("expected ResumeUnavailable, got {other:?}"),
-    }
     let mut rig3 = RemoteRig {
         engine: engine3,
         session: Session::new(reload(dir.path())),
         store: store3,
         clock: clock3,
     };
-    rig3.pump();
+    // `pump_until_loaded`, not `TestEngine::await_loaded` — same fix as
+    // session 2, applied here too.
+    let loaded3 = rig3.pump_until_loaded();
+    match loaded3.disposition {
+        StartDisposition::ResumeUnavailable { retained } => {
+            assert_eq!(retained, original.position.unwrap());
+        }
+        other => panic!("expected ResumeUnavailable, got {other:?}"),
+    }
     // Establish and actually play, the same as session 2 — without this,
     // session 3's `Session` never establishes, and D20's rule ("nothing
     // established, so nothing overwrites the position") is what preserves
