@@ -65,9 +65,9 @@ Every task's requirements implicitly include this section.
 
 | File | Responsibility |
 |---|---|
-| `src/playback/seek_estimate.rs` | `SeekEstimator` — media time to byte offset, audio-data offset, frame resync, reservoir preroll |
+
 | `src/playback/provenance.rs` | `PositionProvenance` and its composition rules |
-| `tests/seek_estimate.rs` | Estimator unit coverage against real fixtures |
+
 | `tests/estimated_seek.rs` | End-to-end estimated seeking over the loopback server |
 | `tests/provenance_policy.rs` | Session-policy coverage for §4's write rules, restart preference and clearing |
 | `tests/fixtures/sine-long-noxing.mp3` | A no-index MP3 long enough that a rescan is measurable |
@@ -76,7 +76,7 @@ Every task's requirements implicitly include this section.
 
 | File | Change |
 |---|---|
-| `src/playback/decode.rs` | `seek_estimated`; the `SeekMode` decision; preroll discard |
+| `src/playback/decode.rs` | The `SeekMode` decision (one line, `:290`). No estimator, no resync, no preroll — `seek_refined`'s existing loop covers the reservoir |
 | `src/http/source.rs` | Wall-clock seek deadline distinct from the stall budget |
 | `src/playback/engine.rs` | Seek path, provenance on `Progress`, recovery with a fresh deadline |
 | `src/playback/wait.rs` | Carry provenance through `SessionFacts` and `publish_progress` |
@@ -163,193 +163,36 @@ git commit -m "spike: settle how an estimated byte seek reaches the demuxer"
 
 ---
 
-## Task 2: The seek estimator
+## Task 2: *Withdrawn by the Task 1 spike*
 
-**Files:**
-- Create: `src/playback/seek_estimate.rs`, `tests/seek_estimate.rs`
-- Modify: `src/playback/mod.rs`
+**Status: do not implement. Nothing in this task is needed, and building it
+would duplicate machinery symphonia already has.**
 
-**Interfaces:**
-- Consumes: Task 1's timestamp-base answer.
-- Produces:
+This task specified a `SeekEstimator` — a `byte_for`/`time_for` pair turning
+media time into a byte offset. The spike established that
+`MpaReader::preseek_coarse` performs exactly this arithmetic internally
+(`(required_ts / total_dur) × audio_byte_len`), then walks forward
+frame-by-frame to a real frame boundary, which a hand-rolled estimator would
+also have had to do. Reimplementing it would have bought a second copy of the
+same formula with the same accuracy characteristics and an additional resync
+adapter to maintain.
 
-```rust
-/// Turns a media time into a byte offset for a source whose demuxer has no
-/// usable seek index.
-///
-/// Deliberately not a general "seek table": this is an *estimate*, and every
-/// caller is expected to treat its landing as such (§3).
-pub struct SeekEstimator {
-    /// Where the first audio frame begins — past any ID3v2 tag. A seek that
-    /// ignores this lands inside metadata and resyncs to the wrong place.
-    audio_data_offset: u64,
-    /// Total audio bytes, excluding the header offset and any trailing tag.
-    audio_data_len: u64,
-    /// The recording's duration, from whatever established it.
-    duration: Duration,
-}
+The whole of this task collapses into **one line** — `SeekMode::Accurate` →
+`SeekMode::Coarse` at `src/playback/decode.rs:290` — which now lives in
+Task 4.
 
-impl SeekEstimator {
-    pub fn new(audio_data_offset: u64, audio_data_len: u64, duration: Duration) -> Self;
-    /// The byte to seek to for `target`, clamped into the audio data.
-    pub fn byte_for(&self, target: Duration) -> u64;
-    /// The media time a byte offset corresponds to — the inverse, needed to
-    /// report where a landing actually is.
-    pub fn time_for(&self, byte: u64) -> Duration;
-}
+**The numbering is deliberately not compacted.** Tasks 3 and 5-8 are
+unchanged and are referred to by number in the spec, the ledger, and the
+review round tables. Renumbering to close a gap would invalidate every one of
+those references to save nothing. **This plan has seven live tasks: 1, 3, 4,
+5, 6, 7, 8.**
 
-/// How many frames after an arbitrary byte offset must be decoded and thrown
-/// away before the output is trustworthy.
-///
-/// **Not a measurement from one fixture.** MP3's bit reservoir lets a frame
-/// reference bits from up to 511 bytes of earlier frames, so the requirement
-/// depends on frame payload and back-reference depth, not on the file. This is
-/// a *bound* justified from the format, and Task 2's tests validate it by
-/// comparing decoded output against continuous decoding across varied offsets,
-/// bitrates and channel modes — a pure sine at one bitrate is the easiest
-/// possible case and proves nothing about the worst one.
-pub const RESERVOIR_PREROLL_FRAMES: usize = /* justify from main_data_begin's range */;
-
-/// Find the next frame header at or after `from`, so decoding starts on a
-/// boundary rather than mid-frame.
-pub fn resync(bytes: &[u8], from: usize) -> Option<usize>;
-```
-
-- [ ] **Step 1: Write the failing tests**
-
-`tests/seek_estimate.rs`, against the real fixtures so the numbers are not invented:
-
-```rust
-use std::time::Duration;
-
-use continuo::playback::seek_estimate::{RESERVOIR_PREROLL_FRAMES, SeekEstimator, resync};
-
-#[allow(clippy::unwrap_used)] // A fixture committed to this repository.
-fn fixture(name: &str) -> Vec<u8> {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures")
-        .join(name);
-    std::fs::read(path).unwrap()
-}
-
-#[test]
-fn a_seek_to_zero_lands_on_the_first_audio_byte_not_byte_zero() {
-    // The captured defect started every rescan at byte 37849 — the first
-    // frame, past a large ID3v2 tag. An estimator that ignores the offset
-    // seeks into metadata and resyncs somewhere arbitrary.
-    let estimator = SeekEstimator::new(37_849, 130_502_739, Duration::from_secs(8156));
-    assert_eq!(estimator.byte_for(Duration::ZERO), 37_849);
-}
-
-#[test]
-fn the_estimate_is_linear_in_the_audio_data_and_inverts() {
-    let estimator = SeekEstimator::new(1_000, 16_000_000, Duration::from_secs(1_000));
-    // Half way through the recording is half way through the audio data,
-    // measured from the first frame rather than from the file's start.
-    assert_eq!(estimator.byte_for(Duration::from_secs(500)), 1_000 + 8_000_000);
-    // And the inverse round-trips, which is what lets a landing report where
-    // it actually is rather than where it was asked for.
-    assert_eq!(
-        estimator.time_for(1_000 + 8_000_000),
-        Duration::from_secs(500)
-    );
-}
-
-#[test]
-fn a_target_past_the_end_clamps_into_the_audio_data() {
-    // A clamp, not a failure: seeking past the end is an ordinary thing for a
-    // listener to ask for, and 416 is never how this project answers it.
-    let estimator = SeekEstimator::new(1_000, 16_000_000, Duration::from_secs(1_000));
-    let last = estimator.byte_for(Duration::from_secs(9_999));
-    assert!(last < 1_000 + 16_000_000, "clamped past the audio data: {last}");
-    assert!(last >= 1_000);
-}
-
-#[test]
-fn a_zero_length_recording_cannot_divide_by_zero() {
-    let estimator = SeekEstimator::new(1_000, 0, Duration::ZERO);
-    assert_eq!(estimator.byte_for(Duration::from_secs(5)), 1_000);
-    assert_eq!(estimator.time_for(1_000), Duration::ZERO);
-}
-
-#[test]
-fn resync_finds_the_next_frame_header_from_an_arbitrary_offset() {
-    // An estimated byte lands mid-frame essentially always. Decoding from
-    // there produces garbage until the next header, which is what resync
-    // exists to skip.
-    let bytes = fixture("sine-long-noxing.mp3");
-    let start = bytes.len() / 2;
-    let found = match resync(&bytes, start) {
-        Some(found) => found,
-        None => panic!("no frame header found after {start} in a 10-minute MP3"),
-    };
-    assert!(found >= start);
-    // A frame header begins with eleven set sync bits.
-    assert_eq!(bytes[found], 0xFF);
-    assert_eq!(bytes[found + 1] & 0xE0, 0xE0);
-    // And it is genuinely nearby: a frame at 128 kbps is ~417 bytes, so a
-    // resync that walked kilobytes is finding false syncs.
-    assert!(found - start < 2_048, "resync walked {} bytes", found - start);
-}
-
-#[test]
-fn resync_reports_absence_rather_than_guessing() {
-    assert_eq!(resync(&[0x00; 64], 0), None);
-    assert_eq!(resync(&[], 0), None);
-}
-
-#[test]
-fn the_preroll_discards_every_frame_the_reservoir_can_poison() {
-    // The real assertion, not a range check on a constant. Decode the fixture
-    // continuously to get the truth, then decode from a byte offset with the
-    // preroll applied, and require the two to agree from the first frame the
-    // preroll admits. A number between one and four proves nothing; matching
-    // samples do.
-    //
-    // Vary the offset across the file and repeat for each bitrate and channel
-    // mode fixture: the reservoir's depth depends on frame payload and
-    // back-reference distance, so a pure sine at one bitrate is the easiest
-    // possible case and the one least likely to expose an insufficient bound.
-    for fixture_name in ["sine-long-noxing.mp3", /* add the varied fixtures */] {
-        let bytes = fixture(fixture_name);
-        let truth = decode_continuously(&bytes);
-        for fraction in [0.1_f64, 0.37, 0.5, 0.84] {
-            let raw = (bytes.len() as f64 * fraction) as usize;
-            let start = match resync(&bytes, raw) {
-                Some(start) => start,
-                None => panic!("no frame header after {raw} in {fixture_name}"),
-            };
-            let (admitted_at, samples) = decode_from_offset_with_preroll(&bytes, start);
-            assert_samples_match(&truth, admitted_at, &samples, fixture_name, fraction);
-        }
-    }
-}
-```
-
-- [ ] **Step 2: Run them and watch them fail**
-
-Run: `cargo test --test seek_estimate 2>&1 | tail -20`
-Expected: FAIL — `unresolved import continuo::playback::seek_estimate`.
-
-- [ ] **Step 3: Implement**
-
-Add `pub mod seek_estimate;` to `src/playback/mod.rs` and write the module. `byte_for` is `audio_data_offset + (target / duration) * audio_data_len`, saturating and clamped, with `duration == 0` yielding the offset. `time_for` inverts it. `resync` scans for `0xFF` followed by three set bits, and — because false syncs are common in audio data — validates the candidate's version, layer and bitrate fields before accepting it; say in a comment why a bare sync-word match is not enough.
-
-**Justify `RESERVOIR_PREROLL_FRAMES` from the format, not from one measurement.** MP3's `main_data_begin` back-reference has a bounded range (511 bytes), which bounds how many prior frames a frame can draw on; derive the constant from that and say so in the doc comment. If the comparison test shows the derived bound is insufficient for any fixture, that is a finding — either the derivation is wrong or the preroll must become dependency-aware (reading `main_data_begin` and discarding until the reservoir is satisfied). Report which, rather than raising the constant until tests pass.
-
-You will need extra fixtures at varied bitrates and channel modes. Generate them the same way as `sine-long-noxing.mp3`, and record each in `tests/fixtures/README.md` with its command and its purpose. Prefer material with more spectral content than a pure sine — a sine compresses to almost nothing and barely uses the reservoir at all.
-
-- [ ] **Step 4: Verify**
-
-Run: `cargo test --test seek_estimate` — expected PASS, 7 tests.
-Run: `cargo fmt --check && cargo clippy --locked --all-targets --all-features -- -D warnings`
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add src/playback/seek_estimate.rs src/playback/mod.rs tests/seek_estimate.rs
-git commit -m "feat(playback): add the byte-offset seek estimator"
-```
+**One thing this task got right, and it moves to Task 4.** The estimator's
+doc comment said the byte offset "is an *estimate*, and every caller is
+expected to treat its landing as such". The spike proved that far more
+strongly than this task assumed — see §5.2's measurements, where a landing
+can be 235 s from its target — so the requirement survives its task and is
+carried into Task 4's provenance handling.
 
 ---
 
@@ -500,7 +343,7 @@ time the decoder established is still established."
 
 ---
 
-## Task 4: The bounded estimated seek
+## Task 4: The bounded Coarse seek
 
 **Files:**
 - Modify: `src/playback/decode.rs`, `src/http/channel.rs`, `src/http/source.rs`, `src/playback/engine.rs`
@@ -509,23 +352,6 @@ time the decoder established is still established."
 **Interfaces:**
 
 ```rust
-// src/playback/decode.rs
-impl DecodedSource {
-    /// Seek by byte estimate, for a source whose demuxer cannot seek in media
-    /// time without rescanning. Lands approximately; the caller reports the
-    /// landing as `PositionProvenance::Estimated`.
-    pub fn seek_estimated(
-        &mut self,
-        target: Duration,
-        estimator: &SeekEstimator,
-        deadline: Instant,
-    ) -> Result<SeekOutcome, PlaybackError>;
-
-    /// Whether this source needs the estimated path — a byte-seekable
-    /// transport under a demuxer with no usable index.
-    pub fn needs_estimated_seek(&self) -> bool;
-}
-
 // src/http/channel.rs — the deadline must live HERE, not only above it.
 impl SourceInterrupt {
     /// An absolute deadline for one operation, checked inside `read`'s wait
@@ -546,7 +372,34 @@ impl HttpMediaSource {
 }
 ```
 
-**The routing and timestamp policy (R2), which is one decision applied in four places.** `seek_refined` has four callers, and routing only `seek_to` leaves three scanning:
+**The core change is one line.** At `src/playback/decode.rs:290`, inside
+`seek_refined`, `SeekMode::Accurate` becomes `SeekMode::Coarse`. That is the
+entire fix for the wedge. Everything else in this task exists to bound and
+label it honestly.
+
+Three consequences the spike settled, which mean this stays a one-line change
+rather than growing:
+
+- **Reservoir priming is already handled.** `Coarse` is *not* reservoir-safe
+  on its own — the spike measured real corruption in the first three frames
+  after a landing (max sample error 0.119 CBR / 1.581 VBR, then bit-exact
+  from frame 3, consistent with `MAX_REF_FRAMES = 4`). But `seek_refined`'s
+  existing loop at `decode.rs:309` already decodes forward from `actual_ts`
+  to the target and discards as it goes, and it does not know or care which
+  preseek mode produced its starting frame. **Write no new reservoir code.**
+- **Timestamp origin is a non-issue.** `Coarse` seeks the *original* reader,
+  whose `next_packet_ts` has counted from the true start since it was opened,
+  so `actual_ts` is already absolute. The base-offset treatment the withdrawn
+  Task 2 would have needed does not arise.
+- **The local path changes too, and that is intended.** There is one
+  `SeekMode` call site, shared by local and remote sources. `Coarse` on a
+  local file trades a rescan for byte arithmetic there as well. Local seeks
+  are not the reported bug, so treat any local-fixture regression as a signal
+  to stop and reconsider, not to special-case the mode by transport.
+
+**The routing and deadline policy (R2), one decision applied in four places.**
+`seek_refined` has four callers, and bounding only `seek_to` leaves three
+unbounded:
 
 | Site | Reached by |
 |---|---|
@@ -555,28 +408,48 @@ impl HttpMediaSource {
 | `engine.rs:2484` (`reseek`) | stop→play, and device recovery |
 | `engine.rs:2633` (`verify_seek_support`) | stopped-seek capability validation |
 
-Introduce **one** routing function they all call, so the decision cannot drift, and give it the deadline. Two consequences to handle explicitly:
+Introduce **one** routing function they all call, so the decision cannot
+drift, and give it the deadline. The deadline applies to every remote seek —
+an indexed MP3 takes the same path and needs the same bound.
 
-- **Timestamp origin.** If Task 1 chose shape A, a re-probed reader's timestamps may be relative to its new origin rather than absolute. Every one of these four sites then needs the same base-offset treatment, or a later absolute seek lands wrong. Task 1 recorded the answer; apply it in one place.
-- **The refined fallback is not automatically safe.** An *indexed* MP3 still takes the same `Accurate` path today. Bound it too — the deadline applies to every remote seek, not only estimated ones.
+**What the deadline can and cannot promise (§5.3).** Checks in
+`HttpMediaSource` bound source **I/O**. They do not bound demuxer work over
+bytes already buffered above them — `MediaSourceStream` holds 64 KiB and
+frame headers can be parsed out of it without touching the source. Write that
+limitation in the code, at the deadline. `Coarse` shrinks the exposure by
+roughly 320× (3,072 B consumed against 983,040 B, measured) but does not
+remove it: the `FormatReader::seek()` call is still on this path.
 
-**What the deadline can and cannot promise (§5.3).** Checks in `HttpMediaSource` bound source **I/O**. They do not bound demuxer work over bytes already buffered above them — `MediaSourceStream` holds 64 KiB and frame headers can be parsed out of it without touching the source. Write that limitation in the code, at the deadline. If Task 1 chose shape A, the `FormatReader::seek()` call is gone from this path and the bound is real; say which case you are in.
+**Recovery (§5.4).** A failed or expired seek restores the pre-seek position
+with **one fresh bounded attempt carrying its own deadline** — never the
+expired one, never a loop. An inherited expired deadline fails recovery
+instantly, leaving the decoder mid-scan with no way back: bounded, but the
+position becomes unrecoverable rather than merely late, which is worse than
+the wedge being fixed. If the fresh attempt also fails, report the seek
+failed, restore the position logically, and retire the source so the next
+explicit action reopens cleanly.
 
-**Recovery (§5.4).** A failed or expired seek restores the pre-seek position with **one fresh bounded attempt carrying its own deadline** — never the expired one, never a loop. An inherited expired deadline fails recovery instantly, leaving the decoder mid-scan with no way back: bounded, but the position becomes unrecoverable rather than merely late, which is worse than the wedge being fixed. If the fresh attempt also fails, report the seek failed, restore the position logically, and retire the source so the next explicit action reopens cleanly.
+**Provenance, and why it is unconditional (§5.2).** Every `Coarse` landing
+reports `PositionProvenance::Estimated` — never conditionally, never
+"established because this file looked like CBR". Nothing observable at seek
+time distinguishes a file where the arithmetic is exact from one where it
+lands 235 s away, and the spike's measurements are the evidence that this is
+a real span rather than a rounding concern.
 
 - [ ] **Step 1: Write the failing tests**
 
 `tests/estimated_seek.rs`, all against `TestServer` and `TestOutput`:
 
-1. `a_forward_seek_on_a_no_index_mp3_lands_without_rescanning_from_the_first_packet` — seek forward, assert the requested byte is near the estimate and **not** the audio-data offset, and that the server sent far less than the whole prefix.
+1. `a_forward_seek_on_a_no_index_mp3_lands_without_rescanning_from_the_first_packet` — seek forward, assert the requested byte is near the arithmetic estimate and **not** `first_packet_pos`, and that the demuxer consumed far less than the whole prefix.
 2. `repeated_seeks_stay_responsive` — five `submit_seek` calls in succession; each is serviced, none rescans, and the engine reaches a landing after each. This is the user's actual report.
 3. `a_seek_against_a_stalled_source_fails_within_its_deadline` — `stall_body_after`, prove the wait was entered with `wait_until_stalled`, assert the seek fails inside the deadline and the pre-seek position is restored.
 4. `pause_stop_and_quit_are_serviced_during_a_seek` — issue a seek against a slow source, prove it is in flight, then `submit_pause` and assert the state changes promptly rather than after the seek.
 5. `an_estimated_landing_reports_estimated_provenance` — and playing on from it keeps reporting `Estimated`, per §3.1.
 6. `recovery_after_a_failed_seek_gets_a_fresh_deadline` — the recovery attempt is not refused instantly by an inherited expired deadline.
-7. `a_seek_that_stalls_while_paused_still_fails_within_its_deadline` — **R1's regression, and the one the source-level design would have missed.** Pause first, then seek against a stalled source, and prove the read was entered before asserting. The stall budget is suspended while frozen, so only a deadline checked inside the wait loop regardless of freeze can end this; a version that bounds the seek when playing and hangs when paused passes every other test here.
-8. `a_seek_on_an_indexed_remote_mp3_is_bounded_too` — the refined fallback path takes the same deadline.
-9. `every_seek_entry_point_is_routed` — launch resume, stop→play, device recovery and stopped-seek validation all go through the shared routing rather than calling `seek_refined` directly. Assert on observable behaviour (no rescan from the audio-data offset) rather than on structure.
+7. `a_seek_that_stalls_while_paused_still_fails_within_its_deadline` — **R1's regression.** Pause first, then seek against a stalled source, and prove the read was entered before asserting. The stall budget is suspended while frozen, so only a deadline checked inside the wait loop regardless of freeze can end this; a version that bounds the seek when playing and hangs when paused passes every other test here.
+8. `a_seek_on_an_indexed_remote_mp3_is_bounded_too` — the same deadline applies.
+9. `every_seek_entry_point_is_routed` — launch resume, stop→play, device recovery and stopped-seek validation all go through the shared routing rather than calling `seek_refined` directly. Assert on observable behaviour (no rescan from `first_packet_pos`) rather than on structure.
+10. `a_launch_resume_past_an_estimated_ceiling_preserves_the_checkpoint` — **the retained-limitation test.** Against `sine-long-vbr-noxing.mp3`, whose duration symphonia estimates at ~361 s against a true 600 s, resume at a stored position of 400 s (real audio exists there). Symphonia's own `max_ts` check refuses it with `SeekErrorKind::OutOfRange` — mode-independently, since the check at `demuxer.rs:267-271` precedes the mode dispatch at `:291-295` — so the seek *must* fail. Assert that it fails, and that **the stored checkpoint still reads 400 s afterwards**: a position we could not reach is not a position we may discard. This limitation is retained deliberately (§5.5); the test pins the behaviour so a later change cannot quietly turn a refusal into a reset.
 
 - [ ] **Step 2: Run and watch them fail**
 
@@ -584,7 +457,7 @@ Run: `cargo test --test estimated_seek 2>&1 | tail -20`
 
 - [ ] **Step 3: Implement**
 
-Build the estimator from the source's evidence at open (`byte_len`, the audio-data offset the spike identified, and the decoder's duration). Route `seek_to` through `seek_estimated` when `needs_estimated_seek()`, and through the existing refined seek otherwise — the local path must not change. Apply the preroll discard. Set and clear the seek deadline around the operation. Report the landing's provenance from which path ran.
+Swap the `SeekMode` at `decode.rs:290`. Introduce the shared routing function and move all four callers onto it. Add `set_operation_deadline` to `SourceInterrupt`, checked inside `read`'s wait loop regardless of freeze level, and `set_seek_deadline` on `HttpMediaSource` to reach it. Set and clear the deadline around the operation. Report every landing from this path as `Estimated`. Add no estimator, no resync adapter, and no reservoir bookkeeping.
 
 - [ ] **Step 4: Verify, then un-ignore the reproduction**
 
@@ -597,7 +470,7 @@ Run the new file three times consecutively; report each.
 
 ```bash
 git add -A
-git commit -m "fix(playback): seek by byte estimate rather than rescanning
+git commit -m "fix(playback): seek Coarse rather than rescanning from the first packet
 
 Closes the wedge found in M3's manual acceptance."
 ```
@@ -729,7 +602,7 @@ git commit -m "docs: describe estimated seeking and position provenance"
 
 **Placeholder scan.** Tasks 5, 6 and 7 give test *names and obligations* rather than full bodies, because each mirrors an existing file's established shape and the naming carries the requirement. Tasks 2 and 3 give complete test code. Task 1 deliberately specifies an experiment rather than an implementation — that is its nature, and it is the one task allowed to end in "neither shape works".
 
-**Type consistency.** `SeekEstimator`, `resync`, `RESERVOIR_PREROLL_FRAMES` (Task 2) → Task 4. `PositionProvenance` (Task 3) → Tasks 4, 6, 8. `seek_estimated`, `needs_estimated_seek`, `set_seek_deadline` (Task 4) → Task 7. `PersistedCheckpoint.estimated`, `SCHEMA_VERSION` (Task 5) → Task 6. `StartDisposition::ResumedEstimated` (Task 6) → Tasks 7, 8. Each is defined before first use.
+**Type consistency.** `PositionProvenance` (Task 3) → Tasks 4, 6, 8. `set_operation_deadline`, `set_seek_deadline` (Task 4) → Task 7. Task 2's `SeekEstimator`, `resync` and `RESERVOIR_PREROLL_FRAMES` are withdrawn and referenced by nothing. `PersistedCheckpoint.estimated`, `SCHEMA_VERSION` (Task 5) → Task 6. `StartDisposition::ResumedEstimated` (Task 6) → Tasks 7, 8. Each is defined before first use.
 
 **Corrections made while writing and reviewing this plan.** Four claims in earlier drafts were false about code the plan does not own, and each would have propagated:
 
@@ -740,4 +613,6 @@ git commit -m "docs: describe estimated seeking and position provenance"
 
 The pattern is the same each time: a claim about someone else's code, asserted rather than checked. Verify before building on it.
 
-**A note on Task 1's leverage.** If the spike finds `Coarse` works, Tasks 2 and 4 shrink to routing and bounding, and `SeekEstimator` may not be needed at all. The plan is deliberately ordered so that outcome deletes work rather than invalidating it — do not start Task 2 before Task 1 reports.
+**Task 1's leverage, realised.** The spike found `Coarse` works, so Task 2 is withdrawn entirely and Task 4 is one line plus routing and bounding. The plan was ordered so that outcome would delete work rather than invalidate it, and it did: seven live tasks remain (1, 3, 4, 5, 6, 7, 8), numbering left uncompacted so existing references stay valid.
+
+**What the spike cost, and what it bought.** It ran three rounds, and the first two produced wrong answers that survived until challenged — a CBR-only accuracy claim, then a circular VBR one that compared two self-reported timestamps both constructed to converge on the same target. The third round measured against an independent byte-offset → cumulative-frame-time map and found `Coarse`'s VBR error reaching 235 s on a 600 s file. That number did not change the decision, because the cost argument (3,072 B against 983,040 B) never depended on it and the alternatives share the same vulnerability — but it did change what the design is allowed to claim, which is the point of gating on a spike.
