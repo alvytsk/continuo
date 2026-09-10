@@ -522,12 +522,22 @@ the wedge being fixed. If the fresh attempt also fails, report the seek
 failed, restore the position logically, and retire the source so the next
 explicit action reopens cleanly.
 
-**Provenance, and why it is unconditional (§5.2).** Every `Coarse` landing
-reports `PositionProvenance::Estimated` — never conditionally, never
+**Provenance, and the exact scope of "unconditional" (§5.2).** An **MP3**
+landing reports `PositionProvenance::Estimated` — never conditionally, never
 "established because this file looked like CBR". Nothing observable at seek
 time distinguishes a file where the arithmetic is exact from one where it
-lands 235 s away, and the spike's measurements are the evidence that this is
-a real span rather than a rounding concern.
+lands 235 s away.
+
+**Every other format keeps `Established`.** MP3 is the only demuxer in
+symphonia that reads `SeekMode` at all (see §5.2's table); FLAC, ISO-BMFF,
+OGG, MKV and ADTS all take `_mode` and ignore it, so `Coarse` and `Accurate`
+run byte-identical code for them. FLAC frames carry absolute sample numbers
+and its seek binary-searches against them; MP3 frames carry none, which is
+the whole reason estimation is needed. Decide from
+`FormatReader::format_info().format` against `FORMAT_ID_MP3`, never from an
+extension, a URL, or the transport. A blanket `Estimated` would be false
+rather than conservative, and under §4 it would freeze every local file's
+checkpoint at its pre-seek value the moment the listener seeks.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -542,7 +552,8 @@ a real span rather than a rounding concern.
 7. `a_seek_that_stalls_while_paused_still_fails_within_its_deadline` — **R1's regression.** Pause first, then seek against a stalled source, and prove the read was entered before asserting. The stall budget is suspended while frozen, so only a deadline checked inside the wait loop regardless of freeze can end this; a version that bounds the seek when playing and hangs when paused passes every other test here.
 8. `a_seek_on_an_indexed_remote_mp3_is_bounded_too` — the same deadline applies.
 9. `every_seek_entry_point_is_routed` — launch resume, stop→play, device recovery and stopped-seek validation all go through the shared routing rather than calling `seek_refined` directly. Assert on observable behaviour (no rescan from `first_packet_pos`) rather than on structure.
-10. `a_launch_resume_past_an_estimated_ceiling_preserves_the_checkpoint` — **the retained-limitation test.** Against `sine-long-vbr-noxing.mp3`, whose duration symphonia estimates at ~361 s against a true 600 s, resume at a stored position of 400 s (real audio exists there). Symphonia's own `max_ts` check refuses it with `SeekErrorKind::OutOfRange` — mode-independently, since the check at `demuxer.rs:267-271` precedes the mode dispatch at `:291-295` — so the seek *must* fail. Assert that it fails, and that **the stored checkpoint still reads 400 s afterwards**: a position we could not reach is not a position we may discard. This limitation is retained deliberately (§5.5); the test pins the behaviour so a later change cannot quietly turn a refusal into a reset.
+10. `a_remote_mp3_seek_is_estimated_but_a_local_flac_seek_is_established` — pins the scope rule above. Mutation-test both directions: unconditional `Estimated` must fail the FLAC half, unconditional `Established` must fail the MP3 half.
+11. `a_launch_resume_past_an_estimated_ceiling_preserves_the_checkpoint` — **the retained-limitation test.** Against `sine-long-vbr-noxing.mp3`, whose duration symphonia estimates at ~361 s against a true 600 s, resume at a stored position of 400 s (real audio exists there). Symphonia's own `max_ts` check refuses it with `SeekErrorKind::OutOfRange` — mode-independently, since the check at `demuxer.rs:267-271` precedes the mode dispatch at `:291-295` — so the seek *must* fail. Assert that it fails, and that **the stored checkpoint still reads 400 s afterwards**: a position we could not reach is not a position we may discard. This limitation is retained deliberately (§5.5); the test pins the behaviour so a later change cannot quietly turn a refusal into a reset.
 
 - [ ] **Step 2: Run and watch them fail**
 

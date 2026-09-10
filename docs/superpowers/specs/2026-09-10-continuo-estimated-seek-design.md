@@ -528,6 +528,45 @@ are allowed to talk about where a `Coarse` landing actually is: never as a
 number a listener can trust to be close, only as an estimate whose error
 has no practical ceiling below the file's own length.
 
+**Which formats this reaches, and why it is MP3 alone.** `SeekMode` looks
+like a global switch and is not. Across the whole symphonia tree, exactly one
+demuxer reads the parameter:
+
+| Demuxer | Signature |
+|---|---|
+| `symphonia-bundle-mp3-0.6.1/src/demuxer.rs:232` | `fn seek(&mut self, mode: SeekMode, ..)` |
+| `symphonia-bundle-flac-0.6.1/src/demuxer.rs:249` | `_mode` |
+| `symphonia-format-isomp4-0.6.1/src/demuxer.rs:671` | `_mode` |
+| `symphonia-format-ogg-0.6.1/src/demuxer.rs:492` | `_mode` |
+| `symphonia-format-mkv-0.6.1/src/demuxer.rs:595` | `_mode` |
+| `symphonia-codec-aac-0.6.1/src/adts.rs:324` | `_mode` |
+
+For every format except MP3, `Coarse` and `Accurate` execute byte-identical
+code. The reason is structural rather than incidental: **FLAC frames carry
+absolute sample numbers in their headers**, so FLAC's seek binary-searches the
+byte range against real timestamps and lands on the frame that actually
+contains the target. **MP3 frames carry no timestamps at all**, which is
+exactly why `preseek_coarse` must divide a byte ratio and why its landing can
+be wrong by the margins measured above.
+
+**So provenance follows the demuxer that ran, not the seek mode requested:**
+
+- **MP3 → `Estimated`, unconditionally.** Never conditioned on Xing/Info
+  presence, on bitrate, or on anything sampled from the file.
+- **Every other format → `Established`,** exactly as M1 and M2 reported it.
+  This amendment changes nothing about their seeks, so it must not change
+  what they claim about them.
+
+Read the format from `FormatReader::format_info().format` against
+`FORMAT_ID_MP3` — never from a file extension, a URL, or the transport.
+
+**This is not a softening of the rule below; it is its scope.** Marking a FLAC
+landing `Estimated` would not be conservative, it would be false, and §4 makes
+falseness expensive: an estimated position may not replace an established
+checkpoint, so a blanket `Estimated` would freeze the checkpoint of every
+local file at its pre-seek value the moment the listener seeks. M1 and M2 do
+not have that bug and this amendment must not introduce it.
+
 **Consequence for provenance, sharpened by this finding.** Nothing
 observable at seek time distinguishes a CBR file (where the estimate
 happens to be exact) from a VBR one (where the error can span a large
