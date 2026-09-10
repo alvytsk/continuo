@@ -655,7 +655,9 @@ git commit -m "feat(persistence): record an estimated location beside the establ
 
 - [ ] **Steps: failing tests, implement, verify, commit**
 
-Model the tests on `tests/session_policy.rs`'s existing shape, driven synchronously with `FakeClock`. Each of the three clearing exits gets its own test, and each must be shown to fail without its clause — say in the report which ablation you ran.
+Model the tests on `tests/session_policy.rs`'s existing shape, driven synchronously with `FakeClock`. Each of the **two** clearing exits — an establishing seek, and an established `Restart` — gets its own test, and each must be shown to fail without its clause; say in the report which ablation you ran.
+
+**Two, not three.** An earlier draft of this plan listed verified completion as a third exit and this step still said "three"; that draft is superseded by the `completed`-under-estimated-provenance rule above. Completion establishes that the *body* finished, not that the anchor was right, so an estimated completion **retains** estimated provenance and checkpoint protection. Write a third test asserting exactly that — an estimated completion does **not** clear — so the superseded rule cannot creep back in.
 
 ```bash
 git commit -m "feat(session): an estimated location never overwrites an established one"
