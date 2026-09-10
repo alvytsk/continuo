@@ -323,20 +323,41 @@ Add to `tests/engine_contract.rs`:
 ```rust
 #[test]
 fn an_estimated_duration_does_not_clamp_a_seek() {
-    // The listener asked for a real position. An estimate that says it is
-    // past the end is not evidence enough to move the request.
-    // Assert on the target the engine actually attempts, not on where it
-    // lands — the seek is still allowed to fail, and under an estimated
-    // duration symphonia will often refuse it. Failing honestly is the
+    // The listener asked for a real position. An estimate saying it is past
+    // the end is not evidence enough to move the request.
+    //
+    // Assert on the target the engine *attempts*, not on where it lands: the
+    // seek is still allowed to fail, and under an estimated duration
+    // symphonia will often refuse it outright. Failing honestly is the
     // intended outcome; landing somewhere unrequested is not.
+    let engine = TestEngine::with_metadata(MediaMetadata {
+        title: None,
+        duration: Some(Duration::from_secs(60)),
+        duration_provenance: PositionProvenance::Estimated,
+    });
+    let attempted = engine.clamp_target(Duration::from_secs(90));
+    assert_eq!(attempted, Duration::from_secs(90));
 }
 
 #[test]
 fn an_established_duration_still_clamps_a_seek() {
     // The M1/M2 behaviour, unchanged. Without this, an implementation that
     // simply deletes the clamp passes the test above.
+    let engine = TestEngine::with_metadata(MediaMetadata {
+        title: None,
+        duration: Some(Duration::from_secs(60)),
+        duration_provenance: PositionProvenance::Established,
+    });
+    let attempted = engine.clamp_target(Duration::from_secs(90));
+    assert_eq!(attempted, Duration::from_secs(60));
 }
 ```
+
+`clamp_target` is private; expose it to the test the way this crate already
+exposes other internals to `tests/engine_contract.rs`, or drive it through
+the public seek path and assert on the recorded target. Match the
+surrounding file — do not add a `pub` that exists only for a test if the
+file's existing pattern avoids that.
 
 The second test is not optional: it is what stops the first from being
 satisfied by removing the clamp entirely.
