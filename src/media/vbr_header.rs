@@ -32,6 +32,12 @@ const VBRI_TAG_ID: [u8; 4] = *b"VBRI";
 /// The VBRI tag sits at a fixed offset past the frame header, independent of
 /// side info length — `symphonia-bundle-mp3-0.6.1/src/demuxer.rs:1025`.
 const VBRI_TAG_OFFSET_FROM_HEADER: usize = 32;
+/// The minimum buffer length symphonia requires past the VBRI offset before
+/// even checking the tag id — `is_maybe_vbri_tag`'s `MIN_VBRI_TAG_LEN`,
+/// `symphonia-bundle-mp3-0.6.1/src/demuxer.rs:1024`. Not the bare 4-byte tag
+/// id: the gate covers the whole minimal tag (id, version, delay, quality,
+/// byte and frame counts).
+const MIN_VBRI_TAG_LEN: usize = 26;
 
 /// What established an MP3's frame count, and therefore its duration.
 ///
@@ -87,10 +93,16 @@ pub fn probe_vbr_header(source: &mut dyn MediaSource) -> Result<Option<VbrHeader
 /// too — so the common case never asks a source for more than this.
 const INITIAL_LEN: usize = 4 * 1024;
 
-/// Bytes needed past the frame header to check both possible tag positions:
-/// Xing/Info's widest `side_info_len` (32, MPEG1 stereo) and VBRI's fixed
-/// 32-byte offset, plus the 4-byte tag id itself.
-const TAG_REGION_LEN: usize = 32 + 4;
+/// Bytes needed past the frame header to fully check both possible tag
+/// positions: Xing/Info's widest `side_info_len` (32, MPEG1 stereo) plus its
+/// 4-byte tag id, versus VBRI's fixed 32-byte offset plus symphonia's own
+/// 26-byte minimum tag length past that offset (`MIN_VBRI_TAG_LEN`) — the
+/// larger of the two, since either may be what a given frame carries.
+const TAG_REGION_LEN: usize = if 32 + 4 > VBRI_TAG_OFFSET_FROM_HEADER + MIN_VBRI_TAG_LEN {
+    32 + 4
+} else {
+    VBRI_TAG_OFFSET_FROM_HEADER + MIN_VBRI_TAG_LEN
+};
 
 /// Reads only as much of the head as the evidence actually requires: a
 /// small initial chunk, extended only when that chunk itself reveals an
@@ -246,21 +258,46 @@ fn side_info_len(shape: &FrameShape) -> usize {
 fn detect(buf: &[u8]) -> Option<VbrHeader> {
     let frame_offset = first_frame_offset(buf)?;
     let header_end = frame_offset.checked_add(MPEG_HEADER_LEN)?;
-    let word: [u8; 4] = buf.get(frame_offset..header_end)?.try_into().ok()?;
+    let word: [u8; 4] = match buf.get(frame_offset..header_end) {
+        Some(bytes) => bytes.try_into().ok()?,
+        None => {
+            // `frame_offset` is nonzero only when `first_frame_offset` found
+            // a leading ID3v2 tag; a short buffer at offset 0 means no tag,
+            // and therefore no frame either — genuinely "not MP3" — so this
+            // keeps returning `None`, which fails open to `Established` at
+            // the call site. That fail-open is load-bearing for FLAC, WAV
+            // and M4A, which reach here with no MP3 frame to find at all.
+            // A short buffer *past* a real ID3v2 tag is a different case
+            // (B3, §5.5): the file is MP3-shaped, but this probe gathered
+            // no evidence about its Xing/Info/VBRI tag. Report `Absent`
+            // (→ `Estimated`) rather than `None` (→ `Established`) — not
+            // knowing must not license a destructive decision.
+            return if frame_offset > 0 {
+                Some(VbrHeader::Absent)
+            } else {
+                None
+            };
+        }
+    };
     let shape = parse_frame_shape(word)?;
 
     let xing_pos = header_end + side_info_len(&shape);
     let vbri_pos = header_end + VBRI_TAG_OFFSET_FROM_HEADER;
-    // Both candidate positions must be fully covered by what was read
-    // before concluding `Absent` — a short read must report "no evidence",
-    // never "no header present".
-    let furthest_needed = xing_pos.max(vbri_pos) + 4;
+    // Both candidate regions must be fully covered by what was read before
+    // concluding anything about them. VBRI's minimum tag length is 26 bytes
+    // past its offset, not the bare 4-byte tag id —
+    // `symphonia-bundle-mp3-0.6.1/src/demuxer.rs:1024,1033-1035`
+    // (`MIN_VBRI_TAG_LEN`).
+    let furthest_needed = (xing_pos + 4).max(vbri_pos + MIN_VBRI_TAG_LEN);
     if buf.len() < furthest_needed {
-        return None;
+        // A genuine MP3 frame header was found above (unlike the `None`
+        // case), but the tag region beyond it was not fully read. Same B3
+        // reasoning as above: "we don't know" reports `Absent`, never the
+        // `None` that a short read used to produce here.
+        return Some(VbrHeader::Absent);
     }
 
     if shape.is_layer3 {
-        let candidate = &buf[xing_pos..xing_pos + 4];
         // `header_size()` — where the side info actually starts — counts an
         // optional 2-byte CRC that the tag *offset* above deliberately does
         // not (symphonia's own comment: "The CRC is not included in this
@@ -268,6 +305,7 @@ fn detect(buf: &[u8]) -> Option<VbrHeader> {
         // same reason: the offset predicts where symphonia looks for the
         // tag id; this predicts where its side-info zero-check starts.
         let header_size = header_end + if shape.has_crc { 2 } else { 0 };
+
         // A real Xing/Info frame is a dummy frame whose side info is all
         // zero — `is_maybe_info_tag`, `demuxer.rs:966-967`. Without this,
         // four ASCII bytes that happen to spell "Xing"/"Info" inside
@@ -275,16 +313,25 @@ fn detect(buf: &[u8]) -> Option<VbrHeader> {
         // real tag when symphonia would reject it and fall back to
         // `estimate_num_mpeg_frames` — reporting `Established` for a
         // duration that is actually an estimate, which is the one direction
-        // §5.5 forbids. No VBRI equivalent exists in symphonia, so this
-        // check applies only here.
-        let side_info_is_zero = buf[header_size..xing_pos].iter().all(|&b| b == 0);
-        if side_info_is_zero && (candidate == XING_TAG_ID || candidate == INFO_TAG_ID) {
+        // §5.5 forbids.
+        let xing_candidate = &buf[xing_pos..xing_pos + 4];
+        let xing_side_info_is_zero = buf[header_size..xing_pos].iter().all(|&b| b == 0);
+        if xing_side_info_is_zero
+            && (xing_candidate == XING_TAG_ID || xing_candidate == INFO_TAG_ID)
+        {
             return Some(VbrHeader::XingInfo);
         }
-    }
-    let candidate = &buf[vbri_pos..vbri_pos + 4];
-    if candidate == VBRI_TAG_ID {
-        return Some(VbrHeader::Vbri);
+
+        // `is_maybe_vbri_tag`, `demuxer.rs:1023-1046`, mirrored in full: a
+        // layer-3 frame (this `if`), a minimum buffer length (the
+        // `furthest_needed` check above), the tag id, and — same reasoning
+        // as the Xing/Info check just above — a zeroed side-info region
+        // from `header_size` to the tag's own offset.
+        let vbri_candidate = &buf[vbri_pos..vbri_pos + 4];
+        let vbri_side_info_is_zero = buf[header_size..vbri_pos].iter().all(|&b| b == 0);
+        if vbri_side_info_is_zero && vbri_candidate == VBRI_TAG_ID {
+            return Some(VbrHeader::Vbri);
+        }
     }
 
     Some(VbrHeader::Absent)
@@ -333,7 +380,11 @@ mod tests {
 
     /// An ID3v2.4 tag of `padding` zero bytes of content, followed by a
     /// valid MPEG1 Layer III stereo frame header (`side_info_len` 32) with a
-    /// `Xing` tag glued on immediately after its side info.
+    /// `Xing` tag glued on immediately after its side info, and enough
+    /// trailing bytes to satisfy `detect`'s VBRI-region length gate (26
+    /// bytes past its offset) too — a real file always has more audio past
+    /// its first frame; only this synthetic fixture would otherwise end
+    /// exactly at the tag.
     fn id3_then_xing_frame(padding: usize) -> Vec<u8> {
         let mut buf = Vec::new();
         buf.extend_from_slice(b"ID3");
@@ -349,6 +400,7 @@ mod tests {
         buf.extend_from_slice(&[0xff, 0xfb, 0x90, 0x00]); // MPEG1 L3 stereo
         buf.extend(std::iter::repeat_n(0u8, 32)); // side info, stereo
         buf.extend_from_slice(b"Xing");
+        buf.extend(std::iter::repeat_n(0u8, 32)); // trailing "rest of the file"
         buf
     }
 
@@ -438,6 +490,7 @@ mod tests {
         let mut buf = vec![0xff, 0xfb, 0x90, 0x00]; // MPEG1 L3 stereo, no CRC
         buf.extend(std::iter::repeat_n(0xAAu8, 32)); // non-zero "side info"
         buf.extend_from_slice(b"Xing");
+        buf.extend(std::iter::repeat_n(0u8, 22)); // reach the VBRI region's length gate too
         assert_eq!(detect(&buf), Some(VbrHeader::Absent));
     }
 
@@ -456,6 +509,7 @@ mod tests {
         buf.extend_from_slice(&[0xab, 0xcd]); // the 2 CRC bytes, non-zero
         buf.extend(std::iter::repeat_n(0u8, 30)); // the rest of side info, zeroed
         buf.extend_from_slice(b"Xing");
+        buf.extend(std::iter::repeat_n(0u8, 22)); // reach the VBRI region's length gate too
         assert_eq!(detect(&buf), Some(VbrHeader::XingInfo));
     }
 
@@ -469,15 +523,89 @@ mod tests {
         let mut buf = vec![0xff, 0xfb, 0x90, 0xc0]; // MPEG1 Layer III, mono
         buf.extend(std::iter::repeat_n(0u8, 32));
         buf.extend_from_slice(b"VBRI");
+        // symphonia's `is_maybe_vbri_tag` requires 26 bytes past the VBRI
+        // offset, not just the 4-byte tag id (`MIN_VBRI_TAG_LEN`) — pad past
+        // that minimum, itself past symphonia's own floor.
+        buf.extend(std::iter::repeat_n(0u8, 22));
         assert_eq!(detect(&buf), Some(VbrHeader::Vbri));
     }
 
     #[test]
-    fn detect_reports_none_on_a_truncated_read() {
+    fn detect_reports_absent_for_vbri_bytes_short_of_symphonias_26_byte_minimum() {
+        // The same bytes as `detect_reports_vbri_for_a_valid_header_with_a_vbri_tag`,
+        // without the 22-byte pad past the tag id. symphonia's own
+        // `is_maybe_vbri_tag` requires the buffer to reach 26 bytes past the
+        // VBRI offset before it will even look at the tag id
+        // (`MIN_VBRI_TAG_LEN`, demuxer.rs:1024) — the bare 4-byte id is not
+        // enough. B4: a buffer this short must report "unknown" (`Absent`),
+        // not accept the tag on 4 bytes symphonia itself would reject on
+        // length alone.
+        let mut buf = vec![0xff, 0xfb, 0x90, 0xc0]; // MPEG1 Layer III, mono
+        buf.extend(std::iter::repeat_n(0u8, 32));
+        buf.extend_from_slice(b"VBRI");
+        assert_eq!(detect(&buf), Some(VbrHeader::Absent));
+    }
+
+    #[test]
+    fn detect_rejects_vbri_bytes_over_non_zero_side_info() {
+        // Mirrors `detect_rejects_xing_bytes_over_non_zero_side_info`, for
+        // VBRI's own zero-side-info gate (`is_maybe_vbri_tag`,
+        // demuxer.rs:1044-1045, B4). A mono header keeps the VBRI offset
+        // (32) distinct from the Xing/Info offset (17), so this pins the
+        // VBRI check specifically rather than riding on the Xing one.
+        let mut buf = vec![0xff, 0xfb, 0x90, 0xc0]; // MPEG1 Layer III, mono
+        buf.extend(std::iter::repeat_n(0xAAu8, 32)); // non-zero "side info"
+        buf.extend_from_slice(b"VBRI");
+        buf.extend(std::iter::repeat_n(0u8, 22)); // reach the 26-byte minimum
+        assert_eq!(detect(&buf), Some(VbrHeader::Absent));
+    }
+
+    #[test]
+    fn detect_ignores_vbri_bytes_in_a_non_layer3_frame() {
+        // symphonia's `is_maybe_vbri_tag` refuses anything but a layer-3
+        // frame before it looks at length, id or side info
+        // (demuxer.rs:1027-1029, B4). Same header as
+        // `detect_reports_vbri_for_a_valid_header_with_a_vbri_tag` with the
+        // layer bits changed from Layer III (0b01) to Layer II (0b10);
+        // everything else — the zeroed side info, the real "VBRI" id, the
+        // padding past the 26-byte minimum — is left exactly as that test's
+        // accepting case, so only the layer check can be what rejects it.
+        let mut buf = vec![0xff, 0xfd, 0x90, 0xc0]; // MPEG1 Layer II, mono
+        buf.extend(std::iter::repeat_n(0u8, 32));
+        buf.extend_from_slice(b"VBRI");
+        buf.extend(std::iter::repeat_n(0u8, 22));
+        assert_eq!(detect(&buf), Some(VbrHeader::Absent));
+    }
+
+    #[test]
+    fn detect_reports_absent_on_a_truncated_read_of_a_real_frame() {
         // A valid-looking header word but nothing after it to check either
-        // tag position against.
+        // tag region against: B3/§5.5 — this is an MP3 frame we could not
+        // fully examine, not "not MP3", so it must report `Absent` (→
+        // `Estimated`), never `None` (→ `Established`).
         let buf = vec![0xff, 0xfb, 0x90, 0x00];
+        assert_eq!(detect(&buf), Some(VbrHeader::Absent));
+    }
+
+    #[test]
+    fn detect_reports_none_when_the_frame_header_itself_is_unreachable_and_no_id3_tag_was_found() {
+        // No ID3 tag (`first_frame_offset` returns `Some(0)`) and a buffer
+        // too short even to hold the 4-byte frame header: genuinely "not
+        // MP3, or too little to tell" — must stay `None`, load-bearing for
+        // FLAC/WAV/M4A (B3).
+        let buf = vec![0xff, 0xfb];
         assert_eq!(detect(&buf), None);
+    }
+
+    #[test]
+    fn detect_reports_absent_when_an_id3_tag_pushes_the_frame_past_what_was_read() {
+        // An ID3 tag was found (`frame_offset > 0`) but the buffer stops
+        // before the frame header it points to — the exact shape a >64 KiB
+        // ID3v2 tag produces against the real `PROBE_LEN` cap (B3). MP3-
+        // shaped, no evidence gathered: `Absent`, never `None`.
+        let mut buf = vec![b'I', b'D', b'3', 4, 0, 0, 0, 0, 0, 0x22]; // frame at 10 + 34 = 44
+        buf.resize(20, 0); // far short of the frame header at 44
+        assert_eq!(detect(&buf), Some(VbrHeader::Absent));
     }
 
     #[test]

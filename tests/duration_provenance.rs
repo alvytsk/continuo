@@ -152,6 +152,39 @@ fn a_xing_header_behind_a_large_id3_tag_is_still_found() {
 }
 
 #[test]
+#[allow(clippy::unwrap_used)]
+fn an_mp3_with_a_tag_past_probe_len_and_no_xing_header_reports_estimated_duration() {
+    // B3/§5.5: an ID3v2 tag over 64 KiB (`PROBE_LEN`) pushes the first MPEG
+    // frame past what `probe_vbr_header` reads at all. Before the fix,
+    // `detect` returned `None` here — the same "gathered no evidence" value
+    // it returns for a non-MP3 container — and `None` maps to `Established`
+    // at the call site, silently claiming a real index for a duration
+    // symphonia is actually estimating. The fixture behind the tag carries
+    // no Xing/Info/VBRI tag either, so there is no header to find even once
+    // the frame is reached.
+    let sine_bytes = std::fs::read(fixture("sine-noxing.mp3").as_path()).unwrap();
+    let audio = strip_id3(&sine_bytes);
+    let mut combined = synthetic_id3v24_tag(80 * 1024);
+    assert!(
+        combined.len() > 64 * 1024,
+        "tag must exceed PROBE_LEN so the first frame is never reached"
+    );
+    combined.extend_from_slice(audio);
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("huge-id3-no-xing.mp3");
+    std::fs::write(&path, &combined).unwrap();
+    let abs = AbsolutePath::new(path.canonicalize().unwrap()).unwrap();
+    let source = DecodedSource::open(&abs).unwrap();
+
+    assert_eq!(
+        source.metadata().duration_provenance,
+        PositionProvenance::Estimated,
+        "an MP3 frame this probe could not reach is unknown, not established"
+    );
+}
+
+#[test]
 fn a_flac_source_reports_established_duration() {
     let source = open("sine.flac");
     assert_eq!(
