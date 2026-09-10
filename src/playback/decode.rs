@@ -16,6 +16,7 @@ use crate::media::capabilities::{
 };
 use crate::media::id::AbsolutePath;
 use crate::media::metadata::MediaMetadata;
+use crate::media::vbr_header::{VbrHeader, probe_vbr_header};
 
 use super::error::PlaybackError;
 use super::provenance::PositionProvenance;
@@ -111,11 +112,18 @@ impl DecodedSource {
     /// for diagnostics — `UnsupportedInput`'s `path` field and this source's
     /// own `path()` accessor.
     pub fn from_media_source(
-        source: Box<dyn MediaSource>,
+        mut source: Box<dyn MediaSource>,
         hint: Hint,
         label: PathBuf,
         evidence: SourceEvidence,
     ) -> Result<Self, PlaybackError> {
+        // Read the container's own evidence for the MP3 frame-count header
+        // (Xing/Info/VBRI) before `MediaSourceStream` takes the source. This
+        // must run first: symphonia's `Track` never says whether its
+        // `num_frames` came from this header or from
+        // `estimate_num_mpeg_frames`'s ~16-frame extrapolation, and by the
+        // time the reader is built that distinction is unrecoverable.
+        let vbr_header = probe_vbr_header(source.as_mut())?;
         let mss = MediaSourceStream::new(
             source,
             MediaSourceStreamOptions {
@@ -191,16 +199,22 @@ impl DecodedSource {
             time_base,
             sample_rate,
             channels,
-            // Task 3 boundary: this probe does not yet distinguish a real
-            // index/container header from `estimate_num_mpeg_frames`'s
-            // ~16-frame extrapolation (symphonia's `Track` exposes no such
-            // flag) — that detection is Task 4's job, alongside
-            // `SeekMode::Coarse`. Every duration this decoder reports today
-            // keeps the meaning it always had.
+            // `Some(XingInfo | Vbri)` is a real index: `Established`.
+            // `Some(Absent)` is symphonia's `estimate_num_mpeg_frames`
+            // fallback: `Estimated` (§5.5). `None` means this probe gathered
+            // no evidence at all (a non-MP3 container, a short read, or an
+            // unseekable source) and must not silently downgrade a duration
+            // that may be perfectly good — every non-MP3 format's real
+            // index/container header keeps the meaning it always had.
             metadata: MediaMetadata {
                 title,
                 duration,
-                duration_provenance: PositionProvenance::Established,
+                duration_provenance: match vbr_header {
+                    Some(VbrHeader::XingInfo | VbrHeader::Vbri) | None => {
+                        PositionProvenance::Established
+                    }
+                    Some(VbrHeader::Absent) => PositionProvenance::Estimated,
+                },
             },
             planes: vec![Vec::new(); usize::from(channels)],
             cursor: 0,
