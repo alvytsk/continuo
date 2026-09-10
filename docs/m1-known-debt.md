@@ -246,15 +246,34 @@ table rather than a design judgement.
   uncancellable, unbounded call to `FormatReader::seek`; `SEEK_BUDGET`
   (`engine.rs:114`) cannot bound it, because that budget only gates
   `seek_refined`'s residual-alignment loop *after* `reader.seek()` already
-  returns, never the scan itself. `SeekMode::Coarse` is not a drop-in escape:
-  `preseek_coarse` refuses outright with `SeekErrorKind::Unseekable` whenever
-  `num_frames` is absent, which is exactly the file shape this defect hits.
-  Reproduced in `tests/engine_remote.rs::
-  a_short_forward_seek_on_a_no_index_mp3_rescans_the_whole_file_instead_of_landing_quickly`
-  (`#[ignore]`d — the reproduction is confirmed but the fix is a design
-  decision, not made here). A fix is designed separately; this entry is the
-  interim record until it lands, at which point the `#[ignore]` comes off and
-  that test becomes the regression test.
+  returns, never the scan itself.
+
+  **This paragraph's claim that `SeekMode::Coarse` is not a drop-in escape
+  because `preseek_coarse` "refuses outright... whenever `num_frames` is
+  absent" is false, and is corrected here.** `preseek_coarse`'s `Unseekable`
+  refusal (`symphonia-bundle-mp3-0.6.1/src/demuxer.rs:503-513`) fires only
+  when the stream itself is not byte-seekable, or when `max_ts` cannot be
+  computed at all. For a byte-seekable file with no Xing/Info/VBRI tag,
+  `MpaReader::try_new` (`demuxer.rs:465-471`) still calls
+  `estimate_num_mpeg_frames` and populates `track.num_frames` from a
+  ~16-frame sample, so `max_ts` is available and `preseek_coarse` proceeds —
+  it does not refuse. Verified both by reading the source and by exercising
+  it (`docs/superpowers/specs/2026-09-10-continuo-estimated-seek-design.md`
+  §5.2).
+
+  **Fixed by M3.1 Task 4.** `seek_refined` (`src/playback/decode.rs`) now
+  requests `SeekMode::Coarse` rather than `Accurate` for every seek —
+  including `verify_seek_support`'s own trial seek, which routes through the
+  same call — computing a byte offset directly from the track's duration
+  arithmetic instead of rewinding and rescanning. Measured against the file
+  that reproduced this defect: `Coarse` consumed 3,072 bytes against the
+  983,040 bytes the `Accurate` rescan it replaces consumed for the same
+  seek. The reproduction, renamed to
+  `tests/engine_remote.rs::a_short_forward_seek_on_a_no_index_mp3_lands_quickly_without_rescanning`,
+  is un-`#[ignore]`d and is now the regression test. `Coarse`'s own landing
+  accuracy on a no-Xing-tag VBR file is a separate, still-open concern —
+  recorded under Milestone 3.1 below, not this entry, which was about the
+  rescan hang and is closed.
 - **`verify_seek_support`'s two possible outcomes are asymmetrically tested.**
   `tests/engine_remote.rs::a_capability_change_carries_the_current_session_rev`
   proves the `Unknown → Native` transition (a stopped seek's trial succeeds and
@@ -366,3 +385,70 @@ such changes be explicit rather than silent:
   returns `None` when there is no controlling terminal (`enable_raw_mode`
   fails for want of a tty — the CI case), and a session that starts with no
   tty reads no keys but still prints `Loading` and any failure normally.
+
+# Milestone 3.1 — carried debt
+
+Findings from executing the estimated-seeking amendment
+(`docs/superpowers/specs/2026-09-10-continuo-estimated-seek-design.md`) that
+were judged fine to carry. None threatens the amendment's invariant (an
+estimated position or duration may drive display and resume, but must never
+replace an established checkpoint or drive a destructive decision). All four
+were established during the implementation spike rather than planned for, so
+the plan could not name them in advance.
+
+- **An MP3 `Coarse` landing has no useful accuracy bound.** Measured error
+  grows from 0.4 s at a 10 s target to **235 s of error on a 600 s file** as
+  the target approaches the file's estimated duration ceiling — at a 360 s
+  target it lands at 595 s while self-reporting a plausible ~360 s, with no
+  signal to the caller that anything is wrong. The error is bounded only by
+  the file's own length, which is not a guarantee a listener asking to land
+  at a specific point can use. This is why every MP3 landing reports
+  `PositionProvenance::Estimated`, unconditionally. The conjunction that
+  produces it: no Xing/Info/VBRI tag, so `num_frames` comes from
+  `estimate_num_mpeg_frames`'s ~16-frame sample rather than an encoder's own
+  count, **and** genuinely variable bitrate, so even a correct frame count
+  would not make uniform-bitrate byte arithmetic exact. A file with a tag —
+  which includes the podcast from the manual acceptance report (`Info` tag,
+  exact frame count, CBR to within 0.03 s over 2 h 16 m) — lands essentially
+  exactly, because the denominator driving the estimate is then the
+  encoder's own declared count rather than a 16-frame extrapolation.
+- **The tail of an under-estimated file is unreachable, deliberately.**
+  Symphonia's own `max_ts` check (`symphonia-bundle-mp3-0.6.1/src/
+  demuxer.rs:267-271`) refuses a target past the estimated ceiling *before*
+  the mode dispatch at `:292-296`, so the refusal is mode-independent by
+  construction and no choice of `SeekMode` recovers it. `clamp_target`
+  (`src/playback/engine.rs:2615`) no longer clamps to an *estimated*
+  duration — only to an established one, via `established_duration` — which
+  turned a silent mislanding at the estimated ceiling into a visible,
+  honest `OutOfRange` refusal; it did not extend how far into such a file a
+  seek can actually reach. Retained, not a bug to fix here.
+- **Shapes A (re-probe at the byte offset) and B (byte-seek beneath a live
+  reader), rejected by the Task 1 spike.** Shape A is implementable but needs
+  either a codec-specific constructor called directly or a `MediaSource`
+  adapter, because `Probe::probe()` cannot probe from an offset:
+  `MediaSourceStream::new` always initialises its internal `abs_pos` to 0
+  with no way to tell it the source starts elsewhere, and `Probe::probe()`'s
+  trailing-metadata pre-scan restores to `mss.pos()` — 0, by the above —
+  before the main scan runs. Corrected and measured, shape A costs one
+  request at the estimated byte and needs the same 3-frame reservoir discard
+  `Coarse` also needs, but carries the identical duration-estimate
+  vulnerability as the finding above plus a bespoke adapter and manual
+  reservoir/timestamp-origin bookkeeping that `Coarse` gets for free from
+  `MpaReader::seek`'s existing machinery. Shape B is **structurally
+  unimplementable**: `FormatReader`'s only route back to the underlying
+  stream is `into_inner(self: Box<Self>)`, which consumes the reader, and
+  nothing exposes `next_packet_ts` for external mutation even if a live
+  handle existed — reaching the concrete `MpaReader` would mean downcasting
+  the trait object, which this crate's `unsafe_code = "forbid"` and ordinary
+  API discipline both rule out.
+- **A better duration estimate was not attempted.**
+  `estimate_num_mpeg_frames` samples only the first ~16 frames
+  (`demuxer.rs:684`, `MAX_FRAMES: u32 = 16`) and extrapolates. Sampling frame
+  headers at ten points across the file would cost roughly 40 KB against the
+  983 KB rescan this amendment removes, and would collapse the dominant
+  error term in the first finding above. Symphonia's own Xing TOC — parsed
+  into `XingInfoTag.toc` (`demuxer.rs:749-757`, `#[allow(dead_code)]`) and
+  never read — would do better still if it were reachable through the
+  public API. Neither is attempted: this amendment removes a wedge, and
+  widening it into duration-estimator work was deliberately kept out of
+  scope.

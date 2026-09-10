@@ -30,10 +30,31 @@ M0 has no audio system dependency; every later milestone requires libasound2-dev
 
 HTTP playback's honest limits:
 
-- A range-capable server can seek and resume.
+- A range-capable server can seek and resume — including MP3 files with no
+  seek index, such as most podcasts.
 - A range-less server plays through from the start but cannot seek or resume.
 - A live stream, or a source whose continuity cannot be established, is refused rather than played.
 - There is no automatic reconnection: a dropped connection fails rather than retrying on its own. Playing again makes one explicit attempt to reopen at the preserved position.
+
+### Seeking accuracy
+
+Seeking on MP3 works by computing a byte offset instead of asking the
+decoder to scan forward, which is what makes seeking on a long podcast fast
+and responsive instead of stalling. A file that carries a proper seek index
+(a Xing, Info, or VBRI header, which most encoders write) lands exactly, or
+within a fraction of a second for variable-bitrate audio.
+
+A file with **no such header** is different: the landing is a rough
+estimate, and "approximate" here can mean landing in a substantially
+different part of the recording, not just a few seconds off. Measured on a
+worst case — a 600-second file with no seek index and genuinely variable
+bitrate — a seek requested a third of the way through the recording landed
+five seconds from the end: 235 seconds away from where it was asked to go.
+Constant-bitrate files without an index are unaffected by this — the
+estimate happens to be exact for them — but nothing in the file tells the
+player which kind it is before the seek runs, so every landing on an
+index-less MP3 is reported and should be read as an estimate, never as a
+confirmed position.
 
 ## Design and roadmap
 
