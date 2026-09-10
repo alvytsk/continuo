@@ -537,14 +537,31 @@ destructive decision.** Concretely:
   stale is destructive and an estimate is not evidence enough to do it.
 - `clamp_target` does not clamp to an estimated duration. A seek beyond it is
   attempted and allowed to fail honestly, which is better than landing
-  somewhere the listener did not ask for.
+  silently somewhere the listener did not ask for.
+
+  **This does not make the tail seekable, and the amendment must not be read
+  as claiming it does.** Symphonia applies its own `max_ts` check and refuses
+  a target past its estimated ceiling — observed as `OutOfRange`, identically
+  under `Coarse` and `Accurate`. Removing the application-level clamp changes
+  a silent mislanding into a visible refusal; it does not extend reach. The
+  tail of an under-estimated VBR file stays unreachable, and that is a
+  **retained limitation** of this change.
+
+  The case that matters is a **launch resume** to a stored position past the
+  estimated ceiling: it will fail. The checkpoint must survive that failure
+  untouched, which is the same principle as §4 — a position we could not
+  reach is not a position we may discard.
 - The status line already renders an unknown duration as `--:--:--`. An
   estimated one is displayed, not hidden — but it must not be presented as
   though it were measured.
 
-**This generalises §3.** Provenance is not a property of positions
-specifically; it is a property of every quantity this player derives rather
-than observes. Duration was simply the first other one to matter.
+**Scope, deliberately narrow.** Provenance applies to **position and duration
+only** in this change. Those are the two quantities with demonstrated
+destructive consequences — a discarded checkpoint and an unreachable tail —
+and both are fixed by the rules above. Generalising to "every derived
+quantity" would be a framework built ahead of its second use case, and this
+project has no other quantity today whose estimation destroys anything. If a
+third appears, the pattern is here to copy.
 
 ## 6. Acceptance
 

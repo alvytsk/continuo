@@ -369,6 +369,10 @@ git commit -m "feat(playback): add the byte-offset seek estimator"
 
 So `MediaMetadata::duration` records whether it was derived or observed, and §5.5's rule applies: **an estimated duration may inform display and must never drive a destructive decision.** `decide_resume` treats an estimated duration exactly as it treats an absent one — `ResumeDecision::Unvalidated`, which M2 already implements and which retains the stored position. `StalePastEnd` requires an *established* duration. `clamp_target` does not clamp to an estimated one.
 
+**Two boundaries on this, both binding.** First, provenance is scoped to **position and duration only** — those are the two quantities with demonstrated destructive consequences. Do not generalise it to other derived values; that is a framework ahead of its second use case.
+
+Second, **removing the clamp does not make the tail seekable.** Symphonia's own `max_ts` check still refuses a target past its estimated ceiling (`OutOfRange`, identically under `Coarse` and `Accurate`). The change converts a silent mislanding into a visible refusal, nothing more, and the tail of an under-estimated VBR file stays unreachable — a retained limitation to record, not a problem to solve here. The case that must be tested is a **launch resume** to a position past that ceiling: it fails, and the checkpoint must survive untouched.
+
 **The rule that matters, and the one a reviewer should check hardest:** provenance is a **second axis**, never merged into `PositionQuality`. `PositionQuality::Estimated` already exists and means something else entirely — how precisely we know what has been *heard*, reconstructed from callback spans, which is the ordinary state during playback. A `Degraded` position whose media time was decoder-established is still `Established`. The session policy reads provenance and never quality.
 
 **Stickiness (§3.1).** Decoding forward from an estimated landing keeps reporting `Estimated`. Provenance changes only when something establishes the absolute position: a confirmed seek landing, an established restart, a fresh load. It is not a function of elapsed playback, and no timer clears it.
