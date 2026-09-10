@@ -507,6 +507,65 @@ fn a_load_of_a_completed_entry_replays_from_zero_and_says_so() {
     assert_eq!(loaded.position, Duration::ZERO);
 }
 
+// --------------------------------------- §4.3 restart preference (Task 6 fix)
+
+/// The end-to-end wiring §4.2/§4.3 was missing: a `ResumeIntent` carrying
+/// both a stored `estimated` location and its established fallback must
+/// land the load *at the estimate*, not at `position` — and report which
+/// established value it kept beside it. Ablation: routing
+/// `ResumeIntent::EstimatedCandidate` through the same branch as `Candidate`
+/// (i.e. seeking to `established` instead of `target`) makes the position
+/// assertion fail — `loaded.position` would land near 1 s instead of 3 s.
+#[test]
+fn a_load_with_both_locations_resumes_at_the_estimate_and_reports_the_kept_fallback() {
+    let mut engine = TestEngine::start(TRACK);
+    engine.load_with_resume(
+        support::fixture(TRACK),
+        ResumeIntent::EstimatedCandidate {
+            target: Duration::from_secs(3),
+            established: Some(Duration::from_secs(1)),
+        },
+    );
+    let loaded = engine.await_loaded();
+    assert_eq!(
+        loaded.disposition,
+        StartDisposition::ResumedEstimated {
+            established: Some(Duration::from_secs(1))
+        }
+    );
+    assert!(
+        loaded.position >= Duration::from_secs(3),
+        "the load must land at the estimate, not the established fallback: {:?}",
+        loaded.position
+    );
+}
+
+/// R8: an estimate-only entry (nothing ever established) must report
+/// `established: None`, never a fabricated fallback — and must still resume
+/// at the estimate. Ablation: a wrong `resume_intent_for` (or a wrong
+/// engine-side pass-through) that substitutes `Duration::ZERO` for the
+/// absent established position would be indistinguishable from a genuine
+/// zero-established entry, which is exactly the "never established" vs.
+/// "established at the start" conflation R8 forbids — caught here because
+/// `established` is asserted as `None`, not merely "not `Some(1s)`".
+#[test]
+fn an_estimate_only_load_resumes_at_the_estimate_and_reports_no_established_fallback() {
+    let mut engine = TestEngine::start(TRACK);
+    engine.load_with_resume(
+        support::fixture(TRACK),
+        ResumeIntent::EstimatedCandidate {
+            target: Duration::from_secs(3),
+            established: None,
+        },
+    );
+    let loaded = engine.await_loaded();
+    assert_eq!(
+        loaded.disposition,
+        StartDisposition::ResumedEstimated { established: None }
+    );
+    assert!(loaded.position >= Duration::from_secs(3));
+}
+
 #[test]
 fn an_explicit_restart_announces_that_it_established() {
     // G1. Without this event `Session` cannot tell a restart from any other

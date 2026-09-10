@@ -340,6 +340,44 @@ fn a_range_less_server_plays_but_cannot_seek_or_resume() {
     server2.shutdown();
 }
 
+/// §4.3/§10 (Task 6 fix round 1): the `SeekSupport::Unsupported` fallback a
+/// non-seekable source triggers for `Candidate` (this file's test just
+/// above) must not be routed around by `EstimatedCandidate` — an estimated
+/// target is exactly as unreachable on a range-less server as an
+/// established one, and the load must still announce `ResumeUnavailable`
+/// rather than silently starting at zero. Ablation: an `EstimatedCandidate`
+/// branch that skips the `SeekSupport::Unsupported` check (the constraint
+/// the coordinator's fix round named explicitly) makes this fail —
+/// `loaded.disposition` would read `ResumedEstimated` and `loaded.position`
+/// would land nonzero instead of at `Duration::ZERO`.
+#[test]
+fn an_estimated_resume_on_a_range_less_server_falls_back_to_resume_unavailable() {
+    let server = TestServer::start(Script::from_fixture("sine-5s.flac").without_ranges());
+    let mut engine = TestEngine::start_idle();
+    engine.load_remote_with_resume(
+        &server.url("/audio.flac"),
+        ResumeIntent::EstimatedCandidate {
+            target: Duration::from_secs(2),
+            established: Some(Duration::from_secs(1)),
+        },
+    );
+    let loaded = engine.await_loaded();
+    match loaded.disposition {
+        StartDisposition::ResumeUnavailable { retained } => {
+            assert_eq!(
+                retained,
+                Duration::from_secs(2),
+                "the estimate is the location that could not be honoured"
+            );
+        }
+        other => panic!("expected ResumeUnavailable, got {other:?}"),
+    }
+    assert_eq!(loaded.position, Duration::ZERO);
+
+    engine.finish();
+    server.shutdown();
+}
+
 /// Build a WAV body of arbitrary size by repeating `sine-5s.wav`'s own PCM
 /// payload, with the RIFF and `data` chunk sizes patched to match. H13 needs
 /// a body well past the byte channel's real capacity (see the occupancy

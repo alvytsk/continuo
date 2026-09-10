@@ -22,7 +22,7 @@ use crate::media::capabilities::{MediaCapabilities, SeekSupport};
 use crate::media::id::{AbsolutePath, MediaId, NormalizedUrl};
 use crate::media::source::SourceLocation;
 use crate::persistence::PersistenceError;
-use crate::persistence::model::PersistedState;
+use crate::persistence::model::{PersistedCheckpoint, PersistedState};
 use crate::persistence::store::{LoadReason, StateStore};
 use crate::persistence::writer::{ShutdownOutcome, StateSink, Urgency, WriterHandle};
 use crate::playback::command::{Admission, PlaybackCommand, ResumeIntent};
@@ -34,7 +34,7 @@ use crate::playback::provenance::PositionProvenance;
 use crate::playback::state::PlaybackState;
 use crate::playback::timeline::PositionQuality;
 use crate::playback::volume::Volume;
-use crate::resume::{ResumeCandidate, resume_candidate};
+use crate::resume::{restart_preference, resume_candidate};
 use crate::session::{Action, Session};
 
 const SEEK_STEP_SECS: i64 = 10;
@@ -59,7 +59,7 @@ pub fn run(cli: cli::Cli) -> Result<(), PlaybackError> {
     let Persistence {
         mut session,
         writer,
-        candidate,
+        resume,
         volume,
         persisting,
     } = open_persistence(platform_store(&clock), &media, &clock);
@@ -79,7 +79,7 @@ pub fn run(cli: cli::Cli) -> Result<(), PlaybackError> {
         engine.set_http(Some(service));
     }
 
-    for command in resume_commands(media, location, candidate, volume) {
+    for command in resume_commands(media, location, resume, volume) {
         engine.commands().send(command).ok();
     }
 
@@ -472,16 +472,17 @@ impl WaitHook for InertHook {
 fn resume_commands(
     media: MediaId,
     source: SourceLocation,
-    candidate: Option<ResumeCandidate>,
+    resume: Option<ResumeIntent>,
     volume: Volume,
 ) -> [PlaybackCommand; 3] {
-    // No entry is not itself a `Candidate`: the worker would decide `NoEntry`
-    // from it anyway (§11), so this is the same outcome without asking the
-    // worker to resolve a candidate that was never there.
-    let resume = match candidate {
-        Some(candidate) => ResumeIntent::Candidate(candidate),
-        None => ResumeIntent::StartAt(Duration::ZERO),
-    };
+    // No entry is not itself a resume intent: the worker would decide
+    // `NoEntry` from an absent `Candidate` anyway (§11), so this is the same
+    // outcome without asking the worker to resolve one that was never
+    // there. `resume_intent_for` has already decided, for whatever entry
+    // there was, between `Candidate` (§11, unchanged) and
+    // `EstimatedCandidate` (§4.3) — this function's only job left is the
+    // "nothing at all" case.
+    let resume = resume.unwrap_or(ResumeIntent::StartAt(Duration::ZERO));
     [
         PlaybackCommand::SetVolume(volume),
         PlaybackCommand::Load {
@@ -508,12 +509,15 @@ impl StateSink for DisabledSink {
 struct Persistence {
     session: Session,
     writer: WriterHandle,
-    /// The stored entry for this media, unresolved. Resolving it needs a
-    /// duration, and only the worker's own decode probe has one (Ruling 5) —
-    /// so `open_persistence` hands the raw candidate onward rather than
+    /// The resume intent built from the stored entry for this media,
+    /// unresolved against a duration — `resume_intent_for` (§4.2, §4.3)
+    /// already decided between an established candidate and an estimated
+    /// one, but a `Candidate`'s own position still needs a duration to
+    /// validate against, and only the worker's own decode probe has one
+    /// (Ruling 5). So `open_persistence` hands this onward rather than
     /// deciding a start position itself, which would mean opening the media
     /// twice for the same answer `decide_resume` gives either time.
-    candidate: Option<ResumeCandidate>,
+    resume: Option<ResumeIntent>,
     volume: Volume,
     /// Whether anything this session submits can reach the disk. A disabled
     /// sink reports every write as a success, deliberately — the writer must
@@ -534,6 +538,43 @@ fn platform_store(clock: &Arc<dyn Clock>) -> Option<StateStore> {
             tracing::warn!(%error, "no state directory; this session will not be persisted");
             None
         }
+    }
+}
+
+/// Builds the worker-facing resume intent from a stored checkpoint entry,
+/// §4.3's estimated-preference rule folded in beside the established path
+/// left unchanged.
+///
+/// A completed entry never reaches `restart_preference` — its own doc says
+/// so: the caller's concern, and calling it anyway would let a stray
+/// estimate stored before completion redirect a replay that D1 already
+/// says starts over at zero regardless. So a completed entry always goes
+/// through `resume_candidate` exactly as it did before this function
+/// existed, and only a live, uncompleted entry's `estimated` field is ever
+/// consulted.
+///
+/// This is where §4.3 actually gets wired into the load path (Task 6's fix
+/// round 1): `restart_preference`'s pure preference decision — implemented
+/// and tested since Task 6 itself — had no production caller until this
+/// function. `decide_resume` is deliberately not consulted here for the
+/// estimate branch: §4.3 is a preference between two already-known
+/// locations, not a duration-validated choice, and running the estimate
+/// through duration validation would be inventing a rule the design doc
+/// does not state. `decide_resume` keeps governing the established
+/// position exactly as before wherever that path is actually taken — the
+/// `resume_candidate` branch below, reached whenever there is no estimate
+/// to prefer.
+fn resume_intent_for(entry: Option<&PersistedCheckpoint>) -> Option<ResumeIntent> {
+    let entry = entry?;
+    if entry.completed {
+        return resume_candidate(entry.position, entry.completed).map(ResumeIntent::Candidate);
+    }
+    match restart_preference(entry.position, entry.estimated) {
+        Some(preference) => Some(ResumeIntent::EstimatedCandidate {
+            target: preference.target,
+            established: preference.established,
+        }),
+        None => resume_candidate(entry.position, entry.completed).map(ResumeIntent::Candidate),
     }
 }
 
@@ -579,12 +620,14 @@ fn open_persistence(
     // `duration: None` would misreport an ordinary resume as `Unvalidated`
     // every time. The disposition the worker reports on `Loaded` is what a
     // later task logs instead (Ruling 5).
-    // `resume_candidate` (§4.2): a freshly loaded entry may carry only an
-    // estimate with no established position at all, and that case must not
-    // collapse into a fabricated `AtStart`.
-    let candidate = state
-        .entry_for(media)
-        .and_then(|entry| resume_candidate(entry.position, entry.completed));
+    // `resume_intent_for` (§4.2, §4.3): a freshly loaded entry may carry
+    // only an estimate with no established position at all, and that case
+    // must not collapse into a fabricated `AtStart` — and, since Task 6's
+    // fix round 1, an entry whose `estimated` field wins the §4.3
+    // preference is resolved to `ResumeIntent::EstimatedCandidate` here
+    // rather than the plain `Candidate` `resume_candidate` alone would
+    // build.
+    let resume = resume_intent_for(state.entry_for(media));
     let volume = state.volume();
     let sink: Box<dyn StateSink> = match (store, writable) {
         (Some(store), true) => Box::new(store),
@@ -594,7 +637,7 @@ fn open_persistence(
     Persistence {
         session: Session::new(state),
         writer: WriterHandle::spawn(sink, Arc::clone(clock)),
-        candidate,
+        resume,
         volume,
         persisting: writable,
     }
@@ -940,6 +983,7 @@ mod tests {
     use crate::media::metadata::MediaMetadata;
     use crate::playback::checkpoint::PlaybackCheckpoint;
     use crate::playback::event::StartDisposition;
+    use crate::resume::ResumeCandidate;
 
     fn press(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::empty())
@@ -1038,7 +1082,7 @@ mod tests {
         let commands = resume_commands(
             local("/music/sonata.flac"),
             SourceLocation::LocalPath("/music/sonata.flac".into()),
-            Some(candidate),
+            Some(ResumeIntent::Candidate(candidate)),
             Volume::new(0.25),
         );
 
@@ -1090,15 +1134,118 @@ mod tests {
         let persistence = open_persistence(Some(store), &media, &clock);
 
         assert_eq!(
-            persistence.candidate,
-            Some(ResumeCandidate {
+            persistence.resume,
+            Some(ResumeIntent::Candidate(ResumeCandidate {
                 position: Duration::from_secs(93),
                 completed: false,
-            }),
+            })),
             "the entry the file held, unresolved — only the worker's probe has a duration"
         );
         assert_eq!(persistence.volume, Volume::new(0.25));
         assert!(persistence.persisting);
+    }
+
+    /// §4.3 (Task 6 fix round 1): an entry carrying both an `estimated`
+    /// location and its established fallback resolves to
+    /// `ResumeIntent::EstimatedCandidate`, preferring the estimate and
+    /// keeping the established position in reserve. Ablation: a
+    /// `resume_intent_for` that never calls `restart_preference` (the
+    /// pre-fix-round state) makes this fail — `persistence.resume` would
+    /// read `Some(ResumeIntent::Candidate(..))` instead.
+    #[test]
+    fn a_stored_estimate_and_its_established_fallback_resolve_to_an_estimated_candidate() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, clock) = store_at(&dir.path().join("state.json"));
+        let media = local("/music/sonata.flac");
+        let mut stored = PersistedState::default();
+        stored.record(
+            &PlaybackCheckpoint {
+                media: media.clone(),
+                position: Duration::from_secs(40),
+                updated_at: clock.sample().wall,
+            },
+            false,
+        );
+        stored.record_estimated(
+            media.clone(),
+            Duration::from_secs(97),
+            clock.sample().wall,
+            false,
+        );
+        store.write(&stored).unwrap();
+
+        let persistence = open_persistence(Some(store), &media, &clock);
+
+        assert_eq!(
+            persistence.resume,
+            Some(ResumeIntent::EstimatedCandidate {
+                target: Duration::from_secs(97),
+                established: Some(Duration::from_secs(40)),
+            })
+        );
+    }
+
+    /// R8: an entry that only ever carried an estimate must resolve with
+    /// `established: None`, never a fabricated zero. Ablation: the same as
+    /// above, plus — a `resume_intent_for` that reads an absent `position`
+    /// as `Duration::ZERO` (the exact loss `resume_candidate` was written to
+    /// avoid on the established side) would make this fail on the
+    /// `established` field alone while the sibling test above still passes.
+    #[test]
+    fn a_stored_estimate_with_no_established_position_resolves_with_no_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, clock) = store_at(&dir.path().join("state.json"));
+        let media = local("/music/sonata.flac");
+        let mut stored = PersistedState::default();
+        stored.record_estimated(
+            media.clone(),
+            Duration::from_secs(97),
+            clock.sample().wall,
+            false,
+        );
+        store.write(&stored).unwrap();
+
+        let persistence = open_persistence(Some(store), &media, &clock);
+
+        assert_eq!(
+            persistence.resume,
+            Some(ResumeIntent::EstimatedCandidate {
+                target: Duration::from_secs(97),
+                established: None,
+            })
+        );
+    }
+
+    /// A completed entry must ignore a stray `estimated` field entirely: D1
+    /// still resumes it through the ordinary `Candidate`/`CompletedReplay`
+    /// path, not `EstimatedCandidate`. `resume_intent_for`'s own doc says a
+    /// completed entry never reaches `restart_preference` — this is the
+    /// test that would fail if that guard were removed (a `completed`
+    /// entry's `resume` would read `EstimatedCandidate` instead of
+    /// `Candidate`).
+    #[test]
+    fn a_completed_entry_ignores_a_stray_estimate_and_stays_an_ordinary_candidate() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, clock) = store_at(&dir.path().join("state.json"));
+        let media = local("/music/sonata.flac");
+        let mut stored = PersistedState::default();
+        stored.record_estimated(
+            media.clone(),
+            Duration::from_secs(97),
+            clock.sample().wall,
+            true,
+        );
+        store.write(&stored).unwrap();
+
+        let persistence = open_persistence(Some(store), &media, &clock);
+
+        assert_eq!(
+            persistence.resume,
+            Some(ResumeIntent::Candidate(ResumeCandidate {
+                position: Duration::ZERO,
+                completed: true,
+            }))
+        );
     }
 
     /// The sink selection is the whole feature in one line: swap the store for
@@ -1178,7 +1325,7 @@ mod tests {
 
         assert!(!persistence.persisting);
         assert_eq!(
-            persistence.candidate, None,
+            persistence.resume, None,
             "nothing is restored from a file this build cannot read"
         );
         assert_eq!(persistence.volume, Volume::FULL);

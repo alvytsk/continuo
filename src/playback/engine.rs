@@ -1929,6 +1929,36 @@ impl Worker {
                     (target, disposition)
                 }
             }
+            // §4.3 (Task 6 fix round 1): the estimate always wins as the
+            // seek target, unconditionally — it is a preference between two
+            // already-known locations decided upstream in
+            // `resume::restart_preference`, not a duration-validated choice,
+            // so nothing here re-runs `decide_resume` against the decoded
+            // duration the way `Candidate` does. `established` is reported
+            // exactly as `restart_preference` computed it — R8's "never
+            // established" vs. "established at the start" distinction
+            // already lives there, upstream of this call, so it is never
+            // re-derived or re-validated here either.
+            ResumeIntent::EstimatedCandidate {
+                target,
+                established,
+            } => {
+                // §10, carried from the branch above: a non-seekable source
+                // cannot honour an estimated target any more than an
+                // established one. Reported and protected exactly the same
+                // way — `ResumeUnavailable` is not a disposition this
+                // amendment adds a second version of.
+                if target > Duration::ZERO && self.capabilities.seek == SeekSupport::Unsupported {
+                    self.position = Duration::ZERO;
+                    (
+                        Duration::ZERO,
+                        StartDisposition::ResumeUnavailable { retained: target },
+                    )
+                } else {
+                    self.position = target;
+                    (target, StartDisposition::ResumedEstimated { established })
+                }
+            }
         };
 
         if start_at > Duration::ZERO {

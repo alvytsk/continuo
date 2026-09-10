@@ -20,6 +20,20 @@ pub enum ResumeIntent {
     /// Resolved by the worker after its single probe, using the same rules the
     /// application would apply if it had a duration to apply them to.
     Candidate(ResumeCandidate),
+    /// §4.3: the stored checkpoint's `estimated` location won the preference
+    /// over `position` (`resume::restart_preference`). `target` is the
+    /// estimate itself and is what the load seeks to, unconditionally —
+    /// §4.3 is a preference between two already-known locations, not a
+    /// duration-validated choice, so nothing resolves this the way
+    /// `Candidate` resolves against a decoded duration. `established` is the
+    /// stored `position` also on record beside the estimate, carried
+    /// straight through for `Loaded`'s `StartDisposition::ResumedEstimated`
+    /// to report — `None` for an entry that only ever held an estimate
+    /// (R8), never a fabricated zero.
+    EstimatedCandidate {
+        target: Duration,
+        established: Option<Duration>,
+    },
 }
 
 #[derive(Clone, Debug)]
