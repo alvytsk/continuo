@@ -678,6 +678,12 @@ Four rows come from review round 1 and are easy to forget because §6 predates t
 - **Completion under estimate** (R4): an estimated timeline reaching EOF marks the recording complete without overwriting the established `position`.
 - **Estimate-only entry** (R8): a media with no established checkpoint persists an estimate, resumes from it, and reports `established: None`.
 
+A fifth row, carried from Task 4 where it was correctly out of scope:
+
+- **Refused resume preserves the checkpoint, through real persistence.** Task 4 proved this at the `Worker::position` level, which was the right boundary for that task but does not exercise the file. Do it end to end against `sine-long-vbr-noxing.mp3`: store a checkpoint at 400 s (real audio exists there; symphonia estimates the file at ~361 s), relaunch, and let the resume seek be refused by symphonia's own `max_ts` check — which happens before it dispatches on seek mode (`demuxer.rs:267-271` precedes `:291-295`), so no choice of mode avoids it. Assert the seek failed **and** that the on-disk checkpoint still reads 400 s.
+
+  This is the retained limitation (§5.5), not a bug to fix: an under-estimated file's tail stays unreachable, and removing our own `clamp_target` did not change that. The test pins the behaviour so a later change cannot quietly convert a refusal into a reset — which would be data loss wearing the costume of a cleanup.
+
 ```bash
 git commit -m "test: the M3.1 acceptance evidence"
 ```
