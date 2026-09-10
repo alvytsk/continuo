@@ -184,8 +184,9 @@ Task 4.
 **The numbering is deliberately not compacted.** Tasks 3 and 5-8 are
 unchanged and are referred to by number in the spec, the ledger, and the
 review round tables. Renumbering to close a gap would invalidate every one of
-those references to save nothing. **This plan has seven live tasks: 1, 3, 4,
-5, 6, 7, 8.**
+those references to save nothing. **This plan has eight live tasks: 1, 3, 4,
+5, 6, 7, 8, 9** — Task 9 was added after Task 3 exposed a gap this
+reduction created, and runs after Task 3, independently of Task 4.
 
 **One thing this task got right, and it moves to Task 4.** The estimator's
 doc comment said the byte offset "is an *estimate*, and every caller is
@@ -592,6 +593,138 @@ Documentation only; no source or test file changes. Every claim checked against 
 
 ```bash
 git commit -m "docs: describe estimated seeking and position provenance"
+```
+
+---
+
+## Task 9: Duration provenance from container evidence
+
+**Run order: after Task 3, independent of Task 4.** Numbered 9 because the
+plan's numbering is deliberately not compacted (see Task 2); it is not the
+last task to run.
+
+**Files:**
+- Create: `src/media/vbr_header.rs`, `tests/duration_provenance.rs`
+- Modify: `src/media/mod.rs`, `src/playback/decode.rs`
+
+**Interfaces:**
+- Consumes: `PositionProvenance` and `MediaMetadata::duration_provenance` (Task 3).
+- Produces:
+
+```rust
+/// What established an MP3's frame count, and therefore its duration.
+///
+/// Symphonia populates `Track::num_frames` from one of three paths and
+/// exposes no field saying which ran — the only trace is a `log::info!`
+/// line, which is not an API. So we determine it from the container bytes
+/// ourselves, before the reader is built.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VbrHeader {
+    /// A Xing or Info tag in the first frame. `Info` is what LAME writes for
+    /// a constant-bitrate file; both carry a declared total frame count.
+    XingInfo,
+    /// A VBRI tag (Fraunhofer encoders), at a fixed offset in the first frame.
+    Vbri,
+    /// Neither. Symphonia will fall back to `estimate_num_mpeg_frames`, which
+    /// samples ~16 frames and extrapolates.
+    Absent,
+}
+
+/// Reads the head of a seekable source and reports which header it carries.
+/// Restores the source's position before returning, so the caller may hand
+/// it to `MediaSourceStream` unchanged.
+///
+/// Returns `Ok(None)` for a source this cannot answer for — a non-MP3
+/// container, a short read, or a source that is not seekable. `None` means
+/// "no evidence gathered", and the caller must not read it as `Absent`.
+pub fn probe_vbr_header(source: &mut dyn MediaSource) -> Result<Option<VbrHeader>, PlaybackError>;
+```
+
+**Why this task exists, and what breaks without it.** §5.5's rule — *an
+estimated duration may inform display and must never drive a destructive
+decision* — is enforced by `decide_resume`, which returns `Unvalidated`
+(retaining the checkpoint) instead of `StalePastEnd` (discarding it) when the
+duration is `Estimated`. Task 3 built that consumer correctly and wired
+`KnownDuration` through. But its producer at `src/playback/decode.rs:197`
+hardcodes `PositionProvenance::Established`, so the `Estimated` branch is
+**unreachable in production** and the rule never fires. The spike measured the
+consequence directly: `estimate_num_mpeg_frames` reports 361 s for a true
+600 s VBR file, so a legitimate checkpoint at 400 s is declared
+`StalePastEnd` and the listener resumes at zero. That is live data loss, and
+this task is what prevents it.
+
+**Why symphonia cannot answer this and we can.** `try_read_info_tag_inner`
+(`symphonia-bundle-mp3-0.6.1/src/demuxer.rs:768`) parses the tag into
+`XingInfoTag { num_frames, num_bytes, toc, quality, is_cbr, lame }` — a
+struct marked `#[allow(dead_code)]` whose `toc`, `is_cbr`, `num_bytes` and
+`quality` fields are constructed at `:924` and never read. Only `num_frames`
+(`:439`) and `lame` (`:434`) reach the `Track`. The evidence exists in the
+bytes and is discarded at the boundary; we read the same bytes before
+handing the source over.
+
+**The detection, exactly.** Verified by hand against
+`https://cdn.radio-t.com/rt_podcast900.mp3`, whose figures appear below as
+the fixture for the "present" case:
+
+1. If the first three bytes are `ID3`, decode the syncsafe size at bytes 6-9
+   (`(b6&0x7f)<<21 | (b7&0x7f)<<14 | (b8&0x7f)<<7 | (b9&0x7f)`), add 10, and
+   add another 10 if bit 4 of byte 5 (the footer flag) is set. That is where
+   the first frame begins. **This is why an 8 KB probe is not enough** — the
+   Radio-T episode's ID3v2.4 tag is 37,422 bytes, so a naive head read finds
+   no tag and wrongly concludes `Absent`. Read at least 64 KiB, and treat a
+   first-frame offset beyond what was read as `Ok(None)`, never `Absent`.
+2. At that offset, find the frame header: `0xFF` followed by a byte whose top
+   three bits are set. Reject candidates whose version, layer, bitrate index
+   (`0` or `15`) or sample-rate index (`3`) are invalid before accepting one.
+3. `Xing`/`Info` sits at `MPEG_HEADER_LEN + side_info_len` past the header;
+   `VBRI` sits at a fixed 32 bytes past it. Check both.
+
+**Test fixtures, and what each proves.** `tests/fixtures/sine.mp3` has a Xing
+header; `sine-noxing.mp3` and `sine-long-vbr-noxing.mp3` do not — all three
+already exist per `tests/fixtures/README.md`. The ID3 case has no fixture, so
+build one in the test by prepending a synthetic ID3v2.4 tag larger than 8 KiB
+to `sine.mp3`'s bytes; that is the regression the Radio-T file would
+otherwise be the only witness to, and no test should depend on the network.
+
+**Scope discipline.** This task sets provenance from evidence. It does **not**
+improve the duration estimate, and it does not touch `clamp_target` or the
+`max_ts` limitation — a target past an estimated ceiling is still refused by
+symphonia, deliberately and permanently (§5.5). Non-MP3 containers keep
+`Established`: WAV, FLAC and ISO-BMFF carry real durations.
+
+- [ ] **Step 1: Write the failing tests**
+
+`tests/duration_provenance.rs`:
+
+1. `an_mp3_with_a_xing_header_reports_established_duration` — `sine.mp3`.
+2. `an_mp3_without_a_xing_header_reports_estimated_duration` — `sine-noxing.mp3`. This is the one that fails today, because everything is `Established`.
+3. `a_long_vbr_mp3_without_a_header_reports_estimated_duration` — `sine-long-vbr-noxing.mp3`, the fixture whose duration symphonia gets 40% wrong.
+4. `a_xing_header_behind_a_large_id3_tag_is_still_found` — synthetic ID3v2.4 tag of at least 16 KiB prepended to `sine.mp3`. Assert `Established`. A implementation that reads only 8 KiB returns `Absent` and fails this; that is the point.
+5. `a_flac_source_reports_established_duration` — `sine.flac`, proving non-MP3 containers are untouched.
+6. `an_estimated_duration_does_not_declare_a_checkpoint_stale` — **the end-to-end test that justifies the task.** Against `sine-long-vbr-noxing.mp3` (true 600 s, symphonia estimates ~361 s), a stored checkpoint at 400 s must produce `ResumeDecision::Unvalidated(400 s)`, not `StalePastEnd`. Assert the resulting decision *and* that the checkpoint still reads 400 s. Run the same case against a Xing-tagged fixture with a checkpoint genuinely past its real end and assert `StalePastEnd` still fires there — otherwise this test passes against an implementation that simply never declares anything stale.
+
+- [ ] **Step 2: Run and watch them fail**
+
+Run: `cargo test --test duration_provenance 2>&1 | tail -20`
+Expected: 2, 3, 4 and 6 fail; 1 and 5 pass (everything is `Established` today, which is right for those two by accident — say so in the report rather than counting them as evidence).
+
+- [ ] **Step 3: Implement**
+
+Write `probe_vbr_header` per the detection above. Call it in `DecodedSource::open` **before** `MediaSourceStream::new` takes the source (`decode.rs:113`), restore the position, and map the result: `Some(XingInfo | Vbri)` → `Established`, `Some(Absent)` → `Estimated`, `None` → `Established` (no evidence gathered must not silently downgrade a duration that may be perfectly good). Replace the hardcoded literal at `decode.rs:197` and delete the stale comment above it that defers this to Task 4.
+
+- [ ] **Step 4: Verify**
+
+Run: `cargo test --locked 2>&1 | tail -5` — expected 388 + this task's tests, 0 failed, 2 ignored.
+Run: `cargo clippy --locked --all-targets --all-features -- -D warnings` and `cargo fmt --check`.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add -A
+git commit -m "feat(media): establish duration provenance from the container's own header
+
+Without this, decide_resume's Estimated branch is unreachable and a
+legitimate checkpoint on a headerless VBR file is discarded as stale."
 ```
 
 ---
