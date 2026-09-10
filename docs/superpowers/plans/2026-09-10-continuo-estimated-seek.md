@@ -26,6 +26,23 @@ The reproduction is already in the tree, `#[ignore]`d:
 `tests/engine_remote.rs::a_short_forward_seek_on_a_no_index_mp3_rescans_the_whole_file_instead_of_landing_quickly`.
 Run it with `cargo test --locked --test engine_remote -- --ignored a_short_forward_seek`. It must still fail at the start of this work and pass at the end.
 
+## Review round 1 — eight issues resolved before execution
+
+Every claim below was verified against the source, and two turned out worse than reported.
+
+| # | Issue | Resolution |
+|---|---|---|
+| R1 | A source-level deadline cannot bound `ByteChannel::read`: its stall budget is *suspended* while frozen (by design), so a paused, stalled read blocks indefinitely. Passing "remaining deadline" as a stall budget inherits that suspension and bounds nothing. | Task 4 now includes `src/http/channel.rs`. An **absolute** `Instant` deadline is checked inside the wait loop **regardless of freeze**, distinct from the stall budget, with a paused-and-stalled seek regression. |
+| R2 | Routing only `seek_to` leaves three other entry points scanning. Verified: `seek_refined` is called at `engine.rs:1910` (`load` — launch resume), `:2314` (`seek_to`), `:2484` (`reseek` — stop/play and device recovery) and `:2633` (`verify_seek_support` — stopped-seek validation). Under shape A the reader's timestamps may also be relative to a new origin, so a later absolute seek lands wrong. | Task 4 requires **one shared routing and timestamp policy** across all four sites, and must bound the refined remote fallback too — an *indexed* MP3 still takes the same `Accurate` scan today. |
+| R3 | `src/persistence/store.rs:107` rejects **every** unequal version, older included — its own comment says "Not `> SCHEMA_VERSION`". Bumping the constant would mark every existing v1 file unsupported and silently disable persistence for every current user. The plan's "confirm the store needs no change beyond the constant" was wrong. | Task 5 requires explicit **acceptance of v1 and normalisation to v2**, tested through load → modify → write → reload. Deserialisation preserves the file's version while writing asserts the current one, so a partial migration would write estimates under schema 1. |
+| R4 | Verified EOF does not establish absolute media time. `engine.rs:1702` computes the terminal position as `landed_anchor + frames_to_duration(pushed_total, rate)` — anchor plus decoded frames. HTTP verification establishes that the *body* completed, not that the anchor was right. `EndOfTrack` then clears protection and writes that number. | Task 6 must define how EOF under estimated provenance is represented and test estimated seek → EOF → persisted state. **Completion must not silently promote an estimated timestamp.** |
+| R5 | The write rules omitted `SeekTargetStored`. `Session` writes that unvalidated target directly and substitutes it for the sampled position at shutdown (`position_for`). | Task 6 defines estimated seek → stop → new stored target → quit: the newest intent survives without overwriting the established checkpoint. Existing tests pin the old behaviour for established playback, so the compatibility decision must be explicit. |
+| R6 | **The known-debt claim that `Coarse` refuses without Xing is false.** `symphonia-bundle-mp3-0.6.1/src/demuxer.rs:465-471`: with no Xing/Info tag and a seekable source, it calls `estimate_num_mpeg_frames` and sets `num_frames` from bitrate and byte length. So `num_frames` is usually `Some`, `Coarse` would likely not refuse — and our reported duration is itself an estimate. Also, the spike's proposed baseline (play to 60 s, seek to 70 s) does not guarantee the target precedes `next_packet_ts`; encoded read-ahead alone does not advance that timestamp. | Task 1 measures **Coarse alongside A and B**, records both `next_packet_ts` and the target to prove the rewind condition was actually exercised, and records how **index evidence is distinguished from estimated duration** — `num_frames` being present does not mean a seek index exists. |
+| R7 | One sine fixture cannot establish a universal preroll count, and the proposed test only asserted a number between 1 and 4. Reservoir requirements depend on frame payload and back-references, and a pure sine is the easiest possible case. | Task 2 requires a **justified bound or a dependency-aware preroll**, validated by comparing decoded output against continuous decoding across varied offsets and bitrate/channel configurations. |
+| R8 | `position: Duration` is mandatory and cannot express "an entry that carries only an estimate", which §4.2 requires. | `position` becomes `Option<Duration>`: `None` means nothing has ever established one for this media. A v1 file's present value deserialises as `Some`, so the migration is free. `StartDisposition::ResumedEstimated { established: Option<Duration> }` reports `None` when there is no established fallback. |
+
+**What R6 may do to this plan.** If the spike finds `Coarse` both works and does not rescan, it is dramatically simpler than shapes A or B — symphonia performs the byte estimate itself, and Tasks 2 and 4 shrink to routing plus bounding. Task 1 must therefore evaluate `Coarse` **first**, and the plan below is written so that outcome collapses work rather than invalidating it.
+
 ## Global Constraints
 
 Every task's requirements implicitly include this section.
@@ -83,10 +100,13 @@ Every task's requirements implicitly include this section.
 - Create: `tests/fixtures/sine-long-noxing.mp3`, and a throwaway experiment you delete before committing
 - Modify: `tests/fixtures/README.md`
 
-**The question.** Doing our own byte seek leaves `FormatReader`'s `next_packet_ts` stale, and symphonia exposes no way to reset it. Two shapes:
+**The question.** Three shapes, and **evaluate `Coarse` first** — if it works, the other two are unnecessary.
 
+- **C — `SeekMode::Coarse`.** The known-debt entry claims it refuses without a Xing header. **That is false**, verified at `symphonia-bundle-mp3-0.6.1/src/demuxer.rs:465-471`: with no Xing/Info tag and a seekable source, symphonia calls `estimate_num_mpeg_frames` and sets `num_frames` from bitrate and byte length. So `num_frames` is usually `Some` and `Coarse` would likely not refuse — it would do the byte estimate itself. If that holds and it does not rescan, this collapses most of Tasks 2 and 4.
 - **A — re-probe at the offset.** Byte-seek the `MediaSource`, then build a *fresh* `FormatReader` from that position. Legitimate for MP3 from any frame boundary. Removes `FormatReader::seek()` from this path entirely, so §5.3's bound becomes real rather than partial. Costs a probe per seek.
 - **B — byte-seek beneath a live reader.** Cheaper, but depends on demuxer internals the API does not promise, and leaves the stale-timestamp problem to solve.
+
+**A consequence to carry forward whichever shape wins:** if `num_frames` is estimated from bitrate, then the **duration we report is itself an estimate**, and a byte offset derived from it inherits that error. Record how index evidence is to be distinguished from estimated duration — `num_frames` being present does **not** mean a seek index exists, and `SeekSupport` must not treat it as one.
 
 - [ ] **Step 1: Generate the fixture**
 
@@ -101,9 +121,19 @@ Verify it has no Xing/VBRI frame and no seek index, and record it in `tests/fixt
 
 - [ ] **Step 2: Measure the current behaviour**
 
-Write a throwaway binary or `#[test]` that opens the fixture through `HttpMediaSource` against a `TestServer`, plays to ~60 s, then seeks to 70 s, and records: how many bytes the server sent, which offsets were requested, and how long `reader.seek()` blocked. This is your baseline and your evidence that the problem reproduces at this layer, not just at the engine's.
+Write a throwaway binary or `#[test]` that opens the fixture through `HttpMediaSource` against a `TestServer` and records: bytes the server sent, offsets requested, and how long `reader.seek()` blocked.
 
-- [ ] **Step 3: Try shape A**
+**The obvious baseline does not work.** "Play to 60 s, seek to 70 s" does not guarantee the target precedes `next_packet_ts` — encoded read-ahead alone does not advance that timestamp, and the rewind fires only on `required_ts < next_packet_ts`. So a run staged that way may never exercise the bug and would report a clean baseline for the wrong reason.
+
+**Record both numbers and prove the condition fired.** Instrument or infer `next_packet_ts` (decoded packets' timestamps are the observable proxy) alongside the seek target, and assert in your notes that `target < next_packet_ts` held for the run you measured. A baseline that cannot show the rewind condition was met measures nothing.
+
+- [ ] **Step 3: Measure shape C first**
+
+Set `SeekMode::Coarse` and repeat the baseline. Answer: does it refuse (`SeekErrorKind::Unseekable`) or seek? Does `num_frames` come back `Some` for this fixture, and from where — a real index or `estimate_num_mpeg_frames`? Does it rescan from the first packet, or land by arithmetic? How far off is the landing?
+
+If `Coarse` seeks without rescanning, say so plainly and record the accuracy you measured. Steps 3a and 4 then become confirmatory rather than load-bearing, and you should still run them briefly so the decision records what the alternatives cost.
+
+- [ ] **Step 3a: Try shape A**
 
 Byte-seek the source to an estimated offset, resync to the next frame header, build a fresh `FormatReader` from there, and decode. Answer, with measurements:
 
@@ -170,7 +200,15 @@ impl SeekEstimator {
 
 /// How many frames after an arbitrary byte offset must be decoded and thrown
 /// away before the output is trustworthy.
-pub const RESERVOIR_PREROLL_FRAMES: usize = 2;
+///
+/// **Not a measurement from one fixture.** MP3's bit reservoir lets a frame
+/// reference bits from up to 511 bytes of earlier frames, so the requirement
+/// depends on frame payload and back-reference depth, not on the file. This is
+/// a *bound* justified from the format, and Task 2's tests validate it by
+/// comparing decoded output against continuous decoding across varied offsets,
+/// bitrates and channel modes — a pure sine at one bitrate is the easiest
+/// possible case and proves nothing about the worst one.
+pub const RESERVOIR_PREROLL_FRAMES: usize = /* justify from main_data_begin's range */;
 
 /// Find the next frame header at or after `from`, so decoding starts on a
 /// boundary rather than mid-frame.
@@ -261,13 +299,30 @@ fn resync_reports_absence_rather_than_guessing() {
 }
 
 #[test]
-fn the_preroll_is_stated_rather_than_assumed() {
-    // MP3's bit reservoir lets a frame reference bits from earlier frames
-    // that a byte seek never read, so the first frames after a landing decode
-    // to garbage. Task 1's spike measured how many; this pins that number so
-    // a later change has to justify moving it.
-    assert!(RESERVOIR_PREROLL_FRAMES >= 1);
-    assert!(RESERVOIR_PREROLL_FRAMES <= 4);
+fn the_preroll_discards_every_frame_the_reservoir_can_poison() {
+    // The real assertion, not a range check on a constant. Decode the fixture
+    // continuously to get the truth, then decode from a byte offset with the
+    // preroll applied, and require the two to agree from the first frame the
+    // preroll admits. A number between one and four proves nothing; matching
+    // samples do.
+    //
+    // Vary the offset across the file and repeat for each bitrate and channel
+    // mode fixture: the reservoir's depth depends on frame payload and
+    // back-reference distance, so a pure sine at one bitrate is the easiest
+    // possible case and the one least likely to expose an insufficient bound.
+    for fixture_name in ["sine-long-noxing.mp3", /* add the varied fixtures */] {
+        let bytes = fixture(fixture_name);
+        let truth = decode_continuously(&bytes);
+        for fraction in [0.1_f64, 0.37, 0.5, 0.84] {
+            let raw = (bytes.len() as f64 * fraction) as usize;
+            let start = match resync(&bytes, raw) {
+                Some(start) => start,
+                None => panic!("no frame header after {raw} in {fixture_name}"),
+            };
+            let (admitted_at, samples) = decode_from_offset_with_preroll(&bytes, start);
+            assert_samples_match(&truth, admitted_at, &samples, fixture_name, fraction);
+        }
+    }
 }
 ```
 
@@ -280,7 +335,9 @@ Expected: FAIL — `unresolved import continuo::playback::seek_estimate`.
 
 Add `pub mod seek_estimate;` to `src/playback/mod.rs` and write the module. `byte_for` is `audio_data_offset + (target / duration) * audio_data_len`, saturating and clamped, with `duration == 0` yielding the offset. `time_for` inverts it. `resync` scans for `0xFF` followed by three set bits, and — because false syncs are common in audio data — validates the candidate's version, layer and bitrate fields before accepting it; say in a comment why a bare sync-word match is not enough.
 
-Set `RESERVOIR_PREROLL_FRAMES` to whatever Task 1 measured, and cite the spike in its doc comment.
+**Justify `RESERVOIR_PREROLL_FRAMES` from the format, not from one measurement.** MP3's `main_data_begin` back-reference has a bounded range (511 bytes), which bounds how many prior frames a frame can draw on; derive the constant from that and say so in the doc comment. If the comparison test shows the derived bound is insufficient for any fixture, that is a finding — either the derivation is wrong or the preroll must become dependency-aware (reading `main_data_begin` and discarding until the reservoir is satisfied). Report which, rather than raising the constant until tests pass.
+
+You will need extra fixtures at varied bitrates and channel modes. Generate them the same way as `sine-long-noxing.mp3`, and record each in `tests/fixtures/README.md` with its command and its purpose. Prefer material with more spectral content than a pure sine — a sine compresses to almost nothing and barely uses the reservoir at all.
 
 - [ ] **Step 4: Verify**
 
@@ -408,7 +465,7 @@ time the decoder established is still established."
 ## Task 4: The bounded estimated seek
 
 **Files:**
-- Modify: `src/playback/decode.rs`, `src/http/source.rs`, `src/playback/engine.rs`
+- Modify: `src/playback/decode.rs`, `src/http/channel.rs`, `src/http/source.rs`, `src/playback/engine.rs`
 - Test: `tests/estimated_seek.rs` (new)
 
 **Interfaces:**
@@ -431,13 +488,39 @@ impl DecodedSource {
     pub fn needs_estimated_seek(&self) -> bool;
 }
 
+// src/http/channel.rs — the deadline must live HERE, not only above it.
+impl SourceInterrupt {
+    /// An absolute deadline for one operation, checked inside `read`'s wait
+    /// loop **regardless of the freeze level**.
+    ///
+    /// Distinct from the stall budget on purpose. The stall budget is
+    /// suspended while frozen — deliberately, so a pause is never reported as
+    /// a server stall — which means a paused, stalled read waits forever. A
+    /// deadline expressed as "remaining time, passed as a stall budget"
+    /// inherits that suspension and bounds nothing at all.
+    pub fn set_operation_deadline(&self, deadline: Option<Instant>);
+}
+
 // src/http/source.rs
 impl HttpMediaSource {
-    /// A wall-clock deadline for one seek, distinct from the stall budget.
-    /// Past it, reads fail so the operation above unwinds.
+    /// Sets the deadline through to the interrupt, for one seek.
     pub fn set_seek_deadline(&self, deadline: Option<Instant>);
 }
 ```
+
+**The routing and timestamp policy (R2), which is one decision applied in four places.** `seek_refined` has four callers, and routing only `seek_to` leaves three scanning:
+
+| Site | Reached by |
+|---|---|
+| `engine.rs:1910` (`load`) | launch resume at a stored position |
+| `engine.rs:2314` (`seek_to`) | the user's own seek |
+| `engine.rs:2484` (`reseek`) | stop→play, and device recovery |
+| `engine.rs:2633` (`verify_seek_support`) | stopped-seek capability validation |
+
+Introduce **one** routing function they all call, so the decision cannot drift, and give it the deadline. Two consequences to handle explicitly:
+
+- **Timestamp origin.** If Task 1 chose shape A, a re-probed reader's timestamps may be relative to its new origin rather than absolute. Every one of these four sites then needs the same base-offset treatment, or a later absolute seek lands wrong. Task 1 recorded the answer; apply it in one place.
+- **The refined fallback is not automatically safe.** An *indexed* MP3 still takes the same `Accurate` path today. Bound it too — the deadline applies to every remote seek, not only estimated ones.
 
 **What the deadline can and cannot promise (§5.3).** Checks in `HttpMediaSource` bound source **I/O**. They do not bound demuxer work over bytes already buffered above them — `MediaSourceStream` holds 64 KiB and frame headers can be parsed out of it without touching the source. Write that limitation in the code, at the deadline. If Task 1 chose shape A, the `FormatReader::seek()` call is gone from this path and the bound is real; say which case you are in.
 
@@ -453,6 +536,9 @@ impl HttpMediaSource {
 4. `pause_stop_and_quit_are_serviced_during_a_seek` — issue a seek against a slow source, prove it is in flight, then `submit_pause` and assert the state changes promptly rather than after the seek.
 5. `an_estimated_landing_reports_estimated_provenance` — and playing on from it keeps reporting `Estimated`, per §3.1.
 6. `recovery_after_a_failed_seek_gets_a_fresh_deadline` — the recovery attempt is not refused instantly by an inherited expired deadline.
+7. `a_seek_that_stalls_while_paused_still_fails_within_its_deadline` — **R1's regression, and the one the source-level design would have missed.** Pause first, then seek against a stalled source, and prove the read was entered before asserting. The stall budget is suspended while frozen, so only a deadline checked inside the wait loop regardless of freeze can end this; a version that bounds the seek when playing and hangs when paused passes every other test here.
+8. `a_seek_on_an_indexed_remote_mp3_is_bounded_too` — the refined fallback path takes the same deadline.
+9. `every_seek_entry_point_is_routed` — launch resume, stop→play, device recovery and stopped-seek validation all go through the shared routing rather than calling `seek_refined` directly. Assert on observable behaviour (no rescan from the audio-data offset) rather than on structure.
 
 - [ ] **Step 2: Run and watch them fail**
 
@@ -486,18 +572,29 @@ Closes the wedge found in M3's manual acceptance."
 - Modify: `src/persistence/model.rs`, `src/persistence/store.rs`
 - Test: `tests/persistence_model.rs`, `tests/persistence_store.rs` (both additive)
 
-**Interfaces:** `PersistedCheckpoint.estimated: Option<Duration>`, `SCHEMA_VERSION = 2`.
+**Interfaces:** `PersistedCheckpoint.position: Option<Duration>` (R8), `PersistedCheckpoint.estimated: Option<Duration>`, `SCHEMA_VERSION = 2`.
 
 **Why a version bump and not an optional field (§4.5).** M2's store refuses to write when it reads a *newer* schema, preserving the file — that is what makes a downgrade safe, and it only engages if the version actually changes. A v1 build silently dropping `estimated` on its next write would discard the listener's most recent position with no diagnostic, which is the exact class of loss this work exists to prevent.
+
+**The bump needs a real migration, and the plan's first draft was wrong to say otherwise.** `src/persistence/store.rs:107` rejects **every** unequal version, older included — its own comment says "Not `> SCHEMA_VERSION`: a file from a build that renumbered downward is just as unreadable". So bumping the constant alone marks every existing v1 file `UnsupportedVersion`, and **silently disables persistence for every current user**: they keep their file, and never write to it again.
+
+Required instead:
+- **Accept v1 and normalise it to v2 on load.** A v1 entry becomes a v2 entry with `estimated: None` and its `position` as `Some`.
+- **Reject genuinely unknown versions** — anything above `SCHEMA_VERSION`, and anything below the oldest migratable one — with the existing `UnsupportedVersion` behaviour intact.
+- **Test the whole cycle**, not just the read: load a v1 file → modify → write → reload, and assert the file on disk is v2 and the data survived. Deserialisation preserves the file's version while writing asserts the current one, so a partial migration writes estimates *under schema 1* — a file that claims v1 and contains v2 data, which the next v1 build will read and quietly discard.
+
+**On `position: Option<Duration>` (R8).** §4.2 requires an entry that carries only an estimate, and a mandatory `Duration` cannot express "nothing has ever established one". `Option` can, and the migration is free: a v1 file's present value deserialises straight to `Some`. `None` means exactly what it says, and `decide_resume` must handle it rather than defaulting to zero.
 
 - [ ] **Step 1: Write the failing tests**
 
 Additive, in the existing files' style:
 
-- `a_v1_file_loads_under_v2_with_no_estimated_location` — a hand-written v1 JSON round-trips, `estimated` reads `None`, every other field survives.
+- `a_v1_file_is_accepted_and_normalised_to_v2` — a hand-written v1 JSON loads, `estimated` reads `None`, `position` reads `Some`, every other field survives, and `writable` is **true**. A v1 file that loads unwritable is the regression this task exists to prevent.
+- `the_upgrade_cycle_writes_v2_and_survives_a_reload` — load v1 → modify → write → reload; the file on disk claims v2, the data round-trips, and no entry was lost. This is the test that catches a partial migration writing v2 data under a v1 header.
 - `a_v2_file_round_trips_its_estimated_location`.
-- `a_v1_build_reading_v2_preserves_the_file_and_declines_to_write` — assert against the existing `LoadReason::UnsupportedVersion` path rather than a new one; this is M2 behaviour, and the test is that the bump *engages* it.
-- `an_estimated_location_serialises_absent_rather_than_null_when_unset` — so a v2 file with no estimate is byte-comparable to what M2 wrote.
+- `an_entry_with_no_established_position_round_trips` — `position: None` with an `estimated` present, which is §4.2's estimate-only entry.
+- `a_genuinely_unknown_version_is_still_preserved_unwritten` — both a version above `SCHEMA_VERSION` and one below the oldest migratable, against the existing `LoadReason::UnsupportedVersion`.
+- `an_estimated_location_serialises_absent_rather_than_null_when_unset` — so a v2 file with no estimate stays comparable to what M2 wrote.
 
 - [ ] **Step 2–5: Run failing, implement, verify, commit**
 
@@ -519,9 +616,17 @@ git commit -m "feat(persistence): record an estimated location beside the establ
 
 - Estimated progress never writes `position` when an established checkpoint exists — it writes `estimated` only.
 - With no established checkpoint, an estimate persists **only** as `estimated`; it never bootstraps into `position`.
-- `completed` is only ever set from verified completion, which is established by construction. An estimated timeline cannot complete a track.
+- **`completed` under estimated provenance (R4).** The plan's first draft called completion "established by construction". That is false: `engine.rs:1702` computes the terminal position as `landed_anchor + frames_to_duration(pushed_total, rate)` — the anchor plus decoded frames. If the anchor came from an estimate, so does the terminal position. HTTP verification establishes that the **body** completed, not that the anchor was right, and `EndOfTrack` currently makes `Session` clear protection and write that number.
+
+  So decide and implement, explicitly: an `EndOfTrack` reached from an estimated timeline **must not silently promote its timestamp**. Reaching the end of the body is real evidence the recording finished, so `completed` may legitimately be set — but the *position* written alongside it is still estimated and must go to `estimated`, not `position`. Say in a comment why completion and position are separable here. Test: estimated seek → EOF → inspect the persisted state, asserting `position` was not overwritten by the estimated terminal value.
 - Restart prefers `estimated` when present, falling back to `position`, and reports `StartDisposition::ResumedEstimated { established }` so the application can say what it used and what it kept.
 - `estimated` clears — and established writes resume — on exactly three things: an establishing seek, an established `Restart`, verified completion. **Not** on a capability change, not on elapsed playback however long, not on a failed seek.
+
+- **`SeekTargetStored` needs its own rule (R5).** The write rules omitted it, and `Session` currently writes that unvalidated target straight through `record_current` *and* substitutes it for the sampled position at shutdown via `position_for`. Define the sequence: estimated seek → stop → a new stored target → quit. The newest intent must survive — it is the listener's most recent expressed wish — **without** overwriting the established checkpoint.
+
+  The compatibility question must be answered explicitly rather than discovered: existing tests in `tests/session_policy.rs` pin the current behaviour for *established* playback, where a stored target writes `position` directly. Decide whether a stored target inherits the provenance of the position it was computed from (the natural reading — a target 10 s past an estimated position is itself estimated), state that decision in a comment, and make sure the established path is bit-for-bit unchanged. If any existing assertion has to move, stop and report it.
+
+- **When there is no established fallback (R8).** `StartDisposition::ResumedEstimated { established: Option<Duration> }` reports `None` for an estimate-only entry, and the application must render that case without implying a fallback exists. `decide_resume` takes both locations and must not treat an absent `position` as zero — "never established" and "established at the start" are different facts, and M2's `ResumeDecision::AtStart` already means the second one.
 
 **Where the gates go.** M3 put checkpoint protection in `record_current` and `record_outgoing` because those are the only two paths that reach the stored state, and one gate would have missed the other. The same reasoning applies here — find both, and say in a comment why one is not enough.
 
@@ -542,6 +647,13 @@ git commit -m "feat(session): an estimated location never overwrites an establis
 Discharge §6's seven bullets, each pointing at a named test. Several are already written by Tasks 4 and 6 — do not duplicate a test to tick a box; check honestly and write only what is missing. Add the new rows to `docs/m3-acceptance.md` under an M3.1 heading, keeping its existing format, with partial or undischarged rows marked as such.
 
 The cross-process half needs a real `StateStore` in a `tempfile::TempDir`: a session that seeks by estimate, quits, and relaunches must select the estimated location, report what it kept, and leave the established checkpoint intact on disk.
+
+Four rows come from review round 1 and are easy to forget because §6 predates them:
+
+- **Upgrade** (R3): a session started against an existing **v1** file keeps persisting — the file becomes v2, the data survives, and `writable` was never false. This is the one that protects every current user.
+- **Paused seek deadline** (R1): a seek that stalls while paused still fails within its deadline.
+- **Completion under estimate** (R4): an estimated timeline reaching EOF marks the recording complete without overwriting the established `position`.
+- **Estimate-only entry** (R8): a media with no established checkpoint persists an estimate, resumes from it, and reports `established: None`.
 
 ```bash
 git commit -m "test: the M3.1 acceptance evidence"
@@ -573,4 +685,13 @@ git commit -m "docs: describe estimated seeking and position provenance"
 
 **Type consistency.** `SeekEstimator`, `resync`, `RESERVOIR_PREROLL_FRAMES` (Task 2) → Task 4. `PositionProvenance` (Task 3) → Tasks 4, 6, 8. `seek_estimated`, `needs_estimated_seek`, `set_seek_deadline` (Task 4) → Task 7. `PersistedCheckpoint.estimated`, `SCHEMA_VERSION` (Task 5) → Task 6. `StartDisposition::ResumedEstimated` (Task 6) → Tasks 7, 8. Each is defined before first use.
 
-**One correction made while writing this.** An earlier draft of the amendment said `PositionQuality` "gains a third state". It already has `Estimated`, meaning something else — how precisely we know what has been heard. The amendment and this plan now treat provenance as a separate axis, which is both correct and a better design. Verify claims about this codebase before building on them; that error would have propagated into six files.
+**Corrections made while writing and reviewing this plan.** Four claims in earlier drafts were false about code the plan does not own, and each would have propagated:
+
+- `PositionQuality` "gains a third state" — it already has `Estimated`, meaning how precisely we know what has been *heard*. Provenance is now a separate axis, which is both correct and a better design.
+- "`Coarse` refuses without a Xing header" — inherited from M3's known-debt entry. `symphonia-bundle-mp3-0.6.1/src/demuxer.rs:465-471` estimates `num_frames` from bitrate and byte length instead, so `Coarse` may well work. That entry needs correcting in Task 8, and the spike now evaluates `Coarse` first.
+- "The store needs no change beyond the constant" — `store.rs:107` rejects every unequal version including older ones, so the bump alone would have disabled persistence for every existing user.
+- "Completion is established by construction" — the terminal position is anchor plus decoded frames, so an estimated anchor yields an estimated completion.
+
+The pattern is the same each time: a claim about someone else's code, asserted rather than checked. Verify before building on it.
+
+**A note on Task 1's leverage.** If the spike finds `Coarse` works, Tasks 2 and 4 shrink to routing and bounding, and `SeekEstimator` may not be needed at all. The plan is deliberately ordered so that outcome deletes work rather than invalidating it — do not start Task 2 before Task 1 reports.
