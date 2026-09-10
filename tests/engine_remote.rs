@@ -946,9 +946,13 @@ fn a_seek_cancelled_while_reopening_from_stopped_reports_cancelled_not_rejected(
 // directly from the track's own duration arithmetic instead of asking the
 // demuxer to scan - see `docs/superpowers/specs/
 // 2026-09-10-continuo-estimated-seek-design.md` §5.2 for the measurements.
-// This is now the regression test for that fix.
+// This is now the regression test for that fix. It was committed
+// `#[ignore]`d as a failing reproduction and un-ignored when Task 4 made it
+// pass; the assertions below are unchanged from that failing version, which
+// is what makes them evidence rather than a description of current
+// behaviour.
 #[test]
-fn a_short_forward_seek_on_a_no_index_mp3_rescans_the_whole_file_instead_of_landing_quickly() {
+fn a_short_forward_seek_on_a_no_index_mp3_lands_quickly_without_rescanning() {
     let server = TestServer::start(
         Script::from_fixture("sine-noxing.mp3").trickle(2048, Duration::from_millis(80)),
     );
@@ -1000,9 +1004,9 @@ fn a_short_forward_seek_on_a_no_index_mp3_rescans_the_whole_file_instead_of_land
     // playback already sits should request a byte in that same
     // neighbourhood (proportionally, ~3.9s of 5.04s in a 40_377-byte file
     // is ~byte 31_000), not one back at the very start of the file. This
-    // currently fails - the request lands within a few bytes of 0 - which
-    // is the concrete, byte-level proof that every seek rescans from the
-    // top rather than continuing from where playback already reached.
+    // failed before Task 4 - the request landed within a few bytes of 0 -
+    // which was the concrete, byte-level proof that every seek rescanned
+    // from the top rather than continuing from where playback had reached.
     let proportional_estimate =
         (target.as_secs_f64() / Duration::from_millis(5_041).as_secs_f64() * 40_377.0) as u64;
     assert!(
@@ -1015,15 +1019,15 @@ fn a_short_forward_seek_on_a_no_index_mp3_rescans_the_whole_file_instead_of_land
         target.saturating_sub(before)
     );
 
-    // The wedge itself, asserted as the correct behaviour it currently
-    // violates: a step of only 300ms has no honest reason to take anywhere
+    // The wedge itself, asserted as the correct behaviour it violated
+    // before the fix: a step of only 300ms has no honest reason to take anywhere
     // near as long as redelivering the whole file from scratch does -
     // `a_forward_seek_installs_the_media_position_and_requests_that_byte`
     // shows a comparable seek landing well inside a second with no trickle
     // at all. 250ms is generous for an efficient short step and comfortably
     // short of a from-scratch rescan of this fixture at this trickle rate,
-    // so `SeekCompleted` should already have arrived. It currently has not:
-    // the demuxer is still rescanning from the top.
+    // so `SeekCompleted` should already have arrived. Before Task 4 it had
+    // not: the demuxer was still rescanning from the top.
     let landing_deadline = Instant::now() + Duration::from_millis(250);
     let landed = loop {
         match engine.try_event() {
