@@ -156,7 +156,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 /// has no test server reachable from a `src/` unit test (`tests/support` is
 /// only visible to integration tests), and reliably provoking Symphonia's own
 /// *specific* recovery path (`probe_trailing`'s tolerated anchored-metadata
-/// read, `probe.rs:475-540`) through a real fixture is impractical — it fires
+/// read, `probe.rs:475-544`) through a real fixture is impractical — it fires
 /// only when trailing bytes happen to match a real tag format's marker. The
 /// state machine below is what actually has to be correct; testing it
 /// directly is more reliable than hoping to reproduce Symphonia's internals.

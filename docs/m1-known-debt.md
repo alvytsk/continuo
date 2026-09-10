@@ -244,7 +244,7 @@ table rather than a design judgement.
   expensive over HTTP, since the bytes still have to arrive in order through
   the byte channel. The whole rewind-and-rescan runs inside one
   uncancellable, unbounded call to `FormatReader::seek`; `SEEK_BUDGET`
-  (`engine.rs:114`) cannot bound it, because that budget only gates
+  (`engine.rs:116`) cannot bound it, because that budget only gates
   `seek_refined`'s residual-alignment loop *after* `reader.seek()` already
   returns, never the scan itself.
 
@@ -414,7 +414,7 @@ the plan could not name them in advance.
   encoder's own declared count rather than a 16-frame extrapolation.
 - **The tail of an under-estimated file is unreachable, deliberately.**
   Symphonia's own `max_ts` check (`symphonia-bundle-mp3-0.6.1/src/
-  demuxer.rs:267-271`) refuses a target past the estimated ceiling *before*
+  demuxer.rs:268-272`) refuses a target past the estimated ceiling *before*
   the mode dispatch at `:292-296`, so the refusal is mode-independent by
   construction and no choice of `SeekMode` recovers it. `clamp_target`
   (`src/playback/engine.rs:2615`) no longer clamps to an *estimated*

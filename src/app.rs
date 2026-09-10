@@ -773,10 +773,16 @@ impl Mirror {
                 self.capabilities = Some(capabilities);
                 self.position = position;
                 self.quality = PositionQuality::Exact;
-                // `Loaded` does not yet carry its own provenance field
-                // (§3's interfaces are scoped to `Progress`, `SeekCompleted`
-                // and `MediaMetadata::duration`); every load in this
-                // milestone lands at a decoder-confirmed position.
+                // `Loaded` does not carry its own provenance field (§3's
+                // interfaces are scoped to `Progress`, `SeekCompleted` and
+                // `MediaMetadata::duration`), so this hardcodes `Established`
+                // even for a `ResumeIntent::EstimatedCandidate` launch, which
+                // runs `seek_bounded` for the resume and can genuinely land
+                // `Estimated` (`src/playback/engine.rs`'s resume-seek arm).
+                // The mark this drives (` ~est`) is one tick late in that
+                // case: `Progress` corrects `self.provenance` right after
+                // (`:160` below), so the window is a single progress
+                // interval, display-only — not fixed here for its own sake.
                 self.provenance = PositionProvenance::Established;
                 self.state = PlaybackState::Loading;
                 // MINOR (final review): a fresh load starts with nothing

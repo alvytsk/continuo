@@ -4,7 +4,7 @@
 //! extrapolation.
 //!
 //! Symphonia parses exactly this information into `XingInfoTag`
-//! (`symphonia-bundle-mp3-0.6.1/src/demuxer.rs:768`) — a struct marked
+//! (`symphonia-bundle-mp3-0.6.1/src/demuxer.rs:749-758`) — a struct marked
 //! `#[allow(dead_code)]` whose fields are discarded at the crate boundary
 //! except `num_frames` and `lame`. There is no API to ask "did a real
 //! header establish this duration, or did symphonia extrapolate it?" — the

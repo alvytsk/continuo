@@ -536,6 +536,7 @@ demuxer reads the parameter:
 |---|---|
 | `symphonia-bundle-mp3-0.6.1/src/demuxer.rs:232` | `fn seek(&mut self, mode: SeekMode, ..)` |
 | `symphonia-bundle-flac-0.6.1/src/demuxer.rs:249` | `_mode` |
+| `symphonia-format-riff-0.6.1/src/wave/mod.rs:252` | `_mode` |
 | `symphonia-format-isomp4-0.6.1/src/demuxer.rs:671` | `_mode` |
 | `symphonia-format-ogg-0.6.1/src/demuxer.rs:492` | `_mode` |
 | `symphonia-format-mkv-0.6.1/src/demuxer.rs:595` | `_mode` |
@@ -795,12 +796,12 @@ destructive decision.** Concretely:
   let max_ts = dur_ts.and_then(|dur| min_ts.checked_add(dur))
                      .and_then(|dur| dur.checked_add(Duration::from(delay + padding)));
 
-  // :267-271 — refused before any mode dispatch
+  // :268-272 — refused before any mode dispatch
   else if let Some(max_ts) = max_ts {
       if required_ts > max_ts { return seek_error(SeekErrorKind::OutOfRange); }
   }
 
-  // :291-295 — Coarse vs Accurate is only chosen *after* the check above
+  // :292-296 — Coarse vs Accurate is only chosen *after* the check above
   match mode {
       SeekMode::Coarse if is_seekable => self.preseek_coarse(...)?,
       SeekMode::Accurate => self.preseek_accurate(...)?,

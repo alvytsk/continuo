@@ -786,7 +786,7 @@ fn a_launch_resume_past_an_estimated_ceiling_preserves_the_checkpoint() {
     // Xing/Info/VBRI tag) extrapolates ~361s from its first ~16 frames.
     // `MpaReader::seek`'s `max_ts` bounds check derives from that same wrong
     // estimate and runs *before* the `SeekMode` dispatch
-    // (`demuxer.rs:267-271` precedes `:291-295`), so it refuses a resume to
+    // (`demuxer.rs:268-272` precedes `:292-296`), so it refuses a resume to
     // 400s — real audio that exists there — mode-independently. The seek
     // failing is expected and correct; what must not happen is the stored
     // position being discarded because of it.

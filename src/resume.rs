@@ -136,12 +136,10 @@ pub struct RestartPreference {
 /// This is deliberately a preference between two already-known durations,
 /// decided before either is ever handed to a decoder — distinct from
 /// `decide_resume`, which validates one chosen duration against the media's
-/// own length once that is known. Nothing here is wired into a production
-/// load path yet (Task 6's file scope is `session.rs` / `resume.rs` /
-/// `playback::event` only): a caller that constructs `ResumeIntent` and
-/// `StartDisposition::ResumedEstimated` from this result is later work, and
-/// this function and `StartDisposition::ResumedEstimated` are its
-/// prerequisites, exercised directly by this crate's tests until then.
+/// own length once that is known. `src/app.rs`'s `resume_intent_for` is the
+/// production caller: it calls this function and builds exactly the
+/// `ResumeIntent::EstimatedCandidate` / `StartDisposition::ResumedEstimated`
+/// pair this result feeds.
 pub fn restart_preference(
     position: Option<Duration>,
     estimated: Option<Duration>,

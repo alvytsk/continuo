@@ -439,8 +439,8 @@ fn a_relaunch_resumes_an_estimate_only_entry_and_reports_no_established_fallback
 /// retained limitation (§5.5) carried one boundary further: a checkpoint at
 /// 400 s (real audio; the true file is 600 s), stored on disk, refused by
 /// `MpaReader::seek`'s own `max_ts` bound (derived from symphonia's ~361 s
-/// estimate, checked at `demuxer.rs:267-271` — *before* the `SeekMode`
-/// dispatch at `:291-295`, so no seek mode this project could choose would
+/// estimate, checked at `demuxer.rs:268-272` — *before* the `SeekMode`
+/// dispatch at `:292-296`, so no seek mode this project could choose would
 /// avoid it), across an actual relaunch. Not a bug to fix: this pins that a
 /// later change cannot quietly turn the refusal into a silent reset, which
 /// would be data loss wearing the costume of a cleanup.

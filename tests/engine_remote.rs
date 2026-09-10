@@ -920,7 +920,7 @@ fn a_seek_cancelled_while_reopening_from_stopped_reports_cancelled_not_rejected(
 //
 // This is a live defect, not a testing limitation: the whole
 // rewind-and-rescan executes inside one uncancellable, unbounded call to
-// `FormatReader::seek`. `SEEK_BUDGET` (`engine.rs:114`, 5s) does not help -
+// `FormatReader::seek`. `SEEK_BUDGET` (`engine.rs:116`, 5s) does not help -
 // it only bounds `seek_refined`'s own residual-alignment loop *after*
 // `reader.seek()` returns, so it never applies to the scan itself. While the
 // worker thread is parked inside that call it cannot dispatch queued

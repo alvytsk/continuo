@@ -2987,9 +2987,9 @@ fn adopt_preserved(promised: Duration, actual: Duration) -> Duration {
 /// and that limitation is retained deliberately).
 ///
 /// Factored out of `clamp_target` so this branch is provable in isolation:
-/// `DecodedSource` cannot report `Estimated` today (decode.rs's Xing/VBRI
-/// detection is Task 9's job), so nothing can drive this through a live
-/// `Worker` yet.
+/// no integration test drives it through a live `Worker` today (only this
+/// module's own unit test holds it), even though `DecodedSource` has
+/// reported `Estimated` from real Xing/VBRI detection since Task 9.
 fn established_duration(metadata: &MediaMetadata) -> Option<Duration> {
     (metadata.duration_provenance == PositionProvenance::Established)
         .then_some(metadata.duration)
@@ -3090,10 +3090,11 @@ mod tests {
 
     // ---------------------------------------------------- established_duration
     //
-    // `clamp_target`'s Estimated branch cannot be driven through a live
-    // `Worker` today: `DecodedSource` can only ever report `Established`
-    // until Task 9 wires real Xing/VBRI detection into `decode.rs` (a
-    // deliberate, tracked gap — not something to fix here). These two tests
+    // `clamp_target`'s Estimated branch is not driven through a live
+    // `Worker` by any integration test today, even though `DecodedSource`
+    // has reported real `Estimated` durations from Xing/VBRI detection
+    // since Task 9 — no test happens to combine a live worker with a
+    // headerless MP3 and a seek past its estimated ceiling. These two tests
     // exercise the extracted decision directly instead, against a bare
     // `MediaMetadata` literal, which needs no decoder at all. Together they
     // are the two-sided proof the plan calls for: an implementation that
