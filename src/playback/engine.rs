@@ -1743,6 +1743,12 @@ impl Worker {
         self.emit(PlaybackEvent::EndOfTrack {
             session_rev,
             position,
+            // R4 (Task 6): the terminal position above is the landed anchor
+            // plus decoded frames, so it carries the anchor's provenance
+            // unchanged - completion is evidence the *body* finished, not
+            // that the anchor was right, and the session policy needs this
+            // to keep an estimated completion from promoting its timestamp.
+            provenance: self.position_provenance,
         });
         self.set_state(PlaybackState::Ended);
     }
@@ -2522,6 +2528,16 @@ impl Worker {
                 self.emit(PlaybackEvent::RestartEstablished {
                     session_rev,
                     position,
+                    // Task 6: the `reopened` branch above sets this
+                    // Established unconditionally (a fresh open at byte
+                    // zero is exact); the `else` branch reads it back from
+                    // `reseek`'s own outcome, which for an MP3 restart that
+                    // reuses an already-open decoder can still be
+                    // `Estimated` (decode.rs's format check is
+                    // target-independent). The session policy needs the
+                    // real answer to decide whether this restart is one of
+                    // the two acts that clears a sticky `Estimated`.
+                    provenance: self.position_provenance,
                 });
                 self.announce_playing();
             }

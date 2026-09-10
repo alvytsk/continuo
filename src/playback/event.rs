@@ -26,6 +26,15 @@ pub enum StartDisposition {
     /// A positive candidate could not be established, because this source
     /// cannot seek. Playback starts at zero and the entry is protected (§10).
     ResumeUnavailable { retained: Duration },
+    /// The candidate that won was an `estimated` location, preferred over
+    /// `position` as the listener's most recent expressed intent (§4.3).
+    /// `established` carries the fallback `position` that was also on
+    /// record, when one existed - `None` for an entry that only ever
+    /// carried an estimate (R8), which the application must render without
+    /// implying a fallback that does not exist. Distinct from `Resumed`:
+    /// nothing here was decoder-confirmed by the resume decision itself,
+    /// only by whatever landing the seek that follows actually produces.
+    ResumedEstimated { established: Option<Duration> },
 }
 
 #[derive(Clone, Debug)]
@@ -82,6 +91,13 @@ pub enum PlaybackEvent {
     EndOfTrack {
         session_rev: u64,
         position: Duration,
+        /// Whether `position` - the landed anchor plus decoded frames - is
+        /// itself decoder-established or still carries an estimated
+        /// anchor's provenance forward (§3, R4). Reaching the end of the
+        /// body is real evidence the recording finished either way, but
+        /// only an `Established` terminal position may overwrite a stored
+        /// `position`; an `Estimated` one still may not.
+        provenance: PositionProvenance,
     },
     DeviceRecovered {
         session_rev: u64,
@@ -102,6 +118,15 @@ pub enum PlaybackEvent {
     RestartEstablished {
         session_rev: u64,
         position: Duration,
+        /// Whether this landing was decoder-confirmed or is still an
+        /// estimate (§4.4). Despite the event's own name, a restart that
+        /// reuses an already-open decoder seeks like any other, and on MP3
+        /// that seek can still land `Estimated` - only that case, plus an
+        /// establishing seek, earns the right to clear a sticky estimate
+        /// and overwrite an established checkpoint. A fresh reopen sets
+        /// this `Established` unconditionally, since a byte-zero open
+        /// seeks nowhere.
+        provenance: PositionProvenance,
     },
     Warning {
         session_rev: u64,

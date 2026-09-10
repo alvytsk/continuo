@@ -125,6 +125,18 @@ fn stored_position(session: &Session, media: &MediaId) -> Duration {
     }
 }
 
+/// The `estimated` half of a stored entry, read the same way `stored_position`
+/// reads `position` — `None` either for no entry at all or for an entry that
+/// has never had an estimate written to it (Task 6 does not distinguish the
+/// two here; the tests that need to tell them apart check `entry_for`
+/// directly).
+fn stored_estimate(session: &Session, media: &MediaId) -> Option<Duration> {
+    session
+        .state()
+        .entry_for(media)
+        .and_then(|entry| entry.estimated)
+}
+
 /// The same read as `stored_position`, against a `PersistedState` already in
 /// hand (typically the return of `shutdown_snapshot`) rather than a `Session`.
 fn position_in(state: &PersistedState, media: &MediaId) -> Duration {
@@ -270,6 +282,7 @@ fn end_of_track_records_the_events_own_position_and_marks_completion() {
         &PlaybackEvent::EndOfTrack {
             session_rev: 1,
             position: Duration::from_secs(240),
+            provenance: PositionProvenance::Established,
         },
         clock.sample(),
     ));
@@ -915,6 +928,7 @@ fn a_media_switch_does_not_walk_a_completed_entry_backwards() {
         &PlaybackEvent::EndOfTrack {
             session_rev: 1,
             position: Duration::from_secs(240),
+            provenance: PositionProvenance::Established,
         },
         clock.sample(),
     ));
@@ -1007,6 +1021,7 @@ fn an_established_restart_lifts_the_protection() {
         &PlaybackEvent::RestartEstablished {
             session_rev: 1,
             position: Duration::ZERO,
+            provenance: PositionProvenance::Established,
         },
         clock.sample(),
     );
@@ -1055,6 +1070,7 @@ fn verified_completion_lifts_the_protection_and_records_the_completion() {
         &PlaybackEvent::EndOfTrack {
             session_rev: 1,
             position: Duration::from_secs(3000),
+            provenance: PositionProvenance::Established,
         },
         clock.sample(),
     );
@@ -1192,4 +1208,155 @@ fn a_protected_entry_survives_a_stopped_seek_while_still_protected() {
         clock.sample(),
     );
     assert_eq!(stored_position(&session, &media("ep1")), retained);
+}
+
+// ----------------------------------- estimated provenance (Task 6, §4.2-4.4)
+
+/// The counterpart to `an_established_seek_lifts_the_protection`: an
+/// *estimated* landing is not one of the two acts that earns the right to
+/// overwrite an established checkpoint (§4.4), so `protected` must survive
+/// it untouched. Ablation: deleting the `provenance == Established` guard on
+/// `SeekCompleted` (reverting to the old unconditional `self.protected =
+/// None`) makes this fail — `stored_position` would still read `retained`
+/// either way (an estimated write can never touch `position`), which is
+/// exactly why this asserts `stored_estimate` instead: with `protected`
+/// wrongly cleared, the estimated write that follows would no longer be
+/// gated and `estimated` would become `Some(60)`.
+#[test]
+fn an_estimated_seek_does_not_lift_the_protection() {
+    let clock = FakeClock::new();
+    let retained = Duration::from_secs(2400);
+    let mut session = Session::new(state_with(&media("ep1"), retained, false));
+    let _ = session.observe(&loaded_unavailable(&media("ep1"), retained), clock.sample());
+
+    let _ = session.observe(
+        &PlaybackEvent::SeekCompleted {
+            session_rev: 1,
+            requested: Duration::from_secs(60),
+            actual: Duration::from_secs(60),
+            refinement_truncated: false,
+            provenance: PositionProvenance::Estimated,
+        },
+        clock.sample(),
+    );
+    let mut estimated_progress = progress(1, "ep1", 60);
+    estimated_progress.provenance = PositionProvenance::Estimated;
+    let _ = session.tick(&estimated_progress, clock.sample());
+
+    assert_eq!(
+        stored_position(&session, &media("ep1")),
+        retained,
+        "the established position must survive"
+    );
+    assert_eq!(
+        stored_estimate(&session, &media("ep1")),
+        None,
+        "protected must still be in force, so the estimated write is gated too"
+    );
+}
+
+/// The counterpart to `an_established_restart_lifts_the_protection`, for the
+/// same reason: `RestartEstablished`'s name notwithstanding, an estimated
+/// landing from it must not clear `protected` either. Ablation: as above —
+/// deleting the guard clears `protected` and lets the estimated write through,
+/// which only `stored_estimate` (not `stored_position`) can see.
+#[test]
+fn an_estimated_restart_does_not_lift_the_protection() {
+    let clock = FakeClock::new();
+    let retained = Duration::from_secs(2400);
+    let mut session = Session::new(state_with(&media("ep1"), retained, false));
+    let _ = session.observe(&loaded_unavailable(&media("ep1"), retained), clock.sample());
+
+    let _ = session.observe(
+        &PlaybackEvent::RestartEstablished {
+            session_rev: 1,
+            position: Duration::ZERO,
+            provenance: PositionProvenance::Estimated,
+        },
+        clock.sample(),
+    );
+    let mut estimated_progress = progress(1, "ep1", 0);
+    estimated_progress.provenance = PositionProvenance::Estimated;
+    let _ = session.tick(&estimated_progress, clock.sample());
+
+    assert_eq!(stored_position(&session, &media("ep1")), retained);
+    assert_eq!(stored_estimate(&session, &media("ep1")), None);
+}
+
+/// §4.4: "verified completion is not a third exit." An earlier draft of this
+/// plan disagreed; this test pins the corrected rule directly against
+/// `protected` so it cannot creep back in. Ablation: making the `EndOfTrack`
+/// handler clear `protected` unconditionally (the pre-Task-6 behaviour,
+/// applied without regard to `provenance`) makes this fail on both
+/// assertions — `stored_estimate` would become `Some(3000)` and
+/// `completed_in` would flip to `true`, since an unprotected
+/// `record_current_estimated` writes both fields.
+#[test]
+fn an_estimated_completion_does_not_lift_the_protection() {
+    let clock = FakeClock::new();
+    let retained = Duration::from_secs(2400);
+    let mut session = Session::new(state_with(&media("ep1"), retained, false));
+    let _ = session.observe(&loaded_unavailable(&media("ep1"), retained), clock.sample());
+
+    let _ = session.observe(
+        &PlaybackEvent::EndOfTrack {
+            session_rev: 1,
+            position: Duration::from_secs(3000),
+            provenance: PositionProvenance::Estimated,
+        },
+        clock.sample(),
+    );
+
+    assert_eq!(
+        stored_position(&session, &media("ep1")),
+        retained,
+        "the established position must survive an estimated completion"
+    );
+    assert_eq!(
+        stored_estimate(&session, &media("ep1")),
+        None,
+        "protected must still gate the estimated write EndOfTrack raises"
+    );
+    assert!(
+        !completed_in(&session, &media("ep1")),
+        "the write that would have carried `completed` is itself gated"
+    );
+}
+
+/// R8/§4.3: a `Loaded` reporting `ResumedEstimated` landed the listener at
+/// the estimated location itself, not a fallback zero — there is no earlier
+/// point to protect the way `ResumeUnavailable` protects one. Ablation: a
+/// wrong `on_loaded` that treats `ResumedEstimated { established }` like
+/// `ResumeUnavailable { retained }` (`self.protected = Some(established)`,
+/// plausible from copying the match arm) makes this fail: the ordinary
+/// capture below would then be gated and record nothing.
+#[test]
+fn a_resumed_estimated_load_sets_up_no_fallback_protection() {
+    let clock = FakeClock::new();
+    let mut session = Session::new(PersistedState::default());
+    let _ = session.observe(
+        &PlaybackEvent::Loaded {
+            session_rev: 1,
+            media: media("ep1"),
+            metadata: MediaMetadata::default(),
+            capabilities: MediaCapabilities {
+                continuity: Continuity::Finite,
+                seek: SeekSupport::Native,
+            },
+            position: Duration::from_secs(97),
+            disposition: StartDisposition::ResumedEstimated {
+                established: Some(Duration::from_secs(40)),
+            },
+        },
+        clock.sample(),
+    );
+    let _ = session.observe(&state_changed(1, PlaybackState::Playing), clock.sample());
+    clock.advance_monotonic(CAPTURE_INTERVAL + Duration::from_secs(1));
+    let _ = session.tick(&progress(1, "ep1", 100), clock.sample());
+
+    assert_eq!(
+        stored_position(&session, &media("ep1")),
+        Duration::from_secs(100),
+        "an ordinary established capture must not be gated by ResumedEstimated"
+    );
 }

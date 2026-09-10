@@ -216,6 +216,62 @@ impl PersistedState {
         );
     }
 
+    /// The estimated-checkpoint write path (§4.2, Task 6): sets `estimated`
+    /// and, when this media completed, `completed` — and touches nothing
+    /// else. **Never writes `position`.** That is what makes the two write
+    /// rules one code path rather than two: whether an established
+    /// checkpoint already exists for this media or not, an estimated
+    /// location is never allowed to become it, so this method simply has no
+    /// way to. `completed` is written exactly as given rather than merged,
+    /// the same as `record`'s — the only caller with a `true` to pass is an
+    /// estimated `EndOfTrack`, and it is itself the evidence that finished
+    /// the entry.
+    ///
+    /// Participates in the same `touch_seq`/eviction bookkeeping as
+    /// `record`: an estimate-only entry is still a real entry for §2's cap
+    /// and LRU eviction, not a second-class one.
+    pub fn record_estimated(
+        &mut self,
+        media: MediaId,
+        estimated: Duration,
+        updated_at: OffsetDateTime,
+        completed: bool,
+    ) {
+        let fresh = !self.checkpoints.contains_key(&media);
+        if fresh && self.checkpoints.len() >= MAX_ENTRIES {
+            let evicted = self.evict_one(&media);
+            if !evicted {
+                debug_assert!(
+                    false,
+                    "MAX_ENTRIES ({MAX_ENTRIES}) left no evictable entry; the cap would be exceeded"
+                );
+                tracing::warn!(
+                    media = %media,
+                    "no entry could be evicted at the MAX_ENTRIES cap; dropping the incoming checkpoint rather than exceeding it"
+                );
+                return;
+            }
+        }
+        let touch_seq = self.next_seq;
+        self.next_seq = self.next_seq.saturating_add(1);
+        let entry = self
+            .checkpoints
+            .entry(media)
+            .or_insert_with(|| PersistedCheckpoint {
+                // No established position exists yet for a fresh entry (§4.1,
+                // §4.2): an estimate must never bootstrap one into being.
+                position: None,
+                completed: false,
+                touch_seq,
+                updated_at,
+                estimated: None,
+            });
+        entry.estimated = Some(estimated);
+        entry.completed = completed;
+        entry.touch_seq = touch_seq;
+        entry.updated_at = updated_at;
+    }
+
     /// The lowest `touch_seq` among entries that are neither current nor the
     /// one arriving. Returns whether a victim was found and removed; `record`
     /// treats a `false` result as the cap guard firing.

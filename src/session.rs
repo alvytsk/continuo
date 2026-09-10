@@ -18,6 +18,7 @@ use crate::persistence::model::PersistedState;
 use crate::persistence::writer::Urgency;
 use crate::playback::checkpoint::PlaybackCheckpoint;
 use crate::playback::event::{PlaybackEvent, Progress, ShutdownReport, StartDisposition};
+use crate::playback::provenance::PositionProvenance;
 use crate::playback::state::PlaybackState;
 // Re-exported so `src/app.rs` and `tests/resume_contract.rs` keep importing
 // these from `session` — the type and the function moved to `src/resume.rs`
@@ -94,10 +95,31 @@ pub struct Session {
     /// *earlier* resume point, and progress heard in a fallback run does not
     /// replace it however far it goes (R4). Set from `Loaded.disposition`
     /// rather than a later warning, so it is in force before any `Playing` or
-    /// progress event can be observed (§5). Ends only on an established
-    /// `RestartEstablished` (G1), an established `SeekCompleted`, or verified
-    /// completion — never on `CapabilitiesChanged` alone (§10).
+    /// progress event can be observed (§5). Ends only on an *established*
+    /// `RestartEstablished` (G1), an *established* `SeekCompleted`, or
+    /// verified completion reached from an *established* timeline — never on
+    /// `CapabilitiesChanged` alone (§10), and, since Task 6 (§4.4), never on
+    /// any of those three reached from an *estimated* one either: an
+    /// unconfirmed landing does not earn the right to clear a guard that
+    /// exists to protect a confirmed position.
     protected: Option<Duration>,
+    /// Whether the position this media is currently tracking is
+    /// decoder-established or still carries an estimate forward (§3, §4.2).
+    /// Kept current by every tick this session observes (mirroring the
+    /// engine's own `position_provenance`, one pass behind) and by every
+    /// event that reports a landing of its own — `SeekCompleted`,
+    /// `RestartEstablished`, `EndOfTrack` — so that a write with no
+    /// intervening tick (`SeekTargetStored`, R5) still reads the right
+    /// answer. This is what every write path consults to decide between
+    /// `record_current` (writes `position`) and `record_current_estimated`
+    /// (writes only `estimated`, and never bootstraps or overwrites
+    /// `position`) — the session policy reads this field and *never*
+    /// `PositionQuality`, which is an orthogonal axis (see
+    /// `playback::provenance`). Reset to `Established` on every `Loaded`:
+    /// a fresh load is itself one of the acts that re-establishes the
+    /// absolute position, and nothing has claimed otherwise for the
+    /// incoming media yet.
+    position_provenance: PositionProvenance,
 }
 
 impl Session {
@@ -116,6 +138,7 @@ impl Session {
             outstanding_target: None,
             established: false,
             protected: None,
+            position_provenance: PositionProvenance::Established,
         }
     }
 
@@ -150,26 +173,45 @@ impl Session {
                 ..
             } => self.on_loaded(media, *position, disposition, now),
             PlaybackEvent::StateChanged { state, .. } => self.on_state(*state, now),
-            PlaybackEvent::SeekCompleted { .. } => {
+            PlaybackEvent::SeekCompleted { provenance, .. } => {
                 self.resolve_target();
                 self.established = true;
                 self.completed = false;
-                // An established user seek (§10): the listener steered the
-                // position themselves, so whatever fallback zero was protected
-                // no longer needs protecting.
-                self.protected = None;
+                self.position_provenance = *provenance;
+                if *provenance == PositionProvenance::Established {
+                    // An established user seek (§10): the listener steered
+                    // the position themselves and the decoder confirmed it,
+                    // so whatever fallback zero was protected no longer
+                    // needs protecting. One of exactly two acts (§4.4) that
+                    // earns the right to overwrite an established checkpoint.
+                    self.protected = None;
+                }
+                // An estimated landing is still a real landing the listener
+                // can keep playing from, and still deserves a checkpoint
+                // (§4.2) — just not this one: `protected` stays in force
+                // when set, and the deferred write this force raises will
+                // route through `record_current_estimated` once
+                // `position_provenance` above is read back at the next tick.
                 self.pending_force = Some(session_rev);
                 Action::None
             }
             // This event exists only because nothing else lets the policy tell
             // an explicit restart from any other establishment (G1) — which is
             // exactly the distinction clearing protection needs, so it clears
-            // it and otherwise behaves like `SeekCompleted`.
-            PlaybackEvent::RestartEstablished { .. } => {
+            // it and otherwise behaves like `SeekCompleted`. Despite its name,
+            // a restart's landing is not always `Established`: reusing an
+            // already-open decoder seeks like any other, and on MP3 that seek
+            // can still land `Estimated` (see the emission site's comment) —
+            // so this reads the event's own `provenance` exactly as
+            // `SeekCompleted` does, rather than assuming.
+            PlaybackEvent::RestartEstablished { provenance, .. } => {
                 self.resolve_target();
                 self.established = true;
                 self.completed = false;
-                self.protected = None;
+                self.position_provenance = *provenance;
+                if *provenance == PositionProvenance::Established {
+                    self.protected = None;
+                }
                 self.pending_force = Some(session_rev);
                 Action::None
             }
@@ -184,7 +226,20 @@ impl Session {
                 // beside `completed` would be thrown away by the resume it
                 // exists to steer.
                 self.completed = false;
-                self.record_current(*target, now);
+                // R5: a stored target is arithmetic on whatever position was
+                // current when the seek was accepted — target = that position
+                // plus or minus a listener-chosen delta — and arithmetic
+                // cannot make an unconfirmed number confirmed. So the target
+                // inherits that position's provenance rather than being
+                // treated as established by virtue of being the listener's
+                // own number. `self.position_provenance` already tracks
+                // exactly that position: every tick and every landing event
+                // keeps it current, and nothing has touched it since.
+                if self.position_provenance == PositionProvenance::Established {
+                    self.record_current(*target, now);
+                } else {
+                    self.record_current_estimated(*target, now);
+                }
                 self.submit(Urgency::Forced)
             }
             PlaybackEvent::VolumeChanged { volume, .. } => {
@@ -193,15 +248,37 @@ impl Session {
             }
             // The other one (D6): the end of the track is a position the engine
             // reached, carried by the event that reports it.
-            PlaybackEvent::EndOfTrack { position, .. } => {
+            PlaybackEvent::EndOfTrack {
+                position,
+                provenance,
+                ..
+            } => {
                 self.resolve_target();
                 self.established = true;
                 self.completed = true;
-                // Cleared before `record_current`, not after: verified
-                // completion is itself the thing worth writing, and clearing
-                // afterwards would have gated that very write (§10).
-                self.protected = None;
-                self.record_current(*position, now);
+                self.position_provenance = *provenance;
+                if *provenance == PositionProvenance::Established {
+                    // Cleared before `record_current`, not after: verified
+                    // completion reached from an established timeline is
+                    // itself the thing worth writing, and clearing afterwards
+                    // would have gated that very write (§10).
+                    self.protected = None;
+                    self.record_current(*position, now);
+                } else {
+                    // R4: the engine computes this terminal position as the
+                    // landed anchor plus decoded frames, so an estimated
+                    // anchor yields an estimated terminal position — HTTP
+                    // verification establishes only that the *body*
+                    // finished, not that the anchor was right. `completed`
+                    // is still set above, because reaching the end is real
+                    // evidence either way, but the position it is written
+                    // beside must not promote to `position`, and `protected`
+                    // is deliberately left untouched: an estimated
+                    // completion retains checkpoint protection exactly as it
+                    // retains estimated provenance (§4.4) — this is not a
+                    // third clearing exit.
+                    self.record_current_estimated(*position, now);
+                }
                 self.submit(Urgency::Forced)
             }
             // §10: "Capability changes alone never delete, clear or replace
@@ -233,6 +310,11 @@ impl Session {
             media,
             position: progress.position,
         });
+        // Kept current on every tick, whether or not it ends up due for a
+        // capture: `checkpoint_from_progress` (below) and `record_outgoing`
+        // both read this to route a write, and both can fire on a pass this
+        // method never reaches the capture-interval check on.
+        self.position_provenance = progress.provenance;
 
         // The sample the pending force has been waiting for. §3's pass ordering
         // makes it newer than the transition that raised the force, so this is
@@ -301,7 +383,15 @@ impl Session {
             return false;
         }
         let position = self.position_for(sampled);
-        self.record_current(position, now);
+        // §4.2: route on the position's own provenance, never on whether an
+        // established checkpoint already exists for this media — the two
+        // write rules (never overwrite one, never bootstrap one) collapse
+        // into the same routing decision this way, with nothing to forget.
+        if self.position_provenance == PositionProvenance::Established {
+            self.record_current(position, now);
+        } else {
+            self.record_current_estimated(position, now);
+        }
         true
     }
 
@@ -362,6 +452,12 @@ impl Session {
         self.resolve_target();
         self.established = false;
         self.last_capture = None;
+        // A fresh load re-establishes the absolute position for the incoming
+        // media (§4.4's "fresh load" exit): nothing has claimed otherwise for
+        // it yet, and the write gate below only starts writing once
+        // `established` above goes true again, so this is read no earlier
+        // than the first tick or landing event that follows.
+        self.position_provenance = PositionProvenance::Established;
         // Set from the disposition this `Loaded` carries, not from a later
         // warning: this is what puts protection in force before any `Playing`
         // or progress event for the incoming media can be observed (§5).
@@ -369,6 +465,13 @@ impl Session {
         // other one, including a plain reload of the same media, clears it.
         self.protected = match disposition {
             StartDisposition::ResumeUnavailable { retained } => Some(*retained),
+            // A resumed estimate lands the listener at the estimated location
+            // itself, not a fallback zero — there is no earlier point to
+            // protect the way `ResumeUnavailable` protects one. What keeps
+            // `position` from being overwritten by the estimated playback
+            // that follows is the write-routing gate above
+            // (`position_provenance`, §4.2), not this field.
+            StartDisposition::ResumedEstimated { .. } => None,
             _ => None,
         };
 
@@ -393,10 +496,11 @@ impl Session {
     /// the only place that position still exists.
     ///
     /// **Call this before the per-media fields reset.** `completed`,
-    /// `established`, `outstanding_target` and `protected` are all read here,
-    /// and all four describe the outgoing media only until `on_loaded` resets
-    /// them — read afterwards they describe the incoming one, and the mistake
-    /// would be silent. They are read nowhere else in `on_loaded`.
+    /// `established`, `outstanding_target`, `protected` and
+    /// `position_provenance` are all read here, and all five describe the
+    /// outgoing media only until `on_loaded` resets them — read afterwards
+    /// they describe the incoming one, and the mistake would be silent. They
+    /// are read nowhere else in `on_loaded`.
     ///
     /// Three things make a retained sample not worth writing. A completed
     /// entry's position is the one `EndOfTrack` recorded and the sample can
@@ -409,6 +513,15 @@ impl Session {
     /// previous media's entry straight from `last_sample`, so a gate placed
     /// only in `record_current` would leave a media switch free to overwrite
     /// the very checkpoint protection exists to keep.
+    ///
+    /// A fourth, added by Task 6: the outgoing media's own `position_provenance`
+    /// gates *which* entry gets written, never whether one does — this is the
+    /// same reasoning M3 already applied to `protected`, carried to the write
+    /// rules of §4.2. `checkpoint_from_progress` cannot cover this path:
+    /// a media switch writes the previous media's entry straight from
+    /// `last_sample`, never through `record_current`, so a routing decision
+    /// placed only there would leave a switch away from an estimated landing
+    /// free to promote it to `position` anyway.
     fn record_outgoing(&mut self, now: ClockSample) {
         let Some(previous) = self.last_sample.take() else {
             return;
@@ -422,14 +535,19 @@ impl Session {
         // A stopped seek's target is the outgoing media's real position, and
         // resolving it first would write the pre-seek sample back over it (D17).
         let position = self.position_for(previous.position);
-        self.state.record(
-            &PlaybackCheckpoint {
-                media: previous.media,
-                position,
-                updated_at: now.wall,
-            },
-            false,
-        );
+        if self.position_provenance == PositionProvenance::Established {
+            self.state.record(
+                &PlaybackCheckpoint {
+                    media: previous.media,
+                    position,
+                    updated_at: now.wall,
+                },
+                false,
+            );
+        } else {
+            self.state
+                .record_estimated(previous.media, position, now.wall, false);
+        }
     }
 
     /// The only write path for the current media and its completion. Nothing in
@@ -464,6 +582,12 @@ impl Session {
             return self.state.clone();
         };
         let sampled = if progress.session_rev == self.session_rev {
+            // The live sample is fresher than anything `tick` last recorded,
+            // so its provenance is read back too — the same field every
+            // write path routes on. The `last_sample` fallback below has no
+            // fresher provenance to offer than what the last live tick or
+            // landing event already left in place, so it is left untouched.
+            self.position_provenance = progress.provenance;
             Some(progress.position)
         } else {
             self.last_sample
@@ -501,13 +625,16 @@ impl Session {
         self.shutdown_snapshot(&report.progress, now)
     }
 
-    /// The write path for the current media's checkpoint: the periodic 5 s
-    /// capture, the pause and stop forces, the resolved shutdown snapshot and
-    /// `SeekTargetStored` all reach the stored state through here, so gating
-    /// here alone covers all of them at once. It does **not** cover
-    /// `record_outgoing`: that path writes the *previous* media's entry from
-    /// `last_sample` on a media switch, never through this function, so it
-    /// carries the identical gate on its own (§10).
+    /// The write path for the current media's *established* checkpoint: the
+    /// periodic 5 s capture, the pause and stop forces, the resolved shutdown
+    /// snapshot and an established `SeekTargetStored` all reach the stored
+    /// state through here, so gating here alone covers all of them at once.
+    /// It does **not** cover `record_outgoing`: that path writes the
+    /// *previous* media's entry from `last_sample` on a media switch, never
+    /// through this function, so it carries the identical gate on its own
+    /// (§10). Every call site decides `Established` vs. `Estimated` first
+    /// (§4.2) — this function itself has no branch on provenance, because a
+    /// caller only reaches it once that decision already went one way.
     fn record_current(&mut self, position: Duration, now: ClockSample) {
         if self.protected.is_some() {
             return;
@@ -524,6 +651,29 @@ impl Session {
             },
             completed,
         );
+    }
+
+    /// The estimated-write counterpart to `record_current` (§4.2): every call
+    /// site that reaches this one instead has already read
+    /// `position_provenance == Estimated`. Writes only `estimated` — never
+    /// `position`, whether or not an established checkpoint already exists
+    /// for this media, which is what makes the two write rules ("never
+    /// overwrite", "never bootstrap") one code path instead of two that could
+    /// drift apart. Carries the identical `protected` gate `record_current`
+    /// does, for the same reason: a caller that already checked `protected`
+    /// itself (`checkpoint_from_progress`) and one that has not
+    /// (`EndOfTrack`'s handler, which must decide *before* touching
+    /// `protected` — see its own comment) both reach here safely either way.
+    fn record_current_estimated(&mut self, position: Duration, now: ClockSample) {
+        if self.protected.is_some() {
+            return;
+        }
+        let Some(media) = self.current_media.clone() else {
+            return;
+        };
+        let completed = self.completed;
+        self.state
+            .record_estimated(media, position, now.wall, completed);
     }
 
     fn submit(&self, urgency: Urgency) -> Action {

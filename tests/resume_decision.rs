@@ -7,7 +7,8 @@ use std::time::Duration;
 
 use continuo::playback::provenance::PositionProvenance;
 use continuo::resume::{
-    KnownDuration, ResumeCandidate, ResumeDecision, decide_resume, resume_candidate,
+    KnownDuration, RestartPreference, ResumeCandidate, ResumeDecision, decide_resume,
+    restart_preference, resume_candidate,
 };
 
 fn stored(secs: u64, completed: bool) -> ResumeCandidate {
@@ -225,4 +226,63 @@ fn resume_candidate_with_an_established_position_carries_it_through() {
             completed: false,
         })
     );
+}
+
+// ------------------------------------------- restart preference (§4.3, R8)
+
+/// §4.3: `estimated` is the listener's most recent expressed intent and
+/// must win over an older established point, never be averaged with it or
+/// discarded in its favour. A wrong implementation that prefers `position`
+/// instead — or that returns the established value as the target — fails
+/// this on the `target` field alone.
+#[test]
+fn restart_preference_prefers_the_estimate_and_keeps_the_established_fallback() {
+    let position = Some(Duration::from_secs(40));
+    let estimated = Some(Duration::from_secs(97));
+    assert_eq!(
+        restart_preference(position, estimated),
+        Some(RestartPreference {
+            target: Duration::from_secs(97),
+            established: Some(Duration::from_secs(40)),
+        })
+    );
+}
+
+/// R8: an entry that only ever carried an estimate must report `None` for
+/// `established`, never `Some(Duration::ZERO)` — "never established" and
+/// "established at the start" are different facts, and conflating them is
+/// exactly the loss `resume_candidate` was already written to avoid for the
+/// position side of this same rule. A wrong implementation that defaults
+/// the absent position to zero, or that reads it through
+/// `.unwrap_or_default()`, fails this on the `established` field alone
+/// while `restart_preference_prefers_the_estimate_and_keeps_the_established_fallback`
+/// above still passes — which is why this is its own test.
+#[test]
+fn restart_preference_with_no_established_fallback_reports_none_for_it() {
+    let estimated = Some(Duration::from_secs(97));
+    assert_eq!(
+        restart_preference(None, estimated),
+        Some(RestartPreference {
+            target: Duration::from_secs(97),
+            established: None,
+        })
+    );
+}
+
+/// No estimate at all: this function must add nothing, leaving the
+/// established path (`resume_candidate` / `decide_resume`) completely
+/// unchanged and in charge. A wrong implementation that falls back to
+/// `position` as the target here would make `ResumedEstimated` reachable
+/// for an entry that never held an estimate, which #4.3 does not allow.
+#[test]
+fn restart_preference_with_no_estimate_falls_through_to_the_established_path() {
+    assert_eq!(
+        restart_preference(Some(Duration::from_secs(40)), None),
+        None
+    );
+}
+
+#[test]
+fn restart_preference_with_neither_location_is_none() {
+    assert_eq!(restart_preference(None, None), None);
 }

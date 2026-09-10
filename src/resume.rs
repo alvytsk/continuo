@@ -98,6 +98,60 @@ pub fn resume_candidate(position: Option<Duration>, completed: bool) -> Option<R
     })
 }
 
+/// What a resumed load should target, and what it should report keeping in
+/// reserve, when the stored checkpoint carries an `estimated` location
+/// (design doc §4.3). Built by [`restart_preference`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RestartPreference {
+    /// The location to seek to: always the estimate, per the rule below.
+    pub target: Duration,
+    /// The established `position` also on record beside the estimate that
+    /// won, when one exists. `None` for an entry that only ever carried an
+    /// estimate (design doc §4.3's R8) — distinct from "established at the
+    /// start", which this function never fabricates from an absent value,
+    /// the same discipline [`resume_candidate`] already applies.
+    pub established: Option<Duration>,
+}
+
+/// Resolves which of a checkpoint's two locations — `estimated` and
+/// `position` — a resumed load should target (§4.3). `estimated` wins
+/// whenever it is present: it is the listener's most recent expressed
+/// intent, and falling back to an older established point would silently
+/// undo their last seek, which is the exact failure this ruling exists to
+/// prevent. `position` is carried along as the fallback that is never
+/// discarded, not merged into the target or averaged with it.
+///
+/// Returns `None` when there is no estimate to prefer — including when
+/// there is no checkpoint at all — and a `None` here is the caller's signal
+/// to fall through to the existing, unchanged `resume_candidate` /
+/// `decide_resume` path: this function only ever *adds* a preference, never
+/// removes the established path's own behaviour, which design doc §4.3
+/// requires to stay bit-for-bit as it was.
+///
+/// A `completed` entry is the caller's own concern, exactly as it is for
+/// `resume_candidate`: check it first, and do not call this function at all
+/// when it is set, since D1 retains a completed entry's position and
+/// nothing here should be seeked to.
+///
+/// This is deliberately a preference between two already-known durations,
+/// decided before either is ever handed to a decoder — distinct from
+/// `decide_resume`, which validates one chosen duration against the media's
+/// own length once that is known. Nothing here is wired into a production
+/// load path yet (Task 6's file scope is `session.rs` / `resume.rs` /
+/// `playback::event` only): a caller that constructs `ResumeIntent` and
+/// `StartDisposition::ResumedEstimated` from this result is later work, and
+/// this function and `StartDisposition::ResumedEstimated` are its
+/// prerequisites, exercised directly by this crate's tests until then.
+pub fn restart_preference(
+    position: Option<Duration>,
+    estimated: Option<Duration>,
+) -> Option<RestartPreference> {
+    estimated.map(|estimated| RestartPreference {
+        target: estimated,
+        established: position,
+    })
+}
+
 /// What §11's table says about one resume candidate, and why.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ResumeDecision {

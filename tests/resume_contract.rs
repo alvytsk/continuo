@@ -19,8 +19,8 @@ use continuo::playback::command::PlaybackCommand;
 use continuo::playback::decode::DecodedSource;
 use continuo::playback::state::PlaybackState;
 use continuo::playback::volume::Volume;
-use continuo::resume::resume_candidate;
-use continuo::session::{Action, CAPTURE_INTERVAL, Session, decide_resume};
+use continuo::resume::{RestartPreference, decide_resume, restart_preference, resume_candidate};
+use continuo::session::{Action, CAPTURE_INTERVAL, Session};
 
 mod support;
 
@@ -510,4 +510,82 @@ fn a_position_past_the_end_is_refused_as_a_start() {
     let mut rig = Rig::open_at(dir.path(), reloaded, decision.start_at());
     assert_eq!(rig.engine_state(), PlaybackState::Playing);
     rig.quit();
+}
+
+// ------------------------------------------- restart preference (§4.3, R8)
+
+/// Both of a checkpoint's locations survive a real write-and-reload round
+/// trip and still compose the way `restart_preference` (Task 6) promises:
+/// the estimate wins as the target, and the established position that was
+/// also on record comes back as the fallback — neither field clobbers the
+/// other on the way through the store, which is the concern this file's
+/// other tests exist to catch and a pure unit test on `resume.rs` alone
+/// could not.
+#[test]
+fn a_stored_estimate_and_its_established_fallback_both_survive_a_reload() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, clock) = store_in(dir.path());
+    let mut state = PersistedState::default();
+    state.record(
+        &PlaybackCheckpoint {
+            media: track_id(),
+            position: Duration::from_secs(40),
+            updated_at: clock.sample().wall,
+        },
+        false,
+    );
+    state.record_estimated(
+        track_id(),
+        Duration::from_secs(97),
+        clock.sample().wall,
+        false,
+    );
+    store.write(&state).unwrap();
+
+    let reloaded = reload(dir.path());
+    let entry = match reloaded.entry_for(&track_id()) {
+        Some(entry) => entry,
+        None => panic!("the entry must survive the reload"),
+    };
+    assert_eq!(
+        restart_preference(entry.position, entry.estimated),
+        Some(RestartPreference {
+            target: Duration::from_secs(97),
+            established: Some(Duration::from_secs(40)),
+        })
+    );
+}
+
+/// R8, round-tripped: an entry that only ever carried an estimate must not
+/// grow an established position merely by passing through the store — the
+/// reload must still report `established: None`, not a fabricated zero.
+#[test]
+fn a_stored_estimate_with_no_established_position_reports_none_for_it_after_a_reload() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, clock) = store_in(dir.path());
+    let mut state = PersistedState::default();
+    state.record_estimated(
+        track_id(),
+        Duration::from_secs(97),
+        clock.sample().wall,
+        false,
+    );
+    store.write(&state).unwrap();
+
+    let reloaded = reload(dir.path());
+    let entry = match reloaded.entry_for(&track_id()) {
+        Some(entry) => entry,
+        None => panic!("the entry must survive the reload"),
+    };
+    assert_eq!(
+        entry.position, None,
+        "no established position was ever recorded"
+    );
+    assert_eq!(
+        restart_preference(entry.position, entry.estimated),
+        Some(RestartPreference {
+            target: Duration::from_secs(97),
+            established: None,
+        })
+    );
 }

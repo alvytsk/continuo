@@ -764,6 +764,7 @@ impl Mirror {
             PlaybackEvent::EndOfTrack {
                 session_rev,
                 position,
+                ..
             } => {
                 self.session_rev = session_rev;
                 self.position = position;
@@ -782,6 +783,7 @@ impl Mirror {
             PlaybackEvent::RestartEstablished {
                 session_rev,
                 position,
+                ..
             } => {
                 self.session_rev = session_rev;
                 self.position = position;
