@@ -17,6 +17,12 @@ use super::model::{PersistedState, SCHEMA_VERSION};
 /// How many `-2`, `-3`, … candidates a quarantine will try before giving up.
 pub const MAX_QUARANTINE_CANDIDATES: u32 = 100;
 
+/// The oldest schema version `load` still knows how to bring forward to
+/// [`SCHEMA_VERSION`] (design doc §4.5). A version below this, like one
+/// above [`SCHEMA_VERSION`], is genuinely unreadable rather than migratable:
+/// `UnsupportedVersion` and a preserved file either way.
+const OLDEST_MIGRATABLE_VERSION: u32 = 1;
+
 /// Only the field every future version is obliged to keep. Read before the
 /// model, so that a valid newer file is never misclassified as garbage (D3).
 #[derive(Deserialize)]
@@ -104,9 +110,15 @@ impl StateStore {
                 return self.reject_malformed();
             }
         };
-        // Not `> SCHEMA_VERSION`: a file from a build that renumbered downward
-        // is just as unreadable as one from a build ahead of this one.
-        if envelope.schema_version != SCHEMA_VERSION {
+        // Not `> SCHEMA_VERSION` alone: a file from a build that renumbered
+        // downward is just as unreadable as one from a build ahead of this
+        // one. `OLDEST_MIGRATABLE_VERSION` widens the accepted band by
+        // exactly the versions this build knows how to bring forward — today
+        // only v1 — everything else, above or below, is rejected the same
+        // way it always was.
+        if envelope.schema_version > SCHEMA_VERSION
+            || envelope.schema_version < OLDEST_MIGRATABLE_VERSION
+        {
             tracing::warn!(
                 path = ?self.path,
                 found = envelope.schema_version,
@@ -122,13 +134,36 @@ impl StateStore {
         }
 
         match serde_json::from_slice::<PersistedState>(&bytes) {
-            Ok(state) => LoadOutcome {
-                state,
-                writable: true,
-                reason: LoadReason::Loaded,
-            },
+            Ok(mut state) => {
+                // A v1 file's shape already deserialises cleanly into the
+                // current `PersistedState` (§4.5): `position` lands in
+                // `Some`, and the absent `estimated` defaults to `None`. What
+                // is missing is the label — without this, the next write
+                // would serialise that v2-shaped data back out under a v1
+                // envelope, which the next v1 build would read and quietly
+                // discard.
+                if envelope.schema_version != SCHEMA_VERSION {
+                    tracing::info!(
+                        path = ?self.path,
+                        from = envelope.schema_version,
+                        to = SCHEMA_VERSION,
+                        "migrating the state file to the current schema"
+                    );
+                    state.migrate_to_current_schema();
+                }
+                LoadOutcome {
+                    state,
+                    writable: true,
+                    reason: LoadReason::Loaded,
+                }
+            }
             Err(error) => {
-                tracing::warn!(path = ?self.path, %error, "the state file is version 1 but unreadable");
+                tracing::warn!(
+                    path = ?self.path,
+                    found = envelope.schema_version,
+                    %error,
+                    "the state file's version is supported but its shape is unreadable"
+                );
                 self.reject_malformed()
             }
         }

@@ -54,6 +54,38 @@ pub struct ResumeCandidate {
     pub completed: bool,
 }
 
+/// Builds the candidate `decide_resume` reasons about from a checkpoint's raw
+/// fields, without this module ever importing `PersistedCheckpoint` (G3): the
+/// caller — `open_persistence`, resolving whatever a freshly loaded file
+/// contains — hands over `position` and `completed` directly instead.
+///
+/// An absent established position (design doc §4.2 — an entry that exists
+/// only to carry an estimate, with nothing ever established) is its own
+/// case, `None`, rather than a fabricated `Some(ResumeCandidate { position:
+/// Duration::ZERO, .. })`: `decide_resume` would read that as
+/// `ResumeDecision::AtStart`, an established position of zero, which is not
+/// what an absent position means. Resuming a listener at the start because
+/// only an estimate was ever stored for them is exactly the loss this
+/// construction exists to prevent.
+///
+/// A completed entry is still reported even with no established position
+/// (an estimated timeline can complete a track without ever establishing its
+/// anchor, design doc §4.2): `decide_resume` decides `Completed` before it
+/// ever looks at `position` (see below), so the filler `Duration::ZERO` built
+/// here for that case is provably never read.
+pub fn resume_candidate(position: Option<Duration>, completed: bool) -> Option<ResumeCandidate> {
+    if completed {
+        return Some(ResumeCandidate {
+            position: position.unwrap_or(Duration::ZERO),
+            completed: true,
+        });
+    }
+    position.map(|position| ResumeCandidate {
+        position,
+        completed: false,
+    })
+}
+
 /// What §11's table says about one resume candidate, and why.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ResumeDecision {

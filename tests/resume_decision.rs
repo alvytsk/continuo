@@ -6,7 +6,9 @@
 use std::time::Duration;
 
 use continuo::playback::provenance::PositionProvenance;
-use continuo::resume::{KnownDuration, ResumeCandidate, ResumeDecision, decide_resume};
+use continuo::resume::{
+    KnownDuration, ResumeCandidate, ResumeDecision, decide_resume, resume_candidate,
+};
 
 fn stored(secs: u64, completed: bool) -> ResumeCandidate {
     ResumeCandidate {
@@ -176,5 +178,51 @@ fn a_checkpoint_past_an_established_duration_is_still_stale() {
     assert_eq!(
         decide_resume(Some(candidate), established(Duration::from_secs(361))),
         ResumeDecision::StalePastEnd
+    );
+}
+
+/// Persistence model §4.2: an entry can carry only an estimate, with nothing
+/// ever established for it. `resume_candidate` must answer `None` — no
+/// established candidate at all — rather than fabricating one at zero, which
+/// `decide_resume` would read as `AtStart` and could not tell apart from a
+/// position genuinely established at the start.
+#[test]
+fn resume_candidate_with_no_established_position_and_not_completed_is_no_candidate() {
+    assert_eq!(resume_candidate(None, false), None);
+    assert_eq!(
+        decide_resume(resume_candidate(None, false), secs(300)),
+        ResumeDecision::NoEntry
+    );
+}
+
+/// §4.2: an estimated timeline can complete a track without ever
+/// establishing its anchor, so completion must still be reported even with
+/// no established position — `decide_resume` decides `Completed` before it
+/// ever looks at the position `resume_candidate` filled in for this case.
+#[test]
+fn resume_candidate_reports_completion_even_with_no_established_position() {
+    assert_eq!(
+        resume_candidate(None, true),
+        Some(ResumeCandidate {
+            position: Duration::ZERO,
+            completed: true,
+        })
+    );
+    assert_eq!(
+        decide_resume(resume_candidate(None, true), secs(300)),
+        ResumeDecision::Completed
+    );
+}
+
+/// The ordinary case is unaffected: an established position still produces
+/// exactly the candidate it always did.
+#[test]
+fn resume_candidate_with_an_established_position_carries_it_through() {
+    assert_eq!(
+        resume_candidate(Some(Duration::from_secs(93)), false),
+        Some(ResumeCandidate {
+            position: Duration::from_secs(93),
+            completed: false,
+        })
     );
 }

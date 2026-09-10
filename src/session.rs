@@ -36,10 +36,21 @@ pub const CAPTURE_INTERVAL: Duration = Duration::from_secs(5);
 /// Persistence is a `session` concern, not a `resume` one: `resume` must not
 /// know `PersistedCheckpoint` exists (G3), so this is the one place a stored
 /// entry becomes the persistence-free shape `decide_resume` reasons about.
+///
+/// Infallible, and only honest for a checkpoint whose position is
+/// established: an absent `position` (design doc §4.2 — an entry that exists
+/// only to carry `estimated`) becomes `Duration::ZERO` here, which
+/// `decide_resume` cannot tell apart from a position genuinely established
+/// at zero. Every caller of this conversion resolves a checkpoint it already
+/// knows carries an established position. The one caller that must not make
+/// that assumption — `open_persistence`, resolving whatever a freshly loaded
+/// file happens to contain — uses [`crate::resume::resume_candidate`]
+/// instead, which treats a missing position as its own case rather than
+/// defaulting it to zero.
 impl From<&PersistedCheckpoint> for ResumeCandidate {
     fn from(entry: &PersistedCheckpoint) -> Self {
         Self {
-            position: entry.position,
+            position: entry.position.unwrap_or(Duration::ZERO),
             completed: entry.completed,
         }
     }

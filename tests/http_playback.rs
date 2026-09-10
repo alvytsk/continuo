@@ -288,7 +288,7 @@ fn a_range_less_server_plays_but_cannot_seek_or_resume() {
         .entry_for(&media)
         .cloned()
         .unwrap_or_else(|| panic!("session 1 must have left a checkpoint"));
-    assert!(before.position >= Duration::from_secs(1) && !before.completed);
+    assert!(before.position.unwrap() >= Duration::from_secs(1) && !before.completed);
 
     // Session 2: the same URL, now behind a range-less server. Restoration
     // is unavailable, so playback falls back to zero with the entry
@@ -305,7 +305,7 @@ fn a_range_less_server_plays_but_cannot_seek_or_resume() {
     let loaded = engine2.await_loaded();
     match loaded.disposition {
         StartDisposition::ResumeUnavailable { retained } => {
-            assert_eq!(retained, before.position);
+            assert_eq!(retained, before.position.unwrap());
         }
         other => panic!("expected ResumeUnavailable, got {other:?}"),
     }

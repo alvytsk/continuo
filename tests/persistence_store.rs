@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use continuo::clock::FakeClock;
-use continuo::persistence::model::PersistedState;
+use continuo::persistence::model::{PersistedState, SCHEMA_VERSION};
 use continuo::persistence::store::{LoadReason, MAX_QUARANTINE_CANDIDATES, StateStore};
 use continuo::playback::checkpoint::PlaybackCheckpoint;
 use support::media;
@@ -70,7 +70,7 @@ fn a_write_is_readable_back_and_leaves_no_temp_behind() {
     assert!(outcome.writable);
     assert_eq!(
         outcome.state.entry_for(&media("a")).unwrap().position,
-        Duration::from_secs(93)
+        Some(Duration::from_secs(93))
     );
     assert!(
         temp_files(dir.path()).is_empty(),
@@ -175,13 +175,13 @@ fn a_quarantine_that_cannot_be_performed_disables_writing_and_keeps_the_file() {
 #[test]
 fn an_unsupported_version_is_preserved_in_place_and_disables_writing() {
     let dir = tempfile::tempdir().unwrap();
-    let newer = br#"{"schema_version":2,"checkpoints":{}}"#;
+    let newer = br#"{"schema_version":3,"checkpoints":{}}"#;
     fs::write(dir.path().join("state.json"), newer).unwrap();
 
     let outcome = store(dir.path()).load();
     assert!(matches!(
         outcome.reason,
-        LoadReason::UnsupportedVersion { found: 2 }
+        LoadReason::UnsupportedVersion { found: 3 }
     ));
     assert!(!outcome.writable);
     assert_eq!(
@@ -200,13 +200,13 @@ fn a_newer_file_is_classified_by_version_even_when_its_shape_is_alien() {
     // Deserializing the model first would call this garbage; the envelope is
     // the only thing every future version is obliged to keep.
     let dir = tempfile::tempdir().unwrap();
-    let alien = br#"{"schema_version":2,"checkpoints":[1,2,3],"queues":{"a":true}}"#;
+    let alien = br#"{"schema_version":3,"checkpoints":[1,2,3],"queues":{"a":true}}"#;
     fs::write(dir.path().join("state.json"), alien).unwrap();
 
     let outcome = store(dir.path()).load();
     assert!(matches!(
         outcome.reason,
-        LoadReason::UnsupportedVersion { found: 2 }
+        LoadReason::UnsupportedVersion { found: 3 }
     ));
     assert_eq!(fs::read(dir.path().join("state.json")).unwrap(), alien);
 }
@@ -236,6 +236,151 @@ fn a_version_one_file_that_will_not_deserialize_is_malformed() {
         "the original name must no longer be present once quarantined"
     );
     assert!(outcome.writable);
+}
+
+/// design doc §4.5: the bump needs a real migration, not just a rejected
+/// older version. A v1 file must load, and its data must arrive exactly as
+/// a v2 build would have written it - `position` in `Some`, `estimated`
+/// absent as `None` - with writing still on. A v1 file that loads unwritable
+/// is the regression this task exists to prevent.
+#[test]
+fn a_v1_file_is_accepted_and_normalised_to_v2() {
+    let dir = tempfile::tempdir().unwrap();
+    let v1 = br#"{
+        "schema_version": 1,
+        "current_media": "local:/music/a.flac",
+        "volume": 0.75,
+        "checkpoints": {
+            "local:/music/a.flac": {
+                "position": { "secs": 42, "nanos": 0 },
+                "completed": false,
+                "touch_seq": 7,
+                "updated_at": "1970-01-01T00:00:00Z"
+            }
+        }
+    }"#;
+    fs::write(dir.path().join("state.json"), v1).unwrap();
+
+    let outcome = store(dir.path()).load();
+    assert!(
+        matches!(outcome.reason, LoadReason::Loaded),
+        "a migratable older version loads rather than being rejected: {:?}",
+        outcome.reason
+    );
+    assert!(
+        outcome.writable,
+        "a v1 file that loads unwritable is the regression this task exists to prevent"
+    );
+    assert_eq!(outcome.state.schema_version(), SCHEMA_VERSION);
+    assert_eq!(outcome.state.volume().as_gain(), 0.75);
+    assert_eq!(outcome.state.current_media(), Some(&media("a")));
+
+    let entry = outcome
+        .state
+        .entry_for(&media("a"))
+        .expect("the v1 entry must survive normalisation");
+    assert_eq!(entry.position, Some(Duration::from_secs(42)));
+    assert_eq!(entry.estimated, None);
+    assert!(!entry.completed);
+    assert_eq!(entry.touch_seq, 7);
+}
+
+/// design doc §4.5: deserialisation preserves the file's version while
+/// writing asserts the current one, so a migration that reads v1 but writes
+/// without updating the envelope produces a file claiming v1 while holding
+/// v2 data - which the next v1 build would read and quietly discard. This
+/// test drives the whole cycle, not just the read, and inspects the raw
+/// bytes on disk rather than trusting a re-load to catch a mislabelled file.
+#[test]
+fn the_upgrade_cycle_writes_v2_and_survives_a_reload() {
+    let dir = tempfile::tempdir().unwrap();
+    let v1 = br#"{
+        "schema_version": 1,
+        "current_media": null,
+        "volume": 1.0,
+        "checkpoints": {
+            "local:/music/a.flac": {
+                "position": { "secs": 10, "nanos": 0 },
+                "completed": false,
+                "touch_seq": 3,
+                "updated_at": "1970-01-01T00:00:00Z"
+            }
+        }
+    }"#;
+    fs::write(dir.path().join("state.json"), v1).unwrap();
+
+    let store = store(dir.path());
+    let mut state = store.load().state;
+
+    state.record(
+        &PlaybackCheckpoint {
+            media: media("b"),
+            position: Duration::from_secs(20),
+            updated_at: OffsetDateTime::UNIX_EPOCH,
+        },
+        false,
+    );
+    store.write(&state).unwrap();
+
+    let bytes = fs::read(dir.path().join("state.json")).unwrap();
+    let raw: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        raw["schema_version"], 2,
+        "the file on disk must claim v2 once it holds v2-shaped data: {raw}"
+    );
+
+    let reloaded = store.load();
+    assert!(matches!(reloaded.reason, LoadReason::Loaded));
+    assert_eq!(
+        reloaded
+            .state
+            .entry_for(&media("a"))
+            .expect("the migrated entry must not have been lost")
+            .position,
+        Some(Duration::from_secs(10))
+    );
+    assert_eq!(
+        reloaded
+            .state
+            .entry_for(&media("b"))
+            .expect("the newly recorded entry must survive the round trip")
+            .position,
+        Some(Duration::from_secs(20))
+    );
+    assert_eq!(
+        reloaded.state.len(),
+        2,
+        "no entry was lost across the cycle"
+    );
+}
+
+/// design doc §4.5: the migratable band widens what `load` accepts by
+/// exactly the versions this build knows how to bring forward, not
+/// unconditionally. A version above `SCHEMA_VERSION` and one below the
+/// oldest migratable version are both still genuinely unreadable.
+#[test]
+fn a_genuinely_unknown_version_is_still_preserved_unwritten() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let too_new = br#"{"schema_version":3,"checkpoints":{}}"#;
+    fs::write(dir.path().join("state.json"), too_new).unwrap();
+    let outcome = store(dir.path()).load();
+    assert!(matches!(
+        outcome.reason,
+        LoadReason::UnsupportedVersion { found: 3 }
+    ));
+    assert!(!outcome.writable);
+    assert_eq!(fs::read(dir.path().join("state.json")).unwrap(), too_new);
+
+    let too_old = br#"{"schema_version":0,"checkpoints":{}}"#;
+    fs::write(dir.path().join("state.json"), too_old).unwrap();
+    let outcome = store(dir.path()).load();
+    assert!(matches!(
+        outcome.reason,
+        LoadReason::UnsupportedVersion { found: 0 }
+    ));
+    assert!(!outcome.writable);
+    assert_eq!(fs::read(dir.path().join("state.json")).unwrap(), too_old);
 }
 
 #[cfg(unix)]

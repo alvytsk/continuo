@@ -117,7 +117,10 @@ fn state_with(media: &MediaId, position: Duration, completed: bool) -> Persisted
 /// apart from "something happened and changed nothing."
 fn stored_position(session: &Session, media: &MediaId) -> Duration {
     match session.state().entry_for(media) {
-        Some(entry) => entry.position,
+        Some(entry) => match entry.position {
+            Some(position) => position,
+            None => panic!("expected an established position for {media:?}"),
+        },
         None => panic!("expected a stored entry for {media:?}"),
     }
 }
@@ -126,7 +129,10 @@ fn stored_position(session: &Session, media: &MediaId) -> Duration {
 /// hand (typically the return of `shutdown_snapshot`) rather than a `Session`.
 fn position_in(state: &PersistedState, media: &MediaId) -> Duration {
     match state.entry_for(media) {
-        Some(entry) => entry.position,
+        Some(entry) => match entry.position {
+            Some(position) => position,
+            None => panic!("expected an established position for {media:?}"),
+        },
         None => panic!("expected a stored entry for {media:?}"),
     }
 }
@@ -160,7 +166,7 @@ fn five_seconds_of_playback_becomes_an_ordinary_submission() {
     let (state, urgency) = submitted(session.tick(&progress(1, "a", 5), clock.sample()));
     assert_eq!(urgency, Urgency::Ordinary);
     assert_eq!(
-        state.entry_for(&media("a")).unwrap().position,
+        state.entry_for(&media("a")).unwrap().position.unwrap(),
         Duration::from_secs(5),
         "the position is the tick's own sample"
     );
@@ -187,7 +193,7 @@ fn a_wall_clock_that_jumps_backwards_does_not_disturb_the_interval() {
 
     let (state, _) = submitted(session.tick(&progress(1, "a", 5), clock.sample()));
     assert_eq!(
-        state.entry_for(&media("a")).unwrap().position,
+        state.entry_for(&media("a")).unwrap().position.unwrap(),
         Duration::from_secs(5),
         "deadlines read the monotonic hand; only updated_at reads the wall"
     );
@@ -231,7 +237,7 @@ fn a_revision_is_adopted_from_an_event_the_policy_otherwise_ignores() {
     clock.advance(Duration::from_secs(5));
     let (state, _) = submitted(session.tick(&progress(9, "a", 5), clock.sample()));
     assert_eq!(
-        state.entry_for(&media("a")).unwrap().position,
+        state.entry_for(&media("a")).unwrap().position.unwrap(),
         Duration::from_secs(5)
     );
 }
@@ -270,7 +276,7 @@ fn end_of_track_records_the_events_own_position_and_marks_completion() {
     assert_eq!(urgency, Urgency::Forced);
     assert!(state.completed_for(&media("a")));
     assert_eq!(
-        state.entry_for(&media("a")).unwrap().position,
+        state.entry_for(&media("a")).unwrap().position.unwrap(),
         Duration::from_secs(240),
         "D1 retains the position"
     );
@@ -286,7 +292,7 @@ fn a_media_switch_produces_one_snapshot_carrying_both_halves() {
         submitted(session.observe(&loaded(2, "b", Duration::ZERO), clock.sample()));
     assert_eq!(urgency, Urgency::Forced);
     assert_eq!(
-        state.entry_for(&media("a")).unwrap().position,
+        state.entry_for(&media("a")).unwrap().position.unwrap(),
         Duration::from_secs(93),
         "the outgoing entry comes from last_sample; load() has already overwritten the engine's position"
     );
@@ -349,7 +355,7 @@ fn a_pause_from_playing_is_resolved_by_the_same_iterations_tick() {
 
     assert_eq!(urgency, Urgency::Forced);
     assert_eq!(
-        state.entry_for(&media("a")).unwrap().position,
+        state.entry_for(&media("a")).unwrap().position.unwrap(),
         Duration::from_secs(2)
     );
 }
@@ -400,7 +406,7 @@ fn a_stop_raises_a_force_that_the_tick_resolves() {
     let (state, urgency) = submitted(session.tick(&progress(2, "a", 93), clock.sample()));
     assert_eq!(urgency, Urgency::Forced);
     assert_eq!(
-        state.entry_for(&media("a")).unwrap().position,
+        state.entry_for(&media("a")).unwrap().position.unwrap(),
         Duration::from_secs(93)
     );
 }
@@ -421,7 +427,7 @@ fn a_seek_persists_the_canonical_position_never_the_events_actual() {
     let (state, urgency) = submitted(session.tick(&progress(1, "a", 60), clock.sample()));
     assert_eq!(urgency, Urgency::Forced);
     assert_eq!(
-        state.entry_for(&media("a")).unwrap().position,
+        state.entry_for(&media("a")).unwrap().position.unwrap(),
         Duration::from_secs(60),
         "D6 sidesteps the debt by never persisting SeekCompleted.actual"
     );
@@ -444,7 +450,7 @@ fn a_force_is_rekeyed_across_a_device_recovery_and_still_resolves() {
         "a real pause must not be lost to an unrelated fault"
     );
     assert_eq!(
-        state.entry_for(&media("a")).unwrap().position,
+        state.entry_for(&media("a")).unwrap().position.unwrap(),
         Duration::from_secs(40)
     );
 }
@@ -459,7 +465,7 @@ fn a_load_retires_a_force_raised_against_the_previous_media() {
     // The load replaces the media; its own handling already recorded `a`.
     let (state, _) = submitted(session.observe(&loaded(2, "b", Duration::ZERO), clock.sample()));
     assert_eq!(
-        state.entry_for(&media("a")).unwrap().position,
+        state.entry_for(&media("a")).unwrap().position.unwrap(),
         Duration::from_secs(93)
     );
 
@@ -489,7 +495,7 @@ fn a_stopped_seek_target_survives_the_shutdown_force() {
     ));
     assert_eq!(urgency, Urgency::Forced);
     assert_eq!(
-        state.entry_for(&media("a")).unwrap().position,
+        state.entry_for(&media("a")).unwrap().position.unwrap(),
         Duration::from_secs(30)
     );
 
@@ -497,7 +503,11 @@ fn a_stopped_seek_target_survives_the_shutdown_force() {
     // stopped seek deliberately does not move it.
     let final_state = session.shutdown_snapshot(&progress(2, "a", 93), clock.sample());
     assert_eq!(
-        final_state.entry_for(&media("a")).unwrap().position,
+        final_state
+            .entry_for(&media("a"))
+            .unwrap()
+            .position
+            .unwrap(),
         Duration::from_secs(30),
         "the target supersedes Progress.position until the engine resolves it"
     );
@@ -524,7 +534,7 @@ fn a_force_that_resolves_under_an_outstanding_target_records_the_target() {
     let (state, urgency) = submitted(session.tick(&progress(2, "a", 93), clock.sample()));
     assert_eq!(urgency, Urgency::Forced);
     assert_eq!(
-        state.entry_for(&media("a")).unwrap().position,
+        state.entry_for(&media("a")).unwrap().position.unwrap(),
         Duration::from_secs(30),
         "the pre-seek sample the engine still reports must not win over the target"
     );
@@ -553,14 +563,18 @@ fn a_restart_clears_the_target_it_discarded() {
     clock.advance(Duration::from_secs(5));
     let (state, _) = submitted(session.tick(&progress(2, "a", 5), clock.sample()));
     assert_eq!(
-        state.entry_for(&media("a")).unwrap().position,
+        state.entry_for(&media("a")).unwrap().position.unwrap(),
         Duration::from_secs(5),
         "an ordinary checkpoint after a restart uses the sample, not the discarded target"
     );
 
     let final_state = session.shutdown_snapshot(&progress(2, "a", 7), clock.sample());
     assert_eq!(
-        final_state.entry_for(&media("a")).unwrap().position,
+        final_state
+            .entry_for(&media("a"))
+            .unwrap()
+            .position
+            .unwrap(),
         Duration::from_secs(7)
     );
 }
@@ -590,7 +604,7 @@ fn a_resumed_stopped_seek_clears_the_target_through_its_seek_completed() {
     );
     let (state, _) = submitted(session.tick(&progress(2, "a", 31), clock.sample()));
     assert_eq!(
-        state.entry_for(&media("a")).unwrap().position,
+        state.entry_for(&media("a")).unwrap().position.unwrap(),
         Duration::from_secs(31)
     );
 }
@@ -623,7 +637,7 @@ fn a_stopped_seek_clears_the_completion_its_target_supersedes() {
 
     assert_eq!(urgency, Urgency::Forced);
     let entry = state.entry_for(&media("a")).unwrap();
-    assert_eq!(entry.position, Duration::from_secs(30));
+    assert_eq!(entry.position.unwrap(), Duration::from_secs(30));
     assert!(
         !entry.completed,
         "the listener asked for 30 s; a retained completion would throw the target away"
@@ -631,7 +645,7 @@ fn a_stopped_seek_clears_the_completion_its_target_supersedes() {
 
     let final_state = session.shutdown_snapshot(&progress(1, "a", 0), clock.sample());
     let entry = final_state.entry_for(&media("a")).unwrap();
-    assert_eq!(entry.position, Duration::from_secs(30));
+    assert_eq!(entry.position.unwrap(), Duration::from_secs(30));
     assert!(!entry.completed);
 
     // The other half of the round trip: read back through the resume
@@ -677,7 +691,11 @@ fn a_launch_that_never_establishes_writes_no_checkpoint() {
 
     let final_state = session.shutdown_snapshot(&progress(1, "a", 0), clock.sample());
     assert_eq!(
-        final_state.entry_for(&media("a")).unwrap().position,
+        final_state
+            .entry_for(&media("a"))
+            .unwrap()
+            .position
+            .unwrap(),
         Duration::from_secs(240),
         "a failed establishment must not overwrite the position D1 retains"
     );
@@ -717,7 +735,7 @@ fn a_switch_away_from_a_media_that_never_established_records_nothing_for_it() {
     let (state, _) = submitted(session.observe(&loaded(2, "b", Duration::ZERO), clock.sample()));
     let entry = state.entry_for(&media("a")).unwrap();
     assert_eq!(
-        entry.position,
+        entry.position.unwrap(),
         Duration::from_secs(300),
         "nothing validated the zero the load reported, so the retained position stands"
     );
@@ -759,7 +777,7 @@ fn a_switch_onto_a_completed_entry_does_not_capture_its_unvalidated_zero() {
     let final_state = session.shutdown_snapshot(&progress(2, "b", 0), clock.sample());
     let entry = final_state.entry_for(&media("b")).unwrap();
     assert_eq!(
-        entry.position,
+        entry.position.unwrap(),
         Duration::from_secs(240),
         "§11 resumes a completed entry at zero while retaining the position D1 keeps"
     );
@@ -797,7 +815,7 @@ fn a_stop_before_anything_establishes_writes_no_checkpoint() {
 
     let final_state = session.shutdown_snapshot(&progress(1, "a", 0), clock.sample());
     let entry = final_state.entry_for(&media("a")).unwrap();
-    assert_eq!(entry.position, Duration::from_secs(240));
+    assert_eq!(entry.position.unwrap(), Duration::from_secs(240));
     assert!(entry.completed);
 }
 
@@ -834,7 +852,11 @@ fn a_second_load_cannot_inherit_the_first_ones_establishment() {
     let final_state = session.shutdown_snapshot(&progress(2, "b", 0), clock.sample());
     assert!(final_state.entry_for(&media("b")).is_none());
     assert_eq!(
-        final_state.entry_for(&media("a")).unwrap().position,
+        final_state
+            .entry_for(&media("a"))
+            .unwrap()
+            .position
+            .unwrap(),
         Duration::from_secs(93),
         "and the outgoing entry the load recorded stands"
     );
@@ -853,7 +875,11 @@ fn a_device_recovery_does_not_re_gate_an_established_session() {
 
     let final_state = session.shutdown_snapshot(&progress(2, "a", 40), clock.sample());
     assert_eq!(
-        final_state.entry_for(&media("a")).unwrap().position,
+        final_state
+            .entry_for(&media("a"))
+            .unwrap()
+            .position
+            .unwrap(),
         Duration::from_secs(40),
         "a revision bump the position is continuous across must not close the gate again"
     );
@@ -876,7 +902,7 @@ fn a_media_switch_carries_the_outgoing_stopped_seek_target_out_with_it() {
 
     let (state, _) = submitted(session.observe(&loaded(3, "b", Duration::ZERO), clock.sample()));
     assert_eq!(
-        state.entry_for(&media("a")).unwrap().position,
+        state.entry_for(&media("a")).unwrap().position.unwrap(),
         Duration::from_secs(30),
         "the outgoing entry is recorded from the effective position, not the pre-seek sample"
     );
@@ -899,7 +925,7 @@ fn a_media_switch_does_not_walk_a_completed_entry_backwards() {
     let (state, _) = submitted(session.observe(&loaded(2, "b", Duration::ZERO), clock.sample()));
     let entry = state.entry_for(&media("a")).unwrap();
     assert_eq!(
-        entry.position,
+        entry.position.unwrap(),
         Duration::from_secs(240),
         "D1 retains what it retained"
     );
@@ -915,7 +941,11 @@ fn the_shutdown_snapshot_refuses_a_position_from_a_session_it_was_not_tracking()
     // A final Progress carrying a revision the policy never learned.
     let final_state = session.shutdown_snapshot(&progress(99, "a", 5), clock.sample());
     assert_eq!(
-        final_state.entry_for(&media("a")).unwrap().position,
+        final_state
+            .entry_for(&media("a"))
+            .unwrap()
+            .position
+            .unwrap(),
         Duration::from_secs(93),
         "it falls back to last_sample rather than trusting the stranger"
     );

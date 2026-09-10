@@ -34,7 +34,7 @@ use crate::playback::provenance::PositionProvenance;
 use crate::playback::state::PlaybackState;
 use crate::playback::timeline::PositionQuality;
 use crate::playback::volume::Volume;
-use crate::resume::ResumeCandidate;
+use crate::resume::{ResumeCandidate, resume_candidate};
 use crate::session::{Action, Session};
 
 const SEEK_STEP_SECS: i64 = 10;
@@ -579,7 +579,13 @@ fn open_persistence(
     // `duration: None` would misreport an ordinary resume as `Unvalidated`
     // every time. The disposition the worker reports on `Loaded` is what a
     // later task logs instead (Ruling 5).
-    let candidate = state.entry_for(media).map(ResumeCandidate::from);
+    // `resume_candidate` (§4.2), not `ResumeCandidate::from` directly: a
+    // freshly loaded entry may carry only an estimate with no established
+    // position at all, and that case must not collapse into a fabricated
+    // `AtStart`.
+    let candidate = state
+        .entry_for(media)
+        .and_then(|entry| resume_candidate(entry.position, entry.completed));
     let volume = state.volume();
     let sink: Box<dyn StateSink> = match (store, writable) {
         (Some(store), true) => Box::new(store),
@@ -1148,7 +1154,7 @@ mod tests {
         let written: PersistedState = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(
             written.entry_for(&media).unwrap().position,
-            Duration::from_secs(150),
+            Some(Duration::from_secs(150)),
             "the file must hold the snapshot that was submitted, not the one it started with"
         );
         assert_eq!(written.volume(), Volume::new(0.5));

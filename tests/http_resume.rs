@@ -127,7 +127,7 @@ fn a_second_session_resumes_from_the_flushed_checkpoint() {
         .entry_for(&media)
         .cloned()
         .unwrap_or_else(|| panic!("session 1 must have left a checkpoint"));
-    assert!(flushed.position >= Duration::from_secs(1) && !flushed.completed);
+    assert!(flushed.position.unwrap() >= Duration::from_secs(1) && !flushed.completed);
 
     // Session 2: a fresh `Session`/`TestEngine` pair that only knows the
     // reloaded file - no Rust object here was ever touched by session 1.
@@ -235,7 +235,7 @@ fn the_protection_survives_a_process_boundary() {
     let loaded = engine2.await_loaded();
     match loaded.disposition {
         StartDisposition::ResumeUnavailable { retained } => {
-            assert_eq!(retained, original.position);
+            assert_eq!(retained, original.position.unwrap());
         }
         other => panic!("expected ResumeUnavailable, got {other:?}"),
     }
@@ -278,7 +278,7 @@ fn the_protection_survives_a_process_boundary() {
     let loaded3 = engine3.await_loaded();
     match loaded3.disposition {
         StartDisposition::ResumeUnavailable { retained } => {
-            assert_eq!(retained, original.position);
+            assert_eq!(retained, original.position.unwrap());
         }
         other => panic!("expected ResumeUnavailable, got {other:?}"),
     }

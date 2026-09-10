@@ -335,7 +335,7 @@ fn no_broken_transfer_can_become_a_completed_track() {
             .cloned()
             .unwrap_or_else(|| panic!("{name}: the periodic capture left no checkpoint"));
         assert!(
-            captured.position >= Duration::from_millis(150),
+            captured.position.unwrap() >= Duration::from_millis(150),
             "{name}: the periodic capture did not carry real playback progress: {:?}",
             captured.position
         );
@@ -420,7 +420,7 @@ fn no_broken_transfer_can_become_a_completed_track() {
         .entry_for(&media)
         .cloned()
         .unwrap_or_else(|| panic!("stalled body: the periodic capture left no checkpoint"));
-    assert!(captured.position >= Duration::from_millis(150));
+    assert!(captured.position.unwrap() >= Duration::from_millis(150));
     assert!(
         server.wait_until_stalled(Duration::from_secs(5)),
         "stalled body: the read never blocked"

@@ -179,7 +179,8 @@ fn a_stop_and_a_quit_resume_where_playback_reached() {
         .entry_for(&track_id())
         .expect("an entry for the track");
     assert!(
-        entry.position >= Duration::from_secs(2) && entry.position < TRACK_DURATION,
+        entry.position.unwrap() >= Duration::from_secs(2)
+            && entry.position.unwrap() < TRACK_DURATION,
         "session 2 must resume near where session 1 stopped: {:?}",
         entry.position
     );
@@ -205,7 +206,7 @@ fn a_pause_and_a_quit_resume_where_playback_reached() {
         .entry_for(&track_id())
         .cloned()
         .expect("an entry for the track");
-    assert!(entry.position >= Duration::from_secs(2));
+    assert!(entry.position.unwrap() >= Duration::from_secs(2));
 }
 
 #[test]
@@ -222,7 +223,7 @@ fn a_seek_is_persisted_from_the_canonical_position() {
         .cloned()
         .expect("an entry for the track");
     assert!(
-        entry.position >= Duration::from_secs(3),
+        entry.position.unwrap() >= Duration::from_secs(3),
         "the seek's landing, taken from Progress rather than from the event: {:?}",
         entry.position
     );
@@ -263,7 +264,7 @@ fn an_ordinary_capture_lands_once_the_interval_has_passed() {
         .cloned()
         .expect("an entry for the track");
     assert!(
-        entry.position >= Duration::from_secs(2),
+        entry.position.unwrap() >= Duration::from_secs(2),
         "the capture carries the tick's position: {:?}",
         entry.position
     );
@@ -286,7 +287,7 @@ fn a_stopped_seek_target_outlives_the_quit() {
         .cloned()
         .expect("an entry for the track");
     assert!(
-        entry.position < Duration::from_secs(2),
+        entry.position.unwrap() < Duration::from_secs(2),
         "the stored target, not the pre-seek position the engine still reports: {:?}",
         entry.position
     );
@@ -315,7 +316,7 @@ fn a_stopped_seek_target_outlives_a_quit_that_races_it() {
         .cloned()
         .expect("an entry for the track");
     assert!(
-        entry.position < Duration::from_secs(2),
+        entry.position.unwrap() < Duration::from_secs(2),
         "the SeekTargetStored is not the application's to lose: {:?}",
         entry.position
     );
@@ -340,7 +341,7 @@ fn a_restart_after_a_stopped_seek_persists_where_it_restarted() {
         .cloned()
         .expect("an entry for the track");
     assert!(
-        entry.position >= Duration::from_secs(2),
+        entry.position.unwrap() >= Duration::from_secs(2),
         "the restarted playback's position, not the target the restart threw away: {:?}",
         entry.position
     );
@@ -358,7 +359,7 @@ fn a_finished_track_is_completed_and_reopens_at_zero_with_its_position_kept() {
     let entry = state.entry_for(&track_id()).cloned().expect("an entry");
     assert!(entry.completed);
     assert!(
-        entry.position > Duration::from_secs(4),
+        entry.position.unwrap() > Duration::from_secs(4),
         "D1 retains it: {:?}",
         entry.position
     );
