@@ -4,6 +4,7 @@ pub mod clock;
 pub mod error;
 pub mod feed;
 pub mod http;
+pub mod library;
 pub mod media;
 pub mod persistence;
 pub mod playback;
