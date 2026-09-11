@@ -9,7 +9,7 @@ thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-url = "2"
+url = { version = "2", features = ["serde"] }
 percent-encoding = "2"
 time = { version = "0.3", features = ["serde", "serde-well-known"] }
 symphonia = { version = "0.6.1", features = ["mp3", "aac", "isomp4", "alac"] }
