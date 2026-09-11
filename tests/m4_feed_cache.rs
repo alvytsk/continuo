@@ -285,3 +285,40 @@ fn a_failed_save_leaves_the_previous_cache_untouched() -> Result<(), Box<dyn std
     );
     Ok(())
 }
+
+/// `path_for`'s R4 fallback for a `FeedId` that fails re-validation must
+/// never echo the offending id back: `slug` is the one field every
+/// `FeedError` `Display` treats as a safe, bare identifier, and
+/// `CacheCorrupt` prints it straight into a suggested command
+/// (`run continuo refresh {slug}`). A traversal-shaped id is exactly the
+/// case where that would be most dangerous, so neither the traversal text
+/// nor any path separator may appear in either rendering — under `Debug` as
+/// much as `Display` (§7.2).
+#[test]
+fn path_for_never_echoes_a_traversal_shaped_id() -> Result<(), Box<dyn std::error::Error>> {
+    let rig = feeds::Rig::new()?;
+    // `FeedId::new` performs no format check (only `validate_feed_id` does),
+    // exactly the gap R4 exists to guard: this is how a traversal-shaped id
+    // could reach `CacheStore` without ever having passed subscription-load
+    // validation.
+    let traversal = FeedId::new("../../etc/passwd".to_string())?;
+
+    let error = match rig.cache.path_for(&traversal) {
+        Ok(path) => return Err(format!("expected CacheCorrupt, got path {path:?}").into()),
+        Err(error) => error,
+    };
+    assert!(
+        matches!(&error, FeedError::CacheCorrupt { .. }),
+        "expected CacheCorrupt, got {error:?}"
+    );
+
+    let display = error.to_string();
+    let debug = format!("{error:?}");
+    for rendering in [&display, &debug] {
+        assert!(
+            !rendering.contains("..") && !rendering.contains('/'),
+            "rendering must not echo the traversal-shaped id, got {rendering:?}"
+        );
+    }
+    Ok(())
+}

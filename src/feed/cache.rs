@@ -319,10 +319,20 @@ impl CacheStore {
     /// `CacheCorrupt` here, before any path is built from the id. This
     /// guards against a `FeedId` that reached this store without having
     /// passed through subscription-load validation — `FeedId::new` itself
-    /// only rejects an empty string, not a traversal-shaped one.
+    /// only rejects an empty string, not a traversal-shaped one, and
+    /// `MediaId`'s own decode path (`src/media/id.rs`) builds `FeedId`
+    /// values that never pass `validate_feed_id` either. Unreachable today
+    /// only by call-site discipline, not structurally, so both fields are
+    /// **static**, exactly like the unsupported-schema diagnostic below: an
+    /// id that already failed validation is precisely the id least safe to
+    /// echo back — `slug` is the one field every `FeedError` `Display`
+    /// prints as a bare, trusted identifier (`CacheCorrupt`'s message
+    /// suggests `run continuo refresh {slug}`), so a traversal-shaped or
+    /// otherwise malformed id must never reach it, under `Debug` as much as
+    /// `Display` (§7.2).
     pub fn path_for(&self, id: &FeedId) -> Result<PathBuf, FeedError> {
         validate_feed_id(id.as_str()).map_err(|_| FeedError::CacheCorrupt {
-            slug: id.as_str().to_string(),
+            slug: "<invalid feed id>".to_string(),
             detail: "feed id is not valid".to_string(),
         })?;
         Ok(self.feeds_dir.join(format!("{}.json", id.as_str())))
