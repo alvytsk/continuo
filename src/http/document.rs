@@ -9,18 +9,23 @@
 //! `block_on` and is driven entirely by whichever runtime the caller awaits
 //! it on (§3.1).
 //!
-//! Redirects and conditional GETs are Task 6's addition to this same file;
-//! here a 304 is always [`RemoteFailure::UnsolicitedNotModified`] because no
-//! conditional header is ever sent yet.
+//! Redirects reuse [`accept_redirect`] unchanged (§3.2): the same hop cap,
+//! loop detection, scheme check and downgrade refusal that guard finite
+//! media guard a feed document too, rather than a second policy forked here.
+//! Conditional GETs (§3.3) are scoped to one resource: a validator is sent
+//! only on the hop whose URL matches the validator's own, and dropped the
+//! moment a redirect moves the request to a different URL.
 
 use reqwest::header::{
-    ACCEPT, ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_TYPE, ETAG, LAST_MODIFIED,
+    ACCEPT, ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_TYPE, ETAG, IF_MODIFIED_SINCE,
+    IF_NONE_MATCH, LAST_MODIFIED, LOCATION,
 };
 use serde::{Deserialize, Serialize};
 use url::Url;
 
 use super::error::{Operation, Phase, RemoteFailure, redact_url};
 use super::limits::Limits;
+use super::response::accept_redirect;
 
 /// §3.5: an XML feed first, everything else as a low-priority fallback.
 const ACCEPT_VALUE: &str =
@@ -29,9 +34,9 @@ const ACCEPT_VALUE: &str =
 /// One document request: where to fetch from, and the validators (if any)
 /// carried over from a prior fetch of that same URL.
 ///
-/// `validators` is part of the type from §3.1 onward even though this task
-/// never reads it: Task 6 is what starts sending it as `If-None-Match` /
-/// `If-Modified-Since`.
+/// `validators` is sent as `If-None-Match` / `If-Modified-Since` only on the
+/// hop whose request URL equals `validators.url` (§3.3) — never forwarded
+/// across a redirect to a different resource.
 #[derive(Debug)]
 pub struct DocumentRequest {
     pub origin: Url,
@@ -100,6 +105,107 @@ fn validate_source_policy(url: &Url) -> Result<(), RemoteFailure> {
     Ok(())
 }
 
+/// Runs the manual redirect loop, sending a resource-scoped conditional
+/// header on whichever hop's URL matches `request.validators` (§3.2/§3.3),
+/// and returns the terminal response plus whether *that* hop's own request
+/// carried a conditional header at all.
+///
+/// `accept_redirect` (`src/http/response.rs`) is reused unchanged: same hop
+/// cap, loop detection, scheme check and downgrade refusal as finite media.
+/// Redirect targets are additionally re-checked against
+/// [`validate_source_policy`], which `accept_redirect` does not enforce
+/// (host presence, no embedded userinfo).
+async fn follow_redirects(
+    client: &reqwest::Client,
+    limits: &Limits,
+    request: &DocumentRequest,
+) -> Result<(reqwest::Response, bool, Option<Url>), RemoteFailure> {
+    let mut current = request.origin.clone();
+    let mut seen: Vec<Url> = Vec::new();
+    let mut hops: u8 = 0;
+    let mut permanent_prefix = true;
+    let mut permanent_url: Option<Url> = None;
+
+    loop {
+        let matching = request.validators.as_ref().filter(|v| v.url == current);
+        let mut builder = client
+            .get(current.clone())
+            .header(ACCEPT_ENCODING, "identity")
+            .header(ACCEPT, ACCEPT_VALUE);
+        let mut sent_conditional = false;
+        if let Some(v) = matching {
+            if let Some(etag) = &v.etag {
+                builder = builder.header(IF_NONE_MATCH, etag);
+                sent_conditional = true;
+            }
+            if let Some(modified) = &v.last_modified {
+                builder = builder.header(IF_MODIFIED_SINCE, modified);
+                sent_conditional = true;
+            }
+        }
+
+        // A cached header value that reqwest cannot encode is caught here,
+        // never a panic and never surfaced through the client's own `Debug`:
+        // `build()` reports it as an ordinary transport error.
+        let built = builder.build().map_err(|error| RemoteFailure::Transport {
+            operation: Operation::Open,
+            detail: super::service::transport_detail(error),
+        })?;
+
+        let response = tokio::time::timeout(limits.headers, client.execute(built))
+            .await
+            .map_err(|_| RemoteFailure::Timeout {
+                phase: Phase::Headers,
+            })?
+            .map_err(|error| {
+                if error.is_connect() && error.is_timeout() {
+                    RemoteFailure::Timeout {
+                        phase: Phase::Connect,
+                    }
+                } else {
+                    RemoteFailure::Transport {
+                        operation: Operation::Open,
+                        detail: super::service::transport_detail(error),
+                    }
+                }
+            })?;
+
+        let status = response.status().as_u16();
+        if !matches!(status, 301 | 302 | 303 | 307 | 308) {
+            return Ok((response, sent_conditional, permanent_url));
+        }
+
+        // The body of a redirect response is never read (§3.2): only the
+        // `Location` header is consulted, and `response` is dropped here.
+        let location = response
+            .headers()
+            .get(LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        let Some(location) = location else {
+            return Err(RemoteFailure::Status {
+                status,
+                operation: Operation::Open,
+            });
+        };
+        drop(response);
+
+        let target = accept_redirect(&current, &location, hops + 1, &seen, limits)?;
+        validate_source_policy(&target)?;
+        // `permanent_url` advances only through the initial uninterrupted
+        // run of 301/308 hops and freezes at the first non-permanent one
+        // (§3.2) — this is that rule, unmodified from the design.
+        if permanent_prefix && matches!(status, 301 | 308) {
+            permanent_url = Some(target.clone());
+        } else {
+            permanent_prefix = false;
+        }
+        seen.push(current.clone());
+        current = target;
+        hops += 1;
+    }
+}
+
 async fn fetch_inner(
     client: reqwest::Client,
     limits: Limits,
@@ -107,35 +213,13 @@ async fn fetch_inner(
 ) -> Result<DocumentOutcome, RemoteFailure> {
     validate_source_policy(&request.origin)?;
 
-    let built = client
-        .get(request.origin.clone())
-        .header(ACCEPT_ENCODING, "identity")
-        .header(ACCEPT, ACCEPT_VALUE)
-        .build()
-        .map_err(|error| RemoteFailure::Transport {
-            operation: Operation::Open,
-            detail: super::service::transport_detail(error),
-        })?;
+    let (mut response, sent_conditional, permanent_url) =
+        follow_redirects(&client, &limits, &request).await?;
 
-    let mut response = tokio::time::timeout(limits.headers, client.execute(built))
-        .await
-        .map_err(|_| RemoteFailure::Timeout {
-            phase: Phase::Headers,
-        })?
-        .map_err(|error| {
-            if error.is_connect() && error.is_timeout() {
-                RemoteFailure::Timeout {
-                    phase: Phase::Connect,
-                }
-            } else {
-                RemoteFailure::Transport {
-                    operation: Operation::Open,
-                    detail: super::service::transport_detail(error),
-                }
-            }
-        })?;
+    let status = response.status().as_u16();
+    let final_url = response.url().clone();
 
-    match response.status().as_u16() {
+    match status {
         200 => {
             if let Some(encoding) = response
                 .headers()
@@ -162,7 +246,6 @@ async fn fetch_inner(
                 .get(LAST_MODIFIED)
                 .and_then(|value| value.to_str().ok())
                 .map(str::to_string);
-            let final_url = response.url().clone();
 
             // A cheap early exit only: the header can be absent or false, so
             // the streaming check below is the authority (§3.4).
@@ -199,7 +282,7 @@ async fn fetch_inner(
             Ok(DocumentOutcome::Fetched {
                 bytes,
                 final_url: final_url.clone(),
-                permanent_url: None,
+                permanent_url,
                 validators: CacheValidators {
                     url: final_url,
                     etag,
@@ -208,9 +291,38 @@ async fn fetch_inner(
                 content_type,
             })
         }
-        // No conditional header is ever sent in this task, so any 304 is
-        // unsolicited (§3.3). Task 6 adds the conditional success path.
-        304 => Err(RemoteFailure::UnsolicitedNotModified),
+        304 => {
+            // §3.3: unsolicited unless this exact hop sent a conditional
+            // header *and* a matching cached validator record still exists.
+            // Neither 200 body-length nor body-encoding checks apply here:
+            // a 304 never carries a body.
+            let existing = sent_conditional
+                .then(|| request.validators.as_ref().filter(|v| v.url == final_url))
+                .flatten();
+            let Some(existing) = existing else {
+                return Err(RemoteFailure::UnsolicitedNotModified);
+            };
+            let mut merged = existing.clone();
+            if let Some(etag) = response
+                .headers()
+                .get(ETAG)
+                .and_then(|value| value.to_str().ok())
+            {
+                merged.etag = Some(etag.to_string());
+            }
+            if let Some(last_modified) = response
+                .headers()
+                .get(LAST_MODIFIED)
+                .and_then(|value| value.to_str().ok())
+            {
+                merged.last_modified = Some(last_modified.to_string());
+            }
+            Ok(DocumentOutcome::Unchanged {
+                final_url,
+                permanent_url,
+                validators: merged,
+            })
+        }
         other => Err(RemoteFailure::Status {
             status: other,
             operation: Operation::Open,
