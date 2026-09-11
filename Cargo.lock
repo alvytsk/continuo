@@ -305,6 +305,7 @@ dependencies = [
  "crossbeam-channel",
  "crossterm",
  "directories",
+ "getrandom 0.4.3",
  "http",
  "percent-encoding",
  "reqwest",
