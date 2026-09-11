@@ -24,11 +24,16 @@ pub enum PersistenceError {
         #[source]
         source: serde_json::Error,
     },
-    #[error("cannot deserialize state from {path:?}")]
+    /// Deliberately without a `#[source]`: a `serde_json::Error`'s `Display`
+    /// can quote the offending input verbatim, and a checkpoint map key is a
+    /// media identity that may carry a URL. `category`, `line` and `column`
+    /// give a caller enough to act on without repeating untrusted text.
+    #[error("state file {path:?} is malformed ({category} error at line {line}, column {column})")]
     Deserialize {
         path: PathBuf,
-        #[source]
-        source: serde_json::Error,
+        category: &'static str,
+        line: usize,
+        column: usize,
     },
     #[error("state file {path:?} is schema version {found}, and this build supports {supported}")]
     UnsupportedVersion {
