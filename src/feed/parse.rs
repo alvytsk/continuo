@@ -13,6 +13,13 @@
 //! `DecodingReader` transcodes with `decode_to_utf8_without_replacement`, so a
 //! malformed byte becomes [`FeedError::Encoding`] rather than U+FFFD. A
 //! silently mangled title is worse than a refusal that names its cause.
+//!
+//! RSS 2.0 and Atom 1.0 are two mappings over **one** walker (§4.3). The
+//! document element picks the mapping once, and from there the format lives in
+//! the [`Context`] the open path resolves to: an RSS arm wants an RSS context
+//! and the empty namespace, an Atom arm wants an Atom context and the Atom
+//! namespace URI. Prefixes never enter into it, and no element can be mistaken
+//! for a field of the other format.
 
 use std::io::ErrorKind;
 use std::time::Duration;
@@ -25,12 +32,17 @@ use quick_xml::events::{BytesDecl, BytesRef, BytesStart, Event};
 use quick_xml::name::{QName, ResolveResult};
 use quick_xml::reader::NsReader;
 use time::OffsetDateTime;
-use time::format_description::well_known::Rfc2822;
+use time::format_description::well_known::{Rfc2822, Rfc3339};
 use url::Url;
 
 use super::error::FeedError;
 use super::model::{Enclosure, ParsedFeed, ParsedItem};
 
+/// The Atom 1.0 namespace. Every Atom element is matched by this URI plus a
+/// local name, never by a prefix, so `<feed>`, `<a:feed>` and `<atom:feed>`
+/// are the same document element and an unqualified `<title>` inside an Atom
+/// feed is not an Atom title at all (§4.2, §4.3).
+const ATOM_NS: &str = "http://www.w3.org/2005/Atom";
 /// The `itunes` namespace, the one extension this parser reads rather than
 /// ignores (§4.3).
 const ITUNES_NS: &str = "http://www.itunes.com/dtds/podcast-1.0.dtd";
@@ -69,9 +81,9 @@ pub struct ParseReport {
 
 /// One non-fatal observation about a document.
 ///
-/// `item` is the **1-based ordinal of the `<item>` element in document
-/// order**, counted before anything is skipped, or `None` for a feed-level
-/// observation.
+/// `item` is the **1-based ordinal of the `<item>` or `<entry>` element in
+/// document order**, counted before anything is skipped, or `None` for a
+/// feed-level observation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ParseWarning {
     pub item: Option<usize>,
@@ -96,8 +108,9 @@ pub enum WarningKind {
     /// An enclosure's URL would not resolve, or its scheme is not HTTP(S),
     /// so that enclosure was discarded (§4.5).
     InvalidEnclosure,
-    /// The item carried more than one `<enclosure>`; the first usable one in
-    /// document order won and this many were ignored (§4.7).
+    /// The item carried more than one enclosure — RSS `<enclosure>` or Atom
+    /// `link[rel=enclosure]` — and the first usable one in document order won,
+    /// so this many were ignored (§4.7).
     ExtraEnclosures { ignored: usize },
 }
 
@@ -109,8 +122,10 @@ pub enum WarningKind {
 /// # Errors
 ///
 /// Feed-level faults only (§4.6): XML that will not parse, a decoding
-/// failure, an unsupported document element, or a missing `<channel>`. Item
-/// faults are counted in [`ParseReport::skipped`] instead.
+/// failure, an unsupported document element, a missing `<channel>`, or a
+/// feed-level identity field carrying an entity that will not resolve — that
+/// last one has no enclosing item to skip, so the document is the only tier
+/// left. Item faults are counted in [`ParseReport::skipped`] instead.
 pub fn parse_feed(bytes: &[u8], retrieval_url: &Url) -> Result<ParseReport, FeedError> {
     let mut reader = NsReader::from_reader(DecodingReader::new(bytes));
     // quick-xml 0.42 defaults are already what §4 asks for: no whitespace
@@ -276,52 +291,115 @@ impl Frame {
     }
 }
 
-/// Where the walker is in the RSS 2.0 tree, derived from the whole open path
-/// rather than from depth alone. An extension element with a matching local
-/// name therefore cannot substitute for an RSS field: its parent chain does
-/// not match.
+/// Which mapping the document element selected (§4.2). Settled once, at the
+/// document element, and never re-derived from a descendant.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Format {
+    Rss,
+    Atom,
+}
+
+/// Where the walker is in the feed tree, derived from the whole open path
+/// rather than from depth alone, and qualified by format. An extension
+/// element with a matching local name therefore cannot substitute for a feed
+/// field — its parent chain does not match — and neither can an unqualified
+/// `<title>` inside an Atom `<feed>`, because the RSS arms of every match
+/// below require both an RSS context *and* the empty namespace.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Context {
     /// Nothing is open yet; the next element is the document element.
     Document,
     /// Inside `rss`.
-    Root,
+    RssRoot,
     /// Inside `rss/channel`.
-    Channel,
+    RssChannel,
     /// Inside `rss/channel/item`.
-    Item,
+    RssItem,
+    /// Inside Atom `feed`, which carries feed-level fields directly.
+    AtomFeed,
+    /// Inside Atom `feed/entry`.
+    AtomEntry,
     /// Anywhere else, including everything below an unrecognized element.
     Ignored,
 }
 
-fn context(stack: &[Frame]) -> Context {
-    match stack {
-        [] => Context::Document,
-        [root] if root.is(None, "rss") => Context::Root,
-        [root, channel] if root.is(None, "rss") && channel.is(None, "channel") => Context::Channel,
-        [root, channel, item]
-            if root.is(None, "rss") && channel.is(None, "channel") && item.is(None, "item") =>
+fn context(format: Option<Format>, stack: &[Frame]) -> Context {
+    // No document element yet, so nothing is open and nothing is decided.
+    let Some(format) = format else {
+        return Context::Document;
+    };
+    match (format, stack) {
+        (_, []) => Context::Document,
+        // The document element's own name was settled by dispatch, so the root
+        // frame needs no second look here.
+        (Format::Rss, [_]) => Context::RssRoot,
+        (Format::Rss, [_, channel]) if channel.is(None, "channel") => Context::RssChannel,
+        (Format::Rss, [_, channel, item])
+            if channel.is(None, "channel") && item.is(None, "item") =>
         {
-            Context::Item
+            Context::RssItem
         }
+        (Format::Atom, [_]) => Context::AtomFeed,
+        (Format::Atom, [_, entry]) if entry.is(Some(ATOM_NS), "entry") => Context::AtomEntry,
         _ => Context::Ignored,
     }
 }
 
 /// One item under construction.
+#[derive(Default)]
 struct ItemBuilder {
     item: ParsedItem,
     /// Set when an identity field could not be decoded; the item is counted
     /// as skipped instead of retained.
     rejected: bool,
-    /// Every `<enclosure>` seen, usable or not (§4.7).
+    /// Every enclosure seen — RSS `<enclosure>` or Atom `link[rel=enclosure]`
+    /// — usable or not (§4.7).
     enclosure_count: usize,
+    /// Atom `published` and `updated`, kept as text until the entry closes.
+    /// Atom's precedence is by element, not by document order: `published`
+    /// wins even when `updated` was written first, and a `published` that will
+    /// not parse yields `None` rather than falling through to `updated`
+    /// (§4.3, §4.6).
+    published_text: Option<String>,
+    updated_text: Option<String>,
+}
+
+/// The attributes an RSS `<enclosure>` and an Atom `<link>` have in common,
+/// gathered before either is interpreted.
+///
+/// `href_undecodable` is kept apart from an absent `href`: a URL that carries
+/// an entity this parser will not resolve is an identity that cannot be
+/// decoded consistently, which is a stronger fault than no URL at all (§4.8).
+#[derive(Default)]
+struct LinkCandidate {
+    href: Option<String>,
+    href_undecodable: bool,
+    length: Option<String>,
+    mime_type: Option<String>,
+}
+
+impl LinkCandidate {
+    fn set_href(&mut self, value: Option<String>) {
+        match value {
+            Some(value) => self.href = Some(value),
+            None => self.href_undecodable = true,
+        }
+    }
 }
 
 struct Walker<'a> {
     retrieval: &'a Url,
     version: XmlVersion,
+    /// `None` until the document element names a mapping (§4.2).
+    format: Option<Format>,
     stack: Vec<Frame>,
+    /// The stack index of an open Atom `title` of type `xhtml`, whose markup
+    /// is dropped and whose descendant text nodes are concatenated (§4.8).
+    ///
+    /// Descendant text is appended straight to that one frame rather than
+    /// folded up level by level as each element closes. Folding would copy the
+    /// accumulated text once per level, which a feed controls the depth of.
+    xhtml_title: Option<usize>,
     feed: ParsedFeed,
     item: Option<ItemBuilder>,
     ordinal: usize,
@@ -336,7 +414,9 @@ impl<'a> Walker<'a> {
         Self {
             retrieval,
             version: XmlVersion::Implicit1_0,
+            format: None,
             stack: Vec::new(),
+            xhtml_title: None,
             feed: ParsedFeed::default(),
             item: None,
             ordinal: 0,
@@ -367,47 +447,80 @@ impl<'a> Walker<'a> {
         element: &BytesStart<'_>,
     ) -> Result<(), FeedError> {
         let (namespace, local) = expanded(reader, element.name())?;
-        let parent = context(&self.stack);
+        let parent = context(self.format, &self.stack);
 
         if parent == Context::Document {
             if self.root_closed {
                 return Err(malformed("content after the document element"));
             }
-            // §4.2 dispatches on the *expanded* name. `{Atom}feed` joins this
-            // match when the Atom mapping lands; until then every root but an
-            // unqualified `rss` is refused by name rather than half-parsed.
-            if namespace.is_some() || local != "rss" {
-                return Err(FeedError::UnsupportedFormat);
-            }
+            // §4.2 dispatches on the *expanded* name. Everything else, RSS 1.0
+            // included, is refused by name rather than half-parsed.
+            self.format = Some(match (namespace.as_deref(), local.as_str()) {
+                (None, "rss") => Format::Rss,
+                (Some(ATOM_NS), "feed") => Format::Atom,
+                _ => return Err(FeedError::UnsupportedFormat),
+            });
         }
 
         let base = self.element_base(reader, element)?;
 
         match (parent, namespace.as_deref(), local.as_str()) {
-            (Context::Root, None, "channel") => self.saw_channel = true,
-            (Context::Channel, None, "item") => {
+            (Context::RssRoot, None, "channel") => self.saw_channel = true,
+            (Context::RssChannel, None, "item") | (Context::AtomFeed, Some(ATOM_NS), "entry") => {
                 self.ordinal += 1;
-                self.item = Some(ItemBuilder {
-                    item: ParsedItem::default(),
-                    rejected: false,
-                    enclosure_count: 0,
-                });
+                self.item = Some(ItemBuilder::default());
             }
-            (Context::Item, None, "enclosure") => {
+            (Context::RssItem, None, "enclosure") => {
                 // Attributes resolve against the base in scope *here*, which
                 // includes this element's own `xml:base`.
                 let effective = base.as_ref().unwrap_or_else(|| self.base()).clone();
                 self.read_enclosure(element, &effective)?;
             }
+            (Context::AtomFeed | Context::AtomEntry, Some(ATOM_NS), "link") => {
+                let effective = base.as_ref().unwrap_or_else(|| self.base()).clone();
+                self.read_atom_link(element, &effective, parent == Context::AtomEntry)?;
+            }
             _ => {}
         }
 
-        let collect = matches!(
-            (parent, namespace.as_deref(), local.as_str()),
-            (Context::Channel, None, "title" | "link")
-                | (Context::Item, None, "guid" | "title" | "link" | "pubDate")
-                | (Context::Item, Some(ITUNES_NS), "duration")
-        );
+        // Inside an xhtml title every element is markup to be dropped, and its
+        // text belongs to the title's own frame, so nothing below it collects
+        // for itself (§4.8).
+        let collect = self.xhtml_title.is_none()
+            && matches!(
+                (parent, namespace.as_deref(), local.as_str()),
+                (Context::RssChannel, None, "title" | "link")
+                    | (
+                        Context::RssItem,
+                        None,
+                        "guid" | "title" | "link" | "pubDate"
+                    )
+                    | (Context::AtomFeed, Some(ATOM_NS), "title")
+                    | (
+                        Context::AtomEntry,
+                        Some(ATOM_NS),
+                        "id" | "title" | "published" | "updated"
+                    )
+                    | (
+                        Context::RssItem | Context::AtomEntry,
+                        Some(ITUNES_NS),
+                        "duration"
+                    )
+            );
+        // `title` is the one element whose gathering depends on an attribute.
+        if collect
+            && matches!(
+                (parent, namespace.as_deref(), local.as_str()),
+                (
+                    Context::AtomFeed | Context::AtomEntry,
+                    Some(ATOM_NS),
+                    "title"
+                )
+            )
+            && is_xhtml_title(element, self.version)
+        {
+            self.xhtml_title = Some(self.stack.len());
+        }
 
         self.stack.push(Frame {
             namespace,
@@ -447,10 +560,7 @@ impl<'a> Walker<'a> {
     }
 
     fn read_enclosure(&mut self, element: &BytesStart<'_>, base: &Url) -> Result<(), FeedError> {
-        let mut href = None;
-        let mut href_undecodable = false;
-        let mut length = None;
-        let mut mime_type = None;
+        let mut candidate = LinkCandidate::default();
         for attribute in element.attributes() {
             let attribute = attribute.map_err(|_| malformed("invalid attribute"))?;
             // `enclosure`'s attributes are unprefixed, and an unprefixed
@@ -462,39 +572,83 @@ impl<'a> Walker<'a> {
             }
             let value = normalized(&attribute, self.version);
             match key {
-                "url" => match value {
-                    Some(value) => href = Some(value),
-                    None => href_undecodable = true,
-                },
-                "length" => length = value,
-                "type" => mime_type = value,
+                "url" => candidate.set_href(value),
+                "length" => candidate.length = value,
+                "type" => candidate.mime_type = value,
+                _ => {}
+            }
+        }
+        self.push_enclosure(candidate, base);
+        Ok(())
+    }
+
+    /// One Atom `link`. `rel` defaults to `alternate` (RFC 4287 §4.2.7.2),
+    /// applied before any selection, so a bare `<link href="..."/>` is the
+    /// site link or the item link exactly as a spelled-out one would be
+    /// (§4.3).
+    fn read_atom_link(
+        &mut self,
+        element: &BytesStart<'_>,
+        base: &Url,
+        in_entry: bool,
+    ) -> Result<(), FeedError> {
+        let mut candidate = LinkCandidate::default();
+        let mut rel = None;
+        for attribute in element.attributes() {
+            let attribute = attribute.map_err(|_| malformed("invalid attribute"))?;
+            let key = attribute.key.as_ref();
+            if key.contains(':') {
+                continue;
+            }
+            let value = normalized(&attribute, self.version);
+            match key {
+                "rel" => rel = value,
+                "href" => candidate.set_href(value),
+                "length" => candidate.length = value,
+                "type" => candidate.mime_type = value,
                 _ => {}
             }
         }
 
+        match rel.as_deref().map_or("alternate", str::trim) {
+            "enclosure" if in_entry => self.push_enclosure(candidate, base),
+            "alternate" => self.push_alternate(candidate, base, in_entry)?,
+            // `self`, `related`, `via`, a hub, an unregistered relation: not a
+            // field this parser maps, so not a field whose href has to decode.
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Records an enclosure candidate, whatever element it came from.
+    fn push_enclosure(&mut self, candidate: LinkCandidate, base: &Url) {
         let Some(builder) = self.item.as_mut() else {
-            return Ok(());
+            return;
         };
         builder.enclosure_count += 1;
         if builder.item.enclosure.is_some() {
             // Already have one; §4.7 keeps the first and counts the rest.
-            return Ok(());
+            return;
         }
-        if href_undecodable {
+        if candidate.href_undecodable {
             // An enclosure URL is an identity fallback, and an identity that
             // cannot be decoded consistently is not an identity (§4.8).
             builder.rejected = true;
             self.warn(WarningKind::UnknownIdentityEntity);
-            return Ok(());
+            return;
         }
-        let url = href
+        let url = candidate
+            .href
             .as_deref()
             .and_then(|href| resolved_url(Some(base), href))
             .filter(|url| matches!(url.scheme(), "http" | "https"));
         match url {
             Some(url) => {
-                let length = length.and_then(|raw| raw.trim().parse::<u64>().ok());
-                let mime_type = mime_type
+                let length = candidate
+                    .length
+                    .and_then(|raw| raw.trim().parse::<u64>().ok());
+                let mime_type = candidate
+                    .mime_type
                     .map(|raw| raw.trim().to_owned())
                     .filter(|raw| !raw.is_empty());
                 builder.item.enclosure = Some(Enclosure {
@@ -507,11 +661,58 @@ impl<'a> Walker<'a> {
             // discarded enclosure.
             None => self.warn(WarningKind::InvalidEnclosure),
         }
+    }
+
+    /// Records an Atom `alternate` link: the entry's link, or the feed's site
+    /// link. First in document order wins.
+    fn push_alternate(
+        &mut self,
+        candidate: LinkCandidate,
+        base: &Url,
+        in_entry: bool,
+    ) -> Result<(), FeedError> {
+        let taken = if in_entry {
+            self.item
+                .as_ref()
+                .is_none_or(|builder| builder.item.link.is_some())
+        } else {
+            self.feed.site_link.is_some()
+        };
+        if taken {
+            return Ok(());
+        }
+        if candidate.href_undecodable {
+            if !in_entry {
+                return Err(undecodable_feed_identity());
+            }
+            self.reject_identity();
+            return Ok(());
+        }
+        let url = candidate
+            .href
+            .as_deref()
+            .and_then(|href| resolved_url(Some(base), href));
+        if in_entry {
+            if let Some(builder) = self.item.as_mut() {
+                set_once(&mut builder.item.link, url);
+            }
+        } else {
+            set_once(&mut self.feed.site_link, url);
+        }
         Ok(())
     }
 
+    /// The frame character content belongs to: the innermost open element,
+    /// unless an Atom `xhtml` title is gathering its descendants' text (§4.8).
+    fn text_frame(&mut self) -> Option<&mut Frame> {
+        match self.xhtml_title {
+            Some(index) => self.stack.get_mut(index),
+            None => self.stack.last_mut(),
+        }
+    }
+
     fn push_text(&mut self, text: &str) {
-        if let Some(frame) = self.stack.last_mut()
+        if let Some(frame) = self.text_frame()
             && frame.collect
         {
             frame.text.push_str(text);
@@ -528,7 +729,7 @@ impl<'a> Walker<'a> {
         } else {
             resolve_predefined_entity(reference).map(String::from)
         };
-        let Some(frame) = self.stack.last_mut() else {
+        let Some(frame) = self.text_frame() else {
             return;
         };
         match resolved {
@@ -555,6 +756,18 @@ impl<'a> Walker<'a> {
         let Some(frame) = self.stack.pop() else {
             return Err(malformed("end tag without a matching start tag"));
         };
+        // Inside an Atom `xhtml` title the markup is dropped and only the text
+        // nodes survive, already gathered on the title's own frame (§4.8).
+        // Whitespace at a markup boundary is one of those text nodes, so it
+        // survives too.
+        if let Some(index) = self.xhtml_title {
+            if index < self.stack.len() {
+                return Ok(());
+            }
+            // This *is* the title, so the gathering is over and the frame goes
+            // on to be mapped like any other.
+            self.xhtml_title = None;
+        }
         let Frame {
             namespace,
             local,
@@ -563,28 +776,28 @@ impl<'a> Walker<'a> {
             unknown_entity,
             ..
         } = frame;
-        let parent = context(&self.stack);
+        let parent = context(self.format, &self.stack);
         if parent == Context::Document {
             self.root_closed = true;
         }
 
         match (parent, namespace.as_deref(), local.as_str()) {
-            (Context::Channel, None, "title") => {
+            (Context::RssChannel, None, "title") | (Context::AtomFeed, Some(ATOM_NS), "title") => {
                 set_once(&mut self.feed.title, trimmed(&text));
             }
-            (Context::Channel, None, "link") => {
+            (Context::RssChannel, None, "link") => {
                 if unknown_entity {
-                    self.warnings.push(ParseWarning {
-                        item: None,
-                        kind: WarningKind::UnknownIdentityEntity,
-                    });
-                } else {
-                    let base = base.clone().unwrap_or_else(|| self.base().clone());
-                    set_once(&mut self.feed.site_link, resolved_url(Some(&base), &text));
+                    // A feed-level identity field has no enclosing item to
+                    // skip, so the only tier left is the document (§4.6).
+                    return Err(undecodable_feed_identity());
                 }
+                let base = base.clone().unwrap_or_else(|| self.base().clone());
+                set_once(&mut self.feed.site_link, resolved_url(Some(&base), &text));
             }
-            (Context::Channel, None, "item") => self.finish_item(),
-            (Context::Item, None, "guid") => {
+            (Context::RssChannel, None, "item") | (Context::AtomFeed, Some(ATOM_NS), "entry") => {
+                self.finish_item();
+            }
+            (Context::RssItem, None, "guid") | (Context::AtomEntry, Some(ATOM_NS), "id") => {
                 if unknown_entity {
                     self.reject_identity();
                 } else if let Some(builder) = self.item.as_mut() {
@@ -594,12 +807,12 @@ impl<'a> Walker<'a> {
                     set_once(&mut builder.item.guid, Some(text));
                 }
             }
-            (Context::Item, None, "title") => {
+            (Context::RssItem, None, "title") | (Context::AtomEntry, Some(ATOM_NS), "title") => {
                 if let Some(builder) = self.item.as_mut() {
                     set_once(&mut builder.item.title, trimmed(&text));
                 }
             }
-            (Context::Item, None, "link") => {
+            (Context::RssItem, None, "link") => {
                 if unknown_entity {
                     self.reject_identity();
                 } else {
@@ -610,7 +823,7 @@ impl<'a> Walker<'a> {
                     }
                 }
             }
-            (Context::Item, None, "pubDate") => {
+            (Context::RssItem, None, "pubDate") => {
                 let parsed = parse_rfc2822(&text);
                 let missing = self
                     .item
@@ -623,7 +836,20 @@ impl<'a> Walker<'a> {
                     set_once(&mut builder.item.published, parsed);
                 }
             }
-            (Context::Item, Some(ITUNES_NS), "duration") => {
+            // Atom's two timestamps are resolved together when the entry
+            // closes, because `published` outranks `updated` whichever came
+            // first in the document.
+            (Context::AtomEntry, Some(ATOM_NS), "published") => {
+                if let Some(builder) = self.item.as_mut() {
+                    set_once(&mut builder.published_text, Some(text));
+                }
+            }
+            (Context::AtomEntry, Some(ATOM_NS), "updated") => {
+                if let Some(builder) = self.item.as_mut() {
+                    set_once(&mut builder.updated_text, Some(text));
+                }
+            }
+            (Context::RssItem | Context::AtomEntry, Some(ITUNES_NS), "duration") => {
                 if let Some(builder) = self.item.as_mut() {
                     set_once(&mut builder.item.declared_duration, parse_duration(&text));
                 }
@@ -641,9 +867,26 @@ impl<'a> Walker<'a> {
     }
 
     fn finish_item(&mut self) {
-        let Some(builder) = self.item.take() else {
+        let Some(mut builder) = self.item.take() else {
             return;
         };
+        // `published`, else `updated` (§4.3). A `published` that will not parse
+        // stays `None` — it is still the element that answers the question, so
+        // `updated` does not get a second turn.
+        if let Some(text) = builder
+            .published_text
+            .as_deref()
+            .or(builder.updated_text.as_deref())
+        {
+            let parsed = parse_rfc3339(text);
+            if parsed.is_none() && !text.trim().is_empty() {
+                self.warnings.push(ParseWarning {
+                    item: Some(self.ordinal),
+                    kind: WarningKind::InvalidDate,
+                });
+            }
+            builder.item.published = parsed;
+        }
         if builder.enclosure_count > 1 {
             self.warnings.push(ParseWarning {
                 item: Some(self.ordinal),
@@ -667,7 +910,16 @@ impl<'a> Walker<'a> {
         if !self.stack.is_empty() {
             return Err(malformed("document ended with elements still open"));
         }
-        if !self.root_closed || !self.saw_channel {
+        // RSS keeps its items one level down, so an `<rss>` with no
+        // `<channel>` is a document this parser has nothing to say about.
+        // Atom's `<feed>` *is* the container, and an empty one is a valid,
+        // itemless feed (§4.2, §4.6).
+        let complete = match self.format {
+            Some(Format::Rss) => self.saw_channel,
+            Some(Format::Atom) => true,
+            None => false,
+        };
+        if !self.root_closed || !complete {
             return Err(FeedError::UnsupportedFormat);
         }
         Ok(ParseReport {
@@ -728,6 +980,35 @@ fn trimmed(text: &str) -> Option<String> {
 
 fn parse_rfc2822(value: &str) -> Option<OffsetDateTime> {
     OffsetDateTime::parse(value.trim(), &Rfc2822).ok()
+}
+
+fn parse_rfc3339(value: &str) -> Option<OffsetDateTime> {
+    OffsetDateTime::parse(value.trim(), &Rfc3339).ok()
+}
+
+/// Whether an Atom `title` declares `type="xhtml"`, the one value that changes
+/// how the title's text is gathered.
+///
+/// An absent `type` is `text` (RFC 4287 §3.1.1), and `text` and `html` are
+/// both simply the element's character content — `html`'s markup stays literal
+/// because decoding it properly needs an HTML parser this project is not
+/// adding (§4.8). Anything unrecognized is treated as `text`, which is the
+/// reading that shows the feed's own characters rather than inventing
+/// structure for them.
+fn is_xhtml_title(element: &BytesStart<'_>, version: XmlVersion) -> bool {
+    element.attributes().flatten().any(|attribute| {
+        attribute.key.as_ref() == "type"
+            && normalized(&attribute, version).is_some_and(|value| value.trim() == "xhtml")
+    })
+}
+
+/// A feed-level identity field that will not decode.
+///
+/// The item tier is unavailable — there is no enclosing item to skip — so the
+/// only tier left is the document (§4.6). The detail names the category and
+/// never the field's bytes: a URL is exactly what a log must not repeat.
+fn undecodable_feed_identity() -> FeedError {
+    malformed("a feed-level link contains an entity that cannot be resolved")
 }
 
 /// Resolves `value` against `base`, or parses it as absolute when there is no

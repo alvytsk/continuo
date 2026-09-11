@@ -1,0 +1,10 @@
+<?xml version="1.0"?>
+<rss version="2.0">
+  <channel>
+    <title><![CDATA[A &amp; B]]></title>
+    <item>
+      <guid>cdata</guid>
+      <title><![CDATA[Part &amp; parcel]]> &amp; more</title>
+    </item>
+  </channel>
+</rss>

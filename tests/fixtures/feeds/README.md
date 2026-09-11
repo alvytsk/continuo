@@ -3,9 +3,12 @@
 Self-generated, no third-party content. Every file here is **readable UTF-8**,
 on purpose.
 
-## Why so few files
+## Why the encoding matrix is not here
 
-The encoding matrix (§4.1) is exercised from `tests/m4_feed_parse.rs`, which
+Spec §8.1 names `latin1-declared`, `utf16le-bom`, `utf16be-bom`,
+`utf16le-declared-no-bom`, `bom-utf8`, `utf8-invalid-bytes`,
+`encoding-unknown-label` and `decl-malformed-encoding-attr`. None of them is a
+file. The encoding matrix (§4.1) is exercised from `tests/m4_feed_parse.rs`, which
 builds each variant's bytes in the test itself: `utf16(..)` encodes a UTF-16
 document with or without a byte-order mark, and `splice(..)` drops a raw byte
 into an ASCII document. That is deliberate. A file committed as UTF-8 while
@@ -14,9 +17,13 @@ happens to be legible in an editor — and the one thing these tests must prove
 is that the bytes on the wire decide. Generating the bytes also keeps a
 runtime fixture-generation dependency out of the tree.
 
-So what lives here is the RSS the decoder is not the point of.
+So what lives here is every fixture the decoder is not the point of: the
+RSS 2.0 and Atom 1.0 mappings, `xml:base`, entities, and the two documents
+that must be refused outright.
 
-## `rss2-minimal.xml`
+## RSS 2.0
+
+### `rss2-minimal.xml`
 
 One channel, one item, exercising the whole RSS 2.0 mapping at once: a title
 carrying `&amp;`, a `guid` whose surrounding whitespace is load-bearing (it is
@@ -24,7 +31,114 @@ stored exactly as decoded and never trimmed), a **relative** `enclosure@url`
 that has to resolve against the retrieval URL, an RFC 2822 `pubDate`, and an
 `itunes:duration` in `HH:MM:SS` form.
 
-## `decl-without-encoding.xml`
+### `xml-base-relative.xml`
+
+Three `xml:base` attributes nested inside one another — on `rss`, on `channel`,
+on the first `item` — so that resolving `one.mp3` has to walk all three. The
+second item sets none, which is the half that is easy to get wrong: popping the
+first item's frame has to put the *channel's* base back in force rather than
+leave the sibling's behind.
+
+### `cdata-title.xml`
+
+A CDATA title beside a reference in ordinary text. `<![CDATA[A &amp; B]]>`
+displays `A &amp; B` — CDATA is already literal, and unescaping the assembled
+field a second time would silently rewrite it — while the `&amp;` standing
+outside the CDATA in the item title still decodes to `&`.
+
+### `unknown-entity-in-title.xml`
+
+`&nbsp;` is not an XML entity and this parser has no HTML entity table (§4.8).
+In a title it therefore survives as the literal text `&nbsp;`, while a standard
+`&amp;` in the same string still decodes. Nothing is skipped and nothing is
+warned about: a title is display-only.
+
+### `unknown-entity-in-guid.xml`
+
+The same entity in the same document, in a `guid` instead. An identity that
+cannot be decoded consistently is not an identity, so that item is skipped and
+counted — and the valid items on either side of it are kept, which is the point
+of the item tier existing at all (§4.6).
+
+### `itunes-duration-forms.xml`
+
+`1:02:03`, `62:03` and `3723` are all 3,723 seconds: `MM:SS` minutes may exceed
+59, because a 90-minute episode written `90:00` is a real thing feeds do. `1:60`
+(a seconds field that is not a seconds field), a negative, and a value that
+overflows `u64` are all `None`.
+
+### `enclosure-malformed-with-guid.xml`
+
+An `enclosure@url` that will not parse at all. The enclosure is discarded with a
+warning and the item stays, because its `guid` still answers the identity
+question (§4.5).
+
+### `enclosure-scheme-unsupported.xml`
+
+`file:`, `data:` and `ftp:` enclosures, then an `https:` one. Only `http(s)`
+is a playback source; the other three resolve perfectly well as URLs and are
+discarded anyway.
+
+### `multiple-enclosures.xml`
+
+Four enclosures on one item: an unusable scheme, the winner, and two more. The
+first *usable* one in document order wins, and the warning counts the three
+that lost — including the one that was never usable (§4.7).
+
+## Atom 1.0
+
+### `atom-minimal.xml`
+
+The whole Atom mapping at once, with the namespace behind the prefix `a` to
+prove the prefix is immaterial: a relative `xml:base` on `feed` that resolves
+against the retrieval URL, a second one on `entry` that nests inside it, an
+`id` whose surrounding whitespace is load-bearing, an xhtml title, a
+`link[rel=enclosure]` with `@length` and `@type`, an RFC 3339 `published`, and
+a feed-level `link` with no `rel` at all — which is an `alternate`, and so the
+site link.
+
+### `atom-title-types.xml`
+
+The three values of `title@type` (§4.8), plus an absent one, which is `text`.
+`text` is character content; `html` is decoded and then kept literally, markup
+and all, because reading it properly needs an HTML parser this project is not
+adding; `xhtml` is the concatenated descendant text of the wrapper `<div>`,
+with the markup dropped and the whitespace at each markup boundary kept.
+
+### `atom-link-no-rel.xml`
+
+`link` with no `rel` is `alternate` (RFC 4287 §4.2.7.2), applied before any
+selection. Neither entry has an `id` or an enclosure, so that rel-less link is
+the only identity either one has. The second entry also shows a `related` link
+being passed over and the first alternate beating a later one.
+
+## Refused outright
+
+### `rss1-rdf.xml`
+
+RSS 1.0. Refused by name — `FeedError::UnsupportedFormat` — rather than
+half-parsed: it is rare for podcasts, and pretending to support it is worse
+than saying no (§4.2).
+
+### `truncated-xml.xml`
+
+A document that stops mid-element, after one complete and perfectly usable
+item. A truncated document is a feed-level fault, and the tier it lands in is
+not negotiated by how much of it happened to parse (§4.6). Committed without a
+trailing newline, on purpose.
+
+## Unicode
+
+### `cyrillic-title.xml`
+
+A Cyrillic channel title with guillemets and an em dash, a Cyrillic item title,
+and a `guid` with Cyrillic in it. All three are preserved verbatim: the parser
+does not transliterate, case-fold or normalize. Deriving an ASCII slug from a
+title like this is the subscription layer's problem (§2.5).
+
+## Declarations
+
+### `decl-without-encoding.xml`
 
 `<?xml version="1.0"?>` — a declaration with no `encoding` attribute, which is
 the case §4.1 warns about: `BytesDecl::encoder()` answers `None` for it, the
@@ -33,7 +147,7 @@ alike would refuse a perfectly ordinary feed. The Cyrillic title and item
 title are there so the file also proves the UTF-8 default actually decoded,
 rather than merely not failing.
 
-## The supported declaration bound
+### The supported declaration bound
 
 `quick_xml::encoding::DecodingReader` reads 64 source bytes ahead — three
 fewer after a UTF-8 BOM — so that `set_encoding` can still be called once the

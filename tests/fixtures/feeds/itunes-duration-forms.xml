@@ -1,0 +1,12 @@
+<?xml version="1.0"?>
+<rss version="2.0" xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd">
+  <channel>
+    <title>Durations</title>
+    <item><guid>hh-mm-ss</guid><itunes:duration>1:02:03</itunes:duration></item>
+    <item><guid>mm-ss</guid><itunes:duration>62:03</itunes:duration></item>
+    <item><guid>seconds</guid><itunes:duration>3723</itunes:duration></item>
+    <item><guid>out-of-range</guid><itunes:duration>1:60</itunes:duration></item>
+    <item><guid>negative</guid><itunes:duration>-3723</itunes:duration></item>
+    <item><guid>overflow</guid><itunes:duration>18446744073709551615:00:00</itunes:duration></item>
+  </channel>
+</rss>

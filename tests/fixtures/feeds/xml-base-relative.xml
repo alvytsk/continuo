@@ -1,0 +1,15 @@
+<?xml version="1.0"?>
+<rss version="2.0" xml:base="/media/">
+  <channel xml:base="season-1/">
+    <title>Bases</title>
+    <link>index.html</link>
+    <item xml:base="bonus/">
+      <guid>nested</guid>
+      <enclosure url="one.mp3"/>
+    </item>
+    <item>
+      <guid>sibling</guid>
+      <enclosure url="two.mp3"/>
+    </item>
+  </channel>
+</rss>

@@ -1,0 +1,9 @@
+<a:feed xmlns:a="http://www.w3.org/2005/Atom" xml:base="../podcasts/">
+  <a:title>Example</a:title><a:link href="./"/>
+  <a:entry xml:base="season/">
+    <a:id>  stable&amp;id  </a:id>
+    <a:title type="xhtml"><div xmlns="http://www.w3.org/1999/xhtml">Hello <b>world</b></div></a:title>
+    <a:link rel="enclosure" href="one.mp3" length="42" type="audio/mpeg"/>
+    <a:published>2026-09-06T18:00:00Z</a:published>
+  </a:entry>
+</a:feed>

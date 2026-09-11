@@ -1,0 +1,9 @@
+<?xml version="1.0"?>
+<rss version="2.0">
+  <channel>
+    <title>Identities</title>
+    <item><guid>before</guid></item>
+    <item><guid>bad&nbsp;guid</guid><title>Dropped</title></item>
+    <item><guid>after</guid></item>
+  </channel>
+</rss>

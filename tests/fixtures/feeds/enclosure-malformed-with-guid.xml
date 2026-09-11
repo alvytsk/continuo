@@ -1,0 +1,11 @@
+<?xml version="1.0"?>
+<rss version="2.0">
+  <channel>
+    <title>Malformed enclosure</title>
+    <item>
+      <guid>urn:example:kept</guid>
+      <title>Still listed</title>
+      <enclosure url="http://[not-a-host/one.mp3" length="42" type="audio/mpeg"/>
+    </item>
+  </channel>
+</rss>
