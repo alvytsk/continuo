@@ -23,6 +23,23 @@
 //! `unsubscribe` writes the subscription before deleting the cache, so a
 //! crash between the two steps is always recoverable and always reported
 //! (never a bare bool — [`FollowupFailure`] carries the cause).
+//!
+//! Task 13 adds [`refresh`] and [`refresh_all`], completing the application
+//! layer. `refresh` fetches unconditionally when the cache is missing,
+//! corrupt or `parser_version`-mismatched, and conditionally otherwise
+//! (§5.4); a 304 preserves the cached episodes, `fetched_from`,
+//! `last_fetched_at` and skipped count, merging only the validators and
+//! advancing `last_refreshed_at` (§3.3, §5.2). The cache commits before any
+//! subscription update, and `subscriptions.json` is rewritten only when the
+//! reconciled title or `fetch_url` actually differs from what is already
+//! stored (§5.1, §5.3) — the private `refresh_work` does the per-feed work
+//! and returns `Err` only for a failure that precedes any commit;
+//! `refresh_one` turns that `Err` into `RefreshOutcome::Failed` with the
+//! slug already known, so a per-feed failure is never swallowed and an
+//! enumeration failure never has to invent one. `refresh_all` walks its
+//! loaded snapshot strictly sequentially, threading the same
+//! `&mut SubscriptionSnapshot` through every feed so that a later feed can
+//! never silently commit an earlier feed's failed subscription update.
 
 use std::collections::BTreeSet;
 use std::num::NonZeroUsize;
@@ -607,4 +624,228 @@ pub fn unsubscribe(
         slug: slug.to_owned(),
         followup,
     })
+}
+
+/// `continuo refresh [<slug>]`'s result (§6.1, §6.6).
+#[derive(Debug)]
+pub enum RefreshOutcome {
+    /// A 304. The cache was revalidated; a permanent redirect may still
+    /// need committing.
+    Unchanged {
+        slug: String,
+        url_moved: Option<String>,
+        followup: Option<FollowupFailure>,
+    },
+    /// A 200 that parsed and was cached. An identical body still reports
+    /// this: §5.2 keeps no fingerprint, so M4 promises fetch status, never
+    /// content hashing.
+    Updated {
+        slug: String,
+        retained: usize,
+        skipped: usize,
+        url_moved: Option<String>,
+        followup: Option<FollowupFailure>,
+    },
+    /// Nothing committed: the fetch, the parse, or the cache write failed.
+    Failed { slug: String, error: FeedError },
+}
+
+/// The per-feed work behind both [`refresh`] and [`refresh_all`] (§5.3,
+/// §5.4, §6.6). Returns `Err` only for a failure that precedes any commit —
+/// reading a cache that failed for a reason other than "no usable
+/// representation yet", or the fetch itself — so [`refresh_one`] can turn it
+/// into a [`RefreshOutcome::Failed`] without inventing anything.
+///
+/// Cache-state selection (§5.4): a missing, corrupt or parser-mismatched
+/// cache is treated as "nothing to revalidate against" and forces an
+/// unconditional fetch, rather than propagating that error — the whole
+/// point of an unconditional refresh is to recover from exactly those
+/// states. Any other cache read failure (a filesystem fault) is not
+/// something a refetch can fix and is propagated as-is.
+///
+/// A 200 parses with *that* response's `final_url`, binds using the
+/// subscription's existing `feed_id` (never a new one) and stamps both
+/// timestamps from `subs.now()`. A 304 requires the old cache — the
+/// transport layer already rejects an unsolicited 304 when no conditional
+/// header was sent at all, but a 304 answered despite the cache being
+/// unusable here reaches this function with `old: None`, and is rejected
+/// the same way rather than fabricating a `CachedFeed` from nothing.
+///
+/// The cache save happens before any subscription reconciliation, and its
+/// failure returns `Err` here without touching `snapshot` at all (§5.3).
+/// The reconciled title and `fetch_url` — "the cached title and
+/// `permanent_url`, if any" — are compared against the subscription's
+/// current fields; if neither differs, `subscriptions.json` is not
+/// rewritten at all. If either does, the batch's `snapshot` is updated only
+/// after `subs.save` itself succeeds, so a later feed in the same batch can
+/// never build on top of a subscription update that did not actually land.
+async fn refresh_work(
+    http: &HttpService,
+    subs: &SubscriptionStore,
+    cache: &CacheStore,
+    snapshot: &mut SubscriptionSnapshot,
+    index: usize,
+) -> Result<RefreshOutcome, FeedError> {
+    let subscription = snapshot.subscriptions[index].clone();
+
+    let old = match cache.read(&subscription) {
+        Ok(feed) => Some(feed),
+        Err(
+            FeedError::CacheMissing { .. }
+            | FeedError::CacheCorrupt { .. }
+            | FeedError::CacheParserMismatch { .. },
+        ) => None,
+        Err(error) => return Err(error),
+    };
+
+    let fetched = http
+        .fetch_document(DocumentRequest {
+            origin: subscription.fetch_url.clone(),
+            validators: old.as_ref().map(|feed| feed.validators.clone()),
+        })
+        .await?;
+
+    let now = subs.now();
+    let (cached, permanent_url, freshly_parsed) = match fetched {
+        DocumentOutcome::Fetched {
+            bytes,
+            final_url,
+            permanent_url,
+            validators,
+            ..
+        } => {
+            let parsed = parse_feed(&bytes, &final_url)?;
+            let bound = bind_feed(&subscription.feed_id, parsed);
+            log_bound_warnings(&subscription.slug, &bound.warnings);
+            let cached =
+                CachedFeed::from_bound(&subscription.feed_id, bound, final_url, validators, now);
+            (cached, permanent_url, true)
+        }
+        DocumentOutcome::Unchanged {
+            permanent_url,
+            validators,
+            ..
+        } => {
+            // §3.3/§5.4: the transport layer already rejects a 304 sent
+            // without a matching conditional header; this also rejects one
+            // that arrives when this layer had no usable cache to
+            // revalidate against, rather than fabricating a `CachedFeed`.
+            let Some(mut cached) = old else {
+                return Err(RemoteFailure::UnsolicitedNotModified.into());
+            };
+            cached.validators = validators;
+            cached.last_refreshed_at = now;
+            (cached, permanent_url, false)
+        }
+    };
+
+    // Commit seam (§5.3): the cache lands first. Its failure returns here
+    // without touching `snapshot`, leaving the durable subscription exactly
+    // as it was.
+    cache.save(&subscription, &cached)?;
+
+    let mut updated_subscription = subscription.clone();
+    updated_subscription.title = cached.title.clone();
+    if let Some(permanent) = &permanent_url {
+        updated_subscription.fetch_url = permanent.clone();
+    }
+    let url_moved = permanent_url.as_ref().map(|url| redact_url(url.as_str()));
+    let changed = updated_subscription.title != subscription.title
+        || updated_subscription.fetch_url != subscription.fetch_url;
+
+    let followup = if changed {
+        let mut candidate = snapshot.clone();
+        candidate.subscriptions[index] = updated_subscription;
+        match subs.save(&candidate) {
+            Ok(()) => {
+                *snapshot = candidate;
+                None
+            }
+            Err(error) => Some(FollowupFailure {
+                step: FollowupStep::SaveSubscription,
+                error,
+            }),
+        }
+    } else {
+        None
+    };
+
+    let slug = subscription.slug;
+    Ok(if freshly_parsed {
+        RefreshOutcome::Updated {
+            slug,
+            retained: cached.episodes.len(),
+            skipped: cached.skipped_items,
+            url_moved,
+            followup,
+        }
+    } else {
+        RefreshOutcome::Unchanged {
+            slug,
+            url_moved,
+            followup,
+        }
+    })
+}
+
+/// Converts [`refresh_work`]'s precommit `Err` into
+/// [`RefreshOutcome::Failed`] with the slug already known — never an
+/// invented one — so a per-feed failure is reported rather than aborting
+/// the whole batch (§6.6).
+async fn refresh_one(
+    http: &HttpService,
+    subs: &SubscriptionStore,
+    cache: &CacheStore,
+    snapshot: &mut SubscriptionSnapshot,
+    index: usize,
+) -> RefreshOutcome {
+    let slug = snapshot.subscriptions[index].slug.clone();
+    match refresh_work(http, subs, cache, snapshot, index).await {
+        Ok(outcome) => outcome,
+        Err(error) => RefreshOutcome::Failed { slug, error },
+    }
+}
+
+/// `continuo refresh <slug>` (§6.1, §6.6). Loads the subscription snapshot
+/// once, resolves `slug` to its index — reusing [`find_subscription`] for
+/// the same `UnknownSlug` presentation every other single-feed lookup in
+/// this file uses — and returns [`refresh_one`]'s outcome for it.
+pub async fn refresh(
+    http: &HttpService,
+    subs: &SubscriptionStore,
+    cache: &CacheStore,
+    slug: &str,
+) -> Result<RefreshOutcome, FeedError> {
+    let mut snapshot = load_mutating(subs)?;
+    let subscription = find_subscription(&snapshot, slug)?;
+    let index = snapshot
+        .subscriptions
+        .iter()
+        .position(|entry| entry.feed_id == subscription.feed_id)
+        .ok_or_else(|| FeedError::UnknownSlug {
+            slug: slug.to_string(),
+        })?;
+    Ok(refresh_one(http, subs, cache, &mut snapshot, index).await)
+}
+
+/// `continuo refresh` with no slug (§6.1, §6.6). Executes strictly
+/// sequentially — no lock, no background task, no retries on a generic
+/// network failure — for deterministic outcomes and bounded resource use.
+///
+/// The outer `Result` is reserved for a failure that prevents enumeration
+/// itself: an unreadable `subscriptions.json` yields no slug to attach a
+/// per-feed outcome to. Once enumeration succeeds, every per-feed result —
+/// success or failure — travels in the returned vector; an empty valid
+/// snapshot returns an empty, successful batch.
+pub async fn refresh_all(
+    http: &HttpService,
+    subs: &SubscriptionStore,
+    cache: &CacheStore,
+) -> Result<Vec<RefreshOutcome>, FeedError> {
+    let mut snapshot = load_mutating(subs)?;
+    let mut results = Vec::with_capacity(snapshot.subscriptions.len());
+    for index in 0..snapshot.subscriptions.len() {
+        results.push(refresh_one(http, subs, cache, &mut snapshot, index).await);
+    }
+    Ok(results)
 }
