@@ -67,6 +67,22 @@ const PREFIX_CAP: u64 = 64;
 /// window, shortening the window by exactly this many bytes.
 const UTF8_BOM: [u8; 3] = [0xEF, 0xBB, 0xBF];
 
+/// The deepest an open-element stack is allowed to get before [`Walker::open`]
+/// refuses to push another [`Frame`].
+///
+/// [`Limits::document_bytes`](crate::http::limits::Limits::document_bytes) bounds the
+/// *input*, not the *work* the walker does per byte, and the two are not
+/// proportional: `<a><a><a>…` costs three source bytes per nested element,
+/// so an 8 MiB document of nothing else opens roughly 2.8 million frames.
+/// Each `Frame` is on the order of 150–160 bytes plus a heap allocation for
+/// `local`, so that document would hold a `Vec<Frame>` north of half a
+/// gigabyte — with a transient peak near double that while the vector grows
+/// — before any typed error could fire. The parse is iterative rather than
+/// recursive, so unbounded depth costs heap, not stack: a slow OOM kill
+/// instead of a refusal. No legitimate RSS or Atom document nests past
+/// single digits, so 256 is generous headroom, not a tight fit.
+const MAX_NESTING_DEPTH: usize = 256;
+
 /// The outcome of parsing one feed document.
 ///
 /// `skipped` counts **parse-stage** item rejection only — an item whose
@@ -100,7 +116,9 @@ pub struct ParseWarning {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WarningKind {
     /// An identity field contained an entity reference this parser cannot
-    /// resolve, so the item was rejected (§4.8).
+    /// resolve (§4.8): for an item- or entry-level field the item is
+    /// rejected, and for a feed-level field (`item: None`) the field is
+    /// merely dropped and the document stands.
     UnknownIdentityEntity,
     /// A publication date would not parse. The item stays, with
     /// `published: None` (§4.6).
@@ -183,6 +201,32 @@ pub fn parse_feed(bytes: &[u8], retrieval_url: &Url) -> Result<ParseReport, Feed
     walker.finish()
 }
 
+/// Makes an XML declaration's raw `encoding` label safe to place in
+/// [`FeedError::UnsupportedEncoding`].
+///
+/// `BytesDecl::encoding()` returns the attribute's bytes decoded but
+/// otherwise unvalidated — quick-xml does not enforce XML 1.0's `Char`
+/// production here, so a feed can put a control character, including an
+/// ANSI escape (ESC, 0x1B), into this string. That string reaches a
+/// terminal or a log line from more than one place — `main.rs` prints
+/// `{error}`, `commands.rs` prints it in a refresh summary, and `tracing`
+/// records it — and none of those call sites goes through a shared escaping
+/// boundary. Sanitizing has to happen here, at construction, rather than at
+/// any one of those formatters.
+///
+/// ASCII graphic characters are the only ones let through: it is a
+/// declaration label, not free text, so there is nothing lost by refusing
+/// whitespace, control characters and non-ASCII here that a genuine
+/// character-set name would ever need. The length cap is generous for a
+/// label and stops a pathological declaration from ballooning the message.
+fn sanitize_declaration_label(label: &str) -> String {
+    label
+        .chars()
+        .filter(char::is_ascii_graphic)
+        .take(64)
+        .collect()
+}
+
 /// Honors the XML declaration's `encoding` attribute, if any (§4.1).
 ///
 /// The declaration is inspected with [`BytesDecl::encoding`] rather than
@@ -217,7 +261,9 @@ fn apply_declaration(
         Some(Ok(label)) => {
             let label = label.into_owned();
             let Some(encoding) = declaration.encoder() else {
-                return Err(FeedError::UnsupportedEncoding { label });
+                return Err(FeedError::UnsupportedEncoding {
+                    label: sanitize_declaration_label(&label),
+                });
             };
             // Already decoding as the declared encoding — either it was
             // detected, or the label is a synonym for it. `set_encoding` would
@@ -455,6 +501,9 @@ impl<'a> Walker<'a> {
         reader: &NsReader<DecodingReader<&[u8]>>,
         element: &BytesStart<'_>,
     ) -> Result<(), FeedError> {
+        if self.stack.len() >= MAX_NESTING_DEPTH {
+            return Err(malformed("document is nested too deeply"));
+        }
         let (namespace, local) = expanded(reader, element.name())?;
         let parent = context(self.format, &self.stack);
 

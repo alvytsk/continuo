@@ -106,9 +106,8 @@ pub enum RemoteFailure {
     /// but the running total while streaming is the authority.
     #[error("feed document exceeds {limit} bytes")]
     DocumentTooLarge { limit: usize },
-    /// §3.3: a 304 arrived when no conditional header was ever sent (M4
-    /// sends none yet) or when the cache backing the conditional request was
-    /// missing or corrupt.
+    /// §3.3: a 304 arrived when no conditional header was ever sent or when
+    /// the cache backing the conditional request was missing or corrupt.
     #[error("received HTTP 304 without a usable conditional request")]
     UnsolicitedNotModified,
 }

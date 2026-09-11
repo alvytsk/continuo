@@ -184,7 +184,19 @@ fn extension_elements_never_substitute_for_rss_fields() -> Result<(), Box<dyn st
 
 #[test]
 fn deeply_nested_extensions_do_not_exhaust_the_stack() -> Result<(), Box<dyn std::error::Error>> {
-    const DEPTH: usize = 20_000;
+    // This used to nest 20,000 levels deep, back when the walker had no
+    // depth cap at all: the point was that an iterative walker pays no
+    // per-level stack cost, however deep a feed nests. `Walker::open` now
+    // enforces `MAX_NESTING_DEPTH` (256) for an unrelated reason — a `Frame`
+    // is heap-allocated, so unbounded depth is unbounded *heap*, not a stack
+    // overflow — and 20,000 would simply hit that cap and return
+    // `FeedError::Malformed` instead of exercising this test's point. 200
+    // stays comfortably under the cap (rss + channel + x:deep + 200 x:n +
+    // the buried title is 204) while still nesting far deeper than any real
+    // feed does. The cap itself, and that it is a typed error rather than
+    // unbounded memory growth, is
+    // `a_document_nested_past_the_depth_cap_is_refused_not_exhausted` below.
+    const DEPTH: usize = 200;
     let body = format!(
         "<x:deep>{}<title>buried</title>{}</x:deep><title>Real</title><item><guid>g</guid></item>",
         "<x:n>".repeat(DEPTH),
@@ -193,6 +205,25 @@ fn deeply_nested_extensions_do_not_exhaust_the_stack() -> Result<(), Box<dyn std
     let report = parse_feed(rss(&body).as_bytes(), &feed_url())?;
     assert_eq!(report.feed.title.as_deref(), Some("Real"));
     assert_eq!(report.feed.items.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn a_document_nested_past_the_depth_cap_is_refused_not_exhausted()
+-> Result<(), Box<dyn std::error::Error>> {
+    // One past what `deeply_nested_extensions_do_not_exhaust_the_stack`
+    // proves is fine: rss + channel + 300 `x:n` clears `MAX_NESTING_DEPTH`
+    // (256), so the walker must refuse this with a typed error long before
+    // it would ever need to allocate 300 frames, let alone the millions an
+    // attacker-sized document would ask for.
+    const DEPTH: usize = 300;
+    let body = format!("{}{}", "<x:n>".repeat(DEPTH), "</x:n>".repeat(DEPTH));
+    match parse_feed(rss(&body).as_bytes(), &feed_url()) {
+        Err(FeedError::Malformed { detail }) => {
+            assert!(detail.contains("nested"), "{detail}");
+        }
+        other => return Err(format!("expected a nesting-depth Malformed, got {other:?}").into()),
+    }
     Ok(())
 }
 
@@ -501,7 +532,15 @@ fn a_deeply_nested_xhtml_title_does_not_exhaust_the_stack() -> Result<(), Box<dy
     // Markup a feed controls the depth of, with text at every level. A walker
     // that recursed, or that folded each level's text into its parent as it
     // unwound, would pay for that depth; this one does not.
-    const DEPTH: usize = 20_000;
+    //
+    // This used to nest 20,000 `x:b` levels, before `Walker::open` gained
+    // `MAX_NESTING_DEPTH` (256, for the unrelated reason that an unbounded
+    // `Vec<Frame>` is unbounded heap — see
+    // `a_document_nested_past_the_depth_cap_is_refused_not_exhausted` in
+    // `m4_feed_parse.rs`). 200 keeps a:feed + a:entry + a:title + x:div +
+    // 200 x:b at 204, under the cap, while still nesting far deeper than any
+    // real Atom title does.
+    const DEPTH: usize = 200;
     let report = parse_feed(
         atom(&format!(
             "<a:entry><a:id>deep</a:id><a:title type=\"xhtml\">\

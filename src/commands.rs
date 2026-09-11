@@ -237,12 +237,30 @@ fn displayable(text: &str) -> String {
 ///
 /// `char::is_control` alone is not the whole set: U+2028 LINE SEPARATOR and
 /// U+2029 PARAGRAPH SEPARATOR are line breaks that it does not classify as
-/// control characters, and the bidi overrides U+202A–U+202E are not line
-/// breaks at all but can reorder everything rendered after them — including
-/// the columns beside the title. A feed title is untrusted input on its way
-/// to a terminal, so all three groups are escaped rather than displayed.
+/// control characters, and the bidi overrides U+202A–U+202E can reorder
+/// everything rendered after them — including the columns beside the title
+/// — without being line breaks at all. Neither are the bidi **isolates**
+/// U+2066–U+2069 (LRI/RLI/FSI/PDI): they reorder the same way the overrides
+/// do, and are the half of the Trojan Source technique that survives in
+/// modern Unicode, since isolates were added specifically so an override
+/// could not leak its reordering past its own text — the isolate itself
+/// still reorders whatever it wraps. U+200E/U+200F (LRM/RLM) and U+061C
+/// (ALM) are direction marks rather than reordering ranges, but they are
+/// invisible and feed-controlled, so they are escaped alongside the rest
+/// for the same reason. A feed title is untrusted input on its way to a
+/// terminal, so every one of these groups is escaped rather than displayed.
 fn needs_escape(value: char) -> bool {
-    value.is_control() || matches!(value, '\u{2028}' | '\u{2029}' | '\u{202a}'..='\u{202e}')
+    value.is_control()
+        || matches!(
+            value,
+            '\u{200e}'
+                | '\u{200f}'
+                | '\u{061c}'
+                | '\u{2028}'
+                | '\u{2029}'
+                | '\u{202a}'..='\u{202e}'
+                | '\u{2066}'..='\u{2069}'
+        )
 }
 
 /// A title cell. An item with no title at all still has to occupy its
@@ -796,16 +814,19 @@ mod tests {
 
     /// Not every line breaker is a control character, and not every
     /// dangerous character is a line breaker. U+2028 LINE SEPARATOR would
-    /// split a row in a terminal that honors it, and a bidi override
+    /// split a row in a terminal that honors it, a bidi override
     /// (U+202A–U+202E) can reorder everything rendered after it — including
-    /// the columns beside the title — while `char::is_control` classifies
-    /// neither as a control.
+    /// the columns beside the title — and a bidi isolate (U+2066–U+2069) can
+    /// do the same reordering while wrapping only its own contents, which is
+    /// what makes isolates the half of Trojan Source that survives once
+    /// overrides alone are blocked. `char::is_control` classifies none of
+    /// the three as a control.
     #[test]
     fn line_separators_and_bidi_overrides_are_escaped_too() -> Fallible {
         let rows = vec![EpisodeRow {
             index: 1,
             media: media("https://cdn.example.org/a.mp3")?,
-            title: Some("split\u{2028}here\u{202e}reversed".to_string()),
+            title: Some("split\u{2028}here\u{202e}reversed\u{2066}isolated\u{2069}".to_string()),
             published: None,
             declared_duration: None,
             playable: true,
@@ -817,8 +838,10 @@ mod tests {
         assert_eq!(rendered.lines().count(), 2, "{rendered:?}");
         assert!(!rendered.contains('\u{2028}'), "{rendered:?}");
         assert!(!rendered.contains('\u{202e}'), "{rendered:?}");
+        assert!(!rendered.contains('\u{2066}'), "{rendered:?}");
+        assert!(!rendered.contains('\u{2069}'), "{rendered:?}");
         assert!(
-            rendered.contains(r"split\u{2028}here\u{202e}reversed"),
+            rendered.contains(r"split\u{2028}here\u{202e}reversed\u{2066}isolated\u{2069}"),
             "{rendered:?}"
         );
         Ok(())

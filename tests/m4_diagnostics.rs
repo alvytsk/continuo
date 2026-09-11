@@ -518,6 +518,19 @@ fn titles_and_explicit_aliases_are_content_rather_than_transport() -> Fallible {
 /// message that hid it would leave the listener unable to see what their feed
 /// actually claimed. The marker here is a string in a declaration, not a
 /// secret, and it survives on purpose.
+///
+/// §8.5's stated scope — URLs, credentials, query strings — says nothing
+/// about control characters, and that silence used to be a gap: quick-xml
+/// does not enforce XML 1.0's `Char` production on this attribute, so
+/// nothing stopped a feed from putting an ANSI escape (ESC, 0x1B) into the
+/// label and having it printed raw to a terminal via `main.rs`'s `{error}`,
+/// to `commands.rs`'s refresh summary, and to `tracing`'s log line. Because
+/// none of those three call sites shares a formatting boundary,
+/// `feed::parse::sanitize_declaration_label` filters the label to ASCII
+/// graphic characters and bounds its length **at construction**, before it
+/// is ever placed in the field, rather than at any one display site — see
+/// [`a_control_character_in_the_encoding_label_never_reaches_a_terminal`]
+/// below.
 #[test]
 fn an_unsupported_encoding_label_is_echoed_exactly_as_the_feed_wrote_it() -> Fallible {
     let rig = feeds::Rig::new()?;
@@ -556,6 +569,54 @@ fn an_unsupported_encoding_label_is_echoed_exactly_as_the_feed_wrote_it() -> Fal
     Ok(())
 }
 
+/// The gap §8.5 is silent on: a declaration label is content, but content
+/// that can carry a raw ANSI escape is not safe to print unfiltered, and
+/// nothing in `BytesDecl::encoding()` rules that out. This drives a real
+/// `subscribe` against a declaration carrying an ESC byte (0x1B) and checks
+/// both `Display` and `Debug` — redaction has to hold under both — for the
+/// raw control byte.
+#[test]
+fn a_control_character_in_the_encoding_label_never_reaches_a_terminal() -> Fallible {
+    let rig = feeds::Rig::new()?;
+    let server = TestServer::start(Script::serving(
+        b"<?xml version=\"1.0\" encoding=\"x-\x1b[31mPWNED\"?>\
+          <rss version=\"2.0\"><channel><title>T</title></channel></rss>"
+            .to_vec(),
+    ));
+    let service = HttpService::spawn(Limits::brisk())?;
+    let url = server.url("/feed");
+
+    let result = service.handle().block_on(library::subscribe(
+        &service, &rig.subs, &rig.cache, &url, None,
+    ));
+    server.shutdown();
+
+    let error = match result {
+        Err(error) => error,
+        Ok(outcome) => {
+            return Err(format!("an unknown encoding must be refused, got {outcome:?}").into());
+        }
+    };
+    assert!(
+        matches!(error, FeedError::UnsupportedEncoding { .. }),
+        "{error:?}"
+    );
+    assert!(
+        !format!("{error}").contains('\x1b'),
+        "an ESC byte must never reach Display: {error:?}"
+    );
+    assert!(
+        !format!("{error:?}").contains('\x1b'),
+        "an ESC byte must never reach Debug: {error:?}"
+    );
+    // The rest of the label is still visible: sanitizing is not redacting.
+    assert!(
+        format!("{error}").contains("PWNED"),
+        "the printable remainder of the label must still reach the listener: {error}"
+    );
+    Ok(())
+}
+
 // --- The variant table -------------------------------------------------
 
 /// Which constructor supplies each [`FeedError`] variant's context, and why
@@ -566,7 +627,7 @@ fn an_unsupported_encoding_label_is_echoed_exactly_as_the_feed_wrote_it() -> Fal
 /// | Variant | Context | Built by | Why it is safe |
 /// |---|---|---|---|
 /// | `Encoding` | none | `feed::parse` | No payload at all. |
-/// | `UnsupportedEncoding` | `label` | `feed::parse` | Feed-controlled **content**, classified with titles rather than with transport. Nothing narrows it: `src/feed/parse.rs` echoes the label precisely *because* `BytesDecl::encoder()` returned `None` for it, so the value is arbitrary text the feed wrote. It is safe because it is a declaration label rather than a URL, and useful because the listener needs to see what was claimed. |
+/// | `UnsupportedEncoding` | `label` | `feed::parse` | Feed-controlled **content**, classified with titles rather than with transport. `src/feed/parse.rs` echoes the label precisely *because* `BytesDecl::encoder()` returned `None` for it, so the value is arbitrary text the feed wrote — but unlike a title, it never reaches `commands::displayable`'s formatting-boundary escaping, since `main.rs` and `tracing` print it directly. §8.5's scope (URLs, credentials, query strings) says nothing about control characters, and quick-xml does not enforce XML 1.0's `Char` production on this attribute, so the label could otherwise carry a raw ANSI escape. `sanitize_declaration_label` filters it to ASCII graphic characters and bounds its length *at construction*, before the field exists, so it is safe both because it is a declaration label rather than a URL and because it cannot contain a control byte, and useful because the listener still sees what was claimed. |
 /// | `UnsupportedFormat` | none | `feed::parse` | No payload at all. |
 /// | `Malformed` | `detail` | `feed::parse`, `commands` | A fixed phrase or a `quick-xml` position; never a document excerpt (`m4_feed_parse.rs` asserts this). |
 /// | `NotPlayable` | `slug`, `index`, `title` | `library::resolve_episode` | A validated slug, an integer, and a title — content the listener asked to see, escaped at the formatting boundary. |
