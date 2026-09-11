@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 
+use continuo::feed::error::FeedError;
 use continuo::subscription::model::{choose_slug, new_feed_id, validate_feed_id, validate_slug};
 
 #[test]
@@ -109,4 +110,29 @@ fn validate_slug_accepts_and_rejects() -> Result<(), Box<dyn std::error::Error>>
     assert!(validate_slug("Radio-T").is_err());
     assert!(validate_slug("radio_t").is_err());
     Ok(())
+}
+
+/// Pins the placeholder variant `validate_feed_id` returns on failure (R4):
+/// every later caller re-maps this into its own domain error rather than
+/// propagating it, so that re-mapping needs a stable variant to match on.
+#[test]
+fn invalid_feed_id_returns_the_pinned_placeholder_variant() {
+    match validate_feed_id("../../state") {
+        Err(FeedError::SubscriptionsUnreadable { .. }) => {}
+        other => panic!("expected FeedError::SubscriptionsUnreadable, got {other:?}"),
+    }
+}
+
+#[test]
+fn host_that_also_yields_an_empty_base_returns_invalid_slug()
+-> Result<(), Box<dyn std::error::Error>> {
+    // "[::]" (the unspecified IPv6 address, fully abbreviated) has no
+    // ASCII-alphanumeric character at all, so both the title-derived and
+    // the host-fallback base are empty; this must surface as a validation
+    // error rather than panicking or looping forever.
+    let url = url::Url::parse("http://[::]/feed")?;
+    match choose_slug(None, &url, None, &BTreeSet::new()) {
+        Err(FeedError::InvalidSlug { .. }) => Ok(()),
+        other => panic!("expected FeedError::InvalidSlug, got {other:?}"),
+    }
 }

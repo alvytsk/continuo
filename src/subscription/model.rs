@@ -26,9 +26,25 @@ pub struct Subscription {
 /// (§2.3). This is the boundary every id read from `subscriptions.json` or a
 /// cache file path must cross before it is trusted, so a traversal-shaped or
 /// otherwise malformed string can never reach a filesystem path.
+///
+/// **On failure this returns `FeedError::SubscriptionsUnreadable` only as a
+/// placeholder.** §7.2 fixes `FeedError`'s variant list and it has no
+/// dedicated invalid-feed-id variant, so this function borrows the nearest
+/// generic one purely to satisfy its signature. The returned error carries
+/// no meaning beyond "this string failed feed-id validation" — it is
+/// **not** a claim that anything is unreadable, and it is not a stand-in for
+/// a corrupt-file or quarantine outcome either. Every caller MUST catch this
+/// `Err` and re-map it to its own domain-appropriate error (a caller
+/// validating `subscriptions.json` records maps it into that store's own
+/// malformed/quarantine category per §5.6; a caller validating a cache path
+/// maps it into `CacheCorrupt`, and so on). **Do not propagate this error
+/// with `?`**, and never pattern-match on `SubscriptionsUnreadable` to tell
+/// an unreadable file apart from a malformed one — this function's failures
+/// and genuine subscription-file-unreadable failures share the variant by
+/// necessity, not by relatedness, and are otherwise indistinguishable.
 pub fn validate_feed_id(value: &str) -> Result<FeedId, FeedError> {
     let invalid = || FeedError::SubscriptionsUnreadable {
-        reason: format!("invalid feed id {value:?}: expected 32 lowercase hex characters"),
+        reason: format!("feed id {value:?} is not 32 lowercase hex characters"),
     };
     let is_lower_hex = |byte: u8| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte);
     if value.len() != 32 || !value.bytes().all(is_lower_hex) {
