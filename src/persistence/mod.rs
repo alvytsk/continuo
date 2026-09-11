@@ -11,7 +11,12 @@ use std::path::PathBuf;
 
 #[derive(Debug, thiserror::Error)]
 pub enum PersistenceError {
-    #[error("cannot {op} state file {path:?}")]
+    /// Deliberately without the words "state file": M4 broadened this
+    /// variant past `state.json` to `subscriptions.json`, the feed cache and
+    /// stdout, so naming one of the four would misreport the other three.
+    /// `op` and `path` say which together — `cannot read "…/state.json"`,
+    /// `cannot write command output to "<stdout>"`.
+    #[error("cannot {op} {path:?}")]
     Io {
         path: PathBuf,
         op: &'static str,

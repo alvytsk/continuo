@@ -215,11 +215,11 @@ fn date_text(value: OffsetDateTime) -> String {
 /// boundary only**: the cached title and the identity derived from it are
 /// untouched, so nothing here changes what a later refresh compares against.
 /// A newline would break the row layout and an escape sequence would reach
-/// the terminal, so control characters become visible escapes; every other
-/// character — Cyrillic, CJK, emoji — passes through exactly as stored,
-/// since transliterating a title would make it someone else's title.
+/// the terminal, so every character that can do either becomes a visible
+/// escape; all the rest — Cyrillic, CJK, emoji — pass through exactly as
+/// stored, since transliterating a title would make it someone else's title.
 fn displayable(text: &str) -> String {
-    if !text.chars().any(char::is_control) {
+    if !text.chars().any(needs_escape) {
         return text.to_string();
     }
     text.chars()
@@ -227,10 +227,22 @@ fn displayable(text: &str) -> String {
             '\n' => r"\n".to_string(),
             '\r' => r"\r".to_string(),
             '\t' => r"\t".to_string(),
-            other if other.is_control() => format!("\\u{{{:x}}}", other as u32),
+            other if needs_escape(other) => format!("\\u{{{:x}}}", other as u32),
             other => other.to_string(),
         })
         .collect()
+}
+
+/// What a title may not carry into a row.
+///
+/// `char::is_control` alone is not the whole set: U+2028 LINE SEPARATOR and
+/// U+2029 PARAGRAPH SEPARATOR are line breaks that it does not classify as
+/// control characters, and the bidi overrides U+202A–U+202E are not line
+/// breaks at all but can reorder everything rendered after them — including
+/// the columns beside the title. A feed title is untrusted input on its way
+/// to a terminal, so all three groups are escaped rather than displayed.
+fn needs_escape(value: char) -> bool {
+    value.is_control() || matches!(value, '\u{2028}' | '\u{2029}' | '\u{202a}'..='\u{202e}')
 }
 
 /// A title cell. An item with no title at all still has to occupy its
@@ -782,6 +794,36 @@ mod tests {
         Ok(())
     }
 
+    /// Not every line breaker is a control character, and not every
+    /// dangerous character is a line breaker. U+2028 LINE SEPARATOR would
+    /// split a row in a terminal that honors it, and a bidi override
+    /// (U+202A–U+202E) can reorder everything rendered after it — including
+    /// the columns beside the title — while `char::is_control` classifies
+    /// neither as a control.
+    #[test]
+    fn line_separators_and_bidi_overrides_are_escaped_too() -> Fallible {
+        let rows = vec![EpisodeRow {
+            index: 1,
+            media: media("https://cdn.example.org/a.mp3")?,
+            title: Some("split\u{2028}here\u{202e}reversed".to_string()),
+            published: None,
+            declared_duration: None,
+            playable: true,
+            progress: Progress::Played,
+        }];
+        let mut out = Vec::new();
+        write_episodes(&mut out, &rows)?;
+        let rendered = text(out)?;
+        assert_eq!(rendered.lines().count(), 2, "{rendered:?}");
+        assert!(!rendered.contains('\u{2028}'), "{rendered:?}");
+        assert!(!rendered.contains('\u{202e}'), "{rendered:?}");
+        assert!(
+            rendered.contains(r"split\u{2028}here\u{202e}reversed"),
+            "{rendered:?}"
+        );
+        Ok(())
+    }
+
     /// An empty listing is a successful listing: the header still names the
     /// columns, and nothing claims a subscription that is not there. The two
     /// minimum widths hold with no rows to measure, so an empty table starts
@@ -806,6 +848,10 @@ mod tests {
 
     /// A missing publication date is `—`, never today's date and never an
     /// invented one.
+    ///
+    /// The row deliberately carries a progress cell that is *not* `—`: with
+    /// `Progress::None` the same dash appears two columns earlier, and the
+    /// assertion would pass however the published column rendered.
     #[test]
     fn an_undated_episode_prints_an_em_dash() -> Fallible {
         let rows = vec![EpisodeRow {
@@ -815,13 +861,19 @@ mod tests {
             published: None,
             declared_duration: None,
             playable: true,
-            progress: Progress::None,
+            progress: Progress::Played,
         }];
         let mut out = Vec::new();
         write_episodes(&mut out, &rows)?;
         let rendered = text(out)?;
         let row = rendered.lines().nth(1).ok_or("expected one episode row")?;
-        assert!(row.contains("—  "), "{row}");
+        // Split at the progress cell, so the dash can only have come from
+        // the published column.
+        let (before, after) = row
+            .split_once("played")
+            .ok_or("expected the progress cell")?;
+        assert!(!before.contains('—'), "{row}");
+        assert!(after.contains('—'), "{row}");
         Ok(())
     }
 
@@ -1153,6 +1205,14 @@ mod tests {
         let error = write_feeds(&mut Broken, &rows)
             .err()
             .ok_or("a broken writer must not report success")?;
+        // The rendering is pinned, not just the fields (R10): this variant
+        // covers `state.json`, `subscriptions.json`, the feed cache and
+        // stdout, so its message must name what `op` and `path` say and
+        // nothing else.
+        assert_eq!(
+            error.to_string(),
+            "cannot write command output to \"<stdout>\""
+        );
         match error {
             FeedError::Persistence(PersistenceError::Io { path, op, .. }) => {
                 assert_eq!(path, PathBuf::from("<stdout>"));
