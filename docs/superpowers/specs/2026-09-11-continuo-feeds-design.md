@@ -204,9 +204,14 @@ warning. Nothing is invented.
 
 A slug is a presentation alias, never identity. It lives in `subscriptions.json` beside the `FeedId`.
 
-Derivation from the feed title: lowercase, non-alphanumerics collapsed to a single `-`, trimmed of leading and
-trailing `-`, truncated to 32 characters. An empty result falls back to the same transform over the fetch
-URL's host. A derived slug that collides takes the first free `-2`, `-3`, … suffix, with the base truncated so
+Derivation from the feed title is **ASCII-only**, so a generated slug always passes §5.6's own validation:
+ASCII letters are lowercased and kept, ASCII digits are kept, and every other run of characters — punctuation,
+whitespace, **and non-ASCII letters** — collapses to a single `-`. The result is trimmed of leading and
+trailing `-` and truncated to 32 characters.
+
+No transliteration is attempted. A title written entirely in a non-ASCII script therefore yields an empty base
+and falls back to the same transform over the fetch URL's **host**, with a leading `www.` stripped first. That
+fallback can never be empty: `url` stores IDN hosts in punycode, which is ASCII by construction. A derived slug that collides takes the first free `-2`, `-3`, … suffix, with the base truncated so
 the **total stays within 32 ASCII characters**.
 
 An explicit `--as` is validated against `^[a-z0-9-]{1,32}$` and is **rejected** on collision rather than
@@ -315,12 +320,21 @@ Decoding is an explicit layer, never `NsReader` over raw bytes:
 bytes -> quick_xml::encoding::DecodingReader -> NsReader<DecodingReader<&[u8]>>
 ```
 
-`DecodingReader::new` detects the encoding from a BOM or the XML declaration's byte pattern. The first event
-is then read, and if it is `Event::Decl` the declared label is resolved with `e.encoder()`:
+`DecodingReader::new` detects the encoding from a BOM or the XML declaration's byte pattern. The first event is
+then read, and if it is `Event::Decl` the declaration is inspected with **`e.encoding()`**, not `e.encoder()`.
+`encoder()` (`quick-xml-0.42.0/src/events/mod.rs:1509`) chains `encoding()` → `.ok()` → `Encoding::for_label`
+and so collapses three different situations into a single `None`; `encoding()`
+(`.../events/mod.rs:1388`) returns `Option<Result<Cow<str>, AttrError>>` and keeps them apart:
 
-- `Some(enc)` → `reader.get_mut().set_encoding(enc)`, which must happen **before the prefix buffer drains**
-  (the reader asserts this).
-- `None` → `FeedError::UnsupportedEncoding { label }`, refused by name rather than guessed at.
+| `e.encoding()` | Meaning | Action |
+|---|---|---|
+| `None` | no `encoding` attribute, e.g. `<?xml version="1.0"?>` | keep the detected or default encoding; **not** an error |
+| `Some(Err(AttrError))` | the attribute is malformed | `FeedError::Malformed` |
+| `Some(Ok(label))`, `Encoding::for_label` → `Some(enc)` | a recognized label | `reader.get_mut().set_encoding(enc)` |
+| `Some(Ok(label))`, `Encoding::for_label` → `None` | present but unrecognized | `FeedError::UnsupportedEncoding { label }` |
+
+Using `encoder()` would send a perfectly valid `<?xml version="1.0"?>` down the unsupported-encoding path.
+`set_encoding` must happen **before the prefix buffer drains**; the reader asserts this.
 
 `DecodingReader` transcodes with `decode_to_utf8_without_replacement`, so `DecoderResult::Malformed` surfaces
 as `io::ErrorKind::InvalidData` and becomes `FeedError::Encoding`. Strict rejection of malformed bytes is the
@@ -425,12 +439,15 @@ At `ProjectDirs::data_dir()` — `$XDG_DATA_HOME/continuo/subscriptions.json` on
       "feed_id": "9f3c1a7e42b58d0c6f19ab3e5d72c840",
       "slug": "radio-t",
       "title": "Радио-Т",
-      "fetch_url": "https://feeds.example/radio-t",
+      "fetch_url": "https://radio-t.com/rss/",
       "added_at": "2026-09-11T09:14:22Z"
     }
   ]
 }
 ```
+
+The `slug` in this example came from `--as radio-t`. Derivation alone could not produce it: the title is
+entirely non-ASCII, so §2.5's ASCII rule yields an empty base and the host fallback would give `radio-t-com`.
 
 `title` is duplicated here and in the cache deliberately: `feeds` must still name a subscription whose
 cache is missing or corrupt, and the cache is by definition disposable.
@@ -439,11 +456,24 @@ It holds **only durable subscription data** and is written **only when one of it
 subscribe, unsubscribe, a committed permanent redirect, or a changed feed title. An ordinary refresh, 200 or
 304, touches exactly one file: the cache.
 
-Load policy is `StateStore::load`'s, deliberately: unreadable → keep the file and disable writing for the
-session; an unknown `schema_version` → preserve and disable writing; malformed → move aside as
-`subscriptions.json.rejected-<timestamp>`. Two differences, both because this is user-authored data rather
-than derived history: **no entry cap and no eviction**. Silently dropping a subscription to respect a limit
-would be data loss.
+**Reads and recovery are separated, exactly as §5.5 separates them for checkpoints.** `feeds` and `episodes`
+load subscriptions too, so a quarantine-on-malformed policy applied to every load would rename a file during a
+command §8.4 promises changes nothing. The store therefore offers two entry points over one shared decode
+step:
+
+- `SubscriptionStore::read_snapshot()` — used by every read-only command. Never renames, never writes.
+  `Missing` yields an empty set; unreadable, malformed or unsupported yields `Err`, surfaced as a visible
+  error (§6.4).
+- `SubscriptionStore::load()` — used by the mutating commands (`subscribe`, `unsubscribe`, `refresh`). This is
+  where `StateStore::load`'s policy applies: unreadable → keep the file and disable writing for the session;
+  an unknown `schema_version` → preserve and disable writing; malformed → move aside as
+  `subscriptions.json.rejected-<timestamp>`, with the message naming the path it was moved to.
+
+Quarantine is kept for the mutating path rather than a flat refusal because the file is preserved either way,
+and refusing would block all subscription management until the user intervened by hand.
+
+Two differences from `state.json`, both because this is user-authored data rather than derived history: **no
+entry cap and no eviction**. Silently dropping a subscription to respect a limit would be data loss.
 
 Writing is synchronous on the calling thread, not through M2's `WriterHandle`: that thread exists to keep
 filesystem work off the playback path, and no playback path is running during `subscribe` or `refresh`.
@@ -486,7 +516,10 @@ validator can never describe a snapshot other than the one on display.
 }
 ```
 
-`fetched_from` is the `final_url`, and it is the base for relative URLs on the next parse. `media_id` is stored
+`fetched_from` records where the cached representation was actually retrieved — the `final_url` of the
+response that produced it. In the example above it differs from the subscription's `fetch_url`, which is what a
+**temporary** redirect looks like: a permanent one would have moved `fetch_url` too (§3.2). It is **not** the base for a later parse: each new response resolves its own
+relative URLs against **that response's** `final_url` (§4.4). `media_id` is stored
 in canonical string form — `MediaId` already round-trips through `String` via serde — and the §2.2 accessors
 recover the feed and key, so neither is stored twice. The escaping is `MediaId`'s own and is not URL encoding:
 `:` stays literal while `/` becomes `%2F` (`tests/media_id.rs:73`), and a `guid%3A…` spelling is rejected as
@@ -666,7 +699,7 @@ pub async fn subscribe(http: &HttpService, subs: &SubscriptionStore, cache: &Cac
 pub async fn refresh(http: &HttpService, subs: &SubscriptionStore, cache: &CacheStore,
                      slug: &str) -> Result<RefreshOutcome, FeedError>;
 pub async fn refresh_all(http: &HttpService, subs: &SubscriptionStore,
-                         cache: &CacheStore) -> Vec<RefreshOutcome>;
+                         cache: &CacheStore) -> Result<Vec<RefreshOutcome>, FeedError>;
 
 pub fn unsubscribe(subs: &SubscriptionStore, cache: &CacheStore, slug: &str)
     -> Result<UnsubscribeOutcome, FeedError>;
@@ -679,22 +712,53 @@ pub fn resolve_episode(subs: &SubscriptionStore, cache: &CacheStore, slug: &str,
     -> Result<(MediaId, SourceLocation), FeedError>;
 ```
 
+Which subscription entry point each function uses follows from §5.1 and is not optional: the four read-only
+functions call `SubscriptionStore::read_snapshot`, and only `subscribe`, `unsubscribe` and the two `refresh`
+functions call `load`. That is what keeps §8.4's "listings change no files" true.
+
+`refresh_all` returns a `Result` because a `Vec<RefreshOutcome>` has no honest way to report that enumeration
+itself failed: an unreadable `subscriptions.json` yields no slug, and `Failed { slug, .. }` would have to
+invent one. The **outer error is reserved for failures that prevent enumeration**; once enumeration succeeds,
+every per-feed result — success or failure — travels in the vector.
+
 Outcomes are structured values; every user-facing message is formatted by `src/commands.rs` from these fields,
 never assembled as a string inside the library:
 
 ```rust
+/// Work that committed, followed by a step that did not. Carries the cause, never a bare bool.
+pub struct FollowupFailure { pub step: FollowupStep, pub error: FeedError }
+pub enum FollowupStep { SaveSubscription, RemoveCache }
+
 pub struct SubscribeOutcome { pub slug: String, pub feed_id: FeedId, pub title: Option<String>,
-                              pub retained: usize, pub skipped: usize, pub subscription_saved: bool }
+                              pub retained: usize, pub skipped: usize,
+                              pub followup: Option<FollowupFailure> }
 
 pub enum RefreshOutcome {
-    Unchanged { slug: String },
+    /// A 304. The cache was revalidated; a permanent redirect may still need committing.
+    Unchanged { slug: String, url_moved: Option<String>, followup: Option<FollowupFailure> },
+    /// A 200 that parsed and was cached.
     Updated   { slug: String, retained: usize, skipped: usize,
-                url_moved: Option<String>, subscription_saved: bool },
+                url_moved: Option<String>, followup: Option<FollowupFailure> },
+    /// Nothing committed: the fetch, the parse, or the cache write failed.
     Failed    { slug: String, error: FeedError },
 }
 
-pub struct UnsubscribeOutcome { pub slug: String, pub cache_removed: bool }
+pub struct UnsubscribeOutcome { pub slug: String, pub followup: Option<FollowupFailure> }
 ```
+
+The `subscription_saved` and `cache_removed` booleans are gone: a bool records *that* a step failed while
+discarding *why*, and §5.3 requires the message to say exactly what did and did not happen. `Unchanged` gains
+`url_moved` because a 304 can still follow a permanent redirect — `A —301→ B`, then `B` answers 304 — so the
+subscription's `fetch_url` must move even though the body did not change, and that commit can fail on its own.
+
+**A partial failure cannot exit successfully.** `src/commands.rs` prints every outcome and then returns an
+`Err` whenever any outcome is `Failed` or carries a `followup`, which reaches `main.rs` through `app::run`'s
+`Result<(), AppError>` (§6.5) and becomes a nonzero exit:
+
+- A single-feed command returns the concrete error — `followup.error`, or the `Failed` error — *after*
+  printing what did commit.
+- `refresh` with no slug returns `FeedError::BatchIncomplete { failed, total }` once every outcome has been
+  printed, so one bad feed neither hides the others nor exits zero.
 
 The two listing row types:
 
@@ -758,7 +822,8 @@ src/http/document.rs          DocumentRequest, DocumentOutcome, fetch_document
 `Malformed { detail }`, `NotPlayable { slug, index, title }`, `UnknownSlug { slug }`,
 `IndexOutOfRange { slug, index, retained }`, `CacheMissing { slug }`, `CacheCorrupt { slug, detail }`,
 `CacheParserMismatch { slug, found, expected }`, `SubscriptionsUnreadable { reason }`, `InvalidSlug { slug }`,
-`SlugTaken { slug }`, `AlreadySubscribed { slug }`, plus `#[from]` arms for `RemoteFailure` and
+`SlugTaken { slug }`, `AlreadySubscribed { slug }`, `BatchIncomplete { failed, total }`, plus `#[from]` arms
+for `RemoteFailure` and
 `PersistenceError`.
 
 **Redaction must hold under `Debug`, not only `Display`.** `main.rs:38-39` prints `{error}` *and* logs
@@ -776,6 +841,7 @@ redirect-chain scripting.
 
 Under `tests/fixtures/feeds/`: `rss2-minimal`, `atom-minimal`, `latin1-declared`, `utf16le-bom`,
 `utf16be-bom`, `utf16le-declared-no-bom`, `bom-utf8`, `utf8-invalid-bytes`, `encoding-unknown-label`,
+`decl-without-encoding`, `decl-malformed-encoding-attr`, `cyrillic-title`,
 `xml-base-relative`, `guid-absent-uses-enclosure`, `item-without-enclosure`, `enclosure-scheme-unsupported`,
 `enclosure-malformed-with-guid`, `multiple-enclosures`, `duplicate-identity`, `cdata-title`,
 `atom-title-types`, `atom-link-no-rel`, `unknown-entity-in-title`, `unknown-entity-in-guid`,
@@ -789,7 +855,10 @@ cache; an unsolicited 304; a body exceeding `document_bytes` with no `Content-Le
 
 ### 8.3 Storage
 
-Every `LoadReason` for the subscription store; each §5.6 semantic-validation rejection; atomic replacement;
+Every `LoadReason` for the subscription store; a malformed `subscriptions.json` exercised through **both**
+entry points — `read_snapshot` returns `Err` and leaves the file untouched, `load` quarantines it and names the
+path — with the directory compared before and after in the read case; each §5.6 semantic-validation rejection;
+atomic replacement;
 cache validation including a foreign `feed_id` and a duplicate key; parser-mismatch recovery through an
 unconditional refetch; failure injection **between** the cache and subscription commits for all three commands
 in §5.3.
@@ -803,7 +872,16 @@ in §5.3.
 - Unreadable `state.json` produces a visible error from `episodes`, not a listing of unplayed rows.
 - `episodes` and `feeds` **change no files** — asserted by comparing directory contents and mtimes before and
   after.
-- Batch `refresh` with mixed outcomes returns one outcome per feed and exits nonzero.
+- Batch `refresh` with mixed outcomes returns one outcome per feed, prints all of them, and exits nonzero with
+  `BatchIncomplete`.
+- `refresh_all` over an unreadable `subscriptions.json` returns the **outer** `Err`, not a fabricated per-feed
+  `Failed`.
+- A 304 that follows a permanent redirect whose subscription write then fails yields
+  `Unchanged { url_moved: Some(_), followup: Some(_) }` and exits nonzero — the case a bare
+  `Unchanged { slug }` could not represent.
+- Every command that commits work and then fails a follow-up step prints what committed **and** exits nonzero;
+  asserted for all three §5.3 sequences.
+- A slug derived from a wholly non-ASCII title falls back to the host and passes §5.6's validation.
 - `-n 0` is rejected; `-n N` truncates without renumbering.
 
 ### 8.5 Playback integration and diagnostics
