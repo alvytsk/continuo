@@ -101,6 +101,16 @@ pub enum RemoteFailure {
     /// above even after Symphonia wraps the `io::Error`.
     #[error("the read was cancelled")]
     Cancelled,
+    /// §3.4: the streaming body would exceed `Limits::document_bytes`. A
+    /// declared `Content-Length` already above the cap is a cheap early exit,
+    /// but the running total while streaming is the authority.
+    #[error("feed document exceeds {limit} bytes")]
+    DocumentTooLarge { limit: usize },
+    /// §3.3: a 304 arrived when no conditional header was ever sent (M4
+    /// sends none yet) or when the cache backing the conditional request was
+    /// missing or corrupt.
+    #[error("received HTTP 304 without a usable conditional request")]
+    UnsolicitedNotModified,
 }
 
 /// Scheme, host, port and path only.
