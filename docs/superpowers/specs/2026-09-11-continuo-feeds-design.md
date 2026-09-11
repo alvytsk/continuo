@@ -40,7 +40,10 @@ Feeds are conventionally newest-first, so it is usually the newest episode, but 
 
 ### 1.3 Targeted changes to existing code
 
-M4 modifies three things outside its own modules. Each is required by the work, and nothing else is touched.
+This is the complete list of existing code M4 touches. Each entry is required by the work; nothing else is
+modified.
+
+**Behavior-changing:**
 
 1. **`src/persistence/atomic.rs`** — the atomic-replace routine inside `StateStore::write` is extracted so the
    subscription and cache stores call it rather than copy it. Semantics are preserved exactly, including
@@ -48,11 +51,26 @@ M4 modifies three things outside its own modules. Each is required by the work, 
    (`src/persistence/store.rs:224-231`).
 2. **`StateStore::read_snapshot`** — a non-mutating read path (§5.5). `StateStore::load` can quarantine a
    malformed file, so calling it from a listing would rewrite `state.json` while merely displaying progress.
+   `load` keeps its current behavior, wrapping the same extracted decode step.
 3. **`app::run` dispatch** — `run` currently destructures a single-variant `CliCommand` irrefutably
-   (`src/app.rs:47`) and resolves the source internally. §6.5 describes the minimal dispatch and handoff wiring.
+   (`src/app.rs:47`) and resolves the source internally. §6.5 describes the minimal dispatch and handoff
+   wiring, including its return type changing to `Result<(), AppError>`.
 
-`MediaId` also gains two accessors (§2.2). `src/app.rs` is **not** split; it is already 2,195 lines and
-splitting it is unrelated work.
+**Additive only** — new items beside existing ones, with no existing behavior altered:
+
+4. **`src/cli.rs`** — five new `CliCommand` variants and `play`'s second positional (§6.3).
+5. **`src/media/id.rs`** — `MediaId::feed` and `MediaId::episode_key` (§2.2).
+6. **`src/media/mod.rs`** — three descriptive fields on the existing `Episode` (§2.2).
+7. **`src/http/service.rs`** — `HttpService::handle` and `HttpService::fetch_document`, with their request and
+   outcome types in a new `src/http/document.rs` (§3.1).
+8. **`src/http/limits.rs`** — `Limits::document_bytes`, default 8 MiB (§3.4).
+9. **`src/http/error.rs`** — `RemoteFailure::DocumentTooLarge` and `RemoteFailure::UnsolicitedNotModified`
+   (§3.3, §3.4).
+10. **`src/error.rs`** — `AppError` (§6.5).
+
+`src/app.rs` is **not** split; it is already 2,195 lines and splitting it is unrelated work.
+`EpisodeKey::resolve`, `resolve_source`, `accept_redirect` and the whole playback path are read and reused,
+never modified.
 
 ### 1.4 New dependencies
 
@@ -615,7 +633,7 @@ Any failed step exits nonzero, and the message says exactly what did and did not
 - `episodes` exits nonzero on corrupt or parser-incompatible cache data; `feeds` exits zero for a merely
   missing cache.
 - `play` on an item whose `source` is `None` fails with `FeedError::NotPlayable { slug, index, title }` —
-  `episode 7 "Outtakes" has no audio enclosure; nothing to play` — exiting nonzero. No `EngineHandle`, no
+  `episode 5 "Bonus: outtakes" has no audio enclosure; nothing to play` — exiting nonzero. No `EngineHandle`, no
   `AudioOutput` and no `HttpService` are constructed on that path.
 
 ### 6.5 Dispatch and handoff
