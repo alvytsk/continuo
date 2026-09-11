@@ -625,6 +625,16 @@ impl TestEngine {
     /// has accounted for, so what a test measures here is the pipeline rather
     /// than the scheduler.
     pub fn play_for(&mut self, target: Duration) {
+        // Behind the same barrier the closing `settle` is, and for a sharper
+        // reason: the entry position decides whether this call plays at all.
+        // `raw_position` on its own is the snapshot published before whatever
+        // command the test sent last was applied, and a caller's `send` gives
+        // that command a wall-clock budget rather than waiting for it. A
+        // `Restart` still queued therefore reads as the pre-restart position,
+        // `target` is already behind it, the loop breaks having played
+        // nothing - and the restart then lands and rewinds to zero, so the
+        // test measures a position taken from before the command it sent.
+        self.settle();
         let deadline = Instant::now() + PATIENCE;
         let clock_at_entry = self.clock();
         let position_at_entry = self.raw_position();
