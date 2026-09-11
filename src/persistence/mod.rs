@@ -1,6 +1,7 @@
 //! Durable playback state: the model, the store that owns the file, and the
 //! writer thread that owns the disk.
 
+pub mod atomic;
 pub mod model;
 pub mod store;
 pub mod writer;
