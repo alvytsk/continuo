@@ -112,6 +112,15 @@ pub enum WarningKind {
     /// `link[rel=enclosure]` — and the first usable one in document order won,
     /// so this many were ignored (§4.7).
     ExtraEnclosures { ignored: usize },
+    /// The binding stage found no GUID, no usable enclosure and no link, so
+    /// the item has no identity and was skipped (§2.4). Never assigned by
+    /// the parser itself — only by [`crate::feed::episode::bind_feed`].
+    MissingIdentity,
+    /// The binding stage resolved this item to the same episode key as an
+    /// earlier item in the same feed; the first occurrence won and this one
+    /// was skipped (§4.7). Never assigned by the parser itself — only by
+    /// [`crate::feed::episode::bind_feed`].
+    DuplicateIdentity,
 }
 
 /// Parses one feed document into parse-layer values.

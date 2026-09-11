@@ -5,7 +5,8 @@
 //! item to an identity needs a `FeedId`, which only the subscription layer
 //! holds, so keeping these types identity-free is what lets
 //! [`crate::feed::parse::parse_feed`] stay a pure bytes-to-values function
-//! testable against fixtures alone.
+//! testable against fixtures alone. [`crate::feed::episode::bind_feed`] is
+//! where identity is added.
 
 use std::time::Duration;
 

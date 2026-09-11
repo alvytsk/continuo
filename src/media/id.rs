@@ -216,3 +216,24 @@ impl FromStr for MediaId {
         Ok(id)
     }
 }
+
+impl MediaId {
+    /// The subscription this id belongs to, or `None` for a `LocalFile` or
+    /// `RemoteUrl` (§2.2). Lets callers reach the feed without a duplicate
+    /// `key` field on `Episode`.
+    pub fn feed(&self) -> Option<&FeedId> {
+        match self {
+            Self::PodcastEpisode { feed, .. } => Some(feed),
+            _ => None,
+        }
+    }
+
+    /// The episode identity within its feed, or `None` for a `LocalFile` or
+    /// `RemoteUrl` (§2.2).
+    pub fn episode_key(&self) -> Option<&EpisodeKey> {
+        match self {
+            Self::PodcastEpisode { episode, .. } => Some(episode),
+            _ => None,
+        }
+    }
+}

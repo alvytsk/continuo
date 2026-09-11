@@ -21,6 +21,9 @@ fn fetch_url_stays_separate_from_identity_and_unplayable_items_exist() {
     let episode = Episode {
         id: id.clone(),
         source: Some(SourceLocation::Http(fetch.clone())),
+        title: None,
+        published: None,
+        declared_duration: None,
     };
     let SourceLocation::Http(actual) = episode.source.unwrap() else {
         panic!("expected HTTP source")
@@ -38,7 +41,17 @@ fn fetch_url_stays_separate_from_identity_and_unplayable_items_exist() {
         episode: EpisodeKey::resolve(Some("guid"), Some(&redirected), None).unwrap(),
     };
     assert_eq!(same_id, id);
-    assert!(Episode { id, source: None }.source.is_none());
+    assert!(
+        Episode {
+            id,
+            source: None,
+            title: None,
+            published: None,
+            declared_duration: None,
+        }
+        .source
+        .is_none()
+    );
     assert_eq!(
         MediaMetadata {
             title: None,
