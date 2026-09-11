@@ -20,12 +20,14 @@
 //!   can echo the offending bytes, and a checkpoint key or a cached
 //!   `media_id` is untrusted text that may itself be a URL. Both decoders
 //!   reduce it to a category plus line and column.
-//! * **Titles and explicit aliases are user-visible content.** They are what
-//!   the listener asked to see, and hiding them would make `unknown feed:
-//!   …` and `episode 2 "…" has no audio` useless. They are escaped at the
-//!   formatting boundary (`commands::displayable`) rather than redacted, and
-//!   this file asserts they survive — otherwise "no secret in the message"
-//!   could be passed by a message that says nothing at all.
+//! * **Titles, explicit aliases and declaration labels are user-visible
+//!   content.** They are what the listener asked to see, or what the feed
+//!   claimed about itself, and hiding them would make `unknown feed: …`,
+//!   `episode 2 "…" has no audio` and `unsupported feed encoding: …`
+//!   useless. They are escaped at the formatting boundary
+//!   (`commands::displayable`) rather than redacted, and this file asserts
+//!   they survive — otherwise "no secret in the message" could be passed by
+//!   a message that says nothing at all. None of the three is ever a URL.
 
 mod support;
 
@@ -219,8 +221,17 @@ fn a_refused_redirect_reports_its_reason_and_never_its_location() -> Fallible {
 ///   reqwest defers to `build()`, produces one that carries none. That is the
 ///   same injection `m4_document_protocol.rs` already uses, and it covers the
 ///   `None` branch — a message that names nothing at all is also safe.
+///
+/// Each iteration asserts the branch it is *for*, not merely that the result
+/// is safe. Both servers are shut down before the refresh, so a
+/// connection-refused error would satisfy `Transport { .. }` in either
+/// iteration; without the `!contains("127.0.0.1")` below, a reqwest change
+/// that stopped rejecting the CR/LF header would silently run the redacting
+/// branch twice and leave the `None` branch unaudited while the suite stayed
+/// green.
 #[test]
 fn a_transport_failure_names_the_host_and_redacts_the_query() -> Fallible {
+    let mut renderings = Vec::new();
     for bad_validator in [false, true] {
         let rig = feeds::Rig::new()?;
         let server = TestServer::start(Script::serving(b"<rss/>".to_vec()));
@@ -261,7 +272,16 @@ fn a_transport_failure_names_the_host_and_redacts_the_query() -> Fallible {
             matches!(error, FeedError::Remote(RemoteFailure::Transport { .. })),
             "{error:?}"
         );
-        if !bad_validator {
+        if bad_validator {
+            // `build()` failed before a request existed, so reqwest's error
+            // carries no URL and `transport_detail` has nothing to append.
+            // This is what distinguishes this iteration from the other one:
+            // a connection-refused error would name the host here.
+            assert!(
+                !rendered.contains("127.0.0.1"),
+                "the builder branch must carry no URL at all: {rendered}"
+            );
+        } else {
             assert!(
                 rendered.contains("127.0.0.1"),
                 "the host must survive redaction: {rendered}"
@@ -271,7 +291,15 @@ fn a_transport_failure_names_the_host_and_redacts_the_query() -> Fallible {
                 "the query must not survive: {rendered}"
             );
         }
+        renderings.push(rendered);
     }
+
+    // Belt and braces: the two iterations must have produced genuinely
+    // different messages, so neither can be the other one run twice.
+    assert_ne!(
+        renderings[0], renderings[1],
+        "both transport branches rendered identically: {renderings:?}"
+    );
     Ok(())
 }
 
@@ -479,6 +507,55 @@ fn titles_and_explicit_aliases_are_content_rather_than_transport() -> Fallible {
     Ok(())
 }
 
+/// The third kind of echoed content, and the one most easily mistaken for a
+/// transport value because it arrives from the network.
+///
+/// An `encoding` label reaches `UnsupportedEncoding` **because**
+/// `BytesDecl::encoder()` did not recognize it — the lookup is what proves
+/// the value is unknown, not what constrains it — so what is echoed is
+/// arbitrary text the feed wrote, exactly like a title. It is safe for the
+/// same reason a title is: it is not a URL, it carries no credential, and a
+/// message that hid it would leave the listener unable to see what their feed
+/// actually claimed. The marker here is a string in a declaration, not a
+/// secret, and it survives on purpose.
+#[test]
+fn an_unsupported_encoding_label_is_echoed_exactly_as_the_feed_wrote_it() -> Fallible {
+    let rig = feeds::Rig::new()?;
+    let server = TestServer::start(Script::serving(
+        b"<?xml version=\"1.0\" encoding=\"x-SECRETVALUE\"?>\
+          <rss version=\"2.0\"><channel><title>T</title></channel></rss>"
+            .to_vec(),
+    ));
+    let service = HttpService::spawn(Limits::brisk())?;
+    let url = server.url("/feed");
+
+    let result = service.handle().block_on(library::subscribe(
+        &service, &rig.subs, &rig.cache, &url, None,
+    ));
+    server.shutdown();
+
+    let error = match result {
+        Err(error) => error,
+        Ok(outcome) => {
+            return Err(format!("an unknown encoding must be refused, got {outcome:?}").into());
+        }
+    };
+    match &error {
+        FeedError::UnsupportedEncoding { label } => assert_eq!(label, "x-SECRETVALUE"),
+        other => return Err(format!("expected UnsupportedEncoding, got {other:?}").into()),
+    }
+    assert!(
+        format!("{error}").contains("x-SECRETVALUE"),
+        "the declared label must reach the listener: {error}"
+    );
+    // Content, not transport: nothing of the *request* leaked alongside it.
+    assert!(
+        !format!("{error}").contains("127.0.0.1"),
+        "an encoding failure must not carry the request URL: {error}"
+    );
+    Ok(())
+}
+
 // --- The variant table -------------------------------------------------
 
 /// Which constructor supplies each [`FeedError`] variant's context, and why
@@ -489,7 +566,7 @@ fn titles_and_explicit_aliases_are_content_rather_than_transport() -> Fallible {
 /// | Variant | Context | Built by | Why it is safe |
 /// |---|---|---|---|
 /// | `Encoding` | none | `feed::parse` | No payload at all. |
-/// | `UnsupportedEncoding` | `label` | `feed::parse` | An XML declaration's encoding label, checked against a fixed table before it is echoed. |
+/// | `UnsupportedEncoding` | `label` | `feed::parse` | Feed-controlled **content**, classified with titles rather than with transport. Nothing narrows it: `src/feed/parse.rs` echoes the label precisely *because* `BytesDecl::encoder()` returned `None` for it, so the value is arbitrary text the feed wrote. It is safe because it is a declaration label rather than a URL, and useful because the listener needs to see what was claimed. |
 /// | `UnsupportedFormat` | none | `feed::parse` | No payload at all. |
 /// | `Malformed` | `detail` | `feed::parse`, `commands` | A fixed phrase or a `quick-xml` position; never a document excerpt (`m4_feed_parse.rs` asserts this). |
 /// | `NotPlayable` | `slug`, `index`, `title` | `library::resolve_episode` | A validated slug, an integer, and a title — content the listener asked to see, escaped at the formatting boundary. |
@@ -510,7 +587,7 @@ fn every_feed_error_variant_has_a_recorded_safe_context() {
     fn context(error: &FeedError) -> &'static str {
         match error {
             FeedError::Encoding | FeedError::UnsupportedFormat => "none",
-            FeedError::UnsupportedEncoding { .. } => "a declaration label",
+            FeedError::UnsupportedEncoding { .. } => "the label the feed declared",
             FeedError::Malformed { .. } => "a fixed phrase or a parser position",
             FeedError::NotPlayable { .. } => "a slug, an index and a title",
             FeedError::UnknownSlug { .. } | FeedError::InvalidSlug { .. } => "the typed slug",

@@ -251,6 +251,22 @@ mod process {
         }
     }
 
+    /// Rewrites the one subscription's `fetch_url` in place, keeping every
+    /// other field — and therefore the file's §5.6 validity — exactly as
+    /// `subscribe` wrote it. This is how a test points an existing
+    /// subscription at a different loopback server without depending on a
+    /// freed port being re-bindable.
+    fn repoint(path: &Path, url: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let mut file: serde_json::Value = serde_json::from_slice(&std::fs::read(path)?)?;
+        let entry = file
+            .get_mut("subscriptions")
+            .and_then(|list| list.get_mut(0))
+            .ok_or("the subscriptions file has no first record")?;
+        entry["fetch_url"] = serde_json::json!(url);
+        std::fs::write(path, serde_json::to_vec(&file)?)?;
+        Ok(())
+    }
+
     /// Puts a nonempty directory where a file is about to be written, which
     /// is what makes the atomic rename over it fail. Deliberately not a
     /// permission bit: a suite running as root would not be stopped by one,
@@ -761,33 +777,38 @@ mod process {
 
     /// §5.3's refresh commit order: the cache lands first, so a subscription
     /// update that cannot be recorded afterwards is reported *with* the fact
-    /// that the episodes were saved. A second server on the first one's port
-    /// keeps the subscription's `fetch_url` valid while giving this run its
-    /// own stall gate (one park/release cycle per server).
+    /// that the episodes were saved.
+    ///
+    /// Two independently bound servers, and the subscription's `fetch_url`
+    /// repointed at the second between the two commands. The obvious
+    /// alternative — shut the first server down and rebind its port — is
+    /// what this test did first and it flaked under the full parallel suite
+    /// with `Address already in use`: `SO_REUSEADDR` lets a port in
+    /// `TIME_WAIT` be rebound, but it cannot win a race against another
+    /// test's `bind_ephemeral` claiming the freed port first. Repointing the
+    /// durable field instead touches no port at all, and is what a feed that
+    /// moved would look like on disk anyway. Each server still parks at most
+    /// once: the first never stalls, the second stalls exactly here.
     #[test]
     fn a_refresh_that_cannot_record_a_changed_title_reports_the_saved_cache() -> Fallible {
         let root = tempfile::tempdir()?;
         let first = TestServer::start(Script::serving(
             feed_xml("https://cdn.example.org/1.mp3").into_bytes(),
         ));
-        let port = first.port();
         succeeded(&subscribe(root.path(), &first)?)?;
         first.shutdown();
 
         let renamed = feed_xml("https://cdn.example.org/1.mp3")
             .replace("<title>Radio T</title>", "<title>Radio T Renamed</title>");
-        let second = TestServer::start_on(
-            port,
+        let second = TestServer::start(
             Script::documents(vec![reply(
                 "/feed",
-                // A different validator, so the conditional request this
-                // refresh sends cannot be answered 304 — a 304 would keep
-                // the old title and there would be nothing to record.
                 vec![("ETag", "\"v2\""), ("Content-Type", "application/rss+xml")],
                 renamed.as_bytes(),
             )])
             .stall_headers(),
         );
+        repoint(&subscriptions(root.path()), &second.url("/feed"))?;
 
         let child = spawn_cli(root.path(), &["refresh", "radio-t"])?;
         let stalled = second.wait_until_stalled(Duration::from_secs(10));

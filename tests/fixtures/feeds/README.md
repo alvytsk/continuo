@@ -66,10 +66,18 @@ accept. The document body in every case is the minimal
 | `utf16le-declared-no-bom` | LE code units, **no** BOM; declaration says `encoding="UTF-16"` | `Ok`, title `Радио` — the `3C 00 3F 00` pattern settles byte order |
 | (BE, declared, with BOM) | `FE FF` + BE code units; declaration says `encoding="UTF-16"` | `Ok`, title `Радио` — XML 1.0 §4.3.3 makes the mark, not the bare label, authoritative |
 | `bom-utf8` | `EF BB BF` + the UTF-8 document, once with no `encoding` and once with `encoding="utf-8"` | `Ok` both ways, title `Радио`, BOM stripped |
-| `latin1-declared` | `splice("<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?>…<title>Caf@</title>…", b"\xe9")` — declaration 43 bytes, inside the window | `Ok`, title `Café` |
+| `latin1-declared` | `splice("<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?>…<title>Caf@</title>…", b"\xe9")` — a 43-byte declaration, and the spliced `E9` lands at **byte 81** | `Ok`, title `Café` |
 | `utf8-invalid-bytes` | `splice(doc, b"\xff")`, once with the byte inside the 64-byte lookahead window and once far past it | `FeedError::Encoding` both times — never a U+FFFD replacement |
 | `encoding-unknown-label` | `encoding="x-nonesuch"`, ASCII body | `FeedError::UnsupportedEncoding { label: "x-nonesuch" }` |
 | `decl-malformed-encoding-attr` | three spellings: unquoted `encoding=utf-8`; no `version` at all; `version="2.0"` | `FeedError::Malformed` for each |
+
+Two offsets are load-bearing in the `latin1-declared` row, not one. The
+43-byte declaration is short enough for `set_encoding` to be applied at all
+(the bound below), **and** the spliced `E9` sits at byte 81 — past the
+decoder's 64-byte prefix window. Both matter: see [the third
+consequence](#the-supported-declaration-bound) below, which is why a
+non-ASCII byte *inside* that window would not be read as Latin-1 even though
+the declaration was honored.
 
 The UTF-16 rows are why the matrix is generated rather than committed: a file
 stored as UTF-8 while claiming to be UTF-16 would prove the opposite of what

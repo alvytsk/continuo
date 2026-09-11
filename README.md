@@ -85,10 +85,11 @@ poller, no refresh-on-listing, no retry loop.
 
 A subscription with no cache behind it shows `—` episodes and `never`.
 `subscribe` writes a cache immediately, so this is what a subscription looks
-like once its cache file has gone — reported as "nothing cached yet" rather
-than as an error, and `feeds` exits zero for it. A cache that exists but
-cannot be read is a different thing entirely, and is not quietly downgraded
-into this one; see [When the cache is unusable](#when-the-cache-is-unusable).
+like once its cache file has gone: those two cells are the whole report, and
+`feeds` exits zero for it rather than treating it as an error. A cache that
+exists but cannot be read is a different thing entirely, and is not quietly
+downgraded into this one; see
+[When the cache is unusable](#when-the-cache-is-unusable).
 
     $ continuo episodes radio-t
       #  PROGRESS            AUDIO  PUBLISHED (UTC)  TITLE
@@ -221,10 +222,17 @@ A podcast episode and a direct URL are **different things to Continuo**, even
 when the bytes are identical. `continuo play radio-t 3` checkpoints the
 *episode* — the feed's identity plus the item's own: its GUID where it has
 one, otherwise its enclosure URL, otherwise its link. `continuo play
-https://cdn.example.org/987.mp3` checkpoints the *URL*. Progress does not carry from one to the other. The
-upside is the one that matters in practice: when a podcast moves its audio to
-another CDN, the episode's position survives, because it was never keyed on
-the enclosure.
+https://cdn.example.org/987.mp3` checkpoints the *URL*. Progress does not
+carry from one to the other.
+
+**How much a change of CDN survives depends on which of those three the item
+had.** For an item with a `<guid>` — which is nearly every podcast item, and
+what publishers are supposed to provide — the identity is the feed plus that
+GUID, so the episode's position survives the show moving its audio elsewhere.
+For an item with **no** GUID, identity falls through to the enclosure URL
+itself, and a move therefore changes the identity: that episode's position is
+lost and it shows as unplayed again. Nothing is synthesized to prevent this —
+an invented identity would be worse than an honest one that changed.
 
 `unsubscribe` removes the subscription and its cached episodes and **keeps
 every checkpoint**. Resubscribing to the same feed mints a new feed identity,
@@ -299,11 +307,12 @@ Reaching the end of a track marks it complete and keeps the position it ended
 at; reopening a completed track starts from the beginning.
 
 One checkpoint is kept per media identity, and a podcast episode's identity is
-its feed plus its episode GUID rather than the URL its audio happens to be
-served from — so `continuo play radio-t 3` and `continuo play
+its feed plus the item's own identity rather than the URL its audio happens to
+be served from — so `continuo play radio-t 3` and `continuo play
 https://cdn.example.org/987.mp3` keep separate positions even when the bytes
-are the same, and an episode's position survives the show moving to another
-CDN.
+are the same. What the item's own identity is, and therefore how much a change
+of CDN survives, is covered under
+[Identities, and what resubscribing does](#identities-and-what-resubscribing-does).
 
 Deleting `state.json` forgets every remembered position — local files, URLs
 and podcast episodes alike — which is the last way out if a stored position

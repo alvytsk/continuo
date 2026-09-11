@@ -34,7 +34,7 @@ The runtime has these execution contexts, with strict ownership:
 
 The decode worker creates, starts, pauses, and destroys the CPAL stream. The callback owns only the ring-buffer consumer and progress counter. Tokio tasks never touch decoder or output-device state, and writer filesystem work stays off Tokio.
 
-M4 adds the two feed contexts without adding a thread. `library.rs` is the application seam M5 reuses: it returns values and never prints, and its four network functions are `async` so that a caller decides where they run. `commands.rs` is the only caller today, and it enters the runtime in exactly one place (`wait_http`), so `block_on` exists at one line of the program rather than being spread through the layer that decides what to fetch.
+M4 adds the two feed contexts without adding a thread. `library.rs` is the application seam M5 reuses: it returns values and never prints, and its three public network functions (`subscribe`, `refresh`, `refresh_all`) are `async` so that a caller decides where they run. `commands.rs` is the only caller today, and it enters the runtime in exactly one place (`wait_http`), so `block_on` exists at one line of the program rather than being spread through the layer that decides what to fetch.
 
 The document fetch is a second shape of HTTP work, not a second HTTP stack: it reuses the same `HttpService`, the same `Limits`, and the same `accept_redirect` policy (hop cap, loop detection, scheme check, HTTPS→HTTP downgrade refusal) as streaming media. The difference is what it does with the body — a feed is small, is needed whole before it can be parsed, and is therefore read to a capped buffer instead of into `ByteChannel`. Nothing about the streaming path changed to make room for it.
 
