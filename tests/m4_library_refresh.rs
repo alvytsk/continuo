@@ -398,6 +398,8 @@ fn an_identical_body_still_reports_updated_and_advances_both_timestamps()
     )]));
     let sub = rig.seed(RADIO_T, &server.url("/feed"))?;
     let before = rig.cache.read(&sub)?;
+    let subs_bytes = std::fs::read(rig.subs.path())?;
+    let subs_mtime = std::fs::metadata(rig.subs.path())?.modified()?;
 
     rig.clock.advance(Duration::from_secs(60));
     let service = HttpService::spawn(Limits::brisk())?;
@@ -415,6 +417,12 @@ fn an_identical_body_still_reports_updated_and_advances_both_timestamps()
         serde_json::to_value(&after.episodes)?,
         serde_json::to_value(&before.episodes)?
     );
+    // §5.1: "An ordinary refresh, 200 or 304, touches exactly one file: the
+    // cache." Title and fetch_url are both unchanged here, so `changed` is
+    // false and `subscriptions.json` must never even be opened for writing —
+    // proven by exact bytes *and* mtime, not just round-tripped content.
+    assert_eq!(std::fs::read(rig.subs.path())?, subs_bytes);
+    assert_eq!(std::fs::metadata(rig.subs.path())?.modified()?, subs_mtime);
     server.shutdown();
     Ok(())
 }
@@ -941,5 +949,45 @@ fn refresh_all_reports_all_three_outcomes_in_subscription_order()
     server1.shutdown();
     server2.shutdown();
     server3.shutdown();
+    Ok(())
+}
+
+// --- §6.6/§8.4: enumeration itself, as distinct from any per-feed result --
+
+/// §8.4: "`refresh_all` over an unreadable `subscriptions.json` returns the
+/// outer `Err`, not a fabricated per-feed `Failed`." A directory sitting at
+/// the subscriptions path (the same deterministic unreadable case the
+/// storage suites already use) makes `load_mutating` fail before
+/// `refresh_all` ever has a slug to attach a `Failed` to, so the enumeration
+/// failure must surface as the function's own `Err`, never as `Ok(vec![...])`
+/// containing an invented outcome.
+#[test]
+fn refresh_all_over_an_unreadable_subscriptions_file_returns_the_outer_error()
+-> Result<(), Box<dyn std::error::Error>> {
+    let rig = feeds::Rig::new()?;
+    std::fs::create_dir_all(rig.subs.path())?;
+    let service = HttpService::spawn(Limits::brisk())?;
+    match service
+        .handle()
+        .block_on(library::refresh_all(&service, &rig.subs, &rig.cache))
+    {
+        Err(FeedError::SubscriptionsUnreadable { .. }) => {}
+        other => return Err(format!("expected an outer Err, got {other:?}").into()),
+    }
+    Ok(())
+}
+
+/// Step 5's other named case: an empty but valid snapshot (no
+/// subscriptions at all) is not an enumeration failure — `refresh_all`
+/// returns an empty, successful batch.
+#[test]
+fn refresh_all_over_an_empty_snapshot_returns_an_empty_successful_batch()
+-> Result<(), Box<dyn std::error::Error>> {
+    let rig = feeds::Rig::new()?;
+    let service = HttpService::spawn(Limits::brisk())?;
+    let outcomes = service
+        .handle()
+        .block_on(library::refresh_all(&service, &rig.subs, &rig.cache))?;
+    assert!(outcomes.is_empty());
     Ok(())
 }
