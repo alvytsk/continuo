@@ -21,6 +21,8 @@
 
 #![allow(dead_code)]
 
+pub mod server;
+
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -28,18 +30,22 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::Sender;
+use url::Url;
 
-use continuo::media::id::{AbsolutePath, MediaId};
+use continuo::http::limits::Limits;
+use continuo::http::service::HttpService;
+use continuo::media::id::{AbsolutePath, MediaId, NormalizedUrl};
 use continuo::media::source::SourceLocation;
 use continuo::playback::callback::CallbackCore;
-use continuo::playback::command::PlaybackCommand;
+use continuo::playback::command::{PlaybackCommand, ResumeIntent};
 use continuo::playback::engine::EngineHandle;
 use continuo::playback::error::PlaybackError;
-use continuo::playback::event::{PlaybackEvent, Progress, ShutdownReport};
+use continuo::playback::event::{PlaybackEvent, Progress, ShutdownReport, StartDisposition};
 use continuo::playback::link::{OutputLink, Phase};
 use continuo::playback::output::cpal_output::OutputFault;
 use continuo::playback::output::test_output::TestOutput;
 use continuo::playback::output::{AudioOutput, Nanos, NegotiatedOutput, OutputRequest};
+use continuo::playback::provenance::PositionProvenance;
 use continuo::playback::state::PlaybackState;
 use continuo::playback::volume::Volume;
 
@@ -76,12 +82,27 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap()
 }
 
+/// Public so a test can build a path to hand `TestEngine::load_with_resume`
+/// directly, for a load whose resume intent `start`/`start_at`'s own
+/// `ResumeIntent::StartAt` cannot express.
 #[allow(clippy::unwrap_used)]
-fn fixture(name: &str) -> AbsolutePath {
+pub fn fixture(name: &str) -> AbsolutePath {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures")
         .join(name);
     AbsolutePath::new(path.canonicalize().unwrap()).unwrap()
+}
+
+/// The path of a fixture, for tests that need its bytes rather than an
+/// `AbsolutePath` - `TestServer::start(Script::serving(...))` among them. A
+/// bare helper, so it panics with the path on failure: a missing fixture is
+/// a repository error, not a test condition.
+pub fn fixture_path(name: &str) -> std::path::PathBuf {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(name);
+    path.canonicalize()
+        .unwrap_or_else(|error| panic!("fixture {path:?} must exist: {error}"))
 }
 
 /// A `MediaId` for a local file that need not exist, for tests that only care
@@ -170,6 +191,39 @@ impl Driver {
     }
 }
 
+/// The fields of a `Loaded` event a resume test cares about, from
+/// `TestEngine::await_loaded`.
+pub struct Loaded {
+    pub position: Duration,
+    pub disposition: StartDisposition,
+}
+
+/// Where a `SeekCompleted` landed, and its provenance (§3), from
+/// `TestEngine::await_seek_completed`.
+///
+/// `PartialEq<Duration>`/`PartialOrd<Duration>` are implemented by hand,
+/// rather than deriving them against `Self`, so every existing call site
+/// that compares the old `Duration`-only return value (`landed >=
+/// Duration::from_secs(2)`, `{landed:?}`) keeps compiling unchanged; a test
+/// that cares about provenance reads `.provenance` explicitly instead.
+#[derive(Clone, Copy, Debug)]
+pub struct SeekLanding {
+    pub actual: Duration,
+    pub provenance: PositionProvenance,
+}
+
+impl PartialEq<Duration> for SeekLanding {
+    fn eq(&self, other: &Duration) -> bool {
+        self.actual == *other
+    }
+}
+
+impl PartialOrd<Duration> for SeekLanding {
+    fn partial_cmp(&self, other: &Duration) -> Option<std::cmp::Ordering> {
+        self.actual.partial_cmp(other)
+    }
+}
+
 pub struct TestEngine {
     handle: Mutex<Option<EngineHandle>>,
     commands: Sender<PlaybackCommand>,
@@ -184,6 +238,30 @@ pub struct TestEngine {
     /// engine has already passed through must not satisfy a later wait.
     consumed_states: Mutex<usize>,
     draining: AtomicBool,
+    /// Built lazily by `load_remote`'s first call, then kept for the
+    /// engine's lifetime.
+    http: Mutex<Option<Arc<HttpService>>>,
+    /// Whether an `EndOfTrack` was ever observed in this run. Latched
+    /// rather than derived from `inbox`, since `play_until_terminal` and
+    /// other draining helpers are free to consume events out of a test's
+    /// direct sight.
+    saw_end_of_track: AtomicBool,
+}
+
+/// A live borrow of the engine's `EngineHandle`, returned by `handle()`.
+/// See that method's doc comment for why this exists rather than a bare
+/// `&EngineHandle`.
+pub struct HandleRef<'a>(MutexGuard<'a, Option<EngineHandle>>);
+
+impl std::ops::Deref for HandleRef<'_> {
+    type Target = EngineHandle;
+
+    fn deref(&self) -> &EngineHandle {
+        match self.0.as_ref() {
+            Some(handle) => handle,
+            None => panic!("the engine handle is gone; the test outlived a shutdown"),
+        }
+    }
 }
 
 impl TestEngine {
@@ -197,6 +275,24 @@ impl TestEngine {
     /// A start that resumes at `start_at`. Deliberately does **not** clear the
     /// inbox: the `Loaded` it produces is the subject of the resume tests.
     pub fn start_at(name: &str, start_at: Duration) -> Self {
+        let mut engine = Self::bare();
+        engine.load_with_resume(fixture(name), ResumeIntent::StartAt(start_at));
+        engine.send(PlaybackCommand::Play);
+        engine.await_state(PlaybackState::Playing);
+        engine
+    }
+
+    /// The device and worker wired up, nothing loaded - `Idle`, ready for
+    /// `load_remote`. `start`/`start_at` need a local fixture immediately;
+    /// a remote test needs control over exactly when the load happens (and
+    /// needs to install an `HttpService` first), so it starts here rather
+    /// than through either of them. Rust has no argument-count overloading,
+    /// so this cannot be a zero-argument `start()` alongside `start(name)`.
+    pub fn start_idle() -> Self {
+        Self::bare()
+    }
+
+    fn bare() -> Self {
         let device = Arc::new(Mutex::new(Device {
             output: TestOutput::new(CHANNELS, RATE, BUFFER_FRAMES, LATENCY),
             link: None,
@@ -226,7 +322,7 @@ impl TestEngine {
                 })
                 .ok()
         };
-        let mut engine = Self {
+        Self {
             commands: handle.commands().clone(),
             wake: handle.wake().clone(),
             handle: Mutex::new(Some(handle)),
@@ -238,17 +334,120 @@ impl TestEngine {
             states: Mutex::new(Vec::new()),
             consumed_states: Mutex::new(0),
             draining: AtomicBool::new(true),
+            http: Mutex::new(None),
+            saw_end_of_track: AtomicBool::new(false),
+        }
+    }
+
+    /// Load an HTTP source. Builds an `HttpService` on first use (`Limits`
+    /// short enough that the cancellation tests do not spend real seconds
+    /// waiting on a deadline they intend to hit) and keeps it for the
+    /// engine's lifetime; every later `load_remote` on this `TestEngine`
+    /// reuses it.
+    pub fn load_remote(&mut self, url: &str) {
+        self.load_remote_inner(url, ResumeIntent::StartAt(Duration::ZERO), None, true);
+    }
+
+    /// `load_remote` under a caller-decided `ResumeIntent`, for a resume test
+    /// whose second session needs `Candidate` rather than the fixed
+    /// `StartAt(ZERO)` `load_remote` always sends (H4, H5's protected
+    /// fallback). Shares the cached brisk `HttpService`, same as
+    /// `load_remote`.
+    pub fn load_remote_with_resume(&mut self, url: &str, resume: ResumeIntent) {
+        self.load_remote_inner(url, resume, None, true);
+    }
+
+    /// `load_remote` against a dedicated `HttpService` built from `limits`
+    /// rather than the cached brisk one — H13's starvation half needs a
+    /// `stall` deadline generous enough that draining the ring and reading
+    /// the frozen position afterwards cannot itself race the brisk 500 ms
+    /// one into a spurious `Failed`.
+    pub fn load_remote_with_limits(&mut self, url: &str, limits: Limits) {
+        self.load_remote_inner(
+            url,
+            ResumeIntent::StartAt(Duration::ZERO),
+            Some(limits),
+            true,
+        );
+    }
+
+    /// `load_remote`, but for a load this test expects to fail rather than
+    /// reach `Paused` (§12's closing paragraph: a sequential-only source
+    /// opening a tail-`moov` file). The `HttpService` still has to be
+    /// attached for the attempt to mean anything — without one the load
+    /// fails immediately as "no HTTP service", which would prove nothing
+    /// about the file itself.
+    pub fn load_remote_expecting_failure(&mut self, url: &str) {
+        self.load_remote_inner(url, ResumeIntent::StartAt(Duration::ZERO), None, false);
+    }
+
+    /// Shared body for the `load_remote*` entry points above. `limits`:
+    /// `None` reuses (and lazily populates) the cached brisk service every
+    /// plain `load_remote` shares; `Some` always spawns a fresh service
+    /// under those limits and replaces the cached one with it, which is fine
+    /// because every test that asks for custom limits loads exactly once.
+    /// `await_paused`: false for a load this test expects to fail, so it
+    /// does not wait for a state the attempt is never going to reach.
+    fn load_remote_inner(
+        &mut self,
+        url: &str,
+        resume: ResumeIntent,
+        limits: Option<Limits>,
+        await_paused: bool,
+    ) {
+        let service = match limits {
+            Some(limits) => {
+                let service = match HttpService::spawn(limits) {
+                    Ok(service) => service,
+                    Err(error) => panic!("the test HttpService must start: {error}"),
+                };
+                *lock(&self.http) = Some(Arc::clone(&service));
+                service
+            }
+            None => {
+                let mut http = lock(&self.http);
+                if http.is_none() {
+                    let service = match HttpService::spawn(Limits::brisk()) {
+                        Ok(service) => service,
+                        Err(error) => panic!("the test HttpService must start: {error}"),
+                    };
+                    *http = Some(service);
+                }
+                #[allow(clippy::unwrap_used)] // just populated above if it was empty.
+                http.clone().unwrap()
+            }
         };
-        let path = fixture(name);
-        engine.send(PlaybackCommand::Load {
-            media: MediaId::LocalFile(path.clone()),
-            source: SourceLocation::LocalPath(path.as_path().to_path_buf()),
-            start_at,
+        if let Some(handle) = lock(&self.handle).as_ref() {
+            handle.set_http(Some(service));
+        }
+        let parsed = match Url::parse(url) {
+            Ok(parsed) => parsed,
+            Err(error) => panic!("test URL {url:?} must parse: {error}"),
+        };
+        let media = match NormalizedUrl::parse(url) {
+            Ok(normalized) => MediaId::RemoteUrl(normalized),
+            Err(error) => panic!("test URL {url:?} must normalize: {error}"),
+        };
+        self.send(PlaybackCommand::Load {
+            media,
+            source: SourceLocation::Http(parsed),
+            resume,
         });
-        engine.await_state(PlaybackState::Paused);
-        engine.send(PlaybackCommand::Play);
-        engine.await_state(PlaybackState::Playing);
-        engine
+        if await_paused {
+            self.await_state(PlaybackState::Paused);
+        }
+    }
+
+    /// The handle, for the submission methods (`submit_pause`, `submit_seek`
+    /// …). A thin `Deref<Target = EngineHandle>` wrapper around a lock guard,
+    /// not a bare `&EngineHandle`: the handle lives behind the same `Mutex`
+    /// `drop_event_receiver` and shutdown already share (a `TestEngine` bound
+    /// without `mut`, as `a_disconnected_event_receiver_terminates_the_worker`
+    /// does, still has to be able to call `drop_event_receiver`), so nothing
+    /// here can hand back a bare reference that outlives the guard reading
+    /// it. `engine.handle().submit_pause()` reads exactly as if it had.
+    pub fn handle(&self) -> HandleRef<'_> {
+        HandleRef(lock(&self.handle))
     }
 
     // ------------------------------------------------------------- commands
@@ -257,6 +456,21 @@ impl TestEngine {
         if self.commands.send(command).is_err() {
             panic!("the engine stopped accepting commands");
         }
+    }
+
+    /// Send `Load` for `path` under a caller-decided resume intent, and wait
+    /// for the source to open. `start_at` sends its own initial load through
+    /// here as `ResumeIntent::StartAt`; a test that needs a
+    /// `ResumeIntent::Candidate` - one only the worker's own decode probe can
+    /// resolve - calls this directly, loading a second time under an intent
+    /// `start`/`start_at` cannot express.
+    pub fn load_with_resume(&mut self, path: AbsolutePath, resume: ResumeIntent) {
+        self.send(PlaybackCommand::Load {
+            media: MediaId::LocalFile(path.clone()),
+            source: SourceLocation::LocalPath(path.as_path().to_path_buf()),
+            resume,
+        });
+        self.await_state(PlaybackState::Paused);
     }
 
     pub fn interrupt_stop(&mut self) {
@@ -321,6 +535,18 @@ impl TestEngine {
             }
             std::thread::sleep(Duration::from_micros(200));
         }
+    }
+
+    /// Whether the device's most recently captured buffer holds any nonzero
+    /// sample — proof that real audio, not silence, reached the output. H1:
+    /// playback must be audible while a remote body is still arriving, not
+    /// merely "not failed".
+    pub fn captured_is_audible(&self) -> bool {
+        lock(&self.device)
+            .output
+            .captured()
+            .iter()
+            .any(|sample| *sample != 0.0)
     }
 
     pub fn inject_xruns(&mut self, count: usize) {
@@ -399,6 +625,16 @@ impl TestEngine {
     /// has accounted for, so what a test measures here is the pipeline rather
     /// than the scheduler.
     pub fn play_for(&mut self, target: Duration) {
+        // Behind the same barrier the closing `settle` is, and for a sharper
+        // reason: the entry position decides whether this call plays at all.
+        // `raw_position` on its own is the snapshot published before whatever
+        // command the test sent last was applied, and a caller's `send` gives
+        // that command a wall-clock budget rather than waiting for it. A
+        // `Restart` still queued therefore reads as the pre-restart position,
+        // `target` is already behind it, the loop breaks having played
+        // nothing - and the restart then lands and rewinds to zero, so the
+        // test measures a position taken from before the command it sent.
+        self.settle();
         let deadline = Instant::now() + PATIENCE;
         let clock_at_entry = self.clock();
         let position_at_entry = self.raw_position();
@@ -487,6 +723,19 @@ impl TestEngine {
         self.settle();
     }
 
+    /// Like `let_time_pass`, but does not settle behind a command round trip
+    /// afterward. `settle` needs the worker to take and answer a `SetVolume`,
+    /// which a worker legitimately blocked inside a live network read
+    /// (starvation, with nothing released to unblock it) cannot do — using
+    /// `let_time_pass` there would wait out `settle`'s own patience rather
+    /// than observe anything about the starved position. The position read
+    /// afterward is the raw published value the worker's last completed pass
+    /// left behind, which is exactly what "starvation does not advance it"
+    /// is a claim about.
+    pub fn let_time_pass_while_unresponsive(&mut self, span: Duration) {
+        self.advance_clock(span);
+    }
+
     pub fn advance_past_output_latency(&mut self) {
         self.advance_clock(LATENCY + LATENCY);
         self.pump_events();
@@ -527,7 +776,43 @@ impl TestEngine {
             if let PlaybackEvent::StateChanged { state, .. } = &event {
                 lock(&self.states).push(*state);
             }
+            if matches!(event, PlaybackEvent::EndOfTrack { .. }) {
+                self.saw_end_of_track.store(true, Ordering::Relaxed);
+            }
             lock(&self.inbox).push(event);
+        }
+    }
+
+    /// Whether an `EndOfTrack` was ever observed in this run.
+    pub fn saw_end_of_track(&self) -> bool {
+        self.pump_events();
+        self.saw_end_of_track.load(Ordering::Relaxed)
+    }
+
+    /// Run until `Ended`, `Failed` or `patience`, whichever comes first.
+    /// Drives the clock (`play_to_end`'s own ADVANCING mode) rather than
+    /// leaving it frozen: a frozen clock never lets the output consume what
+    /// `prime_and_run` already staged, so the ring stays full, `pump_audio`
+    /// never has to read another byte, and a truncated or corrupt tail is
+    /// never discovered at all - the very thing this exists to drive toward.
+    pub fn play_until_terminal(&mut self, patience: Duration) {
+        self.set_mode(ADVANCING);
+        let deadline = Instant::now() + patience;
+        loop {
+            self.pump_events();
+            if self.take_state(PlaybackState::Ended) || self.take_state(PlaybackState::Failed) {
+                self.set_mode(FROZEN);
+                return;
+            }
+            if Instant::now() >= deadline {
+                self.set_mode(FROZEN);
+                panic!(
+                    "playback never reached a terminal state within {patience:?}; it went \
+                     through {:?}",
+                    lock(&self.states)
+                );
+            }
+            std::thread::sleep(Duration::from_millis(2));
         }
     }
 
@@ -565,6 +850,76 @@ impl TestEngine {
             }
             std::thread::sleep(Duration::from_millis(1));
         }
+    }
+
+    /// The next `Loaded` event's position and disposition, so a test can
+    /// assert on them without repeating `PlaybackEvent::Loaded { .. }`'s
+    /// destructuring at every call site.
+    pub fn await_loaded(&mut self) -> Loaded {
+        let event = self.await_event(|e| matches!(e, PlaybackEvent::Loaded { .. }));
+        let PlaybackEvent::Loaded {
+            position,
+            disposition,
+            ..
+        } = event
+        else {
+            unreachable!("await_event's predicate already matched Loaded")
+        };
+        Loaded {
+            position,
+            disposition,
+        }
+    }
+
+    /// The position an explicit restart's `RestartEstablished` reported. G1:
+    /// the only event a policy can key an explicit restart on.
+    pub fn await_restart_established(&mut self) -> Duration {
+        let event = self.await_event(|e| matches!(e, PlaybackEvent::RestartEstablished { .. }));
+        let PlaybackEvent::RestartEstablished { position, .. } = event else {
+            unreachable!("await_event's predicate already matched RestartEstablished")
+        };
+        position
+    }
+
+    /// Wait for `SeekCompleted` and return where it landed, and its
+    /// provenance. Takes its own patience rather than `PATIENCE`: a remote
+    /// seek's refinement can legitimately take longer than a local one's.
+    pub fn await_seek_completed(&mut self, patience: Duration) -> SeekLanding {
+        let deadline = Instant::now() + patience;
+        loop {
+            self.pump_events();
+            {
+                let mut inbox = lock(&self.inbox);
+                if let Some(index) = inbox
+                    .iter()
+                    .position(|e| matches!(e, PlaybackEvent::SeekCompleted { .. }))
+                {
+                    let PlaybackEvent::SeekCompleted {
+                        actual, provenance, ..
+                    } = inbox.remove(index)
+                    else {
+                        unreachable!("the position above already matched SeekCompleted")
+                    };
+                    return SeekLanding { actual, provenance };
+                }
+            }
+            if Instant::now() >= deadline {
+                panic!(
+                    "no SeekCompleted arrived within {patience:?}; saw {:?}",
+                    lock(&self.inbox)
+                );
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    /// Wind the engine down explicitly, rather than leaving it to `Drop` at
+    /// scope exit. Every `engine_remote` test ends with this before shutting
+    /// its `TestServer` down, so the worker's teardown - which may still be
+    /// touching the socket the server owns - completes before the socket
+    /// does.
+    pub fn finish(&mut self) {
+        let _ = self.shutdown_report();
     }
 
     pub fn count_events(&mut self, predicate: impl Fn(&PlaybackEvent) -> bool) -> usize {
@@ -744,7 +1099,7 @@ pub fn load_failure_on_device(name: &str, channels: u16) -> String {
     let sent = handle.commands().send(PlaybackCommand::Load {
         media: MediaId::LocalFile(path.clone()),
         source: SourceLocation::LocalPath(path.as_path().to_path_buf()),
-        start_at: Duration::ZERO,
+        resume: ResumeIntent::StartAt(Duration::ZERO),
     });
     if sent.is_err() {
         panic!("the engine stopped accepting commands");
@@ -793,7 +1148,7 @@ pub fn failed_load_position(
         .send(PlaybackCommand::Load {
             media: id,
             source: SourceLocation::LocalPath(missing.to_path_buf()),
-            start_at,
+            resume: ResumeIntent::StartAt(start_at),
         })
         .expect("engine accepts the load");
     let deadline = Instant::now() + PATIENCE;
@@ -839,7 +1194,7 @@ pub fn failed_device_session(name: &str, channels: u16, start_at: Duration) -> S
     let sent = handle.commands().send(PlaybackCommand::Load {
         media: MediaId::LocalFile(path.clone()),
         source: SourceLocation::LocalPath(path.as_path().to_path_buf()),
-        start_at,
+        resume: ResumeIntent::StartAt(start_at),
     });
     if sent.is_err() {
         panic!("the engine stopped accepting commands");

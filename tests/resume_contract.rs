@@ -10,20 +10,26 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use continuo::clock::{Clock, FakeClock};
+use continuo::media::capabilities::{Continuity, MediaCapabilities, SeekSupport};
 use continuo::media::id::{AbsolutePath, MediaId};
-use continuo::persistence::model::{PersistedCheckpoint, PersistedState};
+use continuo::media::metadata::MediaMetadata;
+use continuo::persistence::model::{PersistedCheckpoint, PersistedState, SCHEMA_VERSION};
 use continuo::persistence::store::StateStore;
 use continuo::persistence::writer::Urgency;
 use continuo::playback::checkpoint::PlaybackCheckpoint;
 use continuo::playback::command::PlaybackCommand;
 use continuo::playback::decode::DecodedSource;
+use continuo::playback::event::{PlaybackEvent, Progress, StartDisposition};
+use continuo::playback::provenance::PositionProvenance;
 use continuo::playback::state::PlaybackState;
+use continuo::playback::timeline::PositionQuality;
 use continuo::playback::volume::Volume;
-use continuo::session::{Action, CAPTURE_INTERVAL, Session, decide_resume};
+use continuo::resume::{RestartPreference, decide_resume, restart_preference, resume_candidate};
+use continuo::session::{Action, CAPTURE_INTERVAL, Session};
 
 mod support;
 
-use support::TestEngine;
+use support::{TestEngine, media};
 
 const TRACK: &str = "sine-5s.flac";
 /// The fixture's duration, which the probe would supply in `app::run`. The rig
@@ -178,13 +184,19 @@ fn a_stop_and_a_quit_resume_where_playback_reached() {
         .entry_for(&track_id())
         .expect("an entry for the track");
     assert!(
-        entry.position >= Duration::from_secs(2) && entry.position < TRACK_DURATION,
+        entry.position.unwrap() >= Duration::from_secs(2)
+            && entry.position.unwrap() < TRACK_DURATION,
         "session 2 must resume near where session 1 stopped: {:?}",
         entry.position
     );
     assert!(!entry.completed);
 
-    let decision = decide_resume(state.entry_for(&track_id()), Some(TRACK_DURATION));
+    let decision = decide_resume(
+        state
+            .entry_for(&track_id())
+            .and_then(|entry| resume_candidate(entry.position, entry.completed)),
+        Some(TRACK_DURATION.into()),
+    );
     assert!(decision.start_at() >= Duration::from_secs(2));
 }
 
@@ -201,7 +213,7 @@ fn a_pause_and_a_quit_resume_where_playback_reached() {
         .entry_for(&track_id())
         .cloned()
         .expect("an entry for the track");
-    assert!(entry.position >= Duration::from_secs(2));
+    assert!(entry.position.unwrap() >= Duration::from_secs(2));
 }
 
 #[test]
@@ -218,7 +230,7 @@ fn a_seek_is_persisted_from_the_canonical_position() {
         .cloned()
         .expect("an entry for the track");
     assert!(
-        entry.position >= Duration::from_secs(3),
+        entry.position.unwrap() >= Duration::from_secs(3),
         "the seek's landing, taken from Progress rather than from the event: {:?}",
         entry.position
     );
@@ -259,7 +271,7 @@ fn an_ordinary_capture_lands_once_the_interval_has_passed() {
         .cloned()
         .expect("an entry for the track");
     assert!(
-        entry.position >= Duration::from_secs(2),
+        entry.position.unwrap() >= Duration::from_secs(2),
         "the capture carries the tick's position: {:?}",
         entry.position
     );
@@ -282,7 +294,7 @@ fn a_stopped_seek_target_outlives_the_quit() {
         .cloned()
         .expect("an entry for the track");
     assert!(
-        entry.position < Duration::from_secs(2),
+        entry.position.unwrap() < Duration::from_secs(2),
         "the stored target, not the pre-seek position the engine still reports: {:?}",
         entry.position
     );
@@ -311,7 +323,7 @@ fn a_stopped_seek_target_outlives_a_quit_that_races_it() {
         .cloned()
         .expect("an entry for the track");
     assert!(
-        entry.position < Duration::from_secs(2),
+        entry.position.unwrap() < Duration::from_secs(2),
         "the SeekTargetStored is not the application's to lose: {:?}",
         entry.position
     );
@@ -336,7 +348,7 @@ fn a_restart_after_a_stopped_seek_persists_where_it_restarted() {
         .cloned()
         .expect("an entry for the track");
     assert!(
-        entry.position >= Duration::from_secs(2),
+        entry.position.unwrap() >= Duration::from_secs(2),
         "the restarted playback's position, not the target the restart threw away: {:?}",
         entry.position
     );
@@ -354,12 +366,17 @@ fn a_finished_track_is_completed_and_reopens_at_zero_with_its_position_kept() {
     let entry = state.entry_for(&track_id()).cloned().expect("an entry");
     assert!(entry.completed);
     assert!(
-        entry.position > Duration::from_secs(4),
+        entry.position.unwrap() > Duration::from_secs(4),
         "D1 retains it: {:?}",
         entry.position
     );
 
-    let decision = decide_resume(state.entry_for(&track_id()), Some(TRACK_DURATION));
+    let decision = decide_resume(
+        state
+            .entry_for(&track_id())
+            .and_then(|entry| resume_candidate(entry.position, entry.completed)),
+        Some(TRACK_DURATION.into()),
+    );
     assert_eq!(
         decision.start_at(),
         Duration::ZERO,
@@ -411,7 +428,11 @@ fn a_position_past_the_end_survives_a_launch_whose_device_refuses_to_open() {
         .cloned()
         .expect("the stale entry");
     assert_eq!(
-        decide_resume(Some(&kept), Some(TRACK_DURATION)).start_at(),
+        decide_resume(
+            resume_candidate(kept.position, kept.completed),
+            Some(TRACK_DURATION.into())
+        )
+        .start_at(),
         Duration::ZERO,
         "§11 opens a position past the end at zero"
     );
@@ -482,11 +503,206 @@ fn a_position_past_the_end_is_refused_as_a_start() {
     store.write(&state).unwrap();
 
     let reloaded = reload(dir.path());
-    let decision = decide_resume(reloaded.entry_for(&track_id()), Some(TRACK_DURATION));
+    let decision = decide_resume(
+        reloaded
+            .entry_for(&track_id())
+            .and_then(|entry| resume_candidate(entry.position, entry.completed)),
+        Some(TRACK_DURATION.into()),
+    );
     assert_eq!(decision.start_at(), Duration::ZERO);
 
     // And the engine can be started from that decision without complaint.
     let mut rig = Rig::open_at(dir.path(), reloaded, decision.start_at());
     assert_eq!(rig.engine_state(), PlaybackState::Playing);
     rig.quit();
+}
+
+// ------------------------------------------- restart preference (§4.3, R8)
+
+/// Both of a checkpoint's locations survive a real write-and-reload round
+/// trip and still compose the way `restart_preference` (Task 6) promises:
+/// the estimate wins as the target, and the established position that was
+/// also on record comes back as the fallback — neither field clobbers the
+/// other on the way through the store, which is the concern this file's
+/// other tests exist to catch and a pure unit test on `resume.rs` alone
+/// could not.
+#[test]
+fn a_stored_estimate_and_its_established_fallback_both_survive_a_reload() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, clock) = store_in(dir.path());
+    let mut state = PersistedState::default();
+    state.record(
+        &PlaybackCheckpoint {
+            media: track_id(),
+            position: Duration::from_secs(40),
+            updated_at: clock.sample().wall,
+        },
+        false,
+    );
+    state.record_estimated(
+        track_id(),
+        Duration::from_secs(97),
+        clock.sample().wall,
+        false,
+    );
+    store.write(&state).unwrap();
+
+    let reloaded = reload(dir.path());
+    let entry = match reloaded.entry_for(&track_id()) {
+        Some(entry) => entry,
+        None => panic!("the entry must survive the reload"),
+    };
+    assert_eq!(
+        restart_preference(entry.position, entry.estimated),
+        Some(RestartPreference {
+            target: Duration::from_secs(97),
+            established: Some(Duration::from_secs(40)),
+        })
+    );
+}
+
+/// R8, round-tripped: an entry that only ever carried an estimate must not
+/// grow an established position merely by passing through the store — the
+/// reload must still report `established: None`, not a fabricated zero.
+#[test]
+fn a_stored_estimate_with_no_established_position_reports_none_for_it_after_a_reload() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, clock) = store_in(dir.path());
+    let mut state = PersistedState::default();
+    state.record_estimated(
+        track_id(),
+        Duration::from_secs(97),
+        clock.sample().wall,
+        false,
+    );
+    store.write(&state).unwrap();
+
+    let reloaded = reload(dir.path());
+    let entry = match reloaded.entry_for(&track_id()) {
+        Some(entry) => entry,
+        None => panic!("the entry must survive the reload"),
+    };
+    assert_eq!(
+        entry.position, None,
+        "no established position was ever recorded"
+    );
+    assert_eq!(
+        restart_preference(entry.position, entry.estimated),
+        Some(RestartPreference {
+            target: Duration::from_secs(97),
+            established: None,
+        })
+    );
+}
+
+// -------------------------------------------------------------- upgrade (R3)
+
+fn loaded_fresh_for(session_rev: u64, media: &MediaId, position: Duration) -> PlaybackEvent {
+    PlaybackEvent::Loaded {
+        session_rev,
+        media: media.clone(),
+        metadata: MediaMetadata::default(),
+        capabilities: MediaCapabilities {
+            continuity: Continuity::Finite,
+            seek: SeekSupport::Native,
+        },
+        position,
+        disposition: StartDisposition::Fresh,
+    }
+}
+
+fn state_changed_to(session_rev: u64, state: PlaybackState) -> PlaybackEvent {
+    PlaybackEvent::StateChanged { session_rev, state }
+}
+
+fn established_progress(session_rev: u64, media: &MediaId, secs: u64) -> Progress {
+    Progress {
+        session_rev,
+        media: Some(media.clone()),
+        position: Duration::from_secs(secs),
+        quality: PositionQuality::Exact,
+        provenance: PositionProvenance::Established,
+        buffering: false,
+    }
+}
+
+/// R3: `tests/persistence_store.rs`'s `a_v1_file_is_accepted_and_normalised_to_v2`
+/// and `the_upgrade_cycle_writes_v2_and_survives_a_reload` prove the migration
+/// at the `StateStore` level directly. What they cannot show is the one hop
+/// `open_persistence` (`engine.rs`) actually takes at every real launch: a
+/// `Session` built straight from the migrated `LoadOutcome`, writing back
+/// through the same store. This is that hop, proven end to end — a v1 file,
+/// read and written through a real `Session`, still ends up v2 on disk with
+/// both the old entry and a brand new one intact, and the store never
+/// stopped reporting itself writable.
+///
+/// Ablation: an `open_persistence` that gated writing on the file's
+/// *original* version rather than `LoadOutcome::writable` (the value the
+/// migration itself already resolved) would make every assertion below fail
+/// together — nothing but the untouched `a` entry would ever reach disk,
+/// since production would have picked `DisabledSink` for a session that
+/// started against a v1 file.
+#[test]
+fn a_session_opened_on_a_v1_file_keeps_persisting_as_v2_with_every_entry_intact() {
+    let dir = tempfile::tempdir().unwrap();
+    let v1 = br#"{
+        "schema_version": 1,
+        "current_media": "local:/music/a.flac",
+        "volume": 0.6,
+        "checkpoints": {
+            "local:/music/a.flac": {
+                "position": { "secs": 42, "nanos": 0 },
+                "completed": false,
+                "touch_seq": 7,
+                "updated_at": "1970-01-01T00:00:00Z"
+            }
+        }
+    }"#;
+    std::fs::write(dir.path().join("state.json"), v1).unwrap();
+
+    let (store, clock) = store_in(dir.path());
+    let outcome = store.load();
+    assert!(
+        outcome.writable,
+        "a v1 file that loads unwritable is the regression this row exists to catch"
+    );
+    let a = media("a");
+    let b = media("b");
+    let mut session = Session::new(outcome.state);
+
+    // Drive a second, unrelated media through the real `Session` — the
+    // production pairing `open_persistence` builds, not a direct
+    // `store.write` the way `persistence_store.rs` proves the migration.
+    let _ = session.observe(&loaded_fresh_for(1, &b, Duration::ZERO), clock.sample());
+    let _ = session.observe(&state_changed_to(1, PlaybackState::Playing), clock.sample());
+    clock.advance_monotonic(CAPTURE_INTERVAL + Duration::from_secs(1));
+    match session.tick(&established_progress(1, &b, 15), clock.sample()) {
+        Action::Submit { state, .. } => store.write(&state).unwrap(),
+        Action::None => panic!("the interval capture must have produced a write"),
+    }
+
+    let bytes = std::fs::read(dir.path().join("state.json")).unwrap();
+    let raw: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        raw["schema_version"], 2,
+        "the file on disk must claim v2 once a v2-aware Session has written through it: {raw}"
+    );
+
+    let reloaded = reload(dir.path());
+    assert_eq!(reloaded.schema_version(), SCHEMA_VERSION);
+    assert_eq!(
+        reloaded.entry_for(&a).and_then(|entry| entry.position),
+        Some(Duration::from_secs(42)),
+        "the v1 entry must survive the upgrade untouched"
+    );
+    assert_eq!(
+        reloaded.entry_for(&b).and_then(|entry| entry.position),
+        Some(Duration::from_secs(15)),
+        "the newly recorded entry must survive the round trip"
+    );
+    assert_eq!(reloaded.len(), 2, "no entry was lost across the upgrade");
+
+    // One further reload, through the store alone: the file is genuinely v2
+    // now, not merely accepted once and forgotten.
+    assert!(store.load().writable);
 }

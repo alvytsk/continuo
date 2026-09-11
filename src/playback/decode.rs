@@ -5,21 +5,31 @@ use std::time::Duration;
 use symphonia::core::audio::GenericAudioBufferRef;
 use symphonia::core::codecs::audio::{AudioDecoder, AudioDecoderOptions};
 use symphonia::core::formats::probe::Hint;
+use symphonia::core::formats::well_known::FORMAT_ID_MP3;
 use symphonia::core::formats::{FormatOptions, FormatReader, SeekMode, SeekTo, TrackType};
-use symphonia::core::io::MediaSourceStream;
+use symphonia::core::io::{MediaSource, MediaSourceStream, MediaSourceStreamOptions};
 use symphonia::core::meta::{MetadataOptions, StandardTag};
 use symphonia::core::units::{TimeBase, Timestamp};
 
-use crate::media::capabilities::{Continuity, MediaCapabilities, SeekSupport};
+use crate::media::capabilities::{
+    Continuity, DemuxerSeek, MediaCapabilities, SeekSupport, SourceEvidence,
+};
 use crate::media::id::AbsolutePath;
 use crate::media::metadata::MediaMetadata;
+use crate::media::vbr_header::{VbrHeader, probe_vbr_header};
 
 use super::error::PlaybackError;
+use super::provenance::PositionProvenance;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SeekOutcome {
     pub actual: Duration,
     pub refinement_truncated: bool,
+    /// Whether this landing is decoder-established or a byte-offset
+    /// estimate (§3) — follows the demuxer that actually ran `Coarse`, not
+    /// the `SeekMode` this call requests uniformly. See `seek_refined`'s own
+    /// comment for why.
+    pub provenance: PositionProvenance,
 }
 
 pub struct DecodedSource {
@@ -38,6 +48,11 @@ pub struct DecodedSource {
     /// trimmed during seek refinement) that `next_planar` should hand out
     /// before pulling a new packet from the reader.
     pending: bool,
+    /// What the caller established about this source independent of the
+    /// decoder — byte length, byte seekability, liveness, and whether the
+    /// demuxer's own seek has been demonstrated. `capabilities()` folds this
+    /// with what the decoder alone can tell.
+    evidence: SourceEvidence,
 }
 
 // `FormatReader` and `AudioDecoder` are trait objects that do not implement
@@ -74,11 +89,47 @@ impl DecodedSource {
             path: owned.clone(),
             source,
         })?;
-        let mss = MediaSourceStream::new(Box::new(file), Default::default());
         let mut hint = Hint::new();
         if let Some(extension) = owned.extension().and_then(|e| e.to_str()) {
             hint.with_extension(extension);
         }
+        let evidence = SourceEvidence {
+            byte_len: Some(metadata_fs.len()),
+            byte_seekable: true,
+            live: false,
+            // Not an assumption: M1 already ships this guarantee for the four
+            // formats M1 supports, and `tests/decode_fixtures.rs` re-proves it
+            // on every run.
+            demuxer: DemuxerSeek::Proven,
+        };
+        Self::from_media_source(Box::new(file), hint, owned, evidence)
+    }
+
+    /// Open over any `MediaSource`, with the supplied evidence folded into the
+    /// capabilities the decoder alone cannot establish.
+    ///
+    /// `label` is the path (local) or redacted origin (remote) carried purely
+    /// for diagnostics — `UnsupportedInput`'s `path` field and this source's
+    /// own `path()` accessor.
+    pub fn from_media_source(
+        mut source: Box<dyn MediaSource>,
+        hint: Hint,
+        label: PathBuf,
+        evidence: SourceEvidence,
+    ) -> Result<Self, PlaybackError> {
+        // Read the container's own evidence for the MP3 frame-count header
+        // (Xing/Info/VBRI) before `MediaSourceStream` takes the source. This
+        // must run first: symphonia's `Track` never says whether its
+        // `num_frames` came from this header or from
+        // `estimate_num_mpeg_frames`'s ~16-frame extrapolation, and by the
+        // time the reader is built that distinction is unrecoverable.
+        let vbr_header = probe_vbr_header(source.as_mut())?;
+        let mss = MediaSourceStream::new(
+            source,
+            MediaSourceStreamOptions {
+                buffer_len: 64 * 1024,
+            },
+        );
         let mut reader = symphonia::default::get_probe()
             .probe(
                 &hint,
@@ -90,7 +141,7 @@ impl DecodedSource {
 
         let track = reader.default_track(TrackType::Audio).ok_or_else(|| {
             PlaybackError::UnsupportedInput {
-                path: owned.clone(),
+                path: label.clone(),
                 reason: "no audio track".into(),
             }
         })?;
@@ -108,13 +159,13 @@ impl DecodedSource {
             .as_ref()
             .and_then(|params| params.audio())
             .ok_or_else(|| PlaybackError::UnsupportedInput {
-                path: owned.clone(),
+                path: label.clone(),
                 reason: "no audio codec parameters".into(),
             })?;
         let sample_rate = params
             .sample_rate
             .ok_or_else(|| PlaybackError::UnsupportedInput {
-                path: owned.clone(),
+                path: label.clone(),
                 reason: "unknown sample rate".into(),
             })?;
         let channels = params
@@ -124,7 +175,7 @@ impl DecodedSource {
             .unwrap_or(0);
         if channels == 0 || channels > 2 {
             return Err(PlaybackError::UnsupportedInput {
-                path: owned,
+                path: label,
                 reason: format!("{channels} channels; M1 supports mono and stereo"),
             });
         }
@@ -141,17 +192,34 @@ impl DecodedSource {
         });
 
         Ok(Self {
-            path: owned,
+            path: label,
             reader,
             decoder,
             track_id,
             time_base,
             sample_rate,
             channels,
-            metadata: MediaMetadata { title, duration },
+            // `Some(XingInfo | Vbri)` is a real index: `Established`.
+            // `Some(Absent)` is symphonia's `estimate_num_mpeg_frames`
+            // fallback: `Estimated` (§5.5). `None` means this probe gathered
+            // no evidence at all (a non-MP3 container, a short read, or an
+            // unseekable source) and must not silently downgrade a duration
+            // that may be perfectly good — every non-MP3 format's real
+            // index/container header keeps the meaning it always had.
+            metadata: MediaMetadata {
+                title,
+                duration,
+                duration_provenance: match vbr_header {
+                    Some(VbrHeader::XingInfo | VbrHeader::Vbri) | None => {
+                        PositionProvenance::Established
+                    }
+                    Some(VbrHeader::Absent) => PositionProvenance::Estimated,
+                },
+            },
             planes: vec![Vec::new(); usize::from(channels)],
             cursor: 0,
             pending: false,
+            evidence,
         })
     }
 
@@ -159,16 +227,35 @@ impl DecodedSource {
         &self.metadata
     }
 
-    /// Local files are finite and, for every format M1 ships, natively seekable.
+    /// Capabilities the decoder can establish *on its own*. The engine combines
+    /// these with transport evidence: HTTP range support alone does not prove
+    /// that a particular container can seek in media time (§4).
     pub fn capabilities(&self) -> MediaCapabilities {
         MediaCapabilities {
-            continuity: if self.metadata.duration.is_some() {
+            // Live evidence is checked *first*. A shoutcast server that also
+            // sends a Content-Length would otherwise come back Finite and be
+            // played as a recording — and `prepare` would never see the
+            // `Indefinite` it refuses live media on, so the refusal path would
+            // be unreachable.
+            continuity: if self.evidence.live {
+                Continuity::Indefinite
+            } else if self.evidence.byte_len.is_some() || self.metadata.duration.is_some() {
                 Continuity::Finite
             } else {
                 Continuity::Unresolved
             },
-            seek: SeekSupport::Native,
+            seek: match (self.evidence.byte_seekable, self.evidence.demuxer) {
+                (true, DemuxerSeek::Proven) => SeekSupport::Native,
+                (true, DemuxerSeek::Unproven) => SeekSupport::Unknown,
+                (false, _) => SeekSupport::Unsupported,
+            },
         }
+    }
+
+    /// Called once a trial seek (Task 10) demonstrates the demuxer can seek in
+    /// media time, promoting `SeekSupport::Unknown` to `Native`.
+    pub fn note_demuxer_proven(&mut self) {
+        self.evidence.demuxer = DemuxerSeek::Proven;
     }
 
     pub fn sample_rate(&self) -> u32 {
@@ -218,10 +305,28 @@ impl DecodedSource {
 
     /// Seek, then decode-and-discard forward to the exact frame.
     ///
-    /// Symphonia's accurate seek lands at or before the target because the
-    /// reader seeks to a packet boundary, so refinement is required for an exact
-    /// landing. `budget` bounds refinement for an *explicit* seek; pass `None`
-    /// for stop-resume and device recovery, which promise preservation.
+    /// `SeekMode::Coarse`, not `Accurate` (M3.1 Task 4): `Accurate`'s
+    /// `preseek_accurate` rewinds to the first packet and rescans forward
+    /// whenever a seek looks backward relative to the demuxer's own
+    /// read-ahead position, inside one uncancellable, unbounded
+    /// `FormatReader::seek()` call — that is the wedge M3's manual
+    /// acceptance found. `Coarse` computes a byte offset directly from the
+    /// track's own duration arithmetic instead, at a measured cost of a few
+    /// KB rather than the whole prefix.
+    ///
+    /// Whether the landing this produces is an estimate or a decoder-
+    /// confirmed position depends on which demuxer actually ran — see
+    /// `SeekOutcome::provenance` and this method's own computation of it,
+    /// just below the `seek()` call. It is *not* unconditionally
+    /// `Estimated`: `Coarse` only changes behaviour for MP3 (fix round 1).
+    ///
+    /// The reader can only seek to a packet boundary, so refinement is
+    /// required for an exact landing regardless of mode; it is also what
+    /// primes the bit reservoir a `Coarse` landing needs before its output
+    /// can be trusted (§5.2) — decoding and discarding forward to the target
+    /// already does this, with no mode-specific bookkeeping. `budget` bounds
+    /// refinement for an *explicit* seek; pass `None` for stop-resume and
+    /// device recovery, which promise preservation.
     pub fn seek_refined(
         &mut self,
         target: Duration,
@@ -231,13 +336,37 @@ impl DecodedSource {
         let seeked = self
             .reader
             .seek(
-                SeekMode::Accurate,
+                SeekMode::Coarse,
                 SeekTo::Time {
                     time: duration_to_time(target),
                     track_id: Some(self.track_id),
                 },
             )
             .map_err(|source| PlaybackError::SeekFailed { target, source })?;
+        // Provenance follows the demuxer that actually ran `Coarse`, not the
+        // `SeekMode` this call requests uniformly (M3.1 Task 4, fix round 1).
+        // Across this crate's whole dependency tree, MP3's `MpaReader` is the
+        // *only* `FormatReader::seek` that reads its `mode` argument at all —
+        // FLAC's own seek (`symphonia-bundle-flac`) binary-searches on real
+        // per-frame sample numbers carried in the frame headers themselves,
+        // and every other format this crate supports (WAV, ISO-BMFF/AAC)
+        // ignores `mode` and always does the equivalent of `Accurate`. So a
+        // landing on any non-MP3 format is exactly as decoder-confirmed as
+        // it always was; only MP3's `preseek_coarse` estimates a byte offset
+        // from uniform-bitrate arithmetic, and only that estimate can be
+        // wrong by the amounts §5.2 measured (235 s on a 600 s file, with no
+        // way to tell from outside). Never conditioned on a Xing/Info tag or
+        // anything else sampled from the file - symphonia ignores the Xing
+        // TOC and does the same arithmetic regardless of whether one is
+        // present, so a tagged MP3 is `Estimated` exactly like an untagged
+        // one. Read from the reader's own `format_info()`, not from the
+        // file extension, the URL, or the transport, so this is exactly the
+        // demuxer that ran, not a guess about it.
+        let provenance = if self.reader.format_info().format == FORMAT_ID_MP3 {
+            PositionProvenance::Estimated
+        } else {
+            PositionProvenance::Established
+        };
         self.decoder.reset();
         // `actual_ts` is signed and MP3 readers report a NEGATIVE timestamp when
         // seeking into an encoder's delay region, so a bare `as u64` wraps to
@@ -283,6 +412,7 @@ impl DecodedSource {
         Ok(SeekOutcome {
             actual: self.position(),
             refinement_truncated: truncated,
+            provenance,
         })
     }
 

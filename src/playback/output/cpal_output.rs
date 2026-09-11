@@ -169,8 +169,16 @@ impl AudioOutput for CpalOutput {
             .build_output_stream(
                 stream_config,
                 move |out: &mut [f32], info: &cpal::OutputCallbackInfo| {
-                    let playback = Nanos::from_stream_nanos(info.timestamp().playback.as_nanos());
-                    core.fill(out, playback);
+                    let timestamp = info.timestamp();
+                    // `callback` is the actual current instant - the same
+                    // domain `stream.now()` reads - and is what `fill` mirrors
+                    // into the clock sink. `playback` is a prediction ahead of
+                    // it (`timeline.rs` relies on that ordering), and still
+                    // stamps `SpanRecord::t0` only. Feeding `playback` in as
+                    // "now" would over-report position by roughly one buffer.
+                    let callback = Nanos::from_stream_nanos(timestamp.callback.as_nanos());
+                    let playback = Nanos::from_stream_nanos(timestamp.playback.as_nanos());
+                    core.fill(out, callback, playback);
                 },
                 move |error: cpal::Error| {
                     // Never blocks: a full fault queue means the worker already

@@ -4,10 +4,12 @@
 
 use std::time::Duration;
 
-use continuo::playback::command::PlaybackCommand;
-use continuo::playback::event::PlaybackEvent;
+use continuo::playback::command::{PlaybackCommand, ResumeIntent};
+use continuo::playback::event::{PlaybackEvent, StartDisposition};
+use continuo::playback::provenance::PositionProvenance;
 use continuo::playback::state::PlaybackState;
 use continuo::playback::volume::Volume;
+use continuo::resume::ResumeCandidate;
 
 mod support;
 use support::TestEngine;
@@ -29,6 +31,58 @@ fn stop_preserves_the_logical_position() {
     engine.send(PlaybackCommand::Stop);
     engine.await_state(PlaybackState::Stopped);
     assert_eq!(engine.position(), before, "stop must not reset position");
+}
+
+#[test]
+fn an_ordinary_local_seek_reports_an_established_landing() {
+    // The M1 path is unchanged: a local FLAC file's refined seek lands where
+    // it says, and nothing about this milestone may make it claim otherwise.
+    //
+    // M3.1 Task 4's `SeekMode::Coarse` swap has exactly one call site,
+    // shared by local and remote sources - but provenance follows the
+    // demuxer that actually *ran* `Coarse`, not the mode this call requests
+    // uniformly (fix round 1). MP3's `MpaReader` is the only
+    // `FormatReader::seek` in this crate's dependency tree that reads `mode`
+    // at all; FLAC's own seek binary-searches on real per-frame sample
+    // numbers carried in the frame headers, so `Coarse` and `Accurate`
+    // execute byte-identical code for it. `TRACK` (`sine-5s.flac`) is FLAC,
+    // so this landing is exactly as decoder-confirmed as it always was. An
+    // earlier round of this task flipped this assertion to `Estimated`
+    // unconditionally; that was wrong, and this is the corrected test - see
+    // `a_remote_mp3_seek_reports_estimated_and_a_local_flac_seek_reports_
+    // established` for the two pinned side by side.
+    let mut engine = TestEngine::start(TRACK);
+    engine.play_for(Duration::from_millis(200));
+    engine.send(PlaybackCommand::SeekTo(Duration::from_secs(2)));
+    let completed = engine.await_seek_completed(Duration::from_secs(10));
+    assert_eq!(completed.provenance, PositionProvenance::Established);
+    engine.finish();
+}
+
+#[test]
+fn an_established_duration_still_clamps_a_seek() {
+    // M1/M2 behaviour, unchanged: a seek requested past a known (established)
+    // duration is clamped to it before the engine ever attempts anything.
+    // Stopped rather than playing, so this observes `clamp_target`'s output
+    // directly through `SeekTargetStored` without also depending on whether
+    // the decoder accepts a real seek to the exact last instant of the file
+    // (a separate, unrelated concern `SeekMode`/`max_ts` own). Without this
+    // test, an implementation that simply deleted the clamp entirely (rather
+    // than skipping it only for an estimated duration) would still look
+    // correct.
+    let mut engine = TestEngine::start(TRACK); // sine-5s.flac: 5s, established.
+    engine.send(PlaybackCommand::Stop);
+    engine.await_state(PlaybackState::Stopped);
+    engine.send(PlaybackCommand::SeekTo(Duration::from_secs(100)));
+    let event = engine.await_event(|e| matches!(e, PlaybackEvent::SeekTargetStored { .. }));
+    let PlaybackEvent::SeekTargetStored { target, .. } = event else {
+        unreachable!("await_event's predicate already matched SeekTargetStored")
+    };
+    assert_eq!(
+        target,
+        Duration::from_secs(5),
+        "a seek past a known duration must be clamped to it before being stored, not kept as-is"
+    );
 }
 
 #[test]
@@ -419,4 +473,106 @@ fn a_failed_load_keeps_the_position_that_was_asked_for() {
         position, start_at,
         "a failed load lost the requested resume position"
     );
+}
+
+// ----------------------------------------------- resume intent and disposition
+
+#[test]
+fn a_load_that_resumes_reports_a_resumed_disposition() {
+    let mut engine = TestEngine::start(TRACK);
+    engine.load_with_resume(
+        support::fixture(TRACK),
+        ResumeIntent::Candidate(ResumeCandidate {
+            position: Duration::from_secs(2),
+            completed: false,
+        }),
+    );
+    let loaded = engine.await_loaded();
+    assert_eq!(loaded.disposition, StartDisposition::Resumed);
+    assert!(loaded.position >= Duration::from_secs(2));
+}
+
+#[test]
+fn a_load_of_a_completed_entry_replays_from_zero_and_says_so() {
+    let mut engine = TestEngine::start(TRACK);
+    engine.load_with_resume(
+        support::fixture(TRACK),
+        ResumeIntent::Candidate(ResumeCandidate {
+            position: Duration::from_secs(2),
+            completed: true,
+        }),
+    );
+    let loaded = engine.await_loaded();
+    assert_eq!(loaded.disposition, StartDisposition::CompletedReplay);
+    assert_eq!(loaded.position, Duration::ZERO);
+}
+
+// --------------------------------------- §4.3 restart preference (Task 6 fix)
+
+/// The end-to-end wiring §4.2/§4.3 was missing: a `ResumeIntent` carrying
+/// both a stored `estimated` location and its established fallback must
+/// land the load *at the estimate*, not at `position` — and report which
+/// established value it kept beside it. Ablation: routing
+/// `ResumeIntent::EstimatedCandidate` through the same branch as `Candidate`
+/// (i.e. seeking to `established` instead of `target`) makes the position
+/// assertion fail — `loaded.position` would land near 1 s instead of 3 s.
+#[test]
+fn a_load_with_both_locations_resumes_at_the_estimate_and_reports_the_kept_fallback() {
+    let mut engine = TestEngine::start(TRACK);
+    engine.load_with_resume(
+        support::fixture(TRACK),
+        ResumeIntent::EstimatedCandidate {
+            target: Duration::from_secs(3),
+            established: Some(Duration::from_secs(1)),
+        },
+    );
+    let loaded = engine.await_loaded();
+    assert_eq!(
+        loaded.disposition,
+        StartDisposition::ResumedEstimated {
+            established: Some(Duration::from_secs(1))
+        }
+    );
+    assert!(
+        loaded.position >= Duration::from_secs(3),
+        "the load must land at the estimate, not the established fallback: {:?}",
+        loaded.position
+    );
+}
+
+/// R8: an estimate-only entry (nothing ever established) must report
+/// `established: None`, never a fabricated fallback — and must still resume
+/// at the estimate. Ablation: a wrong `resume_intent_for` (or a wrong
+/// engine-side pass-through) that substitutes `Duration::ZERO` for the
+/// absent established position would be indistinguishable from a genuine
+/// zero-established entry, which is exactly the "never established" vs.
+/// "established at the start" conflation R8 forbids — caught here because
+/// `established` is asserted as `None`, not merely "not `Some(1s)`".
+#[test]
+fn an_estimate_only_load_resumes_at_the_estimate_and_reports_no_established_fallback() {
+    let mut engine = TestEngine::start(TRACK);
+    engine.load_with_resume(
+        support::fixture(TRACK),
+        ResumeIntent::EstimatedCandidate {
+            target: Duration::from_secs(3),
+            established: None,
+        },
+    );
+    let loaded = engine.await_loaded();
+    assert_eq!(
+        loaded.disposition,
+        StartDisposition::ResumedEstimated { established: None }
+    );
+    assert!(loaded.position >= Duration::from_secs(3));
+}
+
+#[test]
+fn an_explicit_restart_announces_that_it_established() {
+    // G1. Without this event `Session` cannot tell a restart from any other
+    // establishment, and §10's protection can never be lifted.
+    let mut engine = TestEngine::start(TRACK);
+    engine.play_for(Duration::from_millis(200));
+    engine.send(PlaybackCommand::Restart);
+    let established = engine.await_restart_established();
+    assert_eq!(established, Duration::ZERO);
 }

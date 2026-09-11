@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use rtrb::{Consumer, Producer};
 
@@ -26,6 +27,13 @@ pub struct CallbackCore {
     /// the freeze and park acknowledgments.
     pending: Option<SpanRecord>,
     current_gain: f32,
+    /// Mirrors the callback-domain instant on every invocation of `fill` -
+    /// including while parked or frozen - so a wait hook blocked deep inside a
+    /// decoder read, which cannot reach `Worker.output`, still has a live
+    /// "now" to recompute the played position against (G5/§8). This is the
+    /// only context still running while the decode thread is blocked, which
+    /// is why the write lives here and not on `Worker`.
+    clock: Arc<AtomicU64>,
 }
 
 impl CallbackCore {
@@ -35,6 +43,7 @@ impl CallbackCore {
         spans: Producer<SpanRecord>,
         channels: u16,
         sample_rate: u32,
+        clock: Arc<AtomicU64>,
     ) -> Self {
         let gain = link.gain();
         Self {
@@ -47,10 +56,28 @@ impl CallbackCore {
             media_total: 0,
             pending: None,
             current_gain: gain,
+            clock,
         }
     }
 
-    pub fn fill(&mut self, out: &mut [f32], playback: Nanos) {
+    /// `callback` is the actual current instant - the same domain `now()`
+    /// reads elsewhere (`stream.now()` / `info.timestamp().callback`) - and is
+    /// only ever mirrored into `clock`. `playback` is cpal's own prediction of
+    /// when this buffer will actually play, strictly ahead of `callback`
+    /// (`timeline.rs` relies on that ordering for its spans), and is what
+    /// still stamps `SpanRecord::t0` below, exactly as before this split.
+    pub fn fill(&mut self, out: &mut [f32], callback: Nanos, playback: Nanos) {
+        // `fetch_max`, not `store`: this and `Worker::publish_progress`'s own
+        // write race on two different threads with no ordering between them,
+        // so `store` can let an in-flight, already-superseded sample from one
+        // thread overwrite a newer one the other thread just published -
+        // `Relaxed` only orders each store against the *other* stores to this
+        // location, not against which thread observed the later instant.
+        // `fetch_max` makes the location move only forward within a domain,
+        // which is what a clock this steady-state actually needs; see
+        // `Worker::open_transport` for the one place a *lower* value must
+        // still win, because the domain itself just changed.
+        self.clock.fetch_max(callback.0, Ordering::Relaxed);
         self.flush_pending();
         let control = self.link.load_control();
         if control.generation != self.generation {
@@ -190,7 +217,16 @@ mod tests {
         let link = Arc::new(OutputLink::new());
         let (pcm_tx, pcm_rx) = rtrb::RingBuffer::<f32>::new(pcm_frames * 2);
         let (span_tx, span_rx) = rtrb::RingBuffer::<SpanRecord>::new(64);
-        let core = CallbackCore::new(Arc::clone(&link), pcm_rx, span_tx, 2, RATE);
+        // These tests exercise the ring/span/ack behavior, not the clock
+        // mirror, so the sink is a throwaway nobody reads back.
+        let core = CallbackCore::new(
+            Arc::clone(&link),
+            pcm_rx,
+            span_tx,
+            2,
+            RATE,
+            Arc::new(AtomicU64::new(0)),
+        );
         let mut output = TestOutput::new(2, RATE, 480, Duration::from_millis(20));
         output.attach(core);
         (link, pcm_tx, span_rx, output)
@@ -263,7 +299,14 @@ mod tests {
         let link = Arc::new(OutputLink::new());
         let (mut pcm_tx, pcm_rx) = rtrb::RingBuffer::<f32>::new(48_000);
         let (span_tx, mut span_rx) = rtrb::RingBuffer::<SpanRecord>::new(1);
-        let core = CallbackCore::new(Arc::clone(&link), pcm_rx, span_tx, 2, RATE);
+        let core = CallbackCore::new(
+            Arc::clone(&link),
+            pcm_rx,
+            span_tx,
+            2,
+            RATE,
+            Arc::new(AtomicU64::new(0)),
+        );
         let mut out = TestOutput::new(2, RATE, 480, Duration::from_millis(20));
         out.attach(core);
         for _ in 0..480 * 2 * 3 {

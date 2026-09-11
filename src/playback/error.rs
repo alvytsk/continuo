@@ -28,4 +28,6 @@ pub enum PlaybackError {
     Io(#[from] std::io::Error),
     #[error("{0}")]
     Failed(String),
+    #[error(transparent)]
+    Remote(#[from] crate::http::error::RemoteFailure),
 }

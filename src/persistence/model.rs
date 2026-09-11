@@ -11,18 +11,35 @@ use crate::media::id::MediaId;
 use crate::playback::checkpoint::PlaybackCheckpoint;
 use crate::playback::volume::Volume;
 
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// Counting the current entry, which is never evictable (D2).
 pub const MAX_ENTRIES: usize = 512;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PersistedCheckpoint {
-    pub position: Duration,
+    /// The established position — decoder-confirmed, unchanged in meaning
+    /// from M2. `None` when nothing has ever established one for this
+    /// media: an entry that exists only to carry `estimated` (design doc
+    /// §4.1, §4.2). Distinct from `Some(ZERO)`, which means established at
+    /// the start; `decide_resume` must not conflate the two, since
+    /// `ResumeDecision::AtStart` already means the latter.
+    ///
+    /// A v1 file's present value deserialises straight to `Some` (the store
+    /// migrates the envelope's version; see `store::StateStore::load`), so
+    /// the schema bump costs the migration nothing here.
+    pub position: Option<Duration>,
     pub completed: bool,
     pub touch_seq: u64,
     #[serde(with = "time::serde::rfc3339")]
     pub updated_at: OffsetDateTime,
+    /// Where an estimated seek left the listener, when one did (§4.1).
+    /// Never a substitute for `position`: it records a location the engine
+    /// believes but has not confirmed. Absent rather than `null` when
+    /// unset, so a v2 file with no estimate stays comparable to what M2
+    /// wrote.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub estimated: Option<Duration>,
 }
 
 /// Every field is private, so the paths that can write a stored position are an
@@ -102,10 +119,26 @@ impl PersistedState {
         self.volume = volume.as_gain();
     }
 
-    /// Read-only: no path outside this module can change the version a snapshot
-    /// carries, and the store asserts [`SCHEMA_VERSION`] again before it writes.
+    /// Read-only from outside `persistence`: the only path that can change the
+    /// version a snapshot carries is [`Self::migrate_to_current_schema`],
+    /// visible solely to the store's own load path, and the store asserts
+    /// [`SCHEMA_VERSION`] again before it writes.
     pub fn schema_version(&self) -> u32 {
         self.schema_version
+    }
+
+    /// Stamps this snapshot with the build's current schema version. The only
+    /// caller is the store's load path, immediately after it accepts a file
+    /// at an older, migratable version (design doc §4.5) — a file whose
+    /// shape already deserialised cleanly into the current [`PersistedState`]
+    /// (a v1 file's `position` lands straight in `Some`, and an absent
+    /// `estimated` defaults to `None`), so nothing here needs to touch the
+    /// data, only the label. Without this call, the next write would
+    /// serialise v2 data — `estimated`, an optional `position` — under a v1
+    /// envelope: a file that claims v1 while holding v2 data, which the next
+    /// v1 build would read and quietly discard.
+    pub(super) fn migrate_to_current_schema(&mut self) {
+        self.schema_version = SCHEMA_VERSION;
     }
 
     pub fn current_media(&self) -> Option<&MediaId> {
@@ -169,12 +202,74 @@ impl PersistedState {
         self.checkpoints.insert(
             checkpoint.media.clone(),
             PersistedCheckpoint {
-                position: checkpoint.position,
+                position: Some(checkpoint.position),
                 completed,
                 touch_seq,
                 updated_at: checkpoint.updated_at,
+                // `record` is the established-checkpoint path unchanged from
+                // M1/M2 (§4.2's estimated write path is Task 6's, not this
+                // one's), and it always replaces the entry wholesale rather
+                // than merging into it — so any previously stored estimate
+                // for this media is cleared here too.
+                estimated: None,
             },
         );
+    }
+
+    /// The estimated-checkpoint write path (§4.2, Task 6): sets `estimated`
+    /// and, when this media completed, `completed` — and touches nothing
+    /// else. **Never writes `position`.** That is what makes the two write
+    /// rules one code path rather than two: whether an established
+    /// checkpoint already exists for this media or not, an estimated
+    /// location is never allowed to become it, so this method simply has no
+    /// way to. `completed` is written exactly as given rather than merged,
+    /// the same as `record`'s — the only caller with a `true` to pass is an
+    /// estimated `EndOfTrack`, and it is itself the evidence that finished
+    /// the entry.
+    ///
+    /// Participates in the same `touch_seq`/eviction bookkeeping as
+    /// `record`: an estimate-only entry is still a real entry for §2's cap
+    /// and LRU eviction, not a second-class one.
+    pub fn record_estimated(
+        &mut self,
+        media: MediaId,
+        estimated: Duration,
+        updated_at: OffsetDateTime,
+        completed: bool,
+    ) {
+        let fresh = !self.checkpoints.contains_key(&media);
+        if fresh && self.checkpoints.len() >= MAX_ENTRIES {
+            let evicted = self.evict_one(&media);
+            if !evicted {
+                debug_assert!(
+                    false,
+                    "MAX_ENTRIES ({MAX_ENTRIES}) left no evictable entry; the cap would be exceeded"
+                );
+                tracing::warn!(
+                    media = %media,
+                    "no entry could be evicted at the MAX_ENTRIES cap; dropping the incoming checkpoint rather than exceeding it"
+                );
+                return;
+            }
+        }
+        let touch_seq = self.next_seq;
+        self.next_seq = self.next_seq.saturating_add(1);
+        let entry = self
+            .checkpoints
+            .entry(media)
+            .or_insert_with(|| PersistedCheckpoint {
+                // No established position exists yet for a fresh entry (§4.1,
+                // §4.2): an estimate must never bootstrap one into being.
+                position: None,
+                completed: false,
+                touch_seq,
+                updated_at,
+                estimated: None,
+            });
+        entry.estimated = Some(estimated);
+        entry.completed = completed;
+        entry.touch_seq = touch_seq;
+        entry.updated_at = updated_at;
     }
 
     /// The lowest `touch_seq` among entries that are neither current nor the
@@ -221,10 +316,11 @@ mod tests {
         state.checkpoints.insert(
             only.clone(),
             PersistedCheckpoint {
-                position: Duration::ZERO,
+                position: Some(Duration::ZERO),
                 completed: false,
                 touch_seq: 1,
                 updated_at: OffsetDateTime::UNIX_EPOCH,
+                estimated: None,
             },
         );
         state.current_media = Some(only.clone());
