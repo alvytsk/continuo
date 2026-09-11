@@ -95,6 +95,7 @@ fn a_v2_estimated_only_entry_keeps_position_and_estimate_distinct()
         }
     }"#;
     std::fs::write(&path, v2)?;
+    let before = std::fs::metadata(&path)?.modified()?;
 
     let store = StateStore::new(path.clone(), Arc::new(FakeClock::new()));
     let snapshot = store.read_snapshot()?;
@@ -105,6 +106,18 @@ fn a_v2_estimated_only_entry_keeps_position_and_estimate_distinct()
     assert_eq!(entry.position, None, "no established position exists yet");
     assert_eq!(entry.estimated, Some(Duration::from_secs(17)));
     assert!(!snapshot.completed_for(&media("a")));
+
+    assert_eq!(
+        std::fs::read(&path)?,
+        v2,
+        "a read must never rewrite the file"
+    );
+    assert_eq!(
+        std::fs::metadata(&path)?.modified()?,
+        before,
+        "a read must never touch the file's mtime"
+    );
+    assert_eq!(std::fs::read_dir(dir.path())?.count(), 1);
     Ok(())
 }
 
@@ -118,11 +131,17 @@ fn an_unsupported_version_is_a_visible_error_and_the_file_is_untouched()
     let path = dir.path().join("state.json");
     let newer = br#"{"schema_version":3,"checkpoints":{}}"#;
     std::fs::write(&path, newer)?;
+    let before = std::fs::metadata(&path)?.modified()?;
 
     let store = StateStore::new(path.clone(), Arc::new(FakeClock::new()));
     assert!(store.read_snapshot().is_err());
 
     assert_eq!(std::fs::read(&path)?, newer);
+    assert_eq!(
+        std::fs::metadata(&path)?.modified()?,
+        before,
+        "a rejected version must never touch the file's mtime"
+    );
     assert_eq!(std::fs::read_dir(dir.path())?.count(), 1);
     Ok(())
 }
@@ -136,6 +155,7 @@ fn an_unreadable_path_is_a_visible_error() -> Result<(), Box<dyn std::error::Err
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("state.json");
     std::fs::create_dir(&path)?;
+    let before = std::fs::metadata(&path)?.modified()?;
 
     let store = StateStore::new(path.clone(), Arc::new(FakeClock::new()));
     assert!(store.read_snapshot().is_err());
@@ -144,6 +164,19 @@ fn an_unreadable_path_is_a_visible_error() -> Result<(), Box<dyn std::error::Err
         path.is_dir(),
         "the directory must be left exactly as it was"
     );
-    assert_eq!(std::fs::read_dir(dir.path())?.count(), 1);
+    assert_eq!(
+        std::fs::metadata(&path)?.modified()?,
+        before,
+        "an unreadable path must never be touched, not even its mtime"
+    );
+    let entries: Vec<_> = std::fs::read_dir(dir.path())?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name())
+        .collect();
+    assert_eq!(
+        entries,
+        vec![std::ffi::OsString::from("state.json")],
+        "no file was created, renamed, or quarantined alongside it"
+    );
     Ok(())
 }
