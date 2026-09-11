@@ -1,5 +1,7 @@
 //! The `continuo` command-line surface.
 
+use std::num::NonZeroUsize;
+
 use clap::{Parser, Subcommand};
 
 #[derive(Debug, Parser)]
@@ -11,13 +13,71 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum CliCommand {
-    /// Play a local audio file or an HTTP(S) URL.
+    /// Play a local audio file, an HTTP(S) URL, or a subscribed feed's
+    /// episode by index.
     Play {
-        /// Path to an MP3, FLAC, WAV or M4A file, or an http(s):// URL.
+        /// Path to an MP3, FLAC, WAV or M4A file, an http(s):// URL, or —
+        /// with an index after it — a subscribed feed's slug.
         source: String,
+        /// The 1-based episode index within `source`'s cached episode list,
+        /// as `continuo episodes <slug>` displays it (§6.3).
+        #[arg(value_parser = positive_index)]
+        index: Option<NonZeroUsize>,
         /// Open the source, print what was found, and exit without using a
-        /// device or a terminal.
+        /// device or a terminal. With an index, this applies after the
+        /// episode is resolved (§6.3).
         #[arg(long)]
         probe_only: bool,
     },
+    /// Subscribe to a podcast feed.
+    Subscribe {
+        /// The feed's http(s):// URL.
+        url: String,
+        /// Use this slug instead of one derived from the feed's title.
+        #[arg(long = "as")]
+        slug: Option<String>,
+    },
+    /// Remove a subscription and its cached episodes. Checkpoints are kept.
+    Unsubscribe {
+        /// The slug `continuo feeds` displays.
+        slug: String,
+    },
+    /// List every subscription.
+    Feeds,
+    /// Refresh one subscription, or every subscription when no slug is given.
+    Refresh {
+        /// The slug to refresh; omit to refresh all of them.
+        slug: Option<String>,
+    },
+    /// List a subscription's cached episodes and their playback progress.
+    Episodes {
+        /// The slug `continuo feeds` displays.
+        slug: String,
+        /// Display only the first N episodes. Indices never change (§6.3).
+        #[arg(short = 'n', value_parser = positive_count)]
+        limit: Option<NonZeroUsize>,
+    },
+}
+
+/// Episode indices are 1-based (§1.2), so `0` is not a smaller index — it is
+/// not an index at all. The message names both `play` spellings because a
+/// rejected second positional is exactly where the two forms get confused.
+fn positive_index(value: &str) -> Result<NonZeroUsize, String> {
+    value
+        .parse::<usize>()
+        .ok()
+        .and_then(NonZeroUsize::new)
+        .ok_or_else(|| {
+            "expected a positive episode index: play <path-or-url> or play <slug> <index>".into()
+        })
+}
+
+/// §6.3: `-n N` requires N ≥ 1. A zero limit would display nothing while
+/// reporting success, which is never what was asked for.
+fn positive_count(value: &str) -> Result<NonZeroUsize, String> {
+    value
+        .parse::<usize>()
+        .ok()
+        .and_then(NonZeroUsize::new)
+        .ok_or_else(|| "expected a positive count".into())
 }

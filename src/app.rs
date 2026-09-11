@@ -42,16 +42,67 @@ const VOLUME_STEP: f32 = 0.05;
 const HELP_LINE: &str =
     "space pause · ←/→ seek 10s · Home restart · -/+ volume · s stop · p play · q quit";
 
-/// Runs the parsed CLI to completion.
-pub fn run(cli: cli::Cli) -> Result<(), PlaybackError> {
-    let CliCommand::Play { source, probe_only } = cli.command;
-
-    if probe_only {
-        return run_probe_only(&source);
+/// Runs the parsed CLI to completion (design doc §6.5).
+///
+/// Both `play` forms resolve their `(MediaId, SourceLocation)` pair *before*
+/// entering the shared playback body: one positional through the existing
+/// [`resolve_source`], two through [`crate::library::resolve_episode`].
+/// `resolve_source` itself is unchanged; it gained a sibling. Everything
+/// else dispatches to [`crate::commands`], which owns every line this
+/// program prints for a feed command, the one synchronous bridge into the
+/// HTTP runtime, and the exit status a partial failure has to carry.
+pub fn run(cli: cli::Cli) -> Result<(), crate::error::AppError> {
+    match cli.command {
+        CliCommand::Play {
+            source,
+            index: None,
+            probe_only,
+        } => {
+            if probe_only {
+                return run_probe_only(&source).map_err(Into::into);
+            }
+            let (media, location) = resolve_source(&source)?;
+            run_resolved(media, location).map_err(Into::into)
+        }
+        CliCommand::Play {
+            source: slug,
+            index: Some(index),
+            probe_only,
+        } => {
+            // No `EngineHandle`, no `AudioOutput` and no `HttpService` exist
+            // yet, which is what keeps `NotPlayable` (§6.4) a resolution
+            // failure rather than a playback one.
+            let (subs, cache) = crate::commands::platform_subscription_stores()?;
+            let (media, location) =
+                crate::library::resolve_episode(&subs, &cache, &slug, index.get())?;
+            if probe_only {
+                // §6.3: the probe applies *after* resolution, over the
+                // enclosure this episode actually points at. The `RemoteUrl`
+                // identity `run_probe_only` derives internally is never
+                // persisted — the probe writes no state at all — so the
+                // podcast identity resolved above is not diluted by it.
+                if let SourceLocation::Http(url) = &location {
+                    return run_probe_only(url.as_str()).map_err(Into::into);
+                }
+                return Err(crate::feed::error::FeedError::Malformed {
+                    detail: "podcast cache contained a non-HTTP source".into(),
+                }
+                .into());
+            }
+            // The podcast `MediaId` travels on unchanged: what is played is
+            // the enclosure, what is checkpointed is the episode.
+            run_resolved(media, location).map_err(Into::into)
+        }
+        command => crate::commands::run(command).map_err(Into::into),
     }
+}
 
-    let (media, location) = resolve_source(&source)?;
-
+/// The shared playback body: persistence open, engine assembly, resume,
+/// session, both key loops and the shutdown. Unchanged from when it was
+/// `run`'s own tail — it only stopped resolving its own source, so that one
+/// caller can hand it a local file or a URL and the other a podcast episode
+/// and nothing downstream can tell which.
+fn run_resolved(media: MediaId, location: SourceLocation) -> Result<(), PlaybackError> {
     // Persistence opens before the engine: the resume candidate is an
     // argument to the load, and the restored volume is a command that
     // precedes it.
@@ -1274,6 +1325,7 @@ mod tests {
     use super::*;
     use crate::clock::FakeClock;
     use crate::media::capabilities::{Continuity, MediaCapabilities, SeekSupport};
+    use crate::media::id::{EpisodeKey, FeedId};
     use crate::media::metadata::MediaMetadata;
     use crate::playback::checkpoint::PlaybackCheckpoint;
     use crate::playback::event::StartDisposition;
@@ -1322,6 +1374,46 @@ mod tests {
         // lowers it: an unshifted key exists for each.
         assert!(volume_after(KeyCode::Char('='), 0.5).is_some());
         assert!(volume_after(KeyCode::Char('-'), 0.5).is_some());
+    }
+
+    /// §6.5's handoff: `run_resolved` plays whatever pair it is handed, and
+    /// the identity in the `Load` it issues is that pair's own — never one
+    /// re-derived from the source. For a podcast episode the two differ:
+    /// what is played is the enclosure, what is checkpointed is the episode,
+    /// and only the latter survives a feed moving its audio to another CDN.
+    #[test]
+    fn a_resolved_podcast_pair_loads_the_episode_identity_not_the_enclosure() {
+        let enclosure = "https://cdn.example.org/987.mp3";
+        let (feed, episode) = match (
+            FeedId::new("0123456789abcdef0123456789abcdef".to_string()),
+            EpisodeKey::resolve(Some("ep-987"), None, None),
+        ) {
+            (Ok(feed), Ok(episode)) => (feed, episode),
+            (feed, episode) => panic!("literal identities must parse: {feed:?} {episode:?}"),
+        };
+        let media = MediaId::PodcastEpisode { feed, episode };
+        let location = match Url::parse(enclosure) {
+            Ok(url) => SourceLocation::Http(url),
+            Err(error) => panic!("a literal URL must parse: {error}"),
+        };
+
+        let commands = resume_commands(media.clone(), location, None, Volume::FULL);
+        match &commands[1] {
+            PlaybackCommand::Load {
+                media: loaded,
+                source,
+                resume,
+            } => {
+                assert_eq!(loaded, &media);
+                assert!(matches!(source, SourceLocation::Http(url) if url.as_str() == enclosure));
+                assert!(matches!(resume, ResumeIntent::StartAt(at) if *at == Duration::ZERO));
+                match NormalizedUrl::parse(enclosure) {
+                    Ok(url) => assert_ne!(loaded, &MediaId::RemoteUrl(url)),
+                    Err(error) => panic!("a literal URL must normalize: {error}"),
+                }
+            }
+            other => panic!("the second command must be the load: {other:?}"),
+        }
     }
 
     fn local(path: &str) -> MediaId {

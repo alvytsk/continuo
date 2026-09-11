@@ -1,6 +1,7 @@
 pub mod app;
 pub mod cli;
 pub mod clock;
+pub mod commands;
 pub mod error;
 pub mod feed;
 pub mod http;
