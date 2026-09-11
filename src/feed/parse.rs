@@ -121,11 +121,11 @@ pub enum WarningKind {
 ///
 /// # Errors
 ///
-/// Feed-level faults only (§4.6): XML that will not parse, a decoding
-/// failure, an unsupported document element, a missing `<channel>`, or a
-/// feed-level identity field carrying an entity that will not resolve — that
-/// last one has no enclosing item to skip, so the document is the only tier
-/// left. Item faults are counted in [`ParseReport::skipped`] instead.
+/// Feed-level faults only, and §4.6's list of them is exhaustive: XML that
+/// will not parse, a decoding failure, an unsupported document element, or a
+/// missing `<channel>`. Item faults are counted in
+/// [`ParseReport::skipped`] instead, and a feed-level field that will not
+/// decode is merely absent.
 pub fn parse_feed(bytes: &[u8], retrieval_url: &Url) -> Result<ParseReport, FeedError> {
     let mut reader = NsReader::from_reader(DecodingReader::new(bytes));
     // quick-xml 0.42 defaults are already what §4 asks for: no whitespace
@@ -612,7 +612,7 @@ impl<'a> Walker<'a> {
 
         match rel.as_deref().map_or("alternate", str::trim) {
             "enclosure" if in_entry => self.push_enclosure(candidate, base),
-            "alternate" => self.push_alternate(candidate, base, in_entry)?,
+            "alternate" => self.push_alternate(candidate, base, in_entry),
             // `self`, `related`, `via`, a hub, an unregistered relation: not a
             // field this parser maps, so not a field whose href has to decode.
             _ => {}
@@ -626,15 +626,19 @@ impl<'a> Walker<'a> {
             return;
         };
         builder.enclosure_count += 1;
-        if builder.item.enclosure.is_some() {
-            // Already have one; §4.7 keeps the first and counts the rest.
-            return;
-        }
         if candidate.href_undecodable {
             // An enclosure URL is an identity fallback, and an identity that
-            // cannot be decoded consistently is not an identity (§4.8).
+            // cannot be decoded consistently is not an identity (§4.8). This
+            // runs *before* the "already have one" return: §4.8's "every href"
+            // is unqualified, and a rule whose outcome depended on which
+            // enclosure the feed happened to list first would be a rule about
+            // line order rather than about identity.
             builder.rejected = true;
             self.warn(WarningKind::UnknownIdentityEntity);
+            return;
+        }
+        if builder.item.enclosure.is_some() {
+            // Already have one; §4.7 keeps the first and counts the rest.
             return;
         }
         let url = candidate
@@ -665,28 +669,16 @@ impl<'a> Walker<'a> {
 
     /// Records an Atom `alternate` link: the entry's link, or the feed's site
     /// link. First in document order wins.
-    fn push_alternate(
-        &mut self,
-        candidate: LinkCandidate,
-        base: &Url,
-        in_entry: bool,
-    ) -> Result<(), FeedError> {
-        let taken = if in_entry {
-            self.item
-                .as_ref()
-                .is_none_or(|builder| builder.item.link.is_some())
-        } else {
-            self.feed.site_link.is_some()
-        };
-        if taken {
-            return Ok(());
-        }
+    fn push_alternate(&mut self, candidate: LinkCandidate, base: &Url, in_entry: bool) {
+        // Checked before anything asks whether the field is already filled, so
+        // that good-then-bad and bad-then-good reach the same outcome.
         if candidate.href_undecodable {
-            if !in_entry {
-                return Err(undecodable_feed_identity());
+            if in_entry {
+                self.reject_identity();
+            } else {
+                self.warn_feed_identity();
             }
-            self.reject_identity();
-            return Ok(());
+            return;
         }
         let url = candidate
             .href
@@ -699,7 +691,6 @@ impl<'a> Walker<'a> {
         } else {
             set_once(&mut self.feed.site_link, url);
         }
-        Ok(())
     }
 
     /// The frame character content belongs to: the innermost open element,
@@ -787,12 +778,11 @@ impl<'a> Walker<'a> {
             }
             (Context::RssChannel, None, "link") => {
                 if unknown_entity {
-                    // A feed-level identity field has no enclosing item to
-                    // skip, so the only tier left is the document (§4.6).
-                    return Err(undecodable_feed_identity());
+                    self.warn_feed_identity();
+                } else {
+                    let base = base.clone().unwrap_or_else(|| self.base().clone());
+                    set_once(&mut self.feed.site_link, resolved_url(Some(&base), &text));
                 }
-                let base = base.clone().unwrap_or_else(|| self.base().clone());
-                set_once(&mut self.feed.site_link, resolved_url(Some(&base), &text));
             }
             (Context::RssChannel, None, "item") | (Context::AtomFeed, Some(ATOM_NS), "entry") => {
                 self.finish_item();
@@ -864,6 +854,22 @@ impl<'a> Walker<'a> {
             builder.rejected = true;
         }
         self.warn(WarningKind::UnknownIdentityEntity);
+    }
+
+    /// A **feed-level** href that will not decode: the field goes absent and
+    /// the document stands.
+    ///
+    /// §4.6's list of feed-level faults is exhaustive and does not include
+    /// this, and §4.8's remedy — fail the item — has no item to fail here.
+    /// Nor should it invent one: a site link is identity for nothing. It never
+    /// reaches `EpisodeKey::resolve`, so refusing to decode it costs the
+    /// homepage URL and nothing else, and losing every episode over a
+    /// homepage URL is not a trade §4.6 asks for.
+    fn warn_feed_identity(&mut self) {
+        self.warnings.push(ParseWarning {
+            item: None,
+            kind: WarningKind::UnknownIdentityEntity,
+        });
     }
 
     fn finish_item(&mut self) {
@@ -1000,15 +1006,6 @@ fn is_xhtml_title(element: &BytesStart<'_>, version: XmlVersion) -> bool {
         attribute.key.as_ref() == "type"
             && normalized(&attribute, version).is_some_and(|value| value.trim() == "xhtml")
     })
-}
-
-/// A feed-level identity field that will not decode.
-///
-/// The item tier is unavailable — there is no enclosing item to skip — so the
-/// only tier left is the document (§4.6). The detail names the category and
-/// never the field's bytes: a URL is exactly what a log must not repeat.
-fn undecodable_feed_identity() -> FeedError {
-    malformed("a feed-level link contains an entity that cannot be resolved")
 }
 
 /// Resolves `value` against `base`, or parses it as absolute when there is no

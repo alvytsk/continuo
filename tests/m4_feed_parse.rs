@@ -539,26 +539,159 @@ fn a_second_document_element_is_refused_whatever_it_is() -> Result<(), Box<dyn s
 }
 
 #[test]
-fn a_feed_level_identity_that_will_not_decode_fails_the_document()
+fn a_feed_level_href_that_will_not_decode_is_dropped_not_fatal()
 -> Result<(), Box<dyn std::error::Error>> {
-    // A feed-level link has no enclosing item to skip, so the item tier is
-    // unavailable and the only tier left is the document (§4.6).
+    // A site link is identity for nothing — it never reaches
+    // `EpisodeKey::resolve` — so §4.8's remedy of failing the item has nothing
+    // to fail, and §4.6's exhaustive list of feed-level faults does not include
+    // this. The field goes absent, the warning says so, and every episode in
+    // the feed survives a bad homepage URL.
+    const BAD: &str = "https://example.org/&nbsp;";
+    const GOOD: &str = "https://example.org/site/";
+    let cases = [
+        (
+            rss(&format!("<link>{BAD}</link><item><guid>a</guid></item>")),
+            None,
+        ),
+        (
+            atom(&format!(
+                "<a:link href=\"{BAD}\"/><a:entry><a:id>a</a:id></a:entry>"
+            )),
+            None,
+        ),
+        // And with a usable link beside it, in both orders: the good one wins
+        // and the warning is raised exactly once either way.
+        (
+            rss(&format!(
+                "<link>{BAD}</link><link>{GOOD}</link><item><guid>a</guid></item>"
+            )),
+            Some(GOOD),
+        ),
+        (
+            rss(&format!(
+                "<link>{GOOD}</link><link>{BAD}</link><item><guid>a</guid></item>"
+            )),
+            Some(GOOD),
+        ),
+        (
+            atom(&format!(
+                "<a:link href=\"{BAD}\"/><a:link href=\"{GOOD}\"/>\
+                 <a:entry><a:id>a</a:id></a:entry>"
+            )),
+            Some(GOOD),
+        ),
+        (
+            atom(&format!(
+                "<a:link href=\"{GOOD}\"/><a:link href=\"{BAD}\"/>\
+                 <a:entry><a:id>a</a:id></a:entry>"
+            )),
+            Some(GOOD),
+        ),
+    ];
+    for (document, site_link) in cases {
+        let report = parse_feed(document.as_bytes(), &feed_url())?;
+        assert_eq!(report.feed.items.len(), 1, "{document}");
+        assert_eq!(
+            report.feed.items[0].guid.as_deref(),
+            Some("a"),
+            "{document}"
+        );
+        assert_eq!(
+            report.feed.site_link.as_ref().map(Url::as_str),
+            site_link,
+            "{document}"
+        );
+        assert_eq!(report.skipped, 0, "{document}");
+        assert_eq!(
+            report.warnings,
+            vec![ParseWarning {
+                item: None,
+                kind: WarningKind::UnknownIdentityEntity
+            }],
+            "{document}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn an_undecodable_enclosure_href_rejects_the_item_whatever_the_order()
+-> Result<(), Box<dyn std::error::Error>> {
+    // The same semantic input twice, in both formats. §4.8's "every href" is
+    // unqualified, so an outcome that flipped with line order would be wrong
+    // whichever way it flipped.
+    const BAD: &str = "https://example.org/&nbsp;.mp3";
+    const GOOD: &str = "https://example.org/good.mp3";
     let documents = [
-        rss("<link>https://example.org/&nbsp;</link><item><guid>a</guid></item>"),
-        atom("<a:link href=\"https://example.org/&nbsp;\"/><a:entry><a:id>a</a:id></a:entry>"),
+        rss(&format!(
+            "<item><guid>a</guid><enclosure url=\"{BAD}\"/><enclosure url=\"{GOOD}\"/></item>"
+        )),
+        rss(&format!(
+            "<item><guid>a</guid><enclosure url=\"{GOOD}\"/><enclosure url=\"{BAD}\"/></item>"
+        )),
+        atom(&format!(
+            "<a:entry><a:id>a</a:id><a:link rel=\"enclosure\" href=\"{BAD}\"/>\
+             <a:link rel=\"enclosure\" href=\"{GOOD}\"/></a:entry>"
+        )),
+        atom(&format!(
+            "<a:entry><a:id>a</a:id><a:link rel=\"enclosure\" href=\"{GOOD}\"/>\
+             <a:link rel=\"enclosure\" href=\"{BAD}\"/></a:entry>"
+        )),
     ];
     for document in documents {
-        let Err(error) = parse_feed(document.as_bytes(), &feed_url()) else {
-            return Err(format!("expected a feed-level failure for {document}").into());
-        };
-        let rendered = format!("{error} / {error:?}");
-        assert!(
-            matches!(error, FeedError::Malformed { .. }),
-            "expected Malformed, got {rendered}"
+        let report = parse_feed(document.as_bytes(), &feed_url())?;
+        assert_eq!(report.feed.items, vec![], "{document}");
+        assert_eq!(report.skipped, 1, "{document}");
+        assert_eq!(
+            report.warnings,
+            vec![
+                ParseWarning {
+                    item: Some(1),
+                    kind: WarningKind::UnknownIdentityEntity
+                },
+                ParseWarning {
+                    item: Some(1),
+                    kind: WarningKind::ExtraEnclosures { ignored: 1 }
+                },
+            ],
+            "{document}"
         );
-        assert!(
-            !rendered.contains("example.org"),
-            "error output quoted the document: {rendered}"
+    }
+    Ok(())
+}
+
+#[test]
+fn an_undecodable_item_link_rejects_the_item_whatever_the_order()
+-> Result<(), Box<dyn std::error::Error>> {
+    const BAD: &str = "https://example.org/&nbsp;";
+    const GOOD: &str = "https://example.org/good";
+    let documents = [
+        rss(&format!(
+            "<item><guid>a</guid><link>{BAD}</link><link>{GOOD}</link></item>"
+        )),
+        rss(&format!(
+            "<item><guid>a</guid><link>{GOOD}</link><link>{BAD}</link></item>"
+        )),
+        atom(&format!(
+            "<a:entry><a:id>a</a:id><a:link href=\"{BAD}\"/>\
+             <a:link href=\"{GOOD}\"/></a:entry>"
+        )),
+        atom(&format!(
+            "<a:entry><a:id>a</a:id><a:link href=\"{GOOD}\"/>\
+             <a:link href=\"{BAD}\"/></a:entry>"
+        )),
+    ];
+    for document in documents {
+        let report = parse_feed(document.as_bytes(), &feed_url())?;
+        assert_eq!(report.feed.items, vec![], "{document}");
+        assert_eq!(report.skipped, 1, "{document}");
+        assert_eq!(
+            report.warnings,
+            vec![ParseWarning {
+                item: Some(1),
+                kind: WarningKind::UnknownIdentityEntity
+            }],
+            "{document}"
         );
     }
     Ok(())
