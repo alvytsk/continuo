@@ -166,3 +166,32 @@ and the label says otherwise. UTF-16 never gets there: the byte-order mark (or
 the `3C 00 3F 00` pattern) already settled it, and XML 1.0 §4.3.3 makes the
 mark rather than the label authoritative for byte order — so a big-endian
 document declaring the bare label `UTF-16` is honored, not refused.
+
+## Episode binding
+
+Used from `tests/m4_episode_binding.rs` (§2.4): plain UTF-8 RSS, nothing about
+decoding, so — unlike the encoding matrix above — there is no reason for
+these to be built in the test itself rather than committed as files.
+
+### `guid-absent-uses-enclosure.xml`
+
+One item with no `guid` at all and a usable `enclosure`. Identity falls
+through to the enclosure URL.
+
+### `item-without-enclosure.xml`
+
+One item with a `guid` and no enclosure. Identity survives; the bound episode
+is retained with `source: None` (§2.4 "identity without playability").
+
+### `item-without-identity.xml`
+
+One item with no `guid`, no enclosure and no link — no identity at all. It is
+skipped with `WarningKind::MissingIdentity` (§2.4 "no synthesis").
+
+### `duplicate-identity.xml`
+
+Two items sharing the guid `same` — the second also carries a usable
+enclosure the first lacks — plus a third item with no identity at all. The
+first occurrence of `same` wins and is retained with `source: None`; the
+second is skipped as a duplicate; the third is skipped as identityless
+(§4.7).

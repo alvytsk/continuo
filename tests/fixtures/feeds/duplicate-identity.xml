@@ -1,0 +1,18 @@
+<?xml version="1.0"?>
+<rss version="2.0">
+  <channel>
+    <title>Duplicate guid</title>
+    <item>
+      <guid>same</guid>
+      <title>first</title>
+    </item>
+    <item>
+      <guid>same</guid>
+      <title>second</title>
+      <enclosure url="https://example.org/b.mp3"/>
+    </item>
+    <item>
+      <title>no identity</title>
+    </item>
+  </channel>
+</rss>

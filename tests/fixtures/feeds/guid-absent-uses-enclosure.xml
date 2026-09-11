@@ -1,0 +1,10 @@
+<?xml version="1.0"?>
+<rss version="2.0">
+  <channel>
+    <title>No guid at all</title>
+    <item>
+      <title>no guid</title>
+      <enclosure url="https://example.org/only.mp3"/>
+    </item>
+  </channel>
+</rss>

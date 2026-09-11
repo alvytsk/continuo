@@ -477,7 +477,13 @@ impl<'a> Walker<'a> {
             (Context::RssRoot, None, "channel") => self.saw_channel = true,
             (Context::RssChannel, None, "item") | (Context::AtomFeed, Some(ATOM_NS), "entry") => {
                 self.ordinal += 1;
-                self.item = Some(ItemBuilder::default());
+                self.item = Some(ItemBuilder {
+                    item: ParsedItem {
+                        ordinal: self.ordinal,
+                        ..ParsedItem::default()
+                    },
+                    ..ItemBuilder::default()
+                });
             }
             (Context::RssItem, None, "enclosure") => {
                 // Attributes resolve against the base in scope *here*, which

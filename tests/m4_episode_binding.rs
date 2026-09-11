@@ -12,6 +12,12 @@ use continuo::media::id::{FeedId, MediaId};
 use continuo::subscription::model::validate_feed_id;
 use url::Url;
 
+const GUID_ABSENT_USES_ENCLOSURE: &[u8] =
+    include_bytes!("fixtures/feeds/guid-absent-uses-enclosure.xml");
+const ITEM_WITHOUT_ENCLOSURE: &[u8] = include_bytes!("fixtures/feeds/item-without-enclosure.xml");
+const ITEM_WITHOUT_IDENTITY: &[u8] = include_bytes!("fixtures/feeds/item-without-identity.xml");
+const DUPLICATE_IDENTITY: &[u8] = include_bytes!("fixtures/feeds/duplicate-identity.xml");
+
 fn feed_id() -> Result<FeedId, Box<dyn std::error::Error>> {
     Ok(validate_feed_id("0123456789abcdef0123456789abcdef")?)
 }
@@ -23,15 +29,10 @@ fn feed_url() -> Result<Url, Box<dyn std::error::Error>> {
 #[test]
 fn duplicate_guid_keeps_first_and_nonplayable_identity_survives()
 -> Result<(), Box<dyn std::error::Error>> {
-    let xml = br#"<rss><channel>
-      <item><guid>same</guid><title>first</title></item>
-      <item><guid>same</guid><title>second</title><enclosure url="https://example.org/b.mp3"/></item>
-      <item><title>no identity</title></item>
-    </channel></rss>"#;
     let feed_id = validate_feed_id("0123456789abcdef0123456789abcdef")?;
     let bound = bind_feed(
         &feed_id,
-        parse_feed(xml, &"https://example.org/feed".parse()?)?,
+        parse_feed(DUPLICATE_IDENTITY, &"https://example.org/feed".parse()?)?,
     );
     assert_eq!(bound.items.len(), 1);
     assert_eq!(bound.skipped, 2);
@@ -108,10 +109,10 @@ fn guid_overrides_two_different_enclosures_across_refetches()
 
 #[test]
 fn absent_guid_uses_enclosure() -> Result<(), Box<dyn std::error::Error>> {
-    let xml = br#"<rss><channel>
-      <item><title>no guid</title><enclosure url="https://example.org/only.mp3"/></item>
-    </channel></rss>"#;
-    let bound = bind_feed(&feed_id()?, parse_feed(xml, &feed_url()?)?);
+    let bound = bind_feed(
+        &feed_id()?,
+        parse_feed(GUID_ABSENT_USES_ENCLOSURE, &feed_url()?)?,
+    );
     assert_eq!(bound.items.len(), 1);
     let enclosure_url: Url = "https://example.org/only.mp3".parse()?;
     let expected = MediaId::PodcastEpisode {
@@ -142,6 +143,7 @@ fn invalid_enclosure_scheme_built_directly_falls_back_to_link()
         title: Some("built directly".into()),
         published: None,
         declared_duration: None,
+        ordinal: 1,
     };
     let parsed = ParseReport {
         feed: ParsedFeed {
@@ -167,13 +169,33 @@ fn invalid_enclosure_scheme_built_directly_falls_back_to_link()
 /// retained with `source: None` (§2.4 "identity without playability").
 #[test]
 fn no_enclosure_with_guid_stays_nonplayable() -> Result<(), Box<dyn std::error::Error>> {
-    let xml = br#"<rss><channel>
-      <item><guid>solo</guid><title>text only</title></item>
-    </channel></rss>"#;
-    let bound = bind_feed(&feed_id()?, parse_feed(xml, &feed_url()?)?);
+    let bound = bind_feed(
+        &feed_id()?,
+        parse_feed(ITEM_WITHOUT_ENCLOSURE, &feed_url()?)?,
+    );
     assert_eq!(bound.items.len(), 1);
     assert!(bound.items[0].episode.source.is_none());
     assert_eq!(bound.items[0].episode.title.as_deref(), Some("text only"));
+    Ok(())
+}
+
+/// An item with no GUID, no usable enclosure and no link has no identity at
+/// all and is skipped with `MissingIdentity`. Nothing is invented (§2.4
+/// "no synthesis").
+#[test]
+fn item_with_no_identity_fields_is_skipped_as_missing_identity()
+-> Result<(), Box<dyn std::error::Error>> {
+    let parsed = parse_feed(ITEM_WITHOUT_IDENTITY, &feed_url()?)?;
+    assert_eq!(parsed.skipped, 0); // the parser itself never rejects this item
+    let bound = bind_feed(&feed_id()?, parsed);
+    assert_eq!(bound.items.len(), 0);
+    assert_eq!(bound.skipped, 1);
+    assert!(
+        bound
+            .warnings
+            .iter()
+            .any(|warning| warning.item == Some(1) && warning.kind == WarningKind::MissingIdentity)
+    );
     Ok(())
 }
 
@@ -198,17 +220,19 @@ fn parse_stage_and_binding_stage_skips_both_count_exactly_once()
     assert_eq!(bound.skipped, 2);
     assert_eq!(bound.items.len(), 1);
     assert_eq!(bound.items[0].episode.title.as_deref(), Some("kept"));
+    // The parse-stage skip is item 1 (unknown entity in its guid); the
+    // binding-stage skip is item 2 (no identity at all) — its *true*
+    // document position, not 1, which is where it would land if the
+    // ordinal were derived from its place among the items that survived
+    // parsing instead of from `ParsedItem::ordinal`.
+    assert!(bound.warnings.iter().any(
+        |warning| warning.item == Some(1) && warning.kind == WarningKind::UnknownIdentityEntity
+    ));
     assert!(
         bound
             .warnings
             .iter()
-            .any(|warning| warning.kind == WarningKind::UnknownIdentityEntity)
-    );
-    assert!(
-        bound
-            .warnings
-            .iter()
-            .any(|warning| warning.kind == WarningKind::MissingIdentity)
+            .any(|warning| warning.item == Some(2) && warning.kind == WarningKind::MissingIdentity)
     );
     Ok(())
 }

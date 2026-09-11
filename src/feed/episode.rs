@@ -73,13 +73,12 @@ fn usable_enclosure_url(url: &Url) -> bool {
 /// order wins (§4.7). An item with identity but no usable enclosure is kept
 /// with `source: None` (§2.4).
 ///
-/// **Known limitation:** the `item` ordinal on a warning this stage raises
-/// counts items that survived parsing, not their original position in the
-/// document. `ParseReport` does not carry the ordinal of an item the parser
-/// itself already skipped, so when a parse-stage skip precedes a
-/// binding-stage one in the same feed, this stage's ordinal undercounts by
-/// however many items were skipped before it. The parse stage's own
-/// warnings are unaffected — they are carried forward exactly as produced.
+/// A warning this stage raises names the item by
+/// [`crate::feed::model::ParsedItem::ordinal`] —
+/// the same **pre-skip** document position the parser itself uses for its
+/// own warnings (§7.2's "the ordinal plus the category is enough to find the
+/// item" applies identically to both stages) — never by where the item
+/// lands in `feed.items`, which counts only items that survived parsing.
 pub fn bind_feed(feed_id: &FeedId, parsed: ParseReport) -> BoundFeed {
     let ParseReport {
         feed,
@@ -90,7 +89,8 @@ pub fn bind_feed(feed_id: &FeedId, parsed: ParseReport) -> BoundFeed {
     let mut items = Vec::with_capacity(feed.items.len());
     let mut seen = BTreeSet::new();
 
-    for (ordinal, item) in (1..).zip(feed.items) {
+    for item in feed.items {
+        let ordinal = item.ordinal;
         let enclosure = item
             .enclosure
             .filter(|enclosure| usable_enclosure_url(&enclosure.url));

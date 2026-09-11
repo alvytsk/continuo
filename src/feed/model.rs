@@ -32,6 +32,16 @@ pub struct ParsedItem {
     pub title: Option<String>,
     pub published: Option<OffsetDateTime>,
     pub declared_duration: Option<Duration>,
+    /// The **1-based, pre-skip** document position of this `<item>` or
+    /// `<entry>` element — the same counter [`crate::feed::parse::ParseWarning::item`]
+    /// uses, and the only non-redacted locator a warning carries (§7.2).
+    /// A caller that binds this item to identity and needs to warn about it
+    /// (a missing or duplicate key, say) reads this field rather than
+    /// re-deriving a position from where the item lands in
+    /// [`ParsedFeed::items`] — that index counts only items that survived
+    /// parsing, which is not the same number once an earlier item has been
+    /// skipped.
+    pub ordinal: usize,
 }
 
 /// The `<enclosure>` element, modelled faithfully rather than narrowed.
