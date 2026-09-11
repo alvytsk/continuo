@@ -4,26 +4,46 @@
 //! `subscribe`, `unsubscribe` and the two `refresh` functions (Tasks 12 and
 //! 13, added to this same file) ever touch the network.
 //!
-//! This task builds the three read-only functions: [`list_feeds`],
+//! Task 11 built the three read-only functions: [`list_feeds`],
 //! [`list_episodes`] and [`resolve_episode`]. Each calls
 //! [`SubscriptionStore::read_snapshot`], never [`SubscriptionStore::load`]
 //! — that split is what keeps §8.4's "listings change no files" true, since
 //! `load` is free to quarantine a malformed `subscriptions.json` and a
 //! listing must never do that merely by being asked to display something.
+//!
+//! Task 12 adds the two mutating functions, [`subscribe`] and
+//! [`unsubscribe`]. Both call [`SubscriptionStore::load`] through the
+//! private [`load_mutating`] helper, which narrows `load`'s outcomes down to
+//! the two safe ones — `Loaded` and `Missing`, both writable — and turns
+//! every other [`crate::persistence::store::LoadReason`] into a visible
+//! [`FeedError::SubscriptionsUnreadable`] rather than mutating on top of a
+//! file that was just quarantined, preserved unreadable, or an unsupported
+//! version (§5.1, §5.6). §5.3's commit order is the other half of this
+//! task: `subscribe` writes the cache before the subscription, and
+//! `unsubscribe` writes the subscription before deleting the cache, so a
+//! crash between the two steps is always recoverable and always reported
+//! (never a bare bool — [`FollowupFailure`] carries the cause).
 
+use std::collections::BTreeSet;
 use std::num::NonZeroUsize;
 use std::time::Duration;
 
 use time::OffsetDateTime;
+use url::Url;
 
-use crate::feed::cache::{CacheStore, CachedEpisode};
+use crate::feed::cache::{CacheStore, CachedEpisode, CachedFeed};
+use crate::feed::episode::bind_feed;
 use crate::feed::error::FeedError;
-use crate::media::id::MediaId;
+use crate::feed::parse::{ParseWarning, parse_feed};
+use crate::http::document::{DocumentOutcome, DocumentRequest};
+use crate::http::error::{RemoteFailure, redact_url};
+use crate::http::service::HttpService;
+use crate::media::id::{FeedId, MediaId, NormalizedUrl};
 use crate::media::source::SourceLocation;
 use crate::persistence::model::PersistedCheckpoint;
-use crate::persistence::store::StateSnapshot;
-use crate::subscription::model::Subscription;
-use crate::subscription::store::{SubscriptionSnapshot, SubscriptionStore};
+use crate::persistence::store::{LoadReason, StateSnapshot};
+use crate::subscription::model::{Subscription, choose_slug, new_feed_id, validate_slug};
+use crate::subscription::store::{SubscriptionLoad, SubscriptionSnapshot, SubscriptionStore};
 
 /// One row of `continuo feeds` (§6.1, §6.6). `episodes` and
 /// `last_refreshed_at` are both `None` for a subscription that has never
@@ -252,4 +272,339 @@ fn warn_on_declared_type(slug: &str, index: usize, cached_episode: &CachedEpisod
             );
         }
     }
+}
+
+/// Work that committed, followed by a step that did not. Carries the cause,
+/// never a bare bool — §5.3's message must say exactly what did and did not
+/// happen, and a bool cannot carry that (§6.6).
+#[derive(Debug)]
+pub struct FollowupFailure {
+    pub step: FollowupStep,
+    pub error: FeedError,
+}
+
+/// Which side of a two-step commit failed after the first side already
+/// landed (§5.3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FollowupStep {
+    SaveSubscription,
+    RemoveCache,
+}
+
+/// `continuo subscribe <url> [--as slug]`'s result (§6.1, §6.6).
+#[derive(Debug)]
+pub struct SubscribeOutcome {
+    pub slug: String,
+    pub feed_id: FeedId,
+    pub title: Option<String>,
+    pub retained: usize,
+    pub skipped: usize,
+    pub followup: Option<FollowupFailure>,
+}
+
+/// `continuo unsubscribe <slug>`'s result (§6.1, §6.6).
+#[derive(Debug)]
+pub struct UnsubscribeOutcome {
+    pub slug: String,
+    pub followup: Option<FollowupFailure>,
+}
+
+/// The only entry point [`subscribe`] and [`unsubscribe`] use to read
+/// `subscriptions.json` (§5.1, §5.6). Unlike [`list_feeds`] and
+/// [`list_episodes`], a mutating command must never build a new snapshot on
+/// top of a file [`SubscriptionStore::load`] just quarantined, preserved
+/// unreadable, or refused as an unsupported version — every
+/// [`crate::persistence::store::LoadReason`] but `Loaded` and `Missing`
+/// (both `writable`) becomes a visible [`FeedError::SubscriptionsUnreadable`]
+/// instead, naming the quarantine path where there is one.
+fn load_mutating(subs: &SubscriptionStore) -> Result<SubscriptionSnapshot, FeedError> {
+    let SubscriptionLoad {
+        snapshot,
+        writable,
+        reason,
+    } = subs.load();
+
+    if writable && matches!(reason, LoadReason::Loaded | LoadReason::Missing) {
+        return Ok(snapshot);
+    }
+
+    let reason = match reason {
+        LoadReason::Quarantined { moved_to } => format!(
+            "subscriptions file was malformed and has been moved aside to {}; \
+             subscribe, unsubscribe and refresh are unavailable until this is resolved",
+            moved_to.display()
+        ),
+        LoadReason::QuarantineFailed => "subscriptions file is malformed and could not be \
+             moved aside; subscribe, unsubscribe and refresh are unavailable"
+            .to_string(),
+        LoadReason::Unreadable => "subscriptions file could not be read; subscribe, \
+             unsubscribe and refresh are unavailable"
+            .to_string(),
+        LoadReason::UnsupportedVersion { found } => format!(
+            "subscriptions file is schema version {found}, which this build does not \
+             support; subscribe, unsubscribe and refresh are unavailable"
+        ),
+        // Unreachable given the `writable` guard above: kept so this match
+        // stays exhaustive over every `LoadReason` rather than relying on a
+        // wildcard arm to paper over a future variant.
+        LoadReason::Loaded | LoadReason::Missing => {
+            "subscriptions file could not be prepared for writing".to_string()
+        }
+    };
+    Err(FeedError::SubscriptionsUnreadable { reason })
+}
+
+/// Parses `url` and validates it against the same public-source bar
+/// [`crate::http::document`] holds a feed's `origin` to (§6.7): HTTP(S)
+/// with a host, and no embedded userinfo. Re-expressed here, rather than
+/// reused from that module, because this check must run — and be able to
+/// reject a bad URL — *before* any [`HttpService`] call, including the ones
+/// `AlreadySubscribed` and slug derivation need first.
+fn validate_public_url(url: &str) -> Result<Url, FeedError> {
+    let invalid = |reason: &'static str| {
+        FeedError::from(RemoteFailure::InvalidSource {
+            input: redact_url(url),
+            reason,
+        })
+    };
+    let parsed = Url::parse(url).map_err(|_| invalid("not a valid URL"))?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+        return Err(invalid("expected http(s) with a host"));
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(invalid("URLs with embedded credentials are not supported"));
+    }
+    Ok(parsed)
+}
+
+/// Normalizes a **requested** URL for the `AlreadySubscribed` comparison
+/// (§6.7): scheme, host and default port normalized, fragment removed,
+/// query serialization preserved. Called only after [`validate_public_url`]
+/// has already accepted `url`, so failure here is not expected in practice,
+/// but the type system does not know that.
+fn normalize_requested(url: &str) -> Result<NormalizedUrl, FeedError> {
+    NormalizedUrl::parse(url).map_err(|_| {
+        FeedError::from(RemoteFailure::InvalidSource {
+            input: redact_url(url),
+            reason: "expected http(s) with a host",
+        })
+    })
+}
+
+/// Normalizes an already-stored `fetch_url` the same way, for the other
+/// side of the `AlreadySubscribed` comparison. A stored `fetch_url` already
+/// passed §5.6's validation when the snapshot was loaded, so failure here
+/// would mean the snapshot is corrupt in a way `load` missed.
+fn normalize_stored(url: &Url) -> Result<NormalizedUrl, FeedError> {
+    NormalizedUrl::parse(url.as_str()).map_err(|_| FeedError::SubscriptionsUnreadable {
+        reason: "a stored fetch_url could not be normalized".to_string(),
+    })
+}
+
+/// Rebuilds a `Url` from a [`NormalizedUrl`], for the case where `subscribe`
+/// has no `permanent_url` and must fall back to the normalized requested URL
+/// as the new subscription's `fetch_url`. Infallible in practice: a
+/// `NormalizedUrl` is always a serialized, previously-valid `Url`.
+fn url_from_normalized(normalized: &NormalizedUrl) -> Result<Url, FeedError> {
+    Url::parse(normalized.as_str()).map_err(|_| FeedError::SubscriptionsUnreadable {
+        reason: "cannot rebuild a normalized fetch URL".to_string(),
+    })
+}
+
+/// §6.7's `AlreadySubscribed` check: the **requested** URL against each
+/// stored `fetch_url`, both normalized. Redirect targets never participate
+/// — this is called before any fetch happens, so there is no `final_url` to
+/// compare against yet, and there must not be one.
+fn already_subscribed(
+    snapshot: &SubscriptionSnapshot,
+    requested: &NormalizedUrl,
+) -> Result<Option<String>, FeedError> {
+    for existing in &snapshot.subscriptions {
+        let normalized = normalize_stored(&existing.fetch_url)?;
+        if &normalized == requested {
+            return Ok(Some(existing.slug.clone()));
+        }
+    }
+    Ok(None)
+}
+
+/// Mints a [`FeedId`] not already present in `occupied` (§2.3). A collision
+/// against 128 bits of OS randomness is not realistically reachable; this
+/// loop exists so "unused" is an assertion the code makes, not an
+/// assumption it relies on.
+fn unused_feed_id(occupied: &BTreeSet<String>) -> Result<FeedId, FeedError> {
+    loop {
+        let candidate = new_feed_id()?;
+        if !occupied.contains(candidate.as_str()) {
+            return Ok(candidate);
+        }
+    }
+}
+
+/// Logs [`bind_feed`]'s warnings at the point a feed is first subscribed.
+/// Every [`ParseWarning`] field is already redaction-safe by construction
+/// (§7.2: no GUID, no URL, no title) — only the ordinal and the category are
+/// logged, which is enough to find the item in the feed.
+fn log_bound_warnings(slug: &str, warnings: &[ParseWarning]) {
+    for warning in warnings {
+        tracing::warn!(
+            slug,
+            item = warning.item,
+            kind = ?warning.kind,
+            "feed parse warning while subscribing"
+        );
+    }
+}
+
+/// `continuo subscribe <url> [--as slug]` (§6.1, §6.6, §6.7). Fetches
+/// unconditionally — a subscribe has no cache to revalidate against, so an
+/// `Unchanged` outcome can never legitimately occur here and is reported as
+/// [`RemoteFailure::UnsolicitedNotModified`] rather than fabricating a
+/// cache entry from nothing.
+///
+/// Preflight (no I/O beyond the subscription read): the requested URL is
+/// validated and normalized, checked against every stored `fetch_url` for
+/// `AlreadySubscribed`, and an explicit `--as` alias is validated and
+/// checked for collision — all before the one network call this function
+/// makes. A derived slug collision is resolved only after the fetch, once a
+/// title is known, and takes the first free `-2`, `-3`, … suffix.
+///
+/// Commit order (§5.3): the cache is saved before the subscription. A
+/// failure saving the subscription after the cache already landed is
+/// reported as `followup`, never silently dropped — the cache file is left
+/// behind, unreferenced, recoverable by a future successful subscribe.
+pub async fn subscribe(
+    http: &HttpService,
+    subs: &SubscriptionStore,
+    cache: &CacheStore,
+    url: &str,
+    slug: Option<&str>,
+) -> Result<SubscribeOutcome, FeedError> {
+    let mut snapshot = load_mutating(subs)?;
+
+    let origin = validate_public_url(url)?;
+    let requested = normalize_requested(url)?;
+
+    if let Some(existing_slug) = already_subscribed(&snapshot, &requested)? {
+        return Err(FeedError::AlreadySubscribed {
+            slug: existing_slug,
+        });
+    }
+
+    let occupied_slugs: BTreeSet<String> = snapshot
+        .subscriptions
+        .iter()
+        .map(|subscription| subscription.slug.clone())
+        .collect();
+    if let Some(explicit) = slug {
+        validate_slug(explicit)?;
+        if occupied_slugs.contains(explicit) {
+            return Err(FeedError::SlugTaken {
+                slug: explicit.to_string(),
+            });
+        }
+    }
+
+    let fetched = http
+        .fetch_document(DocumentRequest {
+            origin: origin.clone(),
+            validators: None,
+        })
+        .await?;
+    let (bytes, final_url, permanent_url, validators) = match fetched {
+        DocumentOutcome::Unchanged { .. } => {
+            return Err(RemoteFailure::UnsolicitedNotModified.into());
+        }
+        DocumentOutcome::Fetched {
+            bytes,
+            final_url,
+            permanent_url,
+            validators,
+            ..
+        } => (bytes, final_url, permanent_url, validators),
+    };
+
+    let parsed = parse_feed(&bytes, &final_url)?;
+    let now = subs.now();
+
+    let occupied_ids: BTreeSet<String> = snapshot
+        .subscriptions
+        .iter()
+        .map(|subscription| subscription.feed_id.as_str().to_string())
+        .collect();
+    let chosen_slug = choose_slug(parsed.feed.title.as_deref(), &origin, slug, &occupied_slugs)?;
+    let feed_id = unused_feed_id(&occupied_ids)?;
+
+    let bound = bind_feed(&feed_id, parsed);
+    log_bound_warnings(&chosen_slug, &bound.warnings);
+    let title = bound.title.clone();
+    let cached = CachedFeed::from_bound(&feed_id, bound, final_url, validators, now);
+
+    let fetch_url = match permanent_url {
+        Some(permanent_url) => permanent_url,
+        None => url_from_normalized(&requested)?,
+    };
+
+    let subscription = Subscription {
+        feed_id,
+        slug: chosen_slug,
+        title,
+        fetch_url,
+        added_at: now,
+    };
+
+    // Commit seam (design doc §5.3, brief Step 3): the cache lands first,
+    // so a failure saving the subscription leaves only an unreferenced
+    // cache file — never a subscription pointing at nothing.
+    cache.save(&subscription, &cached)?;
+    let retained = cached.episodes.len();
+    let skipped = cached.skipped_items;
+    let slug = subscription.slug.clone();
+    let feed_id = subscription.feed_id.clone();
+    let title = subscription.title.clone();
+    snapshot.subscriptions.push(subscription);
+    let followup = subs.save(&snapshot).err().map(|error| FollowupFailure {
+        step: FollowupStep::SaveSubscription,
+        error,
+    });
+    Ok(SubscribeOutcome {
+        slug,
+        feed_id,
+        title,
+        retained,
+        skipped,
+        followup,
+    })
+}
+
+/// `continuo unsubscribe <slug>` (§6.1, §6.6). Keeps checkpoints: there is
+/// no [`crate::persistence::store::StateStore`] argument and this function
+/// never deletes one. Resubscribing later mints a fresh `FeedId` (§1.6), so
+/// any checkpoint keyed to the old one is simply orphaned, never reattached.
+///
+/// Commit order (§5.3): the subscription is removed before the cache is
+/// deleted. A subscription-save failure returns before cache deletion is
+/// even attempted; an already-missing cache counts as successful cleanup.
+pub fn unsubscribe(
+    subs: &SubscriptionStore,
+    cache: &CacheStore,
+    slug: &str,
+) -> Result<UnsubscribeOutcome, FeedError> {
+    let mut snapshot = load_mutating(subs)?;
+    let subscription = find_subscription(&snapshot, slug)?;
+    snapshot
+        .subscriptions
+        .retain(|entry| entry.feed_id != subscription.feed_id);
+    subs.save(&snapshot)?;
+    let followup = cache
+        .remove(&subscription.feed_id)
+        .err()
+        .map(|error| FollowupFailure {
+            step: FollowupStep::RemoveCache,
+            error,
+        });
+    Ok(UnsubscribeOutcome {
+        slug: slug.to_owned(),
+        followup,
+    })
 }

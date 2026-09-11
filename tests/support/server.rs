@@ -796,7 +796,18 @@ fn handle_connection(
 
     if script.stall_headers {
         gate.park();
-        return;
+        // Every media-serving test below relies on a stalled connection
+        // simply closing once released — the client never receives a byte
+        // (see `http_cancellation.rs`'s case 3). A scripted `documents`
+        // route is the one deliberate exception: `write_document_reply`'s
+        // own doc comment already describes it — a document response
+        // answered only once `stall_headers`/`release` have run their
+        // course — which is what lets a commit-boundary failure injection
+        // (M4 Task 12) prove a request left the client before its response
+        // exists at all, then let that response land for real afterward.
+        if script.documents.is_none() {
+            return;
+        }
     }
 
     let stream = reader.get_mut();
