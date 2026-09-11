@@ -4,7 +4,7 @@
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::style::Print;
@@ -28,7 +28,7 @@ use crate::persistence::writer::{ShutdownOutcome, StateSink, Urgency, WriterHand
 use crate::playback::command::{Admission, PlaybackCommand, ResumeIntent};
 use crate::playback::engine::EngineHandle;
 use crate::playback::error::PlaybackError;
-use crate::playback::event::PlaybackEvent;
+use crate::playback::event::{PlaybackEvent, Progress};
 use crate::playback::prepare::{PrepareContext, prepare};
 use crate::playback::provenance::PositionProvenance;
 use crate::playback::state::PlaybackState;
@@ -91,6 +91,7 @@ pub fn run(cli: cli::Cli) -> Result<(), PlaybackError> {
     // rather than reporting "nothing ready".
     let raw = RawModeGuard::enable();
     let mut mirror = Mirror::default();
+    let mut router = KeyRouter::new();
 
     // Raw mode does not translate `\n`. §5: "The application displays
     // Loading while preparation is in flight and remains able to stop or
@@ -103,9 +104,10 @@ pub fn run(cli: cli::Cli) -> Result<(), PlaybackError> {
     // line above is rendered. `Loaded` hands off to loop B; `Failed` or a
     // quit decides the run's outcome here, before loop B ever starts.
     let phase = loop {
-        if handle_keys(&engine, &mirror, raw.is_some()) {
+        if handle_keys(&engine, &mut router, &mut mirror, raw.is_some()) {
             break Phase::Done(Ok(()));
         }
+        router.flush(&engine, Instant::now());
 
         let mut failure = None;
         let mut loaded = false;
@@ -116,6 +118,7 @@ pub fn run(cli: cli::Cli) -> Result<(), PlaybackError> {
             loaded |= matches!(event, PlaybackEvent::Loaded { .. });
             // `observe` borrows the event, so the mirror still consumes it.
             submit(&writer, session.observe(&event, clock.sample()));
+            router.observe(&event);
             mirror.apply(event);
         }
         if let Some(message) = failure {
@@ -130,9 +133,10 @@ pub fn run(cli: cli::Cli) -> Result<(), PlaybackError> {
         Phase::Done(outcome) => outcome,
         // Loop B: the existing key/render/checkpoint loop.
         Phase::Loaded => loop {
-            if handle_keys(&engine, &mirror, raw.is_some()) {
+            if handle_keys(&engine, &mut router, &mut mirror, raw.is_some()) {
                 break Ok(());
             }
+            router.flush(&engine, Instant::now());
 
             let mut failure = None;
             while let Ok(event) = engine.events().try_recv() {
@@ -140,6 +144,7 @@ pub fn run(cli: cli::Cli) -> Result<(), PlaybackError> {
                     failure = Some(message.clone());
                 }
                 submit(&writer, session.observe(&event, clock.sample()));
+                router.observe(&event);
                 mirror.apply(event);
             }
             if let Some(message) = failure {
@@ -155,10 +160,7 @@ pub fn run(cli: cli::Cli) -> Result<(), PlaybackError> {
             let progress = engine.progress();
             submit(&writer, session.tick(&progress, clock.sample()));
             if progress.session_rev == mirror.session_rev {
-                mirror.position = progress.position;
-                mirror.quality = progress.quality;
-                mirror.provenance = progress.provenance;
-                mirror.buffering = progress.buffering;
+                apply_progress(&mut mirror, &progress, router.is_seeking());
             }
             // A terminal write failure is not a reason to skip the final
             // checkpoint, so it becomes the loop's outcome instead of returning
@@ -170,6 +172,29 @@ pub fn run(cli: cli::Cli) -> Result<(), PlaybackError> {
     };
 
     finish(engine, session, writer, &clock, raw, persisting, outcome)
+}
+
+/// Copies the worker's view of the position into the mirror.
+///
+/// While a seek target stands - from the press that accumulated it until the
+/// worker accounts for it - the position fields are deliberately left alone.
+/// The display is already showing that target, while `Progress` goes on
+/// reporting where playback actually is: before the flush because the worker
+/// has not been asked to move yet, and after it because reopening a range
+/// request and buffering take time. Copying it in either window would snap
+/// the display back. `buffering` is unrelated to the target and keeps flowing
+/// through.
+///
+/// Once the target is released, the landing arrives by this same path and
+/// corrects the display if the prediction missed.
+fn apply_progress(mirror: &mut Mirror, progress: &Progress, seeking: bool) {
+    mirror.buffering = progress.buffering;
+    if seeking {
+        return;
+    }
+    mirror.position = progress.position;
+    mirror.quality = progress.quality;
+    mirror.provenance = progress.provenance;
 }
 
 /// What loop A decided: hand off to loop B once loaded, or the run is
@@ -231,22 +256,42 @@ fn finish(
 /// someone having pressed `q`. Waiting out one tick and reporting nothing to
 /// do is what actually matches "no keys", leaving the event drain in each
 /// loop as the only thing such a session can still notice.
-fn handle_keys(engine: &EngineHandle, mirror: &Mirror, raw: bool) -> bool {
+fn handle_keys(
+    engine: &EngineHandle,
+    router: &mut KeyRouter,
+    mirror: &mut Mirror,
+    raw: bool,
+) -> bool {
+    // Capped by whatever is sooner: the ordinary tick, or an open burst's own
+    // deadline. Without the cap a window expiring just after a block began
+    // would go unnoticed for a further full block.
+    let budget = router.poll_budget(Instant::now(), Duration::from_millis(100));
     if !raw {
-        std::thread::sleep(Duration::from_millis(100));
+        std::thread::sleep(budget);
         return false;
     }
-    match crossterm::event::poll(Duration::from_millis(100)) {
+    match crossterm::event::poll(budget) {
         Ok(true) => match crossterm::event::read() {
             Ok(Event::Key(key)) => match to_command(key, mirror) {
                 Some(PlaybackCommand::Shutdown) => true,
                 Some(command) => {
-                    route_command(
+                    let optimistic = router.route(
                         engine,
                         mirror.state == PlaybackState::Playing,
                         mirror.position,
+                        mirror.duration,
+                        Instant::now(),
                         command,
                     );
+                    // The jump that makes a single arrow press feel immediate
+                    // even though its fetch waits out the quiet window. It is
+                    // a prediction until the seek lands, so it is marked
+                    // `Estimated` and reaches only the display: the checkpoint
+                    // path reads `Progress`, never the mirror.
+                    if let Some(position) = optimistic {
+                        mirror.position = position;
+                        mirror.provenance = PositionProvenance::Estimated;
+                    }
                     false
                 }
                 None => false,
@@ -268,19 +313,10 @@ fn handle_keys(engine: &EngineHandle, mirror: &Mirror, raw: bool) -> bool {
 /// travel on (IMPORTANT 2, final review). `Shutdown` never reaches here:
 /// `handle_keys` decides to end the loop itself and has nothing left to route.
 ///
-/// `pub`, alongside the rest of this crate's engine-facing surface
-/// (`EngineHandle`, `PlaybackCommand`), so a test can drive the exact routing
-/// a keypress takes with no tty and no crossterm event in the loop at all —
-/// `handle_keys` itself cannot be driven headlessly, since
-/// `crossterm::event::read()` needs a real terminal. `playing` and `position`
-/// are the two `Mirror` fields this routing actually reads, taken separately
-/// so `Mirror` itself can stay private.
-pub fn route_command(
-    engine: &EngineHandle,
-    playing: bool,
-    position: Duration,
-    command: PlaybackCommand,
-) {
+/// `SeekBy` is the one command this does not handle: an arrow press
+/// accumulates into a [`SeekBurst`] rather than reaching the engine on its
+/// own, so it is routed by [`KeyRouter::route`] before it ever gets here.
+fn route_command(engine: &EngineHandle, playing: bool, command: PlaybackCommand) {
     match command {
         // Loop control, decided by `handle_keys` itself before this is ever
         // called - nothing to route.
@@ -309,16 +345,169 @@ pub fn route_command(
                 engine.submit_play()
             });
         }
-        PlaybackCommand::Play => report_admission(engine.submit_play()),
-        PlaybackCommand::Pause => report_admission(engine.submit_pause()),
-        // An arrow-key seek is resolved to an absolute target here, against
-        // the mirror's position, so it can travel through `submit_seek` -
-        // the one path that publishes the SEEK bit and retires the fetch a
-        // stale read would otherwise keep running against (IMPORTANT 2).
-        PlaybackCommand::SeekBy(delta) => {
-            report_admission(engine.submit_seek(seek_target(position, delta)));
+        PlaybackCommand::Play => {
+            report_admission(engine.submit_play());
         }
-        other => report_admission(engine.submit(other)),
+        PlaybackCommand::Pause => {
+            report_admission(engine.submit_pause());
+        }
+        // Never reaches here - `KeyRouter::route` intercepts it into the
+        // burst. Submitting it raw would resolve the target against a mirror
+        // that cannot have moved since the last press, which is the defect
+        // the burst exists to fix.
+        PlaybackCommand::SeekBy(_) => {
+            debug_assert!(false, "SeekBy must be routed through the seek burst");
+        }
+        other => {
+            report_admission(engine.submit(other));
+        }
+    }
+}
+
+/// Owns the [`SeekBurst`] across loop passes and routes every decoded key
+/// command through it.
+///
+/// `pub`, alongside the rest of this crate's engine-facing surface
+/// (`EngineHandle`, `PlaybackCommand`), so a test can drive the exact routing
+/// a keypress takes with no tty and no crossterm event in the loop at all —
+/// `handle_keys` itself cannot be driven headlessly, since
+/// `crossterm::event::read()` needs a real terminal. This is the only entry
+/// point production uses, so a test driving it cannot be exercising a path
+/// the application has stopped taking.
+#[derive(Debug, Default)]
+pub struct KeyRouter {
+    burst: SeekBurst,
+    /// The target submitted and not yet accounted for by the worker.
+    ///
+    /// Submitting is not arriving: the worker goes on reporting the pre-seek
+    /// position until the reopen and the buffering are done, so the display
+    /// has to keep showing the target across that window too - and a further
+    /// press has to accumulate from it rather than from the mirror.
+    submitted: Option<Duration>,
+}
+
+impl KeyRouter {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The `SeekBy` arm of [`Self::route`], which needs no engine. Split out
+    /// so a test can drive the accumulation production performs rather than a
+    /// reimplementation of it.
+    fn press(
+        &mut self,
+        position: Duration,
+        step: i64,
+        now: Instant,
+        duration: Option<Duration>,
+    ) -> Duration {
+        // Seeded from the target already on display rather than from
+        // `position` whenever one is standing. `position` comes from the
+        // mirror, and the mirror cannot have moved since the last press: it
+        // only advances on progress, and the worker publishes none while it is
+        // inside a seek. Re-reading it is what collapsed a burst of presses
+        // onto a single step.
+        let base = self.displayed_target().unwrap_or(position);
+        self.burst.press(base, step, now, duration)
+    }
+
+    /// The target the display is currently showing, if it is showing one
+    /// rather than the worker's own position.
+    fn displayed_target(&self) -> Option<Duration> {
+        self.burst.target().or(self.submitted)
+    }
+
+    /// The target to submit, marking the wait for its landing as begun.
+    fn take_due(&mut self, now: Instant) -> Option<Duration> {
+        let target = self.burst.due(now)?;
+        self.submitted = Some(target);
+        Some(target)
+    }
+
+    /// Lets the router see each drained event, so it can tell when the seek
+    /// it is waiting on has settled - landed, been refused, or been overtaken.
+    pub fn observe(&mut self, event: &PlaybackEvent) {
+        if matches!(
+            event,
+            PlaybackEvent::SeekCompleted { .. }
+                | PlaybackEvent::SeekRejected { .. }
+                | PlaybackEvent::SeekCancelled { .. }
+                | PlaybackEvent::SeekTargetStored { .. }
+                | PlaybackEvent::RestartEstablished { .. }
+                | PlaybackEvent::EndOfTrack { .. }
+                | PlaybackEvent::Loaded { .. }
+                | PlaybackEvent::Failed { .. }
+        ) {
+            self.release();
+        }
+    }
+
+    /// Drops an accumulated seek and the display hold together, for a command
+    /// that supersedes both.
+    fn cancel(&mut self) {
+        self.burst.cancel();
+        self.release();
+    }
+
+    /// Hands the display back to the worker's own position.
+    fn release(&mut self) {
+        self.submitted = None;
+    }
+
+    /// Routes one command. Returns the position the display should adopt
+    /// immediately when an arrow press accumulated into the burst, and `None`
+    /// for every command that leaves the displayed position alone.
+    ///
+    /// `playing`, `position` and `duration` are the three `Mirror` fields this
+    /// routing reads, taken separately so `Mirror` itself can stay private.
+    pub fn route(
+        &mut self,
+        engine: &EngineHandle,
+        playing: bool,
+        position: Duration,
+        duration: Option<Duration>,
+        now: Instant,
+        command: PlaybackCommand,
+    ) -> Option<Duration> {
+        match command {
+            PlaybackCommand::SeekBy(step) => {
+                return Some(self.press(position, step, now, duration));
+            }
+            // An absolute move, a stop, or the end of the run supersedes an
+            // accumulated relative seek outright. Submitting the burst first
+            // would spend a fetch on a target the very next command discards.
+            PlaybackCommand::Restart | PlaybackCommand::Stop | PlaybackCommand::Shutdown => {
+                self.cancel();
+            }
+            // Volume and pause/play move nothing, so they coexist with an open
+            // burst: routing them must not cost the listener their scrub.
+            _ => {}
+        }
+        route_command(engine, playing, command);
+        None
+    }
+
+    /// Submits the accumulated seek once the quiet window has passed. This is
+    /// the only place an arrow press reaches the engine.
+    pub fn flush(&mut self, engine: &EngineHandle, now: Instant) {
+        if let Some(target) = self.take_due(now) {
+            // A seek the queue refuses will never report a landing, so the
+            // hold has to end here rather than wait for an event that is not
+            // coming.
+            if report_admission(engine.submit_seek(target)) != Admission::Accepted {
+                self.release();
+            }
+        }
+    }
+
+    /// Whether the display is currently showing an optimistic target rather
+    /// than the worker's own position.
+    pub fn is_seeking(&self) -> bool {
+        self.burst.is_open() || self.submitted.is_some()
+    }
+
+    fn poll_budget(&self, now: Instant, cap: Duration) -> Duration {
+        self.burst.poll_budget(now, cap)
     }
 }
 
@@ -327,22 +516,121 @@ pub fn route_command(
 /// `engine.rs`'s own `SeekBy` dispatch performs, computed here instead
 /// against the mirror's position now that the CLI resolves the target rather
 /// than handing the worker a signed step to resolve against `self.position`.
-fn seek_target(position: Duration, delta: i64) -> Duration {
+///
+/// `duration` bounds the forward direction when it is known. `None` leaves
+/// it unbounded on purpose: `clamp_target` in the engine bounds a target
+/// against the duration this side has not learned yet, and inventing a
+/// ceiling here would cap a seek the engine could have satisfied.
+fn seek_target(position: Duration, delta: i64, duration: Option<Duration>) -> Duration {
     let step = Duration::from_secs(delta.unsigned_abs());
     if delta >= 0 {
-        position.saturating_add(step)
+        let target = position.saturating_add(step);
+        match duration {
+            Some(duration) => target.min(duration),
+            None => target,
+        }
     } else {
         position.saturating_sub(step)
+    }
+}
+
+/// How long a burst of arrow presses stays open, waiting for the next one.
+///
+/// Key repeat delivers a held arrow roughly every 30ms, well inside this, so
+/// holding the key scrubs continuously and commits one window after release.
+const SEEK_COALESCE_WINDOW: Duration = Duration::from_millis(250);
+
+/// A run of arrow-key presses collapsed into a single seek.
+///
+/// Each press resolves its target in this thread against the mirror, and the
+/// mirror only advances when the worker publishes progress - which it does
+/// not do while it is inside a seek, reopening a range request and buffering.
+/// Resolving each press of a burst independently against that frozen position
+/// therefore produced N identical `SeekTo` commands: the listener moved one
+/// step however many times they pressed, and every one of those commands
+/// called `source_interrupt.retire()` on the fetch its predecessor had just
+/// started.
+///
+/// Accumulating onto the previous target instead of re-reading the mirror is
+/// what makes presses compose, and holding them for a quiet window is what
+/// spends one fetch on the burst rather than one per press.
+#[derive(Debug, Default)]
+pub struct SeekBurst {
+    open: Option<OpenBurst>,
+}
+
+#[derive(Debug)]
+struct OpenBurst {
+    /// The absolute target accumulated so far. Stored rather than recomputed
+    /// from a base and a delta so that what the display was told and what is
+    /// eventually submitted cannot drift apart.
+    target: Duration,
+    deadline: Instant,
+}
+
+impl SeekBurst {
+    /// Accumulates one arrow-key step onto `base`, returning the target the
+    /// display should jump to at once. Choosing `base` is
+    /// [`KeyRouter::press`]'s job - the single place that rule lives.
+    fn press(
+        &mut self,
+        base: Duration,
+        step: i64,
+        now: Instant,
+        duration: Option<Duration>,
+    ) -> Duration {
+        let target = seek_target(base, step, duration);
+        self.open = Some(OpenBurst {
+            target,
+            deadline: now + SEEK_COALESCE_WINDOW,
+        });
+        target
+    }
+
+    /// The target to submit, once the quiet window has passed with no further
+    /// press. Closes the burst, so a target is handed out exactly once.
+    fn due(&mut self, now: Instant) -> Option<Duration> {
+        let open = self.open.as_ref()?;
+        if now < open.deadline {
+            return None;
+        }
+        self.open.take().map(|open| open.target)
+    }
+
+    fn is_open(&self) -> bool {
+        self.open.is_some()
+    }
+
+    /// The target accumulated so far, if a burst is open.
+    fn target(&self) -> Option<Duration> {
+        self.open.as_ref().map(|open| open.target)
+    }
+
+    /// Drops the burst without submitting anything - for a command that
+    /// supersedes it outright rather than merely coexisting with it.
+    fn cancel(&mut self) {
+        self.open = None;
+    }
+
+    /// How long the key poll may block. The loop polls in `cap`-sized blocks;
+    /// left uncapped, a window expiring just after a block began would not be
+    /// noticed until a full block later.
+    fn poll_budget(&self, now: Instant, cap: Duration) -> Duration {
+        match &self.open {
+            Some(open) => open.deadline.saturating_duration_since(now).min(cap),
+            None => cap,
+        }
     }
 }
 
 /// §8: queue saturation must be visible, never silently dropped. `Gone`
 /// means the worker has already shut down - nothing to warn about, since the
 /// run is ending anyway.
-fn report_admission(admission: Admission) {
+fn report_admission(admission: Admission) -> Admission {
     if admission == Admission::Busy {
         tracing::warn!("command queue is busy; the key press had no effect");
     }
+    admission
 }
 
 /// §5's disambiguation. An explicit http/https scheme is a URL; everything
@@ -1599,6 +1887,309 @@ mod tests {
         assert!(
             !mirror.buffering,
             "a fresh load must clear a stale buffering flag"
+        );
+    }
+}
+
+#[cfg(test)]
+mod seek_burst_tests {
+    use super::*;
+
+    fn progress_at(position: Duration) -> Progress {
+        Progress {
+            session_rev: 0,
+            media: None,
+            position,
+            quality: PositionQuality::Exact,
+            provenance: PositionProvenance::Established,
+            buffering: false,
+        }
+    }
+
+    #[test]
+    fn progress_arriving_during_a_burst_does_not_yank_the_display_back() {
+        // The worker has not been asked to move yet, so its progress reports
+        // where playback still is. Copying that over the optimistic target
+        // would undo the jump on the very next tick - roughly 100ms after the
+        // press, which reads as the key not having worked.
+        let mut mirror = Mirror {
+            position: Duration::from_secs(60),
+            provenance: PositionProvenance::Estimated,
+            ..Mirror::default()
+        };
+        apply_progress(&mut mirror, &progress_at(Duration::from_secs(100)), true);
+        assert_eq!(mirror.position, Duration::from_secs(60));
+        assert_eq!(mirror.provenance, PositionProvenance::Estimated);
+    }
+
+    #[test]
+    fn buffering_still_reaches_the_display_during_a_burst() {
+        // Unrelated to the target: suppressing it would blank the buffering
+        // note for as long as the listener kept scrubbing.
+        let mut mirror = Mirror::default();
+        let progress = Progress {
+            buffering: true,
+            ..progress_at(Duration::from_secs(100))
+        };
+        apply_progress(&mut mirror, &progress, true);
+        assert!(mirror.buffering);
+    }
+
+    #[test]
+    fn the_landing_corrects_the_display_once_the_burst_closes() {
+        let mut mirror = Mirror {
+            position: Duration::from_secs(60),
+            provenance: PositionProvenance::Estimated,
+            ..Mirror::default()
+        };
+        apply_progress(&mut mirror, &progress_at(Duration::from_secs(58)), false);
+        assert_eq!(mirror.position, Duration::from_secs(58));
+        assert_eq!(mirror.provenance, PositionProvenance::Established);
+    }
+
+    /// A burst opened at `position`, with `count` presses of `step`, all
+    /// arriving at the same instant — the shape a held or hammered arrow key
+    /// produces, and the one where the mirror cannot have advanced between
+    /// presses.
+    ///
+    /// Driven through `KeyRouter`, the type the key loop actually presses
+    /// into, rather than through `SeekBurst` underneath it - which on its own
+    /// does not decide what a press accumulates from.
+    fn burst_of(position: Duration, step: i64, count: usize) -> (KeyRouter, Instant) {
+        burst_of_within(position, step, count, None)
+    }
+
+    fn burst_of_within(
+        position: Duration,
+        step: i64,
+        count: usize,
+        duration: Option<Duration>,
+    ) -> (KeyRouter, Instant) {
+        let now = Instant::now();
+        let mut router = KeyRouter::new();
+        for _ in 0..count {
+            router.press(position, step, now, duration);
+        }
+        (router, now)
+    }
+
+    #[test]
+    fn four_quick_left_presses_accumulate_into_one_forty_second_seek() {
+        // The bug this exists for: every press resolves against the mirror,
+        // and the mirror cannot advance while the worker is inside a seek
+        // publishing no progress. Resolving each press independently against
+        // that frozen position collapses all four onto the same 10s target,
+        // so the listener moves 10s and pays four reopens.
+        let (mut router, now) = burst_of(Duration::from_secs(100), -SEEK_STEP_SECS, 4);
+        assert_eq!(
+            router.take_due(now + SEEK_COALESCE_WINDOW),
+            Some(Duration::from_secs(60))
+        );
+    }
+
+    #[test]
+    fn a_burst_submits_nothing_until_the_quiet_window_expires() {
+        let (mut router, now) = burst_of(Duration::from_secs(100), -SEEK_STEP_SECS, 1);
+        assert_eq!(router.take_due(now), None);
+        assert_eq!(
+            router.take_due(now + SEEK_COALESCE_WINDOW - Duration::from_millis(1)),
+            None
+        );
+        assert!(router.take_due(now + SEEK_COALESCE_WINDOW).is_some());
+    }
+
+    #[test]
+    fn a_second_press_extends_the_window_rather_than_letting_the_first_expire() {
+        // Without the extension, holding the key would fire a seek every
+        // window - the thrash this is meant to collapse, merely slower.
+        let now = Instant::now();
+        let mut router = KeyRouter::new();
+        router.press(Duration::from_secs(100), -SEEK_STEP_SECS, now, None);
+        let later = now + SEEK_COALESCE_WINDOW - Duration::from_millis(50);
+        router.press(Duration::from_secs(100), -SEEK_STEP_SECS, later, None);
+        assert_eq!(router.take_due(now + SEEK_COALESCE_WINDOW), None);
+        assert_eq!(
+            router.take_due(later + SEEK_COALESCE_WINDOW),
+            Some(Duration::from_secs(80))
+        );
+    }
+
+    #[test]
+    fn a_burst_is_closed_once_it_comes_due_and_does_not_submit_twice() {
+        let (mut router, now) = burst_of(Duration::from_secs(100), -SEEK_STEP_SECS, 1);
+        let due = now + SEEK_COALESCE_WINDOW;
+        assert!(router.take_due(due).is_some());
+        assert_eq!(router.take_due(due), None, "the same burst came due twice");
+    }
+
+    #[test]
+    fn a_backward_burst_clamps_at_zero_rather_than_wrapping() {
+        let (mut router, now) = burst_of(Duration::from_secs(15), -SEEK_STEP_SECS, 4);
+        assert_eq!(
+            router.take_due(now + SEEK_COALESCE_WINDOW),
+            Some(Duration::ZERO)
+        );
+    }
+
+    #[test]
+    fn a_forward_burst_clamps_at_a_known_duration() {
+        let (mut router, now) = burst_of_within(
+            Duration::from_secs(80),
+            SEEK_STEP_SECS,
+            4,
+            Some(Duration::from_secs(100)),
+        );
+        assert_eq!(
+            router.take_due(now + SEEK_COALESCE_WINDOW),
+            Some(Duration::from_secs(100))
+        );
+    }
+
+    #[test]
+    fn an_unknown_duration_leaves_a_forward_burst_unclamped_for_the_engine_to_bound() {
+        // `clamp_target` in the engine is what bounds a target against a
+        // duration this side does not know; inventing a ceiling here would
+        // silently cap a seek the engine could have satisfied.
+        let (mut router, now) = burst_of(Duration::from_secs(80), SEEK_STEP_SECS, 4);
+        assert_eq!(
+            router.take_due(now + SEEK_COALESCE_WINDOW),
+            Some(Duration::from_secs(120))
+        );
+    }
+
+    #[test]
+    fn press_returns_the_optimistic_target_for_the_display_to_show_at_once() {
+        let now = Instant::now();
+        let mut router = KeyRouter::new();
+        assert_eq!(
+            router.press(Duration::from_secs(100), -SEEK_STEP_SECS, now, None),
+            Duration::from_secs(90)
+        );
+        assert_eq!(
+            router.press(Duration::from_secs(100), -SEEK_STEP_SECS, now, None),
+            Duration::from_secs(80),
+            "the second press resolved against the mirror again instead of \
+             against the target the first press already accumulated"
+        );
+    }
+
+    #[test]
+    fn the_display_holds_the_target_from_the_press_until_the_seek_lands() {
+        // Submitting is not arriving. Between the flush and the landing the
+        // worker goes on reporting where playback still is - it has a range
+        // request to reopen and bytes to buffer first - so releasing the hold
+        // at the flush would snap the display back to the old position for
+        // the whole of that wait and then jump a second time. The flicker the
+        // optimistic jump exists to avoid, merely moved later.
+        let now = Instant::now();
+        let mut router = KeyRouter::new();
+        assert!(!router.is_seeking());
+
+        router.press(Duration::from_secs(100), -SEEK_STEP_SECS, now, None);
+        assert!(router.is_seeking(), "the press did not open the hold");
+
+        assert_eq!(
+            router.take_due(now + SEEK_COALESCE_WINDOW),
+            Some(Duration::from_secs(90))
+        );
+        assert!(
+            router.is_seeking(),
+            "the hold ended at the flush rather than at the landing"
+        );
+
+        router.observe(&PlaybackEvent::SeekCompleted {
+            session_rev: 0,
+            requested: Duration::from_secs(90),
+            actual: Duration::from_secs(90),
+            refinement_truncated: false,
+            provenance: PositionProvenance::Established,
+        });
+        assert!(!router.is_seeking(), "the landing did not release the hold");
+    }
+
+    #[test]
+    fn a_refused_seek_releases_the_hold_too() {
+        // Otherwise the display freezes on a target it will never reach.
+        // Symphonia refuses a seek past the last frame outright, so this is a
+        // reachable case, not a defensive one: press the arrow enough times
+        // near the end of a track and the seek comes back rejected.
+        let now = Instant::now();
+        let mut router = KeyRouter::new();
+        router.press(Duration::from_secs(100), SEEK_STEP_SECS, now, None);
+        assert!(router.take_due(now + SEEK_COALESCE_WINDOW).is_some());
+        router.observe(&PlaybackEvent::SeekRejected {
+            session_rev: 0,
+            reason: "cannot seek to 110s".to_string(),
+        });
+        assert!(!router.is_seeking());
+    }
+
+    #[test]
+    fn an_unrelated_event_leaves_the_hold_alone() {
+        let now = Instant::now();
+        let mut router = KeyRouter::new();
+        router.press(Duration::from_secs(100), -SEEK_STEP_SECS, now, None);
+        assert!(router.take_due(now + SEEK_COALESCE_WINDOW).is_some());
+        router.observe(&PlaybackEvent::VolumeChanged {
+            session_rev: 0,
+            volume: Volume::default(),
+        });
+        assert!(
+            router.is_seeking(),
+            "a volume change released a hold that only a seek outcome should"
+        );
+    }
+
+    #[test]
+    fn a_press_during_the_wait_for_a_landing_reopens_the_burst() {
+        // Pressing again while the previous seek is still in flight must
+        // accumulate from what the display is showing, not from the mirror -
+        // which is exactly the position the in-flight seek is moving away
+        // from.
+        let now = Instant::now();
+        let mut router = KeyRouter::new();
+        router.press(Duration::from_secs(100), -SEEK_STEP_SECS, now, None);
+        let submitted = now + SEEK_COALESCE_WINDOW;
+        assert_eq!(router.take_due(submitted), Some(Duration::from_secs(90)));
+        assert_eq!(
+            router.press(Duration::from_secs(100), -SEEK_STEP_SECS, submitted, None),
+            Duration::from_secs(80),
+            "the new burst reseeded from the stale mirror instead of from the \
+             target the display is already showing"
+        );
+    }
+
+    #[test]
+    fn a_cancelled_burst_submits_nothing() {
+        let (mut router, now) = burst_of(Duration::from_secs(100), -SEEK_STEP_SECS, 3);
+        router.cancel();
+        assert!(!router.is_seeking());
+        assert_eq!(router.take_due(now + SEEK_COALESCE_WINDOW), None);
+    }
+
+    #[test]
+    fn an_open_burst_shortens_the_key_poll_to_its_own_deadline() {
+        // The loop polls for keys in 100ms blocks; left alone, a 250ms window
+        // would be noticed up to a full block late.
+        let now = Instant::now();
+        let mut router = KeyRouter::new();
+        let cap = Duration::from_millis(100);
+        assert_eq!(
+            router.poll_budget(now, cap),
+            cap,
+            "an idle burst caps nothing"
+        );
+        router.press(Duration::from_secs(100), -SEEK_STEP_SECS, now, None);
+        assert_eq!(
+            router.poll_budget(now, cap),
+            cap,
+            "250ms away, the cap still wins"
+        );
+        let near = now + SEEK_COALESCE_WINDOW - Duration::from_millis(20);
+        assert_eq!(router.poll_budget(near, cap), Duration::from_millis(20));
+        assert_eq!(
+            router.poll_budget(now + SEEK_COALESCE_WINDOW, cap),
+            Duration::ZERO
         );
     }
 }

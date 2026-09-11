@@ -4,7 +4,7 @@
 //! `Stop`/`Shutdown` used to travel on. `engine_remote.rs`'s
 //! `pause_during_a_stalled_read_freezes_output_and_resume_continues` already
 //! proves the *engine* can deliver a pause to a blocked read promptly; this
-//! proves `app::route_command` - the exact routing a keypress takes - is what
+//! proves `app::KeyRouter` - the exact routing a keypress takes - is what
 //! actually reaches it, with no tty and no crossterm event in the loop at all.
 //!
 //! `engine.drain_ring_without_advancing_clock()`, not a short `play_for`, is
@@ -21,9 +21,10 @@ mod support;
 
 use std::time::{Duration, Instant};
 
-use continuo::app::route_command;
+use continuo::app::KeyRouter;
 use continuo::http::limits::Limits;
 use continuo::playback::command::{Admission, PlaybackCommand};
+use continuo::playback::event::PlaybackEvent;
 use continuo::playback::state::PlaybackState;
 
 use support::TestEngine;
@@ -59,10 +60,12 @@ fn a_pause_routed_through_the_cli_reaches_a_stalled_read_promptly() {
     // decoded `TogglePause` while the mirror shows `Playing`, with no
     // crossterm event and no terminal anywhere in this test.
     let issued = Instant::now();
-    route_command(
+    KeyRouter::new().route(
         &engine.handle(),
         true,
         Duration::ZERO,
+        None,
+        Instant::now(),
         PlaybackCommand::TogglePause,
     );
     engine.await_state(PlaybackState::Paused);
@@ -103,9 +106,20 @@ fn an_arrow_key_seek_routed_through_the_cli_retires_a_stalled_fetch_promptly() {
     let position = engine.progress().position;
     let issued = Instant::now();
     // `SeekBy(3)` from the mirror's position, exactly as the right-arrow key
-    // resolves it in `to_command` - resolved here, at the call site, since
-    // `submit_seek` takes an absolute target rather than a delta.
-    route_command(&engine.handle(), true, position, PlaybackCommand::SeekBy(3));
+    // resolves it in `to_command`. The press only accumulates; `flush` past
+    // the quiet window is what submits it, so both halves of what one arrow
+    // key now does are exercised here.
+    let mut router = KeyRouter::new();
+    let pressed = Instant::now();
+    router.route(
+        &engine.handle(),
+        true,
+        position,
+        None,
+        pressed,
+        PlaybackCommand::SeekBy(3),
+    );
+    router.flush(&engine.handle(), pressed + Duration::from_secs(1));
 
     // Proof the stalled fetch was actually retired and replaced, rather than
     // the seek merely being queued behind it: a fresh request reaching the
@@ -127,4 +141,97 @@ fn an_arrow_key_seek_routed_through_the_cli_retires_a_stalled_fetch_promptly() {
 
     engine.finish();
     server.shutdown();
+}
+
+#[test]
+fn a_burst_of_arrow_presses_costs_one_seek_rather_than_one_per_press() {
+    // The thrash this coalescing exists for. Before the burst, each press
+    // submitted its own `SeekTo` - every one of them retiring the fetch its
+    // predecessor had just started - and because all four resolved against
+    // the same frozen mirror position, the four of them asked for the very
+    // same target: four seeks, four reopens, and one step of movement to show
+    // for it.
+    //
+    // Counted in `SeekCompleted` events rather than server requests on
+    // purpose: one Coarse seek is already worth many range requests on its
+    // own - a seektable-less FLAC bisects the file - so the request count
+    // cannot tell one seek from four.
+    let server = TestServer::start(Script::from_fixture("sine-5s.mp3"));
+    let mut engine = TestEngine::start_idle();
+    engine.load_remote(&server.url("/audio.mp3"));
+    assert_eq!(engine.handle().submit_play(), Admission::Accepted);
+    engine.await_state(PlaybackState::Playing);
+    engine.play_for(Duration::from_millis(100));
+
+    let position = engine.progress().position;
+    // Four one-second steps have to land inside a five-second fixture:
+    // symphonia refuses a seek past the last frame outright, and a rejection
+    // would be indistinguishable here from the coalescing having worked.
+    assert!(
+        position < Duration::from_millis(500),
+        "playback reached {position:?} before the burst; four forward steps \
+         from there would be refused for running off the end of the media \
+         rather than measuring anything about coalescing"
+    );
+
+    let mut router = KeyRouter::new();
+    let pressed = Instant::now();
+    for _ in 0..4 {
+        router.route(
+            &engine.handle(),
+            true,
+            position,
+            None,
+            pressed,
+            PlaybackCommand::SeekBy(1),
+        );
+    }
+
+    // Held, not submitted: the whole point of the quiet window is that
+    // nothing starts buffering until the listener stops pressing.
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(
+        seeks_completed(&mut engine),
+        Vec::<Duration>::new(),
+        "a press reached the engine on its own - the window did not hold it"
+    );
+
+    router.flush(&engine.handle(), pressed + Duration::from_secs(1));
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut completed = Vec::new();
+    while completed.is_empty() {
+        assert!(
+            Instant::now() < deadline,
+            "the flushed burst never reached the engine"
+        );
+        completed.extend(seeks_completed(&mut engine));
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    // Four presses of one second, composed onto each other rather than each
+    // resolved against the position none of them could have moved.
+    assert_eq!(completed, vec![position + Duration::from_secs(4)]);
+
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        seeks_completed(&mut engine),
+        Vec::<Duration>::new(),
+        "a second seek followed the first - the burst did not collapse"
+    );
+
+    engine.finish();
+    server.shutdown();
+}
+
+/// The targets of every `SeekCompleted` waiting in the harness's inbox,
+/// draining them so a later call reports only what arrived since.
+fn seeks_completed(engine: &mut TestEngine) -> Vec<Duration> {
+    let mut targets = Vec::new();
+    while let Some(event) = engine.try_event() {
+        if let PlaybackEvent::SeekCompleted { requested, .. } = event {
+            targets.push(requested);
+        }
+    }
+    targets
 }
