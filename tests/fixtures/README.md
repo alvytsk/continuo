@@ -2,6 +2,29 @@
 
 Self-generated, no third-party content, no licensing constraints.
 
+These are the **audio** fixtures. The RSS and Atom feed documents live in
+[`feeds/`](feeds/README.md), which has its own README covering every file
+there, the byte construction of the encoding variants that are generated
+rather than committed, and the declaration-handling bounds the parser depends
+on.
+
+Every audio fixture in this directory, and what it is for:
+
+| Fixture | Shape | Exists to prove |
+|---|---|---|
+| `sine.wav` | 0.5 s, 44.1 kHz stereo PCM s16le | The baseline short track; tests that need a track to **end** use this length |
+| `sine.mp3` | 0.5 s, 128 kbps MP3 | M1 promises MP3, and symphonia's `mp3` feature is not on by default |
+| `sine.flac` | 0.5 s, FLAC | M1 promises FLAC |
+| `sine-5s.flac` | 5 s, FLAC | Enough headroom to pause and play on past the landing without the fixture running out |
+| `sine-5s.mp3` | 5 s, 128 kbps MP3 | H1 in MP3: audible playback while the body is still stalled mid-transfer |
+| `sine-5s.wav` | 5 s, PCM s16le | H1 in WAV, same reason |
+| `sine-5s.m4a` | 5 s, mono AAC, **tail-`moov`** | A tail-`moov` file opens over byte ranges and cannot open sequentially |
+| `sine-noxing.mp3` | 5 s, MP3, **no Xing/LAME header** | `Continuity::Unresolved` is reachable: nothing in the container or the transport declares a length |
+| `sine-long-noxing.mp3` | 600 s, mono CBR MP3, no Xing | A rescan long enough to *time* (M3.1's seek wedge) |
+| `sine-long-vbr-noxing.mp3` | 600 s, mono, genuinely VBR, no Xing | The byte-offset estimate's actual failure mode, not just its cost |
+
+M4 adds no audio fixture. `sine-5s.flac` is the one it reuses: `tests/m4_playback_identity.rs` and `tests/m4_cli.rs`'s probe test both serve it from the loopback server as a podcast episode's enclosure.
+
 `sine.wav` — 0.5 s, 440 Hz, 44100 Hz, stereo, PCM s16le:
 
     ffmpeg -f lavfi -i "sine=frequency=440:sample_rate=44100:duration=0.5" \

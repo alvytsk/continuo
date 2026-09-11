@@ -3,6 +3,34 @@
 Self-generated, no third-party content. Every file here is **readable UTF-8**,
 on purpose.
 
+## Index
+
+Every committed fixture, and the one thing it exists to prove. Each has its own
+section below with the full expected result.
+
+| Fixture | Expected result |
+|---|---|
+| `rss2-minimal.xml` | The whole RSS 2.0 mapping: entity-bearing title, whitespace-preserving `guid`, relative enclosure, RFC 2822 date, `HH:MM:SS` duration |
+| `xml-base-relative.xml` | Three nested `xml:base`es resolve; popping an item restores the channel's, not the sibling's |
+| `cdata-title.xml` | CDATA is not unescaped a second time; `&amp;` outside it still decodes |
+| `unknown-entity-in-title.xml` | `&nbsp;` survives literally in a title; nothing skipped, nothing warned |
+| `unknown-entity-in-guid.xml` | The same entity in an identity skips **that item only**, and counts it |
+| `itunes-duration-forms.xml` | `1:02:03`, `62:03`, `3723` all parse to 3,723 s; `1:60`, a negative and a `u64` overflow are `None` |
+| `enclosure-malformed-with-guid.xml` | An unparseable `enclosure@url` is dropped with a warning; the item stays on its `guid` |
+| `enclosure-scheme-unsupported.xml` | `file:`, `data:`, `ftp:` are discarded; the `https:` one wins |
+| `multiple-enclosures.xml` | The first *usable* enclosure in document order wins; the other three are counted |
+| `atom-minimal.xml` | The whole Atom 1.0 mapping, behind a non-`atom` namespace prefix |
+| `atom-title-types.xml` | `text`, `html` (kept literal), `xhtml` (descendant text), and an absent `@type` (= `text`) |
+| `atom-link-no-rel.xml` | A rel-less `link` is `alternate`; a `related` is passed over; the first alternate wins |
+| `guid-absent-uses-enclosure.xml` | Identity falls through GUID → enclosure URL |
+| `item-without-enclosure.xml` | Identity without playability: retained with `source: None` |
+| `item-without-identity.xml` | Skipped with `WarningKind::MissingIdentity`; nothing is synthesized |
+| `duplicate-identity.xml` | First occurrence wins; the duplicate and the identityless item are both skipped |
+| `cyrillic-title.xml` | Cyrillic title, item title and `guid` preserved verbatim — no transliteration, case-folding or normalization |
+| `decl-without-encoding.xml` | A declaration with no `encoding` attribute is not an error; UTF-8 is the default |
+| `rss1-rdf.xml` | `FeedError::UnsupportedFormat` — refused by name |
+| `truncated-xml.xml` | `FeedError::Malformed` for the whole document, however much of it parsed |
+
 ## Why the encoding matrix is not here
 
 Spec §8.1 names `latin1-declared`, `utf16le-bom`, `utf16be-bom`,
@@ -20,6 +48,32 @@ runtime fixture-generation dependency out of the tree.
 So what lives here is every fixture the decoder is not the point of: the
 RSS 2.0 and Atom 1.0 mappings, `xml:base`, entities, and the two documents
 that must be refused outright.
+
+### The encoded variants, byte for byte
+
+Each row is built by `tests/m4_feed_parse.rs`'s `utf16(xml, little_endian,
+bom)` or `splice(ascii, raw)`. `utf16` writes an optional byte-order mark
+(`FF FE` little-endian, `FE FF` big-endian) and then every UTF-16 code unit in
+that byte order. `splice` replaces each `@` in an ASCII document with the raw
+bytes given, which is how a document acquires a byte no UTF-8 decoder will
+accept. The document body in every case is the minimal
+`<rss><channel><title>…</title></channel></rss>`.
+
+| Spec name (§8.1) | Byte construction | Expected result |
+|---|---|---|
+| `utf16le-bom` | `FF FE` + LE code units; declaration carries no `encoding` | `Ok`, title `Радио` |
+| `utf16be-bom` | `FE FF` + BE code units; declaration carries no `encoding` | `Ok`, title `Радио` |
+| `utf16le-declared-no-bom` | LE code units, **no** BOM; declaration says `encoding="UTF-16"` | `Ok`, title `Радио` — the `3C 00 3F 00` pattern settles byte order |
+| (BE, declared, with BOM) | `FE FF` + BE code units; declaration says `encoding="UTF-16"` | `Ok`, title `Радио` — XML 1.0 §4.3.3 makes the mark, not the bare label, authoritative |
+| `bom-utf8` | `EF BB BF` + the UTF-8 document, once with no `encoding` and once with `encoding="utf-8"` | `Ok` both ways, title `Радио`, BOM stripped |
+| `latin1-declared` | `splice("<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?>…<title>Caf@</title>…", b"\xe9")` — declaration 43 bytes, inside the window | `Ok`, title `Café` |
+| `utf8-invalid-bytes` | `splice(doc, b"\xff")`, once with the byte inside the 64-byte lookahead window and once far past it | `FeedError::Encoding` both times — never a U+FFFD replacement |
+| `encoding-unknown-label` | `encoding="x-nonesuch"`, ASCII body | `FeedError::UnsupportedEncoding { label: "x-nonesuch" }` |
+| `decl-malformed-encoding-attr` | three spellings: unquoted `encoding=utf-8`; no `version` at all; `version="2.0"` | `FeedError::Malformed` for each |
+
+The UTF-16 rows are why the matrix is generated rather than committed: a file
+stored as UTF-8 while claiming to be UTF-16 would prove the opposite of what
+these assert, which is that the **bytes on the wire** decide.
 
 ## RSS 2.0
 
@@ -166,6 +220,18 @@ and the label says otherwise. UTF-16 never gets there: the byte-order mark (or
 the `3C 00 3F 00` pattern) already settled it, and XML 1.0 §4.3.3 makes the
 mark rather than the label authoritative for byte order — so a big-endian
 document declaring the bare label `UTF-16` is honored, not refused.
+
+There is a third consequence of the same window, and it is not a refusal.
+Those first 64 bytes are decoded under the **detected** encoding, and
+`set_encoding` does not go back and re-decode them — so under a declared
+legacy encoding, any non-ASCII byte *inside* the window is interpreted as
+UTF-8 rather than as that encoding. This is unreachable for the formats this
+parser accepts: an RSS or Atom document's first 64 bytes are the XML
+declaration and the opening of the document element, which are ASCII by
+construction, and a stray non-ASCII byte there would be invalid UTF-8 and
+refused as `FeedError::Encoding` anyway. It is recorded because it is a
+property of the decoder this parser depends on, not a property of these
+fixtures, and a future format with a non-ASCII prologue would meet it.
 
 ## Episode binding
 

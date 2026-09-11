@@ -196,21 +196,71 @@ mod support;
 #[cfg(target_os = "linux")]
 mod process {
     use std::path::{Path, PathBuf};
-    use std::process::Output;
+    use std::process::{Child, Command, Output, Stdio};
+    use std::time::{Duration, Instant};
 
     use crate::support::server::{DocumentReply, Script, TestServer};
 
     type Fallible = Result<(), Box<dyn std::error::Error>>;
 
-    fn run_cli(root: &Path, args: &[&str]) -> std::io::Result<Output> {
-        std::process::Command::new(env!("CARGO_BIN_EXE_continuo"))
+    /// How long a spawned child may take to finish once its server has been
+    /// released. Generous enough not to trip under CPU contention, bounded so
+    /// a wedged child fails the test rather than hanging the suite.
+    const CHILD_PATIENCE: Duration = Duration::from_secs(20);
+
+    fn command(root: &Path, args: &[&str]) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_continuo"));
+        command
             .args(args)
             .env("XDG_DATA_HOME", root.join("data"))
             .env("XDG_CACHE_HOME", root.join("cache"))
             .env("XDG_STATE_HOME", root.join("state"))
             .env("XDG_CONFIG_HOME", root.join("config"))
-            .env("RUST_LOG", "continuo=warn")
-            .output()
+            .env("RUST_LOG", "continuo=warn");
+        command
+    }
+
+    fn run_cli(root: &Path, args: &[&str]) -> std::io::Result<Output> {
+        command(root, args).output()
+    }
+
+    /// Starts the CLI without waiting for it, so a test can act on the
+    /// filesystem while the process is parked mid-request.
+    fn spawn_cli(root: &Path, args: &[&str]) -> std::io::Result<Child> {
+        command(root, args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+    }
+
+    /// Waits for `child` with a deadline, killing it rather than blocking the
+    /// suite forever if it never exits. Both pipes are small here (a handful
+    /// of lines), so reading them after exit cannot deadlock.
+    fn wait_bounded(mut child: Child) -> Result<Output, Box<dyn std::error::Error>> {
+        let deadline = Instant::now() + CHILD_PATIENCE;
+        loop {
+            if child.try_wait()?.is_some() {
+                return Ok(child.wait_with_output()?);
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("the spawned continuo process never exited".into());
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Puts a nonempty directory where a file is about to be written, which
+    /// is what makes the atomic rename over it fail. Deliberately not a
+    /// permission bit: a suite running as root would not be stopped by one,
+    /// and a directory is refused by `rename(2)` for every user.
+    fn obstruct(path: &Path) -> std::io::Result<()> {
+        if path.exists() {
+            std::fs::remove_file(path)?;
+        }
+        std::fs::create_dir_all(path)?;
+        std::fs::write(path.join("sentinel"), b"keep")
     }
 
     fn stdout(output: &Output) -> String {
@@ -541,7 +591,14 @@ mod process {
         )?)?;
         assert!(probed.contains("44100"), "{probed}");
         assert!(probed.contains("Finite"), "{probed}");
+        let requests = media.requests();
         media.shutdown();
+        // The probe ran against the *enclosure*, which is the half that
+        // distinguishes it from probing the feed URL.
+        assert!(
+            requests.iter().any(|request| request.path == "/audio.flac"),
+            "the probe never opened the enclosure: {requests:?}"
+        );
 
         // A probe reads no playback state and writes none.
         assert!(!root.path().join("state").exists());
@@ -568,6 +625,245 @@ mod process {
 
         let listing = succeeded(&run_cli(root.path(), &["feeds"])?)?;
         assert_eq!(listing.lines().count(), 1, "{listing}");
+        Ok(())
+    }
+
+    // --- Step 3: episode probing and partial-failure exits ------------
+
+    /// §6.4's "refused at resolution": an item with identity but no
+    /// enclosure never becomes a request. The media server here is alive and
+    /// answering for the whole test, so an empty request log is evidence
+    /// that nothing was opened rather than evidence that nothing could be.
+    #[test]
+    fn an_episode_without_audio_never_reaches_the_media_server() -> Fallible {
+        let media = TestServer::start(Script::from_fixture("sine-5s.flac"));
+        let feed = TestServer::start(Script::serving(
+            feed_xml(&media.url("/audio.flac")).into_bytes(),
+        ));
+        let root = tempfile::tempdir()?;
+        succeeded(&subscribe(root.path(), &feed)?)?;
+        feed.shutdown();
+
+        // Episode 2 is `feed_xml`'s item with a guid and no enclosure.
+        for args in [
+            ["play", "radio-t", "2"].as_slice(),
+            ["play", "radio-t", "2", "--probe-only"].as_slice(),
+        ] {
+            let error = failed(&run_cli(root.path(), args)?)?;
+            assert!(
+                error.contains("has no audio enclosure"),
+                "{args:?}: {error}"
+            );
+        }
+
+        let requests = media.requests();
+        media.shutdown();
+        assert!(
+            requests.is_empty(),
+            "a resolution failure must open nothing: {requests:?}"
+        );
+        // No device, no terminal, and no checkpoint: `NotPlayable` happens
+        // before any of the three exist.
+        assert!(!root.path().join("state").exists());
+        Ok(())
+    }
+
+    /// §5.3/§6.4: `unsubscribe` removes the subscription first, so a cache
+    /// it then cannot delete leaves the listener genuinely unsubscribed —
+    /// and that half is committed text, printed before the nonzero status
+    /// the incomplete cleanup earns.
+    #[test]
+    fn an_undeletable_cache_still_unsubscribes_and_exits_nonzero() -> Fallible {
+        let root = tempfile::tempdir()?;
+        let server = TestServer::start(Script::serving(
+            feed_xml("https://cdn.example.org/1.mp3").into_bytes(),
+        ));
+        succeeded(&subscribe(root.path(), &server)?)?;
+        server.shutdown();
+
+        let cache = cache_file(root.path())?;
+        obstruct(&cache)?;
+
+        let output = run_cli(root.path(), &["unsubscribe", "radio-t"])?;
+        let error = failed(&output)?;
+        let committed = stdout(&output);
+        assert!(
+            committed.contains(
+                "radio-t: the subscription was removed, but its cached \
+                                episodes could not be deleted"
+            ),
+            "{committed}"
+        );
+        assert!(!error.is_empty(), "the failure must say why on stderr");
+
+        // The subscription really is gone, and the obstruction is untouched.
+        let listing = succeeded(&run_cli(root.path(), &["feeds"])?)?;
+        assert_eq!(listing.lines().count(), 1, "{listing}");
+        assert_eq!(std::fs::read(cache.join("sentinel"))?, b"keep");
+        Ok(())
+    }
+
+    /// §5.3's subscribe commit order, as a whole process. The obstruction is
+    /// created while the response is still withheld, so the cache write
+    /// cannot possibly have started yet: the failure is injected rather than
+    /// raced for. One park/release cycle only — the harness shares a single
+    /// stall gate per server.
+    #[test]
+    fn a_subscription_that_cannot_be_saved_reports_that_nothing_is_subscribed() -> Fallible {
+        let root = tempfile::tempdir()?;
+        let server = TestServer::start(
+            Script::documents(vec![reply(
+                "/feed",
+                vec![("Content-Type", "application/rss+xml")],
+                feed_xml("https://cdn.example.org/1.mp3").as_bytes(),
+            )])
+            .stall_headers(),
+        );
+
+        let url = server.url("/feed");
+        let child = spawn_cli(root.path(), &["subscribe", &url, "--as", "radio-t"])?;
+        let stalled = server.wait_until_stalled(Duration::from_secs(10));
+        if stalled {
+            // `subscriptions.json` does not exist yet; a nonempty directory
+            // in its place is what makes the eventual rename fail.
+            obstruct(&subscriptions(root.path()))?;
+        }
+        let released = server.release();
+        let output = wait_bounded(child);
+        server.shutdown();
+
+        assert!(stalled, "subscribe's request never reached the server");
+        assert!(
+            released,
+            "the stalled connection was not parked as expected"
+        );
+        let output = output?;
+        let error = failed(&output)?;
+        let committed = stdout(&output);
+        assert!(
+            committed.contains(
+                "episodes were cached, but the subscription itself \
+                                could not be saved; nothing is subscribed"
+            ),
+            "{committed}"
+        );
+        assert!(!error.is_empty(), "the failure must say why on stderr");
+
+        // Nothing is subscribed, and the cache file is left behind
+        // unreferenced — recoverable, exactly as §5.3 describes.
+        assert_eq!(
+            std::fs::read(subscriptions(root.path()).join("sentinel"))?,
+            b"keep"
+        );
+        assert!(cache_file(root.path()).is_ok());
+        Ok(())
+    }
+
+    /// §5.3's refresh commit order: the cache lands first, so a subscription
+    /// update that cannot be recorded afterwards is reported *with* the fact
+    /// that the episodes were saved. A second server on the first one's port
+    /// keeps the subscription's `fetch_url` valid while giving this run its
+    /// own stall gate (one park/release cycle per server).
+    #[test]
+    fn a_refresh_that_cannot_record_a_changed_title_reports_the_saved_cache() -> Fallible {
+        let root = tempfile::tempdir()?;
+        let first = TestServer::start(Script::serving(
+            feed_xml("https://cdn.example.org/1.mp3").into_bytes(),
+        ));
+        let port = first.port();
+        succeeded(&subscribe(root.path(), &first)?)?;
+        first.shutdown();
+
+        let renamed = feed_xml("https://cdn.example.org/1.mp3")
+            .replace("<title>Radio T</title>", "<title>Radio T Renamed</title>");
+        let second = TestServer::start_on(
+            port,
+            Script::documents(vec![reply(
+                "/feed",
+                // A different validator, so the conditional request this
+                // refresh sends cannot be answered 304 — a 304 would keep
+                // the old title and there would be nothing to record.
+                vec![("ETag", "\"v2\""), ("Content-Type", "application/rss+xml")],
+                renamed.as_bytes(),
+            )])
+            .stall_headers(),
+        );
+
+        let child = spawn_cli(root.path(), &["refresh", "radio-t"])?;
+        let stalled = second.wait_until_stalled(Duration::from_secs(10));
+        if stalled {
+            obstruct(&subscriptions(root.path()))?;
+        }
+        let released = second.release();
+        let output = wait_bounded(child);
+        second.shutdown();
+
+        assert!(stalled, "refresh's request never reached the server");
+        assert!(
+            released,
+            "the stalled connection was not parked as expected"
+        );
+        let output = output?;
+        let error = failed(&output)?;
+        let committed = stdout(&output);
+        assert!(
+            committed.contains("radio-t: updated, 2 episodes retained, 0 skipped"),
+            "{committed}"
+        );
+        assert!(
+            committed.contains(
+                "radio-t: the episode cache was saved, but the feed's \
+                                changed title could not be recorded"
+            ),
+            "{committed}"
+        );
+        assert!(!error.is_empty(), "the failure must say why on stderr");
+        assert_eq!(
+            std::fs::read(subscriptions(root.path()).join("sentinel"))?,
+            b"keep"
+        );
+        Ok(())
+    }
+
+    /// §6.4: a batch prints every feed before its status is decided, and one
+    /// bad feed neither hides the others nor exits zero. The count on stderr
+    /// is `BatchIncomplete`'s, so it says how many of how many.
+    #[test]
+    fn a_refresh_batch_names_every_slug_and_counts_what_failed() -> Fallible {
+        let root = tempfile::tempdir()?;
+        let healthy = TestServer::start(Script::documents(vec![reply(
+            "/feed",
+            vec![("ETag", "\"v1\""), ("Content-Type", "application/rss+xml")],
+            feed_xml("https://cdn.example.org/1.mp3").as_bytes(),
+        )]));
+        let doomed = TestServer::start(Script::serving(
+            feed_xml("https://cdn.example.org/2.mp3").into_bytes(),
+        ));
+
+        succeeded(&run_cli(
+            root.path(),
+            &["subscribe", &healthy.url("/feed"), "--as", "radio-t"],
+        )?)?;
+        succeeded(&run_cli(
+            root.path(),
+            &["subscribe", &doomed.url("/feed"), "--as", "sysdesign"],
+        )?)?;
+        // Only the second feed's server goes away, so exactly one of the two
+        // can fail.
+        doomed.shutdown();
+
+        let output = run_cli(root.path(), &["refresh"])?;
+        let error = failed(&output)?;
+        let listing = stdout(&output);
+        healthy.shutdown();
+
+        assert!(listing.contains("radio-t: unchanged"), "{listing}");
+        assert!(listing.contains("sysdesign: failed:"), "{listing}");
+        assert_eq!(listing.lines().count(), 2, "{listing}");
+        assert!(
+            error.contains("1 of 2 feeds did not complete successfully"),
+            "{error}"
+        );
         Ok(())
     }
 }

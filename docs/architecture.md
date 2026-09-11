@@ -14,11 +14,11 @@ The canonical position contract is:
 
 A position also carries **provenance** (`PositionProvenance`, `src/playback/provenance.rs`): whether its absolute media time was decoder-confirmed (`Established`) or derived from a byte-offset estimate (`Estimated`). This is a second axis alongside `PositionQuality` (§4), never merged into it and never a fourth quality state — quality reports how precisely *heard* playback is known, reconstructed from the output callback's spans; provenance reports whether the media time itself is trustworthy. The two compose independently: a `Degraded` position (a timing base that jumped) whose media time was decoder-established is still `Established`, and an estimated landing that is playing normally is `Estimated` regardless of quality. Provenance is sticky — decoding forward from an estimated landing keeps reporting `Estimated`; no amount of elapsed playback converts it to `Established`, only an event that independently re-establishes the absolute position does (a confirmed seek landing, an established restart, or a fresh load). An estimated position may drive display and resume (§6), but must never replace an established checkpoint for the same media, and no accuracy figure is promised for it — "estimated" means the true media time may be in a substantially different part of the recording, not "approximately right."
 
-M0 ships values, tracing, repository checks, and this documentation. M1 ships the in-session position behavior described below; M2 persists it. M3 ships finite HTTP media. Of the three transports named above, two work today: local files (M1) and finite remote audio over HTTP (M3) both play, and seek and resume where the server's capabilities support it. The third, podcasts delivered through RSS or Atom feeds, is not implemented until M4 — a remote source is given today as a direct HTTP(S) URL rather than discovered from a feed.
+M0 ships values, tracing, repository checks, and this documentation. M1 ships the in-session position behavior described below; M2 persists it. M3 ships finite HTTP media, and M4 feeds and subscriptions. All three transports named above now work: local files (M1), finite remote audio over HTTP given as a direct URL (M3), and podcast episodes discovered from an RSS or Atom feed (M4). M4 changed nothing about the third one's playback — an episode is played by handing the existing engine the enclosure URL the feed named, under the episode's own identity.
 
 ## 2. Execution contexts
 
-The future runtime has four execution contexts with strict ownership:
+The runtime has these execution contexts, with strict ownership:
 
 | Context | Owns | Must not |
 |---|---|---|
@@ -28,8 +28,17 @@ The future runtime has four execution contexts with strict ownership:
 | Persistence writer thread | Serialize and atomically write state snapshots | Run on Tokio's executor |
 | HTTP source adapter (`HttpMediaSource`, `src/http/source.rs`, invoked from the decode thread) | Implements the pinned Symphonia `MediaSource` contract as synchronous, cancellable reads and seeks over the shared byte channel (`src/http/channel.rs`) | Call into the Tokio runtime, or block on it, directly |
 | Fetch task (spawned by `HttpService` onto its own runtime) | One task per source generation: issues the request, follows redirects, streams the response body into the bounded byte channel | Own or touch decoder, resampler, or CPAL state; run more than one active fetch per source generation, or accumulate an unbounded body |
+| Feed application (`src/library.rs`, M4) | The seven functions a listing, a subscription change or an episode resolution is made of: reads `subscriptions.json`, the feed cache and the checkpoint snapshot, decides what to commit, returns values | Construct an `EngineHandle`, an `AudioOutput` or a terminal; contain a `block_on`; print or format anything |
+| Feed presentation (`src/commands.rs`, M4) | The only place a feed command's columns, its `—`/`never`/`played` spellings and its exit status are decided, and the **one** synchronous bridge into the HTTP runtime | Decide what to fetch or commit; open a device |
+| Document fetch (spawned by `HttpService` onto the same runtime, M4) | One bounded whole-document GET per call, alongside — never instead of — the streaming media fetch above: its own manual redirect loop, its own conditional headers, and a body capped by `Limits::document_bytes` that is buffered entirely in memory before it is parsed | Stream into the byte channel, outlive its caller's `await`, or accumulate a body past the cap |
 
 The decode worker creates, starts, pauses, and destroys the CPAL stream. The callback owns only the ring-buffer consumer and progress counter. Tokio tasks never touch decoder or output-device state, and writer filesystem work stays off Tokio.
+
+M4 adds the two feed contexts without adding a thread. `library.rs` is the application seam M5 reuses: it returns values and never prints, and its four network functions are `async` so that a caller decides where they run. `commands.rs` is the only caller today, and it enters the runtime in exactly one place (`wait_http`), so `block_on` exists at one line of the program rather than being spread through the layer that decides what to fetch.
+
+The document fetch is a second shape of HTTP work, not a second HTTP stack: it reuses the same `HttpService`, the same `Limits`, and the same `accept_redirect` policy (hop cap, loop detection, scheme check, HTTPS→HTTP downgrade refusal) as streaming media. The difference is what it does with the body — a feed is small, is needed whole before it can be parsed, and is therefore read to a capped buffer instead of into `ByteChannel`. Nothing about the streaming path changed to make room for it.
+
+**`library.rs`'s `async` functions still do synchronous filesystem work.** Reading `subscriptions.json`, reading and atomically replacing a cache file, and `fsync`ing both happen on whatever thread polls the future, between `await` points. Today that is harmless: `commands.rs` blocks a `main` that has nothing else to do. It will not be harmless in M5, whose event loop must stay responsive to keystrokes. M5 must therefore schedule these calls off its event loop — a blocking task, a worker thread, or the existing persistence writer thread extended to cover them — rather than polling them inline. Nothing in this API prevents that; the note exists because nothing in it forces it either.
 
 ## 3. Cancellation and channel backpressure
 
@@ -117,6 +126,12 @@ Controls, spaces, double quotes, backslashes, percent signs, and non-ASCII UTF-8
 
 `Episode` holds a `MediaId` and an optional source, so a feed item without an enclosure can retain stable identity and appear in listings without claiming playability. Feed redirects may change a subscription's fetch URL without changing its assigned `FeedId` or episode checkpoints.
 
+M4 implements this without changing any of it. `EpisodeKey::resolve` is called once per item by `bind_feed` (`src/feed/episode.rs`) with the item's GUID, enclosure URL and link in that order, and its result is stored in the cache as the episode's `media_id`; nothing later re-derives an identity from a URL. `resolve_source` (`src/app.rs`) — the function that turns a *command-line argument* into a `(MediaId, SourceLocation)` pair — gained a sibling rather than a branch: `library::resolve_episode` produces the pair for `play <slug> <index>`, and `run_resolved` plays whichever pair it is handed without being able to tell which of the two produced it. The engine, `Session`, the resume decision and the checkpoint writer are M1–M3 code, reused unchanged.
+
+The consequence is that **what is played and what is checkpointed are deliberately different values.** A podcast episode's `SourceLocation` is the enclosure URL; its `MediaId` is `podcast:<feed-id>/<episode-key>`. Playing the same audio as a direct URL produces `remote:<normalized-url>` instead, and the two never share a checkpoint. That is what lets an episode's position survive the show moving its audio to another CDN, and it is asserted end to end — a real cached feed, a real loopback fetch through the virtual output, a real `state.json` — by `tests/m4_playback_identity.rs`.
+
+`--probe-only` on an episode is the one place a second identity is derived: the probe re-resolves the enclosure URL as a `RemoteUrl` to open it. It never persists one, because a probe reads no playback state and writes none.
+
 ## 6. Durable state (M2)
 
 Persistence honors XDG environment variables and their standard defaults:
@@ -143,6 +158,28 @@ the implementation amended them.
 
 M3 adds one protection rule on top of this. When a positive checkpoint exists but capability resolution conclusively rules out resuming it, sequential playback may begin at zero instead of failing outright — and that fallback load marks the existing entry protected: periodic, pause, stop, outgoing-media and shutdown captures do not overwrite it merely because this run is playing from zero. Protection ends only on a successfully established explicit restart, a successfully established seek, or verified completion. This deliberately favors recovering the earlier resume point over saving progress from a fallback run — it is not a maximum-position merge rule, and even later progress that exceeds the protected position does not replace it while protection holds.
 
+M4 adds a second durable file and a disposable one, and keeps them apart on purpose.
+
+`$XDG_DATA_HOME/continuo/subscriptions.json` is durable user data: the slug, the assigned `FeedId`, the feed's last known title, its current fetch URL, and when it was added. `$XDG_CACHE_HOME/continuo/feeds/<feed-id>.json` is refetchable: the parsed episodes, the URL that representation was actually retrieved from, its `ETag`/`Last-Modified` validators, and both timestamps. The cache is keyed by `FeedId` and never by slug, so renaming a subscription cannot orphan it, and it carries a `parser_version` beside its `schema_version` because a later parser fix would not otherwise reach data already cached.
+
+**One cache file is one atomic write, which is what keeps a validator honest.** The episodes, `fetched_from` and the validators live in the same file and are replaced by the same `rename(2)`, so no interleaving can leave an `ETag` describing a representation other than the episodes stored beside it. That matters more than it looks: a validator that outran its episodes would make the *next* conditional refresh answer 304 and preserve a list the server no longer has.
+
+Across the two files there is no such guarantee, and M4 does not pretend otherwise. A single atomic commit would need a journal or a combined file, and combining them would put refetchable data inside durable user data. Instead the commit **order** is fixed so that every interruption leaves a recoverable state, and the incomplete outcome is *reported* rather than hidden:
+
+| Command | First | Then | If the second step fails |
+|---|---|---|---|
+| `subscribe` | write the cache | add the subscription | an unreferenced cache file remains; **nothing is subscribed**, and the command says so and exits nonzero |
+| `unsubscribe` | remove the subscription | delete the cache | the subscription really is gone; a stale cache file remains, is reported, and exits nonzero |
+| `refresh` | write the cache | update title / redirected URL | the episodes really were saved; the metadata was not, is reported, and exits nonzero |
+
+This is why §6.4's "a partial failure cannot exit successfully" is a rule about *exit status*, not about atomicity: the work is genuinely half-done, the half that landed is genuinely useful, and the command's job is to name which half that was. `FollowupFailure` carries the failed step and its cause rather than a bool, precisely so the message can.
+
+Recovery from an unusable cache is a refetch, never a repair. Missing, corrupt and `parser_version`-mismatched are all treated as "nothing to revalidate against", so `refresh` fetches unconditionally in each case; a corrupt file is left exactly where it is, and no listing ever quarantines, rewrites or deletes one. A `304` answered when there was no usable cache to revalidate is refused (`UnsolicitedNotModified`) rather than turned into a fabricated cache entry.
+
+Concurrency is out of scope for M4 and documented rather than solved: each file write is atomic, but nothing serializes one whole process against another, so two simultaneous mutating commands can lose one of the two subscription writes. One process at a time.
+
+Checkpoints are the third file and are never touched by a feed command. `unsubscribe` takes no `StateStore` argument and deletes nothing; resubscribing mints a fresh `FeedId`, so checkpoints keyed to the old one are orphaned rather than reattached. Reattaching would mean trusting a feed URL to name the same feed forever.
+
 ## 7. Diagnostics and errors
 
 Tracing is implemented in M0 and controlled through `RUST_LOG`, for example `RUST_LOG=continuo=debug cargo run --locked`. Logs go to stderr. Without `RUST_LOG` the default filter is `continuo=info`. An invalid filter, or a `RUST_LOG` value that is not valid Unicode, is reported as a startup failure and exits nonzero rather than being silently ignored. Later milestones must log source opened, redirects, range support, selected decoder, known duration, requested and actual seek results, playback state transitions, checkpoint writes, end of track, and output failures. Per-frame logging is forbidden.
@@ -150,6 +187,18 @@ Tracing is implemented in M0 and controlled through `RUST_LOG`, for example `RUS
 Errors carry typed context such as the path or URL, media identity, and operation. The application boundary presents concise text to the user while the full error chain goes to structured logs. Position remains estimated when the device cannot report output latency.
 
 M3 gives `PlaybackEvent::Failed` a typed `cause: Option<RemoteFailure>` beside its existing `message: String`. `RemoteFailure` (`src/http/error.rs`) is one variant per §11 category — invalid source, HTTP status, redirect rejection, timeout, invalid range, resource change, truncated body, probe limit, unresolved continuity, unsupported live media, seek/resume unavailable, non-identity content encoding, transport, and cancellation — so a policy can act on what went wrong rather than only read a string a human wrote. `Display` on every variant is third-party-safe: every URL reaching it has already passed through `redact_url`, so no signed query or userinfo can reach a status line, a log line, or a `Failed` message. This narrows rather than closes M1's known-debt finding about stringly-typed failures: `cause` is `None` for every local (non-remote) fault, so `message` remains the only thing those carry. See `docs/m1-known-debt.md`'s Milestone 3 section for the remaining rough edges in `RemoteFailure` itself.
+
+M4 adds `FeedError` (`src/feed/error.rs`) as the single type every feed and subscription operation returns, and `AppError` (`src/error.rs`) as the two-armed union `app::run` hands to `main`. Both `AppError` arms are `#[error(transparent)]`, so the concrete failure keeps printing rather than a wrapper that says nothing.
+
+`FeedError` follows the same redaction discipline as `RemoteFailure`, and for the same reason: `main.rs` prints `{error}` **and** logs `?error`, and a derived `Debug` prints field values verbatim, so a redaction applied only to `Display` would leak straight through the log line. Every URL-bearing field therefore holds already-redacted text rather than a live `Url`. Three distinct rules are in force, and they are not the same rule:
+
+- **Transport URLs are secret.** Query and userinfo are where a bearer token hides; every URL reaching a message has passed `redact_url` first, and text that does not parse as a URL is replaced by `<unparseable URL>` rather than echoed, since the unparseable text may itself be the secret.
+- **File content is never quoted back.** A `serde_json::Error`'s own `Display` can echo the offending bytes, and a checkpoint key or a cached `media_id` *is* an untrusted identity that may carry a URL. Both the cache decoder and the subscription decoder reduce it to a category plus line and column; `PersistenceError::Deserialize` deliberately carries no `#[source]` for the same reason.
+- **Titles and explicitly requested aliases are content, not transport.** They are what the listener asked to see, so they are escaped at the formatting boundary (control characters, U+2028/U+2029, and the bidi overrides U+202A–U+202E become visible escapes) rather than hidden. Nothing is transliterated: a Cyrillic or CJK title prints as stored.
+
+The same rules bind logging. No `ParsedItem`, `BoundItem`, `CachedFeed`, `CachedEpisode`, `DocumentRequest` or validator record is ever logged whole — any of them under `Debug` would carry a GUID, a title and a URL at once. Parse and bind warnings carry only the item's document ordinal and a warning category; resolution diagnostics carry only the slug, the index and the two declared enclosure fields. `tests/m4_diagnostics.rs` audits this through the real constructors and through the real binary at `RUST_LOG=continuo=debug`.
+
+One accepted inaccuracy: `main.rs` labels its error log line `"playback failed"` for every command, including the feed commands, which is wrong for `subscribe`, `feeds`, `episodes`, `refresh` and `unsubscribe`. The text of the error itself is correct; only the label is not. M4 left `main.rs` untouched on purpose, and this is recorded debt rather than an oversight.
 
 Runtime code forbids unsafe code and denies `unwrap` and `expect`. Tests may use them for assertions and fixtures; where Clippy does not recognize a bare integration-test helper as test code, its exception is scoped to that fixed fixture helper rather than weakening runtime lint policy.
 
@@ -161,10 +210,10 @@ Runtime code forbids unsafe code and denies `unwrap` and `expect`. Tests may use
 | **M1** | Local playback vertical slice: Symphonia + CPAL, decode thread, ring buffer, position accounting, command/event protocol, state machine, resampler choice |
 | **M2** | Checkpoint persistence, stop/resume and restart/resume semantics, completion policy |
 | **M3** | Finite HTTP media, capability probing, range-based seek, `RemoteFile` vs `LiveStream` — shipped |
-| **M4** | RSS/Atom feeds, subscriptions, episode listing and progress |
+| **M4** | RSS/Atom feeds, subscriptions, episode listing and progress — shipped |
 | **M5** | Ratatui TUI over the existing application interfaces |
 
-M0 explicitly defers `PlaybackCommand` and `PlaybackEvent`, the executable state machine, channels, worker threads, callback accounting, buffer management, detailed decoder and device errors, checkpoint storage, completion policy, HTTP buffering, and capability probing. Playback, persistence, HTTP fetching, feeds, subscriptions, and the TUI are not implemented today.
+M0 explicitly defers `PlaybackCommand` and `PlaybackEvent`, the executable state machine, channels, worker threads, callback accounting, buffer management, detailed decoder and device errors, checkpoint storage, completion policy, HTTP buffering, and capability probing. Of those deferrals, everything but the TUI has since been implemented: playback (M1), persistence (M2), HTTP fetching (M3), and feeds and subscriptions (M4).
 
 M1 used Symphonia and CPAL directly to control buffering, cancellation, and position accounting. This choice does not claim that Rodio cannot seek; Rodio's Symphonia backend implements accurate seek refinement. HTTP range support belongs to the source layer, not CPAL. Commands and events will form the application boundary, so no speculative backend trait is introduced. Rodio remains a contingency if M1 uncovers a concrete blocker.
 
@@ -194,7 +243,9 @@ The reference manual Radio-T scenario is:
 10. Start Continuo again
 11. Restore the episode and resume close to the last saved checkpoint
 
-The complete feed-driven scenario becomes executable in M4. M3 exercises its finite HTTP playback portion. The episode must remain finite remote media rather than becoming live radio merely because it uses HTTP.
+M4 makes this executable end to end: steps 1–2 are `subscribe` and `episodes`, step 3 is `play <slug> <index>`, and steps 4–11 are M1–M3 behavior the feed layer does not touch. The episode remains finite remote media rather than becoming live radio merely because it uses HTTP, and steps 9–11 restore it under its **podcast** identity rather than its enclosure URL — `tests/m4_playback_identity.rs` asserts exactly that against a written `state.json`.
+
+M4 adds two dependencies and no more: `quick-xml` for the pull parser, and `getrandom` for the 128 bits of OS randomness a `FeedId` is minted from. `url`'s `serde` feature is activated for the subscription and cache DTOs.
 
 Automated HTTP integration tests use a local test server and have no public-network dependency. They cover range-capable finite files, servers without range support, redirects, invalid range responses, and reconnect-after-stop.
 
