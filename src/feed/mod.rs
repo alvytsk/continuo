@@ -1,7 +1,9 @@
-//! Feed errors.
+//! Feeds: parse-layer values and the parser that produces them.
 //!
-//! Parsing, caching and the HTTP document boundary land in later M4 tasks;
-//! this module currently holds only [`error::FeedError`], the type every
-//! later feed and subscription operation constructs from.
+//! Caching and the episode binding land in later M4 tasks. What is here is
+//! deliberately pure: [`parse::parse_feed`] turns bytes plus a retrieval URL
+//! into [`model::ParsedFeed`], and touches no subscription, cache or socket.
 
 pub mod error;
+pub mod model;
+pub mod parse;

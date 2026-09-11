@@ -1,0 +1,9 @@
+<?xml version="1.0"?>
+<rss version="2.0" xmlns:i="http://www.itunes.com/dtds/podcast-1.0.dtd">
+  <channel><title>Radio &amp; Friends</title><link>https://example.org/</link>
+    <item><guid isPermaLink="true">  https://EXAMPLE.org/p?a=1&amp;b=2  </guid>
+      <title>Opening</title><enclosure url="audio/one.mp3" length="42" type="audio/mpeg"/>
+      <pubDate>Sun, 06 Sep 2026 18:00:00 GMT</pubDate><i:duration>1:42:00</i:duration>
+    </item>
+  </channel>
+</rss>
