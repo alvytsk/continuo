@@ -23,7 +23,7 @@ use crate::media::id::{AbsolutePath, MediaId, NormalizedUrl};
 use crate::media::source::SourceLocation;
 use crate::persistence::PersistenceError;
 use crate::persistence::model::{PersistedCheckpoint, PersistedState};
-use crate::persistence::store::{LoadReason, StateStore};
+use crate::persistence::store::{LoadReason, QueueBackup, StateStore};
 use crate::persistence::writer::{ShutdownOutcome, StateSink, Urgency, WriterHandle};
 use crate::playback::command::{Admission, PlaybackCommand, ResumeIntent};
 use crate::playback::engine::EngineHandle;
@@ -947,6 +947,27 @@ fn open_persistence(
                 }
                 LoadReason::Unreadable => {
                     tracing::warn!("state file could not be read; preserving it and not writing");
+                }
+            }
+            // §6: a repaired queue logs here too, distinct from the warning
+            // `StateStore::load` already emits — that one is unconditional,
+            // this one is what the TUI's status line (Task 17) will surface.
+            if let Some(repair) = &outcome.queue_repair {
+                match &repair.backup {
+                    QueueBackup::Saved(path) => {
+                        tracing::warn!(
+                            fields = repair.reset.fields_reset(),
+                            backup = ?path,
+                            "queue data in the state file was reset"
+                        );
+                    }
+                    QueueBackup::Failed => {
+                        tracing::warn!(
+                            fields = repair.reset.fields_reset(),
+                            "queue data in the state file was reset; the backup could not be \
+                             written, so persistence is disabled for this session"
+                        );
+                    }
                 }
             }
             (outcome.state, outcome.writable)
