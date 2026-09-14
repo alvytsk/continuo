@@ -28,8 +28,10 @@ fn main() -> ExitCode {
     let cli = match cli::Cli::try_parse() {
         Ok(cli) => cli,
         Err(error) => {
-            eprint!("{error}");
-            return ExitCode::FAILURE;
+            // clap sends help and version to stdout with status 0 and usage errors
+            // to stderr with status 2 (§4); printing it ourselves lost both.
+            let _ = error.print();
+            return ExitCode::from(u8::try_from(error.exit_code()).unwrap_or(2));
         }
     };
 
