@@ -19,7 +19,7 @@ use continuo::playback::command::{Admission, ResumeIntent};
 use continuo::playback::event::{PlaybackEvent, StartDisposition};
 use continuo::playback::state::PlaybackState;
 use continuo::resume::resume_candidate;
-use continuo::session::{Action, Session};
+use continuo::session::{Action, LoadTarget, Session};
 
 use support::server::{Script, TestServer};
 use support::{Loaded, TestEngine};
@@ -154,14 +154,18 @@ fn a_second_session_resumes_from_the_flushed_checkpoint() {
     // checkpoint lands in the store.
     let (store, clock) = RemoteRig::store_in(dir.path());
     let server1 = TestServer::start_on(port, Script::from_fixture("sine-5s.flac"));
+    let mut session1 = Session::new(PersistedState::default());
+    let request1 = session1
+        .register_load(LoadTarget::Legacy, &media)
+        .unwrap_or_else(|error| panic!("registered: {error:?}"));
     let mut engine1 = TestEngine::start_idle();
-    engine1.load_remote(&url);
+    engine1.load_remote_as(request1, &url, ResumeIntent::StartAt(Duration::ZERO));
     assert_eq!(engine1.handle().submit_play(), Admission::Accepted);
     engine1.await_state(PlaybackState::Playing);
     engine1.play_for(Duration::from_secs(2));
     let mut rig1 = RemoteRig {
         engine: engine1,
-        session: Session::new(PersistedState::default()),
+        session: session1,
         store,
         clock,
     };
@@ -183,8 +187,13 @@ fn a_second_session_resumes_from_the_flushed_checkpoint() {
     let server2 =
         TestServer::start_on(port, Script::from_fixture("sine-5s.flac").redirect_chain(1));
     let (store2, clock2) = RemoteRig::store_in(dir.path());
+    let mut session2 = Session::new(reload(dir.path()));
+    let request2 = session2
+        .register_load(LoadTarget::Legacy, &media)
+        .unwrap_or_else(|error| panic!("registered: {error:?}"));
     let mut engine2 = TestEngine::start_idle();
-    engine2.load_remote_with_resume(
+    engine2.load_remote_as(
+        request2,
         &url,
         ResumeIntent::Candidate(
             resume_candidate(flushed.position, flushed.completed)
@@ -193,7 +202,7 @@ fn a_second_session_resumes_from_the_flushed_checkpoint() {
     );
     let mut rig2 = RemoteRig {
         engine: engine2,
-        session: Session::new(reload(dir.path())),
+        session: session2,
         store: store2,
         clock: clock2,
     };
@@ -276,14 +285,18 @@ fn the_protection_survives_a_process_boundary() {
     // Session 1: range-capable, plays past zero, then quits.
     let (store, clock) = RemoteRig::store_in(dir.path());
     let server1 = TestServer::start_on(port, Script::from_fixture("sine-5s.flac"));
+    let mut session1 = Session::new(PersistedState::default());
+    let request1 = session1
+        .register_load(LoadTarget::Legacy, &media)
+        .unwrap_or_else(|error| panic!("registered: {error:?}"));
     let mut engine1 = TestEngine::start_idle();
-    engine1.load_remote(&url);
+    engine1.load_remote_as(request1, &url, ResumeIntent::StartAt(Duration::ZERO));
     assert_eq!(engine1.handle().submit_play(), Admission::Accepted);
     engine1.await_state(PlaybackState::Playing);
     engine1.play_for(Duration::from_secs(2));
     let mut rig1 = RemoteRig {
         engine: engine1,
-        session: Session::new(PersistedState::default()),
+        session: session1,
         store,
         clock,
     };
@@ -301,8 +314,13 @@ fn the_protection_survives_a_process_boundary() {
     // whatever zero-start progress this session records for itself.
     let server2 = TestServer::start_on(port, Script::from_fixture("sine-5s.flac").without_ranges());
     let (store2, clock2) = RemoteRig::store_in(dir.path());
+    let mut session2 = Session::new(reload(dir.path()));
+    let request2 = session2
+        .register_load(LoadTarget::Legacy, &media)
+        .unwrap_or_else(|error| panic!("registered: {error:?}"));
     let mut engine2 = TestEngine::start_idle();
-    engine2.load_remote_with_resume(
+    engine2.load_remote_as(
+        request2,
         &url,
         ResumeIntent::Candidate(
             resume_candidate(original.position, original.completed)
@@ -311,7 +329,7 @@ fn the_protection_survives_a_process_boundary() {
     );
     let mut rig2 = RemoteRig {
         engine: engine2,
-        session: Session::new(reload(dir.path())),
+        session: session2,
         store: store2,
         clock: clock2,
     };
@@ -349,8 +367,13 @@ fn the_protection_survives_a_process_boundary() {
     // unavailable and the fallback still applies.
     let server3 = TestServer::start_on(port, Script::from_fixture("sine-5s.flac").without_ranges());
     let (store3, clock3) = RemoteRig::store_in(dir.path());
+    let mut session3 = Session::new(reload(dir.path()));
+    let request3 = session3
+        .register_load(LoadTarget::Legacy, &media)
+        .unwrap_or_else(|error| panic!("registered: {error:?}"));
     let mut engine3 = TestEngine::start_idle();
-    engine3.load_remote_with_resume(
+    engine3.load_remote_as(
+        request3,
         &url,
         ResumeIntent::Candidate(
             resume_candidate(after_session_2.position, after_session_2.completed)
@@ -359,7 +382,7 @@ fn the_protection_survives_a_process_boundary() {
     );
     let mut rig3 = RemoteRig {
         engine: engine3,
-        session: Session::new(reload(dir.path())),
+        session: session3,
         store: store3,
         clock: clock3,
     };

@@ -22,7 +22,7 @@ use crate::media::capabilities::{MediaCapabilities, SeekSupport};
 use crate::media::id::{AbsolutePath, MediaId, NormalizedUrl};
 use crate::media::source::SourceLocation;
 use crate::persistence::PersistenceError;
-use crate::persistence::model::{PersistedCheckpoint, PersistedState};
+use crate::persistence::model::PersistedState;
 use crate::persistence::store::{LoadReason, QueueBackup, StateStore};
 use crate::persistence::writer::{ShutdownOutcome, StateSink, Urgency, WriterHandle};
 use crate::playback::command::{Admission, LoadRequestId, PlaybackCommand, ResumeIntent};
@@ -34,8 +34,7 @@ use crate::playback::provenance::PositionProvenance;
 use crate::playback::state::PlaybackState;
 use crate::playback::timeline::PositionQuality;
 use crate::playback::volume::Volume;
-use crate::resume::{restart_preference, resume_candidate};
-use crate::session::{Action, Session};
+use crate::session::{Action, LoadTarget, Session, resume_intent_for};
 
 const SEEK_STEP_SECS: i64 = 10;
 const VOLUME_STEP: f32 = 0.05;
@@ -130,8 +129,21 @@ fn run_resolved(media: MediaId, location: SourceLocation) -> Result<(), Playback
         engine.set_http(Some(service));
     }
 
-    for command in resume_commands(media, location, resume, volume) {
-        engine.commands().send(command).ok();
+    // One load for the whole run, registered before anything is sent so the
+    // `Loaded` it produces has a token `session` recognizes (M5 §6). `Busy`
+    // cannot happen — this is the only load this session has ever asked
+    // for — so a session-ending error is the honest way to report it anyway.
+    let request = session
+        .register_load(LoadTarget::Legacy, &media)
+        .map_err(|error| PlaybackError::Failed(format!("cannot register the load: {error:?}")))?;
+    for command in resume_commands(media, location, resume, volume, request) {
+        if matches!(command, PlaybackCommand::Load { .. }) {
+            if engine.commands().send(command).is_err() {
+                session.retract_load(request);
+            }
+        } else {
+            engine.commands().send(command).ok();
+        }
     }
 
     // Entered only now (R5, Ruling 1): every fallible step above can still
@@ -813,6 +825,7 @@ fn resume_commands(
     source: SourceLocation,
     resume: Option<ResumeIntent>,
     volume: Volume,
+    request: LoadRequestId,
 ) -> [PlaybackCommand; 3] {
     // No entry is not itself a resume intent: the worker would decide
     // `NoEntry` from an absent `Candidate` anyway (§11), so this is the same
@@ -822,9 +835,6 @@ fn resume_commands(
     // `EstimatedCandidate` (§4.3) — this function's only job left is the
     // "nothing at all" case.
     let resume = resume.unwrap_or(ResumeIntent::StartAt(Duration::ZERO));
-    // Task 6 only: a fixed token for the session's single load. Task 8
-    // replaces this with a session-registered `LoadRequestId`.
-    let request = LoadRequestId::from_raw(1);
     [
         PlaybackCommand::SetVolume(volume),
         PlaybackCommand::Load {
@@ -881,43 +891,6 @@ fn platform_store(clock: &Arc<dyn Clock>) -> Option<StateStore> {
             tracing::warn!(%error, "no state directory; this session will not be persisted");
             None
         }
-    }
-}
-
-/// Builds the worker-facing resume intent from a stored checkpoint entry,
-/// §4.3's estimated-preference rule folded in beside the established path
-/// left unchanged.
-///
-/// A completed entry never reaches `restart_preference` — its own doc says
-/// so: the caller's concern, and calling it anyway would let a stray
-/// estimate stored before completion redirect a replay that D1 already
-/// says starts over at zero regardless. So a completed entry always goes
-/// through `resume_candidate` exactly as it did before this function
-/// existed, and only a live, uncompleted entry's `estimated` field is ever
-/// consulted.
-///
-/// This is where §4.3 actually gets wired into the load path (Task 6's fix
-/// round 1): `restart_preference`'s pure preference decision — implemented
-/// and tested since Task 6 itself — had no production caller until this
-/// function. `decide_resume` is deliberately not consulted here for the
-/// estimate branch: §4.3 is a preference between two already-known
-/// locations, not a duration-validated choice, and running the estimate
-/// through duration validation would be inventing a rule the design doc
-/// does not state. `decide_resume` keeps governing the established
-/// position exactly as before wherever that path is actually taken — the
-/// `resume_candidate` branch below, reached whenever there is no estimate
-/// to prefer.
-fn resume_intent_for(entry: Option<&PersistedCheckpoint>) -> Option<ResumeIntent> {
-    let entry = entry?;
-    if entry.completed {
-        return resume_candidate(entry.position, entry.completed).map(ResumeIntent::Candidate);
-    }
-    match restart_preference(entry.position, entry.estimated) {
-        Some(preference) => Some(ResumeIntent::EstimatedCandidate {
-            target: preference.target,
-            established: preference.established,
-        }),
-        None => resume_candidate(entry.position, entry.completed).map(ResumeIntent::Candidate),
     }
 }
 
@@ -1511,7 +1484,13 @@ mod tests {
             Err(error) => panic!("a literal URL must parse: {error}"),
         };
 
-        let commands = resume_commands(media.clone(), location, None, Volume::FULL);
+        let commands = resume_commands(
+            media.clone(),
+            location,
+            None,
+            Volume::FULL,
+            LoadRequestId::from_raw(1),
+        );
         match &commands[1] {
             PlaybackCommand::Load {
                 media: loaded,
@@ -1586,6 +1565,7 @@ mod tests {
             SourceLocation::LocalPath("/music/sonata.flac".into()),
             Some(ResumeIntent::Candidate(candidate)),
             Volume::new(0.25),
+            LoadRequestId::from_raw(1),
         );
 
         match &commands {

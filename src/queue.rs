@@ -129,7 +129,6 @@ impl QueueEntry {
     pub fn display(&self) -> &DisplayMetadata {
         &self.display
     }
-    #[allow(dead_code)]
     pub(crate) fn display_mut(&mut self) -> &mut DisplayMetadata {
         &mut self.display
     }
@@ -189,7 +188,6 @@ impl Queue {
     pub fn get(&self, id: QueueEntryId) -> Option<&QueueEntry> {
         self.entries.iter().find(|e| e.id == id)
     }
-    #[allow(dead_code)]
     pub(crate) fn get_mut(&mut self, id: QueueEntryId) -> Option<&mut QueueEntry> {
         self.entries.iter_mut().find(|e| e.id == id)
     }
@@ -280,7 +278,6 @@ impl Queue {
     }
 
     /// Only `Session` adopts or clears an occurrence (§3).
-    #[allow(dead_code)]
     pub(crate) fn set_active(&mut self, id: Option<QueueEntryId>) -> Result<(), QueueError> {
         if let Some(id) = id
             && self.get(id).is_none()

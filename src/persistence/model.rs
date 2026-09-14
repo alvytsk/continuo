@@ -202,9 +202,7 @@ impl PersistedState {
     }
 
     /// Mutable access for `Session`, which is the only thing allowed to
-    /// change what is queued (§3). Not yet called outside this crate's own
-    /// tests — `Session` adopts it in a later M5 task.
-    #[allow(dead_code)]
+    /// change what is queued (§3).
     pub(crate) fn queue_mut(&mut self) -> &mut Queue {
         &mut self.queue
     }

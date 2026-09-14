@@ -34,7 +34,7 @@ use continuo::{
         command::{PlaybackCommand, ResumeIntent},
         state::PlaybackState,
     },
-    session::Session,
+    session::{LoadTarget, Session},
 };
 use support::server::{Script, TestServer};
 
@@ -71,7 +71,12 @@ fn playback_persists_the_podcast_id_not_the_enclosure_url() -> Fallible {
     engine
         .handle()
         .set_http(Some(HttpService::spawn(Limits::brisk())?));
-    let request = engine.next_request();
+    // Registered before the `Load` is sent, so the `Loaded` it produces
+    // carries a token this session recognizes (M5 §6).
+    let mut session = Session::new(PersistedState::default());
+    let request = session
+        .register_load(LoadTarget::Legacy, &media)
+        .map_err(|error| format!("cannot register the load: {error:?}"))?;
     engine.send(PlaybackCommand::Load {
         request,
         media: media.clone(),
@@ -83,7 +88,6 @@ fn playback_persists_the_podcast_id_not_the_enclosure_url() -> Fallible {
     // `await_state` consumes only the state history, never the event inbox,
     // so the `Loaded` that told the session which media is current is still
     // queued here and is handed to `observe` rather than fabricated.
-    let mut session = Session::new(PersistedState::default());
     let mut saw_loaded = false;
     while let Some(event) = engine.try_event() {
         saw_loaded |= matches!(

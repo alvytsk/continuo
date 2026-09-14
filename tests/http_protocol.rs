@@ -19,12 +19,12 @@ use continuo::media::id::{MediaId, NormalizedUrl};
 use continuo::media::source::SourceLocation;
 use continuo::persistence::model::PersistedState;
 use continuo::persistence::store::StateStore;
-use continuo::playback::command::Admission;
+use continuo::playback::command::{Admission, ResumeIntent};
 use continuo::playback::error::PlaybackError;
 use continuo::playback::event::PlaybackEvent;
 use continuo::playback::prepare::{PrepareContext, prepare};
 use continuo::playback::state::PlaybackState;
-use continuo::session::{Action, Session};
+use continuo::session::{Action, LoadTarget, Session};
 
 use support::TestEngine;
 use support::server::{Script, TestServer};
@@ -316,7 +316,13 @@ fn no_broken_transfer_can_become_a_completed_track() {
 
     let scenario = |name: &str, server: TestServer| {
         let mut rig = RemoteRig::new(dir.path(), TestEngine::start_idle());
-        rig.engine.load_remote(&server.url("/audio.flac"));
+        let url = server.url("/audio.flac");
+        let request = rig
+            .session
+            .register_load(LoadTarget::Legacy, &media_for(&url))
+            .unwrap_or_else(|error| panic!("{name}: registered: {error:?}"));
+        rig.engine
+            .load_remote_as(request, &url, ResumeIntent::StartAt(Duration::ZERO));
         assert_eq!(rig.engine.handle().submit_play(), Admission::Accepted);
         rig.engine.await_state(PlaybackState::Playing);
         rig.engine.play_for(Duration::from_millis(200));
@@ -404,7 +410,16 @@ fn no_broken_transfer_can_become_a_completed_track() {
     // actually entered before the deadline fires.
     let server = TestServer::start(Script::from_fixture("sine-5s.flac").stall_body_after(48 << 10));
     let mut rig = RemoteRig::new(dir.path(), TestEngine::start_idle());
-    rig.engine.load_remote(&server.url("/audio.flac"));
+    let stalled_url = server.url("/audio.flac");
+    let stalled_request = rig
+        .session
+        .register_load(LoadTarget::Legacy, &media_for(&stalled_url))
+        .unwrap_or_else(|error| panic!("stalled body: registered: {error:?}"));
+    rig.engine.load_remote_as(
+        stalled_request,
+        &stalled_url,
+        ResumeIntent::StartAt(Duration::ZERO),
+    );
     assert_eq!(rig.engine.handle().submit_play(), Admission::Accepted);
     rig.engine.await_state(PlaybackState::Playing);
     rig.engine.play_for(Duration::from_millis(200));

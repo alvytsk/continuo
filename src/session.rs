@@ -9,17 +9,30 @@
 //! *after* the one that applied it, and that the pass publishes progress before
 //! it flushes events — so the sample that follows a transition event is
 //! strictly newer than the transition it reports.
+//!
+//! M5 §6 adds a second responsibility: `Session` is the only allocator of
+//! `LoadRequestId`s and the only place that decides whether a `Loaded`
+//! outcome may adopt a queue occurrence. Every media-specific event — not
+//! only `Loaded` — is now gated on owning the currently adopted token before
+//! it may touch history at all (D20); a stale or unowned event changes
+//! nothing, not even the revision the policy tracks.
 
+use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use crate::clock::ClockSample;
 use crate::media::id::MediaId;
-use crate::persistence::model::PersistedState;
+use crate::media::metadata::MediaMetadata;
+use crate::persistence::model::{PersistedCheckpoint, PersistedState};
 use crate::persistence::writer::Urgency;
 use crate::playback::checkpoint::PlaybackCheckpoint;
+use crate::playback::command::{LoadRequestId, ResumeIntent};
 use crate::playback::event::{PlaybackEvent, Progress, ShutdownReport, StartDisposition};
 use crate::playback::provenance::PositionProvenance;
 use crate::playback::state::PlaybackState;
+use crate::queue::{
+    Direction, DisplayDuration, DurationSource, NewQueueEntry, QueueEntryId, QueueError,
+};
 // Re-exported so `src/app.rs` and `tests/resume_contract.rs` keep importing
 // these from `session` — the type and the function moved to `src/resume.rs`
 // so the playback worker could depend on them too (G3), without dragging
@@ -35,10 +48,17 @@ use crate::playback::state::PlaybackState;
 // instead. Deleted rather than fixed in place: a function that must not be
 // called with an unverified entry is safer removed than documented.
 pub use crate::resume::{ResumeDecision, decide_resume};
+use crate::resume::{restart_preference, resume_candidate};
 
 /// The capture interval §6 requires while playing. With the writer's 2 s
 /// coalescing window it bounds worst-case loss at 7 s.
 pub const CAPTURE_INTERVAL: Duration = Duration::from_secs(5);
+
+/// The application-wide cap on loads that have been sent but whose outcome
+/// has not yet arrived (M5 §6, global constraint). Queue membership does not
+/// pin a checkpoint — this is a bound on in-flight loads only, unrelated to
+/// the 512-entry checkpoint cap.
+pub const MAX_PENDING_LOADS: usize = 16;
 
 #[derive(Debug)]
 pub enum Action {
@@ -49,11 +69,77 @@ pub enum Action {
     },
 }
 
-/// The position the policy would use for a checkpoint it can no longer sample.
+/// What a `Load` this session sent is for: a queue occurrence, or the
+/// caller's own load with nothing queued behind it (the pre-M5 shape every
+/// existing call site still uses).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LoadTarget {
+    Queue(QueueEntryId),
+    Legacy,
+}
+
+/// Why `register_load` refused a token.
+#[derive(Debug, Eq, PartialEq)]
+pub enum RegisterLoadError {
+    /// `MAX_PENDING_LOADS` are already outstanding.
+    Busy,
+    /// `LoadTarget::Queue(id)` named an entry no longer in the queue.
+    UnknownEntry,
+    /// `LoadTarget::Queue(id)` named an entry whose media does not match.
+    MediaMismatch,
+}
+
+/// The load `Session` currently believes owns playback — the request its
+/// `Loaded` adopted, and what that load was for.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AdoptedLoad {
+    pub request: LoadRequestId,
+    pub target: LoadTarget,
+}
+
+/// What an eligible `EndOfTrack` asks the caller to do next (M5 §6).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Advance {
+    Next(QueueEntryId),
+    EndOfQueue,
+}
+
+/// The result of removing a queue entry: the submission it produced, whether
+/// playback must stop because the removed entry was active, and which entry
+/// (if any) the caller should offer to select next. `selection` is advisory
+/// only — `Session` never activates it itself (§3: only a `Loaded` adopts an
+/// occurrence).
+#[derive(Debug)]
+pub struct Removal {
+    pub action: Action,
+    pub stop_playback: bool,
+    pub selection: Option<QueueEntryId>,
+}
+
+/// A registered, not-yet-resolved load. Tracked by `Session` so that a
+/// `Loaded` can be checked against what it was actually asked to load, and so
+/// a queue mutation can invalidate a load racing the entry it targets.
+#[derive(Clone, Debug)]
+struct PendingLoad {
+    target: LoadTarget,
+    media: MediaId,
+    /// Set by a queue mutation that removes or otherwise invalidates
+    /// `target` before this load's outcome arrives (M5 §6). An invalidated
+    /// `Loaded` is never adopted; its registration is still retired normally.
+    invalidated: bool,
+}
+
+/// The position the policy would use for a checkpoint it can no longer
+/// sample.
 struct Sample {
     session_rev: u64,
     media: MediaId,
     position: Duration,
+    /// Whether `position` was decoder-established or an estimate when this
+    /// sample was taken (§3, Task 6). Read back by a fallback capture
+    /// (`capture_current`) that has no fresher provenance of its own to
+    /// offer.
+    provenance: PositionProvenance,
 }
 
 pub struct Session {
@@ -120,6 +206,40 @@ pub struct Session {
     /// absolute position, and nothing has claimed otherwise for the
     /// incoming media yet.
     position_provenance: PositionProvenance,
+    /// The last token issued by `register_load`. Strictly increasing, never
+    /// reused; the first token is `1`.
+    next_request: u64,
+    /// Loads sent but not yet resolved, keyed by the token `register_load`
+    /// handed out for them.
+    pending: BTreeMap<LoadRequestId, PendingLoad>,
+    /// The load whose `Loaded` this session most recently adopted, if any.
+    adopted: Option<AdoptedLoad>,
+    /// `session_rev` at the moment `adopted` was set. Presently informational
+    /// — `session_rev` itself already tracks adopted playback — kept so a
+    /// later task has it without redefining `session_rev`'s meaning.
+    adopted_rev_floor: u64,
+    /// The highest revision any accepted or protected event has carried,
+    /// including a load outcome for a target this session never adopted.
+    /// Distinct from `session_rev`, which belongs to adopted playback alone.
+    latest_engine_rev: u64,
+    /// The token of the most recent `Loaded` this session observed, current
+    /// or not. Ownership of every other media event requires this to still
+    /// name `adopted.request` (D3, D20): a `Loaded` for a load this session
+    /// declined to adopt still moves this field, which is what stops a stale
+    /// `EndOfTrack` from that declined load's playback reaching history
+    /// before its stop lands.
+    last_loaded: Option<LoadRequestId>,
+    /// Raised when an adopted `Loaded` cannot be honoured (its target was
+    /// invalidated, or the media no longer matches) and the caller must stop
+    /// the engine rather than let it keep playing an occurrence this session
+    /// will never adopt.
+    stop_requested: bool,
+    /// What an eligible `EndOfTrack` asks the caller to do next, until taken.
+    advance: Option<Advance>,
+    /// The `(adopted.request, session_rev)` pair of the last `EndOfTrack`
+    /// this session recorded, so a duplicate delivery of the same completion
+    /// cannot record history or advance the queue twice (§6).
+    completion_seen: Option<(LoadRequestId, u64)>,
 }
 
 impl Session {
@@ -139,6 +259,15 @@ impl Session {
             established: false,
             protected: None,
             position_provenance: PositionProvenance::Established,
+            next_request: 0,
+            pending: BTreeMap::new(),
+            adopted: None,
+            adopted_rev_floor: 0,
+            latest_engine_rev: 0,
+            last_loaded: None,
+            stop_requested: false,
+            advance: None,
+            completion_seen: None,
         }
     }
 
@@ -153,25 +282,314 @@ impl Session {
         &self.state
     }
 
+    // --------------------------------------------------------- load tokens
+
+    /// Allocates a token for a `Load` this session is about to send, and
+    /// records what that load is for. `Busy` at `MAX_PENDING_LOADS`, checked
+    /// before the queue lookup below — a caller cannot be told `Busy` for one
+    /// media and `UnknownEntry` for another from the very same call.
+    pub fn register_load(
+        &mut self,
+        target: LoadTarget,
+        media: &MediaId,
+    ) -> Result<LoadRequestId, RegisterLoadError> {
+        if self.pending.len() >= MAX_PENDING_LOADS {
+            return Err(RegisterLoadError::Busy);
+        }
+        if let LoadTarget::Queue(id) = target {
+            match self.state.queue().get(id) {
+                None => return Err(RegisterLoadError::UnknownEntry),
+                Some(entry) if entry.media() != media => {
+                    return Err(RegisterLoadError::MediaMismatch);
+                }
+                Some(_) => {}
+            }
+        }
+        self.next_request += 1;
+        let request = LoadRequestId::from_raw(self.next_request);
+        self.pending.insert(
+            request,
+            PendingLoad {
+                target,
+                media: media.clone(),
+                invalidated: false,
+            },
+        );
+        Ok(request)
+    }
+
+    /// Drops a registration this session's caller never sent, or no longer
+    /// needs — a `Load` the command queue refused, or a superseded legacy
+    /// load. A no-op if `request` has already resolved or was never
+    /// registered.
+    pub fn retract_load(&mut self, request: LoadRequestId) {
+        self.pending.remove(&request);
+    }
+
+    pub fn pending_load_count(&self) -> usize {
+        self.pending.len()
+    }
+
+    pub fn adopted(&self) -> Option<AdoptedLoad> {
+        self.adopted
+    }
+
+    /// Whether `event` is one `observe` will actually act on: for `Loaded`, a
+    /// current registration whose target and media still line up; for every
+    /// other media event, ownership of the adopted token (D20).
+    /// `VolumeChanged` is profile-wide and always accepted. Exposed so a
+    /// caller can tell a legitimate `Action::None` apart from an event this
+    /// session is simply not the owner of.
+    pub fn accepts_media_event(&self, event: &PlaybackEvent) -> bool {
+        match event {
+            PlaybackEvent::Loaded { request, media, .. } => {
+                self.registered_target(*request, media).is_some()
+            }
+            PlaybackEvent::VolumeChanged { .. } => true,
+            _ => self.owns_adopted(event.session_rev()),
+        }
+    }
+
+    /// The still-valid registration for `request`, if `media` matches it, it
+    /// has not been invalidated, and — for a queue target — the entry still
+    /// exists carrying that same media.
+    fn registered_target(&self, request: LoadRequestId, media: &MediaId) -> Option<LoadTarget> {
+        let pending = self.pending.get(&request)?;
+        if pending.invalidated || &pending.media != media {
+            return None;
+        }
+        match pending.target {
+            LoadTarget::Queue(id) => self
+                .state
+                .queue()
+                .get(id)
+                .is_some_and(|entry| entry.media() == media)
+                .then_some(pending.target),
+            LoadTarget::Legacy => Some(pending.target),
+        }
+    }
+
+    /// The shared ownership gate (D20): an adopted token exists, the most
+    /// recent `Loaded` this session observed still names it, and `event_rev`
+    /// is not behind what this session has already recognized.
+    fn owns_adopted(&self, event_rev: u64) -> bool {
+        match self.adopted {
+            Some(adopted) => {
+                self.last_loaded == Some(adopted.request) && event_rev >= self.latest_engine_rev
+            }
+            None => false,
+        }
+    }
+
+    pub fn take_stop_request(&mut self) -> bool {
+        std::mem::take(&mut self.stop_requested)
+    }
+
+    pub fn take_advance(&mut self) -> Option<Advance> {
+        self.advance.take()
+    }
+
+    // --------------------------------------------------------------- queue
+
+    /// Enqueues `batch` all-or-nothing. `Ordinary` submit on success; the
+    /// queue is untouched on failure, so nothing is submitted for it.
+    /// Touches neither adoption nor any pending load's target.
+    pub fn enqueue(
+        &mut self,
+        batch: Vec<NewQueueEntry>,
+    ) -> Result<(Vec<QueueEntryId>, Action), QueueError> {
+        let ids = self.state.queue_mut().enqueue(batch)?;
+        Ok((ids, self.submit(Urgency::Ordinary)))
+    }
+
+    /// Moves one entry a step in `direction`. `Ordinary` submit only when the
+    /// move actually changed the order (an edge is a no-op, submitting
+    /// nothing). Touches neither adoption nor any pending load's target: a
+    /// registered `Loaded` still adopts the entry it named, wherever it now
+    /// sits.
+    pub fn move_entry(
+        &mut self,
+        id: QueueEntryId,
+        direction: Direction,
+    ) -> Result<Action, QueueError> {
+        let moved = self.state.queue_mut().move_entry(id, direction)?;
+        Ok(if moved {
+            self.submit(Urgency::Ordinary)
+        } else {
+            Action::None
+        })
+    }
+
+    /// Removes one entry. Unknown `id` is an error raised before anything
+    /// changes. Every pending load targeting `id` is invalidated first, so a
+    /// `Loaded` already in flight for it can never resurrect it (M5 §6). If
+    /// `id` is the active entry, its checkpoint is captured through the same
+    /// gated path `shutdown_snapshot` uses (`capture_current`) before
+    /// adoption is cleared — `current_media` and the checkpoints already on
+    /// record are left exactly as they are.
+    pub fn remove_entry(
+        &mut self,
+        id: QueueEntryId,
+        progress: &Progress,
+        now: ClockSample,
+    ) -> Result<Removal, QueueError> {
+        if self.state.queue().get(id).is_none() {
+            return Err(QueueError::UnknownEntry(id));
+        }
+        for pending in self.pending.values_mut() {
+            if pending.target == LoadTarget::Queue(id) {
+                pending.invalidated = true;
+            }
+        }
+        let was_active = self.state.queue().active() == Some(id);
+        if was_active {
+            self.capture_current(progress, now);
+            self.adopted = None;
+            self.last_sample = None;
+        }
+        let removed = self.state.queue_mut().remove(id)?;
+        Ok(Removal {
+            action: self.submit(Urgency::Forced),
+            stop_playback: removed.was_active,
+            selection: removed.selection,
+        })
+    }
+
+    /// Copies a decoder-reported title and duration into the queue entry a
+    /// `Loaded` just adopted. Only these two fields move today — artist and
+    /// album arrive in a later task — and only when the decoder actually
+    /// reported them: `MediaMetadata`'s absent fields must never blank out
+    /// what the entry already displayed.
+    fn absorb_load_metadata(&mut self, id: QueueEntryId, metadata: &MediaMetadata) {
+        let Some(entry) = self.state.queue_mut().get_mut(id) else {
+            return;
+        };
+        let display = entry.display_mut();
+        if let Some(title) = &metadata.title {
+            display.title = Some(title.clone());
+        }
+        if let Some(duration) = metadata.duration {
+            display.duration = Some(DisplayDuration {
+                value: duration,
+                source: DurationSource::Decoded(metadata.duration_provenance),
+            });
+        }
+    }
+
+    // ------------------------------------------------------------- observe
+
     pub fn observe(&mut self, event: &PlaybackEvent, now: ClockSample) -> Action {
-        let session_rev = event.session_rev();
-        self.session_rev = session_rev;
+        let accepted = self.accepts_media_event(event);
+
+        // Load outcomes are processed before every ordinary handler, and
+        // their registration is retired first — even for a stale or unknown
+        // one (M5 §6). `accepted` above was computed while that registration
+        // still stood, which is what lets a `Loaded` that fails
+        // `registered_target` be told apart from one this session never
+        // asked for at all.
+        if let Some(request) = event.load_outcome() {
+            let Some(pending) = self.pending.remove(&request) else {
+                // Unknown or duplicate: changes nothing at all, including
+                // revision tracking, `last_loaded`, checkpoint fields and
+                // advancement.
+                return Action::None;
+            };
+            let event_rev = event.session_rev();
+            if event_rev < self.latest_engine_rev {
+                // Known, but superseded by a newer revision already
+                // recognized: retiring the registration above is this
+                // outcome's whole effect. It must never stop newer playback.
+                return Action::None;
+            }
+            return match event {
+                PlaybackEvent::Loaded {
+                    media,
+                    position,
+                    disposition,
+                    metadata,
+                    ..
+                } => {
+                    self.latest_engine_rev = event_rev;
+                    self.last_loaded = Some(request);
+                    if accepted {
+                        self.session_rev = event_rev;
+                        self.adopt_loaded(
+                            request,
+                            pending.target,
+                            media,
+                            *position,
+                            disposition,
+                            metadata,
+                            now,
+                        )
+                    } else {
+                        // The target was invalidated, or the media no longer
+                        // matches: the engine is playing something this
+                        // session will never adopt. The previous adopted
+                        // checkpoint state is left exactly as it stands.
+                        self.stop_requested = true;
+                        Action::None
+                    }
+                }
+                PlaybackEvent::Failed { .. } | PlaybackEvent::LoadCancelled { .. } => {
+                    self.latest_engine_rev = event_rev;
+                    self.last_loaded = None;
+                    Action::None
+                }
+                _ => unreachable!(
+                    "PlaybackEvent::load_outcome() is Some only for Loaded, Failed and LoadCancelled"
+                ),
+            };
+        }
+
+        // A `Loading` announcement for a load this session has registered
+        // retires the previous `last_loaded` before that new load's own
+        // outcome does the same — ownership of the token now in flight is
+        // undecided until it resolves, so nothing may act as though the
+        // previous adopted load is still the most recent one heard from.
+        // Ordinary, so it may be dropped under backlog: losing it is safe
+        // because the protected outcome that follows performs the identical
+        // update (M5 §6).
+        if let PlaybackEvent::StateChanged {
+            state: PlaybackState::Loading,
+            request: Some(request),
+            ..
+        } = event
+            && self.pending.contains_key(request)
+        {
+            let event_rev = event.session_rev();
+            if event_rev >= self.latest_engine_rev {
+                self.latest_engine_rev = event_rev;
+                self.last_loaded = None;
+            }
+            return Action::None;
+        }
+
+        // Profile-wide: bypasses the media-ownership gate below entirely.
+        if let PlaybackEvent::VolumeChanged { volume, .. } = event {
+            self.state.set_volume(*volume);
+            return self.submit(Urgency::Ordinary);
+        }
+
+        // Every remaining event is media-specific and must own the adopted
+        // token before it may touch revision, completion, provenance,
+        // protection, pending force or history (D20).
+        if !accepted {
+            return Action::None;
+        }
+        let event_rev = event.session_rev();
+        self.latest_engine_rev = event_rev;
+        self.session_rev = event_rev;
         // A newer revision re-keys a pending force rather than dropping it:
         // `rebuild` bumps the revision on device recovery with the position
         // continuous across it, so the force is still answerable — and dropping
         // it would lose a real pause for good, since no ordinary trigger fires
         // while paused. `Loaded` is the one exception, retired in `on_loaded`.
         if self.pending_force.is_some() {
-            self.pending_force = Some(session_rev);
+            self.pending_force = Some(event_rev);
         }
 
         match event {
-            PlaybackEvent::Loaded {
-                media,
-                position,
-                disposition,
-                ..
-            } => self.on_loaded(media, *position, disposition, now),
             PlaybackEvent::StateChanged { state, .. } => self.on_state(*state, now),
             PlaybackEvent::SeekCompleted { provenance, .. } => {
                 self.resolve_target();
@@ -192,7 +610,7 @@ impl Session {
                 // when set, and the deferred write this force raises will
                 // route through `record_current_estimated` once
                 // `position_provenance` above is read back at the next tick.
-                self.pending_force = Some(session_rev);
+                self.pending_force = Some(event_rev);
                 Action::None
             }
             // This event exists only because nothing else lets the policy tell
@@ -212,7 +630,7 @@ impl Session {
                 if *provenance == PositionProvenance::Established {
                     self.protected = None;
                 }
-                self.pending_force = Some(session_rev);
+                self.pending_force = Some(event_rev);
                 Action::None
             }
             // One of the two positions that never come from `Progress` (D6),
@@ -242,10 +660,6 @@ impl Session {
                 }
                 self.submit(Urgency::Forced)
             }
-            PlaybackEvent::VolumeChanged { volume, .. } => {
-                self.state.set_volume(*volume);
-                self.submit(Urgency::Ordinary)
-            }
             // The other one (D6): the end of the track is a position the engine
             // reached, carried by the event that reports it.
             PlaybackEvent::EndOfTrack {
@@ -253,6 +667,19 @@ impl Session {
                 provenance,
                 ..
             } => {
+                // `accepted` above guarantees `self.adopted` is `Some` here.
+                let Some(adopted) = self.adopted else {
+                    return Action::None;
+                };
+                let key = (adopted.request, self.session_rev);
+                if self.completion_seen == Some(key) {
+                    // Deduplicated *before* any checkpoint handling (§6):
+                    // neither history nor advancement moves twice for one
+                    // completion.
+                    return Action::None;
+                }
+                self.completion_seen = Some(key);
+
                 self.resolve_target();
                 self.established = true;
                 self.completed = true;
@@ -279,6 +706,14 @@ impl Session {
                     // third clearing exit.
                     self.record_current_estimated(*position, now);
                 }
+                // Both provenances advance (§6); only a queue target has
+                // anywhere to advance to.
+                if let LoadTarget::Queue(id) = adopted.target {
+                    self.advance = Some(match self.state.queue().neighbor(id, Direction::Down) {
+                        Some(next) => Advance::Next(next),
+                        None => Advance::EndOfQueue,
+                    });
+                }
                 self.submit(Urgency::Forced)
             }
             // §10: "Capability changes alone never delete, clear or replace
@@ -296,10 +731,44 @@ impl Session {
         }
     }
 
+    /// The whole of `Loaded`'s adoption: the checkpoint/identity mutations
+    /// `on_loaded` still owns, then the queue and metadata moves, then the
+    /// submission — built only once every earlier mutation has landed, so it
+    /// is never a snapshot cloned before them (D19).
+    #[allow(clippy::too_many_arguments)] // one call site, unpacking `Loaded`'s own fields.
+    fn adopt_loaded(
+        &mut self,
+        request: LoadRequestId,
+        target: LoadTarget,
+        media: &MediaId,
+        position: Duration,
+        disposition: &StartDisposition,
+        metadata: &MediaMetadata,
+        now: ClockSample,
+    ) -> Action {
+        let previous_active = self.state.queue().active();
+        let switched_media = self.on_loaded(media, position, disposition, now);
+        let active = match target {
+            LoadTarget::Queue(id) => Some(id),
+            LoadTarget::Legacy => None,
+        };
+        // The registration was validated against the queue a moment ago in
+        // `observe`.
+        let _ = self.state.queue_mut().set_active(active);
+        if let LoadTarget::Queue(id) = target {
+            self.absorb_load_metadata(id, metadata);
+        }
+        self.adopted = Some(AdoptedLoad { request, target });
+        self.adopted_rev_floor = self.session_rev;
+        if switched_media || previous_active != active {
+            self.submit(Urgency::Forced)
+        } else {
+            Action::None
+        }
+    }
+
     pub fn tick(&mut self, progress: &Progress, now: ClockSample) -> Action {
-        // The same guard `Mirror` already applies: never persist a position
-        // from a session the policy was not tracking.
-        if progress.session_rev != self.session_rev {
+        if !self.accepts_live_sample(progress) {
             return Action::None;
         }
         let Some(media) = self.current_media.clone() else {
@@ -309,6 +778,7 @@ impl Session {
             session_rev: progress.session_rev,
             media,
             position: progress.position,
+            provenance: progress.provenance,
         });
         // Kept current on every tick, whether or not it ends up due for a
         // capture: `checkpoint_from_progress` (below) and `record_outgoing`
@@ -355,6 +825,22 @@ impl Session {
         }
         self.last_capture = Some(now.monotonic);
         self.submit(Urgency::Ordinary)
+    }
+
+    /// Whether `progress` is a live sample the policy may act on directly:
+    /// its revision and media match adopted playback, its own `load` token
+    /// names the adopted request, and the most recent `Loaded` this session
+    /// observed still names that same request too (§3, D20). `tick` and
+    /// `capture_current` (which `shutdown_snapshot` and `remove_entry` share)
+    /// both read this rather than each keeping their own copy of the check.
+    fn accepts_live_sample(&self, progress: &Progress) -> bool {
+        let Some(adopted) = self.adopted else {
+            return false;
+        };
+        self.last_loaded == Some(adopted.request)
+            && progress.session_rev == self.session_rev
+            && progress.load == Some(adopted.request)
+            && progress.media.as_ref() == self.current_media.as_ref()
     }
 
     /// Checkpoint a position that came from `Progress`, and report whether one
@@ -430,13 +916,19 @@ impl Session {
     /// mutation. A keep-latest slot cannot promise that an intermediate
     /// submission reaches disk, so "flush, then move" is unenforceable — and
     /// unnecessary, since the snapshot is the whole state.
+    ///
+    /// Returns whether the incoming media differs from the outgoing one.
+    /// `adopt_loaded` is the only caller and owns the submission this used to
+    /// build itself — the queue and metadata moves it makes belong in the
+    /// same snapshot, so the decision of *whether* to submit had to move
+    /// outward with them.
     fn on_loaded(
         &mut self,
         media: &MediaId,
         position: Duration,
         disposition: &StartDisposition,
         now: ClockSample,
-    ) -> Action {
+    ) -> bool {
         let switching = self.current_media.as_ref() != Some(media);
 
         // First, while every per-media field still describes the media on its
@@ -481,13 +973,10 @@ impl Session {
             session_rev: self.session_rev,
             media: media.clone(),
             position,
+            provenance: self.position_provenance,
         });
 
-        if switching {
-            self.submit(Urgency::Forced)
-        } else {
-            Action::None
-        }
+        switching
     }
 
     /// The entry for the media on its way out, written from the position the
@@ -573,31 +1062,50 @@ impl Session {
         self.outstanding_target.unwrap_or(sampled)
     }
 
+    /// The checkpoint for whatever media is current, captured from a live
+    /// sample when one is available (`accepts_live_sample`) and from the
+    /// retained `last_sample` otherwise — reading that sample's own
+    /// provenance rather than assuming it matches whatever this session most
+    /// recently tracked. Shared by `shutdown_snapshot` and `remove_entry`
+    /// (Ruling 1): both need exactly this capture, and duplicating it would
+    /// let the two drift apart.
+    fn capture_current(&mut self, progress: &Progress, now: ClockSample) {
+        let Some(media) = self.current_media.clone() else {
+            return;
+        };
+        let sampled = if self.accepts_live_sample(progress) {
+            // The live sample is fresher than anything `tick` last recorded,
+            // so its provenance is read back too — the same field every
+            // write path routes on. The `last_sample` fallback below has no
+            // fresher provenance to offer than what the last accepted tick or
+            // landing event already left in place, so it is left untouched.
+            self.position_provenance = progress.provenance;
+            Some(progress.position)
+        } else {
+            let session_rev = self.session_rev;
+            let fallback = self.last_sample.as_ref().and_then(|sample| {
+                (sample.session_rev == session_rev && sample.media == media)
+                    .then_some((sample.position, sample.provenance))
+            });
+            match fallback {
+                Some((position, provenance)) => {
+                    self.position_provenance = provenance;
+                    Some(position)
+                }
+                None => None,
+            }
+        };
+        if let Some(sampled) = sampled {
+            self.checkpoint_from_progress(sampled, now);
+        }
+    }
+
     /// The final snapshot. `volume` and `current_media` are written whatever
     /// happened; the position goes through the same gate every other sampled
     /// position does, and is never taken from a session the policy was not
     /// tracking.
     pub fn shutdown_snapshot(&mut self, progress: &Progress, now: ClockSample) -> PersistedState {
-        let Some(media) = self.current_media.clone() else {
-            return self.state.clone();
-        };
-        let sampled = if progress.session_rev == self.session_rev {
-            // The live sample is fresher than anything `tick` last recorded,
-            // so its provenance is read back too — the same field every
-            // write path routes on. The `last_sample` fallback below has no
-            // fresher provenance to offer than what the last live tick or
-            // landing event already left in place, so it is left untouched.
-            self.position_provenance = progress.provenance;
-            Some(progress.position)
-        } else {
-            self.last_sample
-                .as_ref()
-                .filter(|sample| sample.session_rev == self.session_rev && sample.media == media)
-                .map(|sample| sample.position)
-        };
-        if let Some(sampled) = sampled {
-            self.checkpoint_from_progress(sampled, now);
-        }
+        self.capture_current(progress, now);
         self.state.clone()
     }
 
@@ -609,7 +1117,10 @@ impl Session {
     ///
     /// The replays are reconciliation rather than submission: whatever they
     /// would have submitted on their own is superseded by the snapshot this
-    /// returns.
+    /// returns. Every replayed event and the final snapshot both route
+    /// through the same ownership gates `observe`, `tick` and
+    /// `shutdown_snapshot` already apply (D20) — reconciliation is not a
+    /// second, looser path into history.
     ///
     /// The engine-facing half — the shutdown interrupt and the `join` that
     /// produces the report — stays at the call site: it touches the handle,
@@ -676,10 +1187,55 @@ impl Session {
             .record_estimated(media, position, now.wall, completed);
     }
 
+    /// `resume_intent_for(self.state.entry_for(media))`, defaulting to a
+    /// start of zero for a media with no stored entry at all — no entry is
+    /// not itself a resume intent to resolve, it is the absence of one.
+    pub fn resume_intent(&self, media: &MediaId) -> ResumeIntent {
+        resume_intent_for(self.state.entry_for(media))
+            .unwrap_or(ResumeIntent::StartAt(Duration::ZERO))
+    }
+
     fn submit(&self, urgency: Urgency) -> Action {
         Action::Submit {
             state: self.state.clone(),
             urgency,
         }
+    }
+}
+
+/// Builds the worker-facing resume intent from a stored checkpoint entry,
+/// §4.3's estimated-preference rule folded in beside the established path
+/// left unchanged.
+///
+/// A completed entry never reaches `restart_preference` — its own doc says
+/// so: the caller's concern, and calling it anyway would let a stray
+/// estimate stored before completion redirect a replay that D1 already
+/// says starts over at zero regardless. So a completed entry always goes
+/// through `resume_candidate` exactly as it did before this function
+/// existed, and only a live, uncompleted entry's `estimated` field is ever
+/// consulted.
+///
+/// This is where §4.3 actually gets wired into the load path (Task 6's fix
+/// round 1): `restart_preference`'s pure preference decision — implemented
+/// and tested since Task 6 itself — had no production caller until this
+/// function. `decide_resume` is deliberately not consulted here for the
+/// estimate branch: §4.3 is a preference between two already-known
+/// locations, not a duration-validated choice, and running the estimate
+/// through duration validation would be inventing a rule the design doc
+/// does not state. `decide_resume` keeps governing the established
+/// position exactly as before wherever that path is actually taken — the
+/// `resume_candidate` branch below, reached whenever there is no estimate
+/// to prefer.
+pub fn resume_intent_for(entry: Option<&PersistedCheckpoint>) -> Option<ResumeIntent> {
+    let entry = entry?;
+    if entry.completed {
+        return resume_candidate(entry.position, entry.completed).map(ResumeIntent::Candidate);
+    }
+    match restart_preference(entry.position, entry.estimated) {
+        Some(preference) => Some(ResumeIntent::EstimatedCandidate {
+            target: preference.target,
+            established: preference.established,
+        }),
+        None => resume_candidate(entry.position, entry.completed).map(ResumeIntent::Candidate),
     }
 }

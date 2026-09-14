@@ -21,7 +21,7 @@ use continuo::playback::command::{Admission, ResumeIntent};
 use continuo::playback::event::{PlaybackEvent, StartDisposition};
 use continuo::playback::state::PlaybackState;
 use continuo::resume::resume_candidate;
-use continuo::session::{Action, Session};
+use continuo::session::{Action, LoadTarget, Session};
 
 use support::TestEngine;
 use support::server::{Script, TestServer};
@@ -269,14 +269,18 @@ fn a_range_less_server_plays_but_cannot_seek_or_resume() {
     // incomplete checkpoint lands in the store.
     let (store, clock) = RemoteRig::store_in(dir.path());
     let server1 = TestServer::start_on(port, Script::from_fixture("sine-5s.flac"));
+    let mut session1 = Session::new(PersistedState::default());
+    let request1 = session1
+        .register_load(LoadTarget::Legacy, &media)
+        .unwrap_or_else(|error| panic!("registered: {error:?}"));
     let mut engine1 = TestEngine::start_idle();
-    engine1.load_remote(&url);
+    engine1.load_remote_as(request1, &url, ResumeIntent::StartAt(Duration::ZERO));
     assert_eq!(engine1.handle().submit_play(), Admission::Accepted);
     engine1.await_state(PlaybackState::Playing);
     engine1.play_for(Duration::from_secs(2));
     let mut rig1 = RemoteRig {
         engine: engine1,
-        session: Session::new(PersistedState::default()),
+        session: session1,
         store,
         clock,
     };

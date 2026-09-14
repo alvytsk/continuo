@@ -34,7 +34,7 @@ use continuo::playback::event::{PlaybackEvent, StartDisposition};
 use continuo::playback::provenance::PositionProvenance;
 use continuo::playback::state::PlaybackState;
 use continuo::resume::{restart_preference, resume_candidate};
-use continuo::session::{Action, Session};
+use continuo::session::{Action, LoadTarget, Session};
 use url::Url;
 
 use support::server::{Script, TestServer};
@@ -172,14 +172,18 @@ fn a_relaunch_selects_the_estimate_and_leaves_the_established_checkpoint_on_disk
     // A positive, established checkpoint lands in the store — no estimate
     // anywhere yet.
     let (store1, clock1) = Rig::store_in(dir.path());
+    let mut session1 = Session::new(PersistedState::default());
+    let request1 = session1
+        .register_load(LoadTarget::Legacy, &media)
+        .unwrap_or_else(|error| panic!("registered: {error:?}"));
     let mut engine1 = TestEngine::start_idle();
-    engine1.load_remote(&url);
+    engine1.load_remote_as(request1, &url, ResumeIntent::StartAt(Duration::ZERO));
     assert_eq!(engine1.handle().submit_play(), Admission::Accepted);
     engine1.await_state(PlaybackState::Playing);
     engine1.play_for(Duration::from_secs(2));
     let mut rig1 = Rig {
         engine: engine1,
-        session: Session::new(PersistedState::default()),
+        session: session1,
         store: store1,
         clock: clock1,
     };
@@ -206,8 +210,13 @@ fn a_relaunch_selects_the_estimate_and_leaves_the_established_checkpoint_on_disk
     // without ever re-establishing, so the estimate is the session's last
     // word.
     let (store2, clock2) = Rig::store_in(dir.path());
+    let mut session2 = Session::new(reload(dir.path()));
+    let request2 = session2
+        .register_load(LoadTarget::Legacy, &media)
+        .unwrap_or_else(|error| panic!("registered: {error:?}"));
     let mut engine2 = TestEngine::start_idle();
-    engine2.load_remote_with_resume(
+    engine2.load_remote_as(
+        request2,
         &url,
         ResumeIntent::Candidate(
             resume_candidate(established.position, established.completed)
@@ -216,7 +225,7 @@ fn a_relaunch_selects_the_estimate_and_leaves_the_established_checkpoint_on_disk
     );
     let mut rig2 = Rig {
         engine: engine2,
-        session: Session::new(reload(dir.path())),
+        session: session2,
         store: store2,
         clock: clock2,
     };
@@ -264,8 +273,13 @@ fn a_relaunch_selects_the_estimate_and_leaves_the_established_checkpoint_on_disk
     assert_eq!(preference.established, established.position);
 
     let (store3, clock3) = Rig::store_in(dir.path());
+    let mut session3 = Session::new(reload(dir.path()));
+    let request3 = session3
+        .register_load(LoadTarget::Legacy, &media)
+        .unwrap_or_else(|error| panic!("registered: {error:?}"));
     let mut engine3 = TestEngine::start_idle();
-    engine3.load_remote_with_resume(
+    engine3.load_remote_as(
+        request3,
         &url,
         ResumeIntent::EstimatedCandidate {
             target: preference.target,
@@ -274,7 +288,7 @@ fn a_relaunch_selects_the_estimate_and_leaves_the_established_checkpoint_on_disk
     );
     let mut rig3 = Rig {
         engine: engine3,
-        session: Session::new(reload(dir.path())),
+        session: session3,
         store: store3,
         clock: clock3,
     };
@@ -352,8 +366,12 @@ fn a_relaunch_resumes_an_estimate_only_entry_and_reports_no_established_fallback
     // routed by `position_provenance`, which the seek also set to
     // `Estimated` — so `position` never gets a value at all.
     let (store1, clock1) = Rig::store_in(dir.path());
+    let mut session1 = Session::new(PersistedState::default());
+    let request1 = session1
+        .register_load(LoadTarget::Legacy, &media)
+        .unwrap_or_else(|error| panic!("registered: {error:?}"));
     let mut engine1 = TestEngine::start_idle();
-    engine1.load_remote(&url);
+    engine1.load_remote_as(request1, &url, ResumeIntent::StartAt(Duration::ZERO));
     assert_eq!(engine1.handle().submit_play(), Admission::Accepted);
     engine1.await_state(PlaybackState::Playing);
     engine1.play_for(Duration::from_millis(100));
@@ -369,7 +387,7 @@ fn a_relaunch_resumes_an_estimate_only_entry_and_reports_no_established_fallback
     );
     let mut rig1 = Rig {
         engine: engine1,
-        session: Session::new(PersistedState::default()),
+        session: session1,
         store: store1,
         clock: clock1,
     };
@@ -403,8 +421,13 @@ fn a_relaunch_resumes_an_estimate_only_entry_and_reports_no_established_fallback
         "sanity: the second server must serve the same identity"
     );
     let (store2, clock2) = Rig::store_in(dir.path());
+    let mut session2 = Session::new(reload(dir.path()));
+    let request2 = session2
+        .register_load(LoadTarget::Legacy, &media)
+        .unwrap_or_else(|error| panic!("registered: {error:?}"));
     let mut engine2 = TestEngine::start_idle();
-    engine2.load_remote_with_resume(
+    engine2.load_remote_as(
+        request2,
         &url2,
         ResumeIntent::EstimatedCandidate {
             target: preference.target,
@@ -413,7 +436,7 @@ fn a_relaunch_resumes_an_estimate_only_entry_and_reports_no_established_fallback
     );
     let mut rig2 = Rig {
         engine: engine2,
-        session: Session::new(reload(dir.path())),
+        session: session2,
         store: store2,
         clock: clock2,
     };
@@ -484,6 +507,10 @@ fn a_relaunch_refused_past_an_estimated_ceiling_leaves_the_stored_checkpoint_unt
     // actually emits gets a genuine chance to reach the file, exactly as it
     // would inside `app::run`.
     let (store2, clock2) = Rig::store_in(dir.path());
+    let mut session = Session::new(reload(dir.path()));
+    let request = session
+        .register_load(LoadTarget::Legacy, &media)
+        .unwrap_or_else(|error| panic!("registered: {error:?}"));
     let mut engine = TestEngine::start_idle();
     let service = match HttpService::spawn(Limits::brisk()) {
         Ok(service) => service,
@@ -494,7 +521,6 @@ fn a_relaunch_refused_past_an_estimated_ceiling_leaves_the_stored_checkpoint_unt
         Ok(parsed) => parsed,
         Err(error) => panic!("test URL {url:?} must parse: {error}"),
     };
-    let request = engine.next_request();
     engine.send(PlaybackCommand::Load {
         request,
         media: media.clone(),
@@ -513,7 +539,7 @@ fn a_relaunch_refused_past_an_estimated_ceiling_leaves_the_stored_checkpoint_unt
 
     let mut rig = Rig {
         engine,
-        session: Session::new(reload(dir.path())),
+        session,
         store: store2,
         clock: clock2,
     };
