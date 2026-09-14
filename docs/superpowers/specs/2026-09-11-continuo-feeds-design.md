@@ -360,12 +360,19 @@ worse than saying no.
 | identity | `guid` (+ `isPermaLink`), else enclosure URL, else `link` | `id`, else `link[rel=enclosure]@href`, else `link[rel=alternate]@href` |
 | audio | `enclosure@url`, `@length`, `@type` | `link[rel=enclosure]@href`, `@length`, `@type` |
 | title | `title` | `title`, per `@type` (§4.8) |
-| date | `pubDate`, RFC 2822 | `published`, else `updated`, RFC 3339 |
+| date | `pubDate`, RFC 2822 (see below) | `published`, else `updated`, RFC 3339 |
 | duration | `{http://www.itunes.com/dtds/podcast-1.0.dtd}duration` | same |
 | feed title | `channel/title` | `feed/title` |
 | site link | `channel/link` | `feed/link[rel=alternate]@href` |
 
 An Atom `link` with **no `rel` attribute is `alternate`** (RFC 4287 §4.2.7.2), applied before any selection.
+
+**RFC 2822 with one added zone spelling.** §4.3's obsolete-zone production defines `UT` and `GMT` but never
+`UTC`, so a conforming parser refuses an otherwise well-formed `pubDate` that spells the zero offset that way.
+Feeds spell it that way constantly — Radio-T spells every one of its `pubDate`s `… UTC`, which left the
+`PUBLISHED` column empty for all twenty episodes. A trailing zone token that is exactly `UTC` is therefore read
+as the `+0000` it means. The widening is that one token: `UTCC` and `UTC+1` stay refused, because a zone the
+parser cannot name is one it should not guess at.
 
 `itunes:duration` accepts `HH:MM:SS`, `MM:SS`, and bare seconds. Anything else yields `None`.
 

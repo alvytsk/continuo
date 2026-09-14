@@ -1048,8 +1048,26 @@ fn trimmed(text: &str) -> Option<String> {
     (!text.is_empty()).then(|| text.to_owned())
 }
 
+/// RFC 2822's obsolete-zone production (§4.3) defines `UT` and `GMT` but never
+/// `UTC`, so a strict parser refuses an otherwise well-formed timestamp that
+/// spells the zero offset that way. Real feeds spell it that way constantly —
+/// Radio-T spells every `pubDate` `… UTC`, which blanked the PUBLISHED column
+/// for the whole feed — so §4.3 accepts the spelling rather than the column.
+///
+/// The rewrite is deliberately narrow: only a trailing zone token that is
+/// exactly `UTC` becomes the `+0000` it means, and nothing else about the
+/// timestamp is relaxed. `UTCC` and `UTC+1` stay refused, because a zone this
+/// parser cannot name is a zone it should not guess at.
 fn parse_rfc2822(value: &str) -> Option<OffsetDateTime> {
-    OffsetDateTime::parse(value.trim(), &Rfc2822).ok()
+    let value = value.trim();
+    if let Ok(parsed) = OffsetDateTime::parse(value, &Rfc2822) {
+        return Some(parsed);
+    }
+    let (head, zone) = value.rsplit_once(char::is_whitespace)?;
+    if !zone.eq_ignore_ascii_case("UTC") {
+        return None;
+    }
+    OffsetDateTime::parse(&format!("{head} +0000"), &Rfc2822).ok()
 }
 
 fn parse_rfc3339(value: &str) -> Option<OffsetDateTime> {

@@ -1211,6 +1211,55 @@ fn an_unparsable_date_keeps_the_item_and_never_counts_as_skipped()
     Ok(())
 }
 
+/// Real podcast feeds routinely spell the zero offset `UTC`, which RFC 2822
+/// does not define — its obsolete-zone production allows `UT` and `GMT` but
+/// never `UTC`, so a strict parser rejects the whole timestamp. Radio-T spells
+/// every one of its `pubDate`s that way, which blanked the PUBLISHED column
+/// for an entire feed. §4.3 accepts the spelling rather than the column.
+#[test]
+fn the_utc_zone_spelling_is_accepted_even_though_rfc_2822_omits_it()
+-> Result<(), Box<dyn std::error::Error>> {
+    let report = parse_feed(
+        rss("<item><guid>a</guid><pubDate>Sat, 12 Sep 2026 18:21:23 UTC</pubDate></item>")
+            .as_bytes(),
+        &feed_url(),
+    )?;
+    let published = report.feed.items[0]
+        .published
+        .ok_or("expected a timestamp")?;
+    assert_eq!(published.unix_timestamp(), 1_789_237_283);
+    assert_eq!(published.offset(), time::UtcOffset::UTC);
+    assert_eq!(report.warnings, vec![]);
+    Ok(())
+}
+
+/// The spellings RFC 2822 does define keep working, and a genuinely malformed
+/// zone is still refused — the widening is one spelling, not a loosened parser.
+#[test]
+fn the_conformant_zone_spellings_are_unaffected() -> Result<(), Box<dyn std::error::Error>> {
+    for (zone, offset_hours) in [("GMT", 0), ("UT", 0), ("+0300", 3), ("EST", -5)] {
+        let feed = format!(
+            "<item><guid>a</guid><pubDate>Sat, 12 Sep 2026 18:21:23 {zone}</pubDate></item>"
+        );
+        let report = parse_feed(rss(&feed).as_bytes(), &feed_url())?;
+        let published = report.feed.items[0]
+            .published
+            .ok_or_else(|| format!("{zone} should parse"))?;
+        assert_eq!(published.offset().whole_hours(), offset_hours, "{zone}");
+    }
+    for zone in ["UTC+1", "NOTAZONE", "UTCC"] {
+        let feed = format!(
+            "<item><guid>a</guid><pubDate>Sat, 12 Sep 2026 18:21:23 {zone}</pubDate></item>"
+        );
+        let report = parse_feed(rss(&feed).as_bytes(), &feed_url())?;
+        assert_eq!(
+            report.feed.items[0].published, None,
+            "{zone} must stay refused"
+        );
+    }
+    Ok(())
+}
+
 // -------------------------------------------------------------- identity
 
 #[test]

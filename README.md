@@ -167,6 +167,13 @@ outright rather than silently renamed.
 Without `--as`, a slug is derived from the feed's title: ASCII letters are
 lowercased and kept, ASCII digits are kept, and every other run of characters
 — punctuation, whitespace and non-ASCII letters alike — collapses to a single
+A publication date is read as RFC 2822, plus the one spelling that standard
+omits: real feeds routinely write the zero offset as `UTC`, which RFC 2822's
+obsolete-zone rule does not define, so a strict reading blanks the date for
+every episode in such a feed. That spelling is accepted; anything else that
+will not parse leaves `PUBLISHED` as `—` and keeps the episode, because a bad
+timestamp is not a reason to hide an episode.
+
 `-`, with leading and trailing runs dropped entirely. **No transliteration is
 attempted.** A title written entirely in a non-ASCII script therefore yields
 nothing at all, and the slug falls back to the same transform over the feed
