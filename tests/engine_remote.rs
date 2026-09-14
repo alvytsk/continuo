@@ -1019,16 +1019,27 @@ fn a_short_forward_seek_on_a_no_index_mp3_lands_quickly_without_rescanning() {
         target.saturating_sub(before)
     );
 
-    // The wedge itself, asserted as the correct behaviour it violated
-    // before the fix: a step of only 300ms has no honest reason to take anywhere
-    // near as long as redelivering the whole file from scratch does -
-    // `a_forward_seek_installs_the_media_position_and_requests_that_byte`
-    // shows a comparable seek landing well inside a second with no trickle
-    // at all. 250ms is generous for an efficient short step and comfortably
-    // short of a from-scratch rescan of this fixture at this trickle rate,
-    // so `SeekCompleted` should already have arrived. Before Task 4 it had
-    // not: the demuxer was still rescanning from the top.
-    let landing_deadline = Instant::now() + Duration::from_millis(250);
+    // The wedge itself, asserted as the correct behaviour it violated before
+    // the fix: a step of only 300ms has no honest reason to take anywhere near
+    // as long as rescanning from the top does.
+    //
+    // This deadline was 250ms, which is not what the original comment called
+    // it. Measured on this fixture and trickle, an efficient short step is not
+    // near-instant: it lands in 206-212ms on a 28-core machine and 214-240ms
+    // with the suite pinned to two cores, because the cost is bound by the
+    // trickle's 80ms cadence rather than by CPU. That left 10-40ms of headroom,
+    // which a shared CI runner's sleep overshoot spends — GitHub Actions failed
+    // here with the seek already at the correct byte, i.e. with no wedge at all.
+    //
+    // The broken behaviour is not in the same neighbourhood. With `seek_refined`
+    // put back to `SeekMode::Accurate` (the pre-Task-4 code) the seek requests
+    // byte 44 and does not land inside an 8-second window. Two seconds is ~8x
+    // the slowest measured efficient step and at least 4x short of the wedge, so
+    // it still separates the two by a wide margin. That was re-verified against
+    // the reintroduced bug before this change was committed: the assertion
+    // still fails there, so it remains evidence rather than a description of
+    // whatever the current code happens to do.
+    let landing_deadline = Instant::now() + Duration::from_secs(2);
     let landed = loop {
         match engine.try_event() {
             Some(event @ PlaybackEvent::SeekCompleted { .. }) => break Some(event),
@@ -1037,11 +1048,21 @@ fn a_short_forward_seek_on_a_no_index_mp3_lands_quickly_without_rescanning() {
             None => std::thread::sleep(Duration::from_millis(2)),
         }
     };
+    // The diagnosis is derived from the byte actually requested rather than
+    // written in. The message this replaced asserted a rescan from whatever
+    // byte it was handed, so a CI run that had already requested the correct
+    // byte still reported itself as the wedge.
+    let diagnosis = if seek_byte + 8192 >= proportional_estimate {
+        "The request targeted the right neighbourhood, so this is not the \
+         rescan-from-the-top wedge: landing is being delayed after the request"
+    } else {
+        "The request targeted the file's first frame: this is the \
+         rescan-from-the-top wedge"
+    };
     assert!(
         landed.is_some(),
-        "a 300ms forward seek did not land within 250ms; the worker is \
-         still rescanning the whole file from byte {seek_byte} at the \
-         trickle's pace - this is the wedge from the bug report"
+        "a 300ms forward seek from byte {seek_byte} (near byte \
+         {proportional_estimate} expected) did not land within 2s. {diagnosis}"
     );
 
     engine.finish();
