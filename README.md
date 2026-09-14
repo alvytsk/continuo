@@ -60,7 +60,7 @@ confirmed position.
 
 ## Podcasts
 
-    continuo subscribe https://radio-t.com/rss/ --as radio-t
+    continuo subscribe http://feeds.rucast.net/radio-t --as radio-t
     continuo feeds
     continuo episodes radio-t -n 5
     continuo play radio-t 3
