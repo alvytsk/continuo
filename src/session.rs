@@ -30,9 +30,12 @@ use crate::playback::command::{LoadRequestId, ResumeIntent};
 use crate::playback::event::{PlaybackEvent, Progress, ShutdownReport, StartDisposition};
 use crate::playback::provenance::PositionProvenance;
 use crate::playback::state::PlaybackState;
+use crate::playback::volume::Volume;
 use crate::queue::{
     Direction, DisplayDuration, DurationSource, NewQueueEntry, QueueEntryId, QueueError,
+    QueueSource,
 };
+use url::Url;
 // Re-exported so `src/app.rs` and `tests/resume_contract.rs` keep importing
 // these from `session` — the type and the function moved to `src/resume.rs`
 // so the playback worker could depend on them too (G3), without dragging
@@ -114,6 +117,18 @@ pub struct Removal {
     pub action: Action,
     pub stop_playback: bool,
     pub selection: Option<QueueEntryId>,
+}
+
+/// A partial update to a queue entry's display metadata: a field left `None`
+/// leaves the entry's existing value alone. Distinct from `DisplayMetadata`
+/// itself, whose `None` means "nothing known" and would blank out a field a
+/// caller never meant to touch.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct DisplayUpdate {
+    pub title: Option<String>,
+    pub artist: Option<String>,
+    pub album: Option<String>,
+    pub duration: Option<DisplayDuration>,
 }
 
 /// A registered, not-yet-resolved load. Tracked by `Session` so that a
@@ -437,23 +452,139 @@ impl Session {
         if self.state.queue().get(id).is_none() {
             return Err(QueueError::UnknownEntry(id));
         }
-        for pending in self.pending.values_mut() {
-            if pending.target == LoadTarget::Queue(id) {
-                pending.invalidated = true;
-            }
-        }
+        self.invalidate_pending(|target| target == LoadTarget::Queue(id));
         let was_active = self.state.queue().active() == Some(id);
         if was_active {
-            self.capture_current(progress, now);
-            self.adopted = None;
-            self.last_sample = None;
+            self.release_active(progress, now);
         }
         let removed = self.state.queue_mut().remove(id)?;
         Ok(Removal {
             action: self.submit(Urgency::Forced),
-            stop_playback: removed.was_active,
+            stop_playback: was_active,
             selection: removed.selection,
         })
+    }
+
+    /// Clears the whole queue. Same active-entry capture as `remove_entry`
+    /// (`release_active`); every pending load still targeting a queue entry
+    /// is invalidated first, so none of them can resurrect an entry that no
+    /// longer exists (M5 §6). `current_media` and every checkpoint already on
+    /// record are left exactly as they are — queue membership does not pin a
+    /// checkpoint.
+    pub fn clear_queue(&mut self, progress: &Progress, now: ClockSample) -> Removal {
+        self.invalidate_pending(|target| matches!(target, LoadTarget::Queue(_)));
+        let was_active = self.state.queue().active().is_some();
+        if was_active {
+            self.release_active(progress, now);
+        }
+        self.state.queue_mut().clear();
+        Removal {
+            action: self.submit(Urgency::Forced),
+            stop_playback: was_active,
+            selection: None,
+        }
+    }
+
+    /// Marks every pending load whose target satisfies `matches` as
+    /// invalidated, so a `Loaded` that later arrives for it is never adopted
+    /// (M5 §6). Shared by `remove_entry` (one queue id) and `clear_queue`
+    /// (every queue target) — `LoadTarget::Legacy` never matches either
+    /// caller's predicate, so a legacy load is never invalidated by a queue
+    /// mutation.
+    fn invalidate_pending(&mut self, matches: impl Fn(LoadTarget) -> bool) {
+        for pending in self.pending.values_mut() {
+            if matches(pending.target) {
+                pending.invalidated = true;
+            }
+        }
+    }
+
+    /// Releases whatever this session currently has adopted: captures its
+    /// checkpoint through the same gated path `shutdown_snapshot` uses
+    /// (`capture_current`), then clears `adopted` and `last_sample`. Shared
+    /// by `remove_entry` and `clear_queue` — both need exactly this release
+    /// when the entry they are acting on was active.
+    fn release_active(&mut self, progress: &Progress, now: ClockSample) {
+        self.capture_current(progress, now);
+        self.adopted = None;
+        self.last_sample = None;
+    }
+
+    /// Sets the output volume. `Ordinary` submit — used before an engine
+    /// exists to relay it to, and whenever a volume command arrives outside
+    /// `observe`'s own `VolumeChanged` handling.
+    pub fn set_volume(&mut self, volume: Volume) -> Action {
+        self.state.set_volume(volume);
+        self.submit(Urgency::Ordinary)
+    }
+
+    /// Applies `update` to every queue entry whose media is `media`,
+    /// replacing only the fields `update` actually carries — a field left
+    /// `None` leaves the entry's existing value alone. `Ordinary` submit only
+    /// when at least one entry matched and `update` carried at least one
+    /// field; otherwise `Action::None`, so a caller cannot be told a
+    /// submission happened when nothing was there to change.
+    pub fn update_display(&mut self, media: &MediaId, update: DisplayUpdate) -> Action {
+        if update == DisplayUpdate::default() {
+            return Action::None;
+        }
+        let ids: Vec<QueueEntryId> = self
+            .state
+            .queue()
+            .entries()
+            .iter()
+            .filter(|entry| entry.media() == media)
+            .map(|entry| entry.id())
+            .collect();
+        if ids.is_empty() {
+            return Action::None;
+        }
+        for id in ids {
+            let Some(entry) = self.state.queue_mut().get_mut(id) else {
+                continue;
+            };
+            let display = entry.display_mut();
+            if let Some(title) = &update.title {
+                display.title = Some(title.clone());
+            }
+            if let Some(artist) = &update.artist {
+                display.artist = Some(artist.clone());
+            }
+            if let Some(album) = &update.album {
+                display.album = Some(album.clone());
+            }
+            if let Some(duration) = update.duration {
+                display.duration = Some(duration);
+            }
+        }
+        self.submit(Urgency::Ordinary)
+    }
+
+    /// Replaces one entry's podcast fallback URL. Unknown `id` is an error;
+    /// an entry whose source is not `QueueSource::Podcast` is refused by
+    /// `set_source`'s own `SourceMismatch` — there is no fallback URL to
+    /// compare against on a local file or a plain remote URL, so that is the
+    /// natural answer rather than a silent no-op. A matching URL on an
+    /// existing podcast source is a no-op (`Action::None`); a differing one
+    /// replaces the source and submits `Ordinary`. `MediaId` and every
+    /// checkpoint are untouched either way.
+    pub fn update_podcast_fallback(
+        &mut self,
+        id: QueueEntryId,
+        url: Url,
+    ) -> Result<Action, QueueError> {
+        let entry = self
+            .state
+            .queue_mut()
+            .get_mut(id)
+            .ok_or(QueueError::UnknownEntry(id))?;
+        if let QueueSource::Podcast { fallback } = entry.source()
+            && *fallback == url
+        {
+            return Ok(Action::None);
+        }
+        entry.set_source(QueueSource::Podcast { fallback: url })?;
+        Ok(self.submit(Urgency::Ordinary))
     }
 
     /// Copies a decoder-reported title and duration into the queue entry a

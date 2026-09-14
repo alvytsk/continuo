@@ -132,7 +132,6 @@ impl QueueEntry {
     pub(crate) fn display_mut(&mut self) -> &mut DisplayMetadata {
         &mut self.display
     }
-    #[allow(dead_code)]
     pub(crate) fn set_source(&mut self, source: QueueSource) -> Result<(), QueueError> {
         if !source_matches(&self.media, &source) {
             return Err(QueueError::SourceMismatch);
