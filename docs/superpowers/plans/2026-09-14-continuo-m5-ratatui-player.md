@@ -57,8 +57,8 @@ These resolve gaps found while reading the code against the spec. They are bindi
 5. **Reserve arithmetic, rechecked.** The load row's terminal-or-protected share becomes 3 (`Loaded`, then `Failed` + `StateChanged{Failed}` when the device does not open). Worst pass: stop 1 + fatal fault 2 + load 3 + end of track 2 = 8 ≤ `RESERVED_EVENT_SLOTS` (9). A cancelled load emits only `LoadCancelled` (1). Update the comment block in `engine.rs` with this table.
 6. **Existing session tests register their loads.** `Loaded` now requires a registered token. Test helpers change shape (Task 8 gives the exact helpers); the policy they assert does not change.
 7. **Virtual real-time audio output for subprocess tests.** CI has no audio device, but §12 requires signal tests "during playback". Add `playback::output::null_output::NullOutput`, a paced thread that runs `CallbackCore::fill` every buffer period and discards samples. `EngineHandle::spawn_for_environment()` selects it when `CONTINUO_AUDIO_OUTPUT=null`, otherwise `spawn_cpal()`. Document it in `docs/architecture.md` as a diagnostic switch.
-8. **Process test hooks.** Panic-at-stage and fd-2 probe tests need a deterministic trigger inside the child. `lifecycle::hooks::TestHook::from_env()` reads `CONTINUO_TEST_HOOK` once at startup; unknown or absent values mean no hook. Values: `panic-before-redirect`, `panic-after-redirect`, `panic-after-terminal`, `stderr-probe`, `artwork-job-panic`, `metadata-job-panic`, `worker-panic`.
-9. **No production profile override.** The test helper sets `XDG_STATE_HOME`, `XDG_DATA_HOME`, `XDG_CACHE_HOME`, `XDG_CONFIG_HOME`, and `HOME` on non-Linux targets. Nothing in `src/` reads a new profile variable.
+8. **Process test hooks.** Panic-at-stage and fd-2 probe tests need a deterministic trigger inside the child. `lifecycle::hooks::TestHook::from_env()` reads `CONTINUO_TEST_HOOK` once at startup; unknown or absent values mean no hook. Values: `panic-before-redirect`, `panic-after-redirect`, `panic-after-terminal`, `stderr-probe`, `artwork-job-panic`, `artwork-encoding-panic`, `metadata-job-panic`, `worker-panic`.
+9. **No production profile override.** Subprocess suites run on Linux only, with `XDG_STATE_HOME`, `XDG_DATA_HOME`, `XDG_CACHE_HOME`, and `XDG_CONFIG_HOME` set per child. The shared launcher refuses unsupported platforms before spawning. `HOME` does not redirect Windows Known Folders; do not claim cross-platform isolation. Enable subprocess suites on another platform only after verifying its actual profile paths. Production platform support is unchanged.
 10. **Queue decoding.** `PersistedState` loses its derived serde impls. A private `RawState` decodes the envelope and listening history with `queue` and `active_entry` as `Option<serde_json::Value>`; a pure `recover_queue` turns those values into a `Queue` plus an optional `QueueReset`. A wrong JSON type in either field can no longer fail the whole file.
 11. **Local and remote queue sources duplicate their identity on disk** (`path`, `url`) so a source/identity mismatch is detectable, as §6 requires. A podcast source stores only `fallback_url`; its identity is the entry's `MediaId`.
 12. **Saved-history label** for a checkpoint: completed → `played`; `estimated` present → `~mm:ss saved`; `position` present → `mm:ss saved`; an entry with neither → `position unknown`; no entry → no label.
@@ -68,6 +68,13 @@ These resolve gaps found while reading the code against the spec. They are bindi
 16. **`KeyRouter` and `SeekBurst` move** from `app.rs` to `application::seek`; `app.rs` keeps `pub use crate::application::seek::KeyRouter;` because `tests/app_cli.rs` imports `continuo::app::KeyRouter`.
 17. **The lock-holding process test uses volume** as the newer durable fact: `tui` accepts `+` without an engine and persists volume through `Session`, which is observable without an audio device.
 18. **Spectrum mapping publication.** The callback labels tap blocks with `(transport instance, generation, epoch)`. The worker learns the epoch a `Run` publication will use through a new `Handshake::upcoming_epoch()` and publishes the mapping before calling `start_running` or `release`. The wait hook's thaw path publishes through `TransportCore`, which stores its own `session_rev` and tap instance.
+19. **Adoption snapshots are built last.** Capture outgoing history and change `current_media`, active occurrence and metadata before cloning the single submitted snapshot. The old `on_loaded` submission cannot be reused.
+20. **Lifecycle ownership gates precede history writes.** Track the engine's latest recognized revision separately from the adopted checkpoint revision. Reject stale/unowned media events before the existing checkpoint handlers, including in shutdown reconciliation; completion deduplication also precedes writes.
+21. **Automatic start is token-scoped.** Add `PlaybackCommand::PlayLoaded { request }`: it calls `play()` only when the worker still owns that token and is `Paused` after a successful load/device open. Otherwise it does nothing. Initial `play` and TUI loads queue this command instead of unrestricted `Play`; failure therefore cannot trigger an implicit reopen, and an older start cannot affect a newer load.
+22. **Seek cancellation and load failure are explicit runtime state.** Superseding loads, stop/removal/clear, restart, absolute seeks and shutdown cancel the router's pending burst. A failed request remains retryable even while an older occurrence stays adopted.
+23. **Queue ID exhaustion is an admission error.** Keep `next_id: Option<u64>`; `None` means exhausted. A valid restored `u64::MAX` ID survives recovery, but further nonempty enqueue operations fail atomically with `QueueError::IdExhausted`.
+24. **Artwork preparation is contained too.** Task 23 adds the `image` dependency before using it. Task 25 wraps resize/protocol encoding in a disposable contained job and replaces the cache only after success.
+25. **Spectrum frames expire without PCM.** Use an injectable monotonic freshness check with a 150 ms limit. Pause, disabled analysis, starvation and unchanged stale frames must decay; revision/token equality alone does not make a frame fresh.
 
 ## File and responsibility map
 
@@ -103,6 +110,7 @@ Later tasks rely on these exact names. A task's **Interfaces** block repeats the
 pub struct LoadRequestId(u64);
 impl LoadRequestId { pub const fn from_raw(raw: u64) -> Self; pub fn get(self) -> u64; }
 PlaybackCommand::Load { request: LoadRequestId, media: MediaId, source: SourceLocation, resume: ResumeIntent }
+PlaybackCommand::PlayLoaded { request: LoadRequestId }
 
 // playback::event
 PlaybackEvent::Loaded { session_rev, request: LoadRequestId, media, metadata, capabilities, position, disposition }
@@ -122,7 +130,7 @@ pub enum DurationSource { Decoded(PositionProvenance), Declared }
 pub struct NewQueueEntry;                // NewQueueEntry::new(media, source, display) -> Result<Self, QueueError>
 pub struct QueueEntry;                   // id(), media(), source(), display()
 pub enum Direction { Up, Down }
-pub enum QueueError { Capacity { requested: usize, available: usize }, SourceMismatch, UnknownEntry(QueueEntryId) }
+pub enum QueueError { Capacity { requested: usize, available: usize }, IdExhausted, SourceMismatch, UnknownEntry(QueueEntryId) }
 pub struct Removed { pub entry: QueueEntry, pub was_active: bool, pub selection: Option<QueueEntryId> }
 impl Queue { entries, len, is_empty, get, index_of, active, enqueue, move_entry, remove, clear, neighbor, first }
 
@@ -145,7 +153,7 @@ pub struct AdoptedLoad { pub request: LoadRequestId, pub target: LoadTarget }
 pub enum Advance { Next(QueueEntryId), EndOfQueue }
 pub struct Removal { pub action: Action, pub stop_playback: bool, pub selection: Option<QueueEntryId> }
 impl Session {
-  register_load, retract_load, pending_load_count, adopted, take_stop_request, take_advance,
+  register_load, retract_load, pending_load_count, adopted, accepts_media_event, take_stop_request, take_advance,
   enqueue, move_entry, remove_entry, clear_queue, set_volume, update_display, update_podcast_fallback, resume_intent
 }
 pub fn resume_intent_for(entry: Option<&PersistedCheckpoint>) -> Option<ResumeIntent>;
@@ -155,7 +163,7 @@ pub enum RunOutcome { Completed, Signalled(i32) }   // exit_status(self) -> u8
 pub struct ProfileLock;                             // acquire(state_file: &Path) -> Result<Self, LockError>
 pub enum LockError { Contended, NoStateDirectory, Directory(PersistenceError), Io { path: PathBuf, op: &'static str, source: io::Error } }
 pub struct ShutdownSignals;                         // install() -> Result<Self, io::Error>; request(); requested(); first_signal(); wake(); close()
-pub enum TestHook { None, PanicBeforeRedirect, PanicAfterRedirect, PanicAfterTerminal, StderrProbe, ArtworkJobPanic, MetadataJobPanic, WorkerPanic }
+pub enum TestHook { None, PanicBeforeRedirect, PanicAfterRedirect, PanicAfterTerminal, StderrProbe, ArtworkJobPanic, ArtworkEncodingPanic, MetadataJobPanic, WorkerPanic }
 pub fn run_contained<R>(label: &'static str, job: impl FnOnce() -> R) -> Result<R, ContainedPanic>;
 pub struct TakeOnceSlot<T>;                          // new, publish, try_take
 pub struct FatalCleanup;                            // install_panic_hook(Arc<FatalCleanup>)
@@ -195,7 +203,7 @@ pub struct PlayerRuntime; pub enum AppCommand; pub enum EnqueueItem; pub struct 
 **Interfaces:**
 - Produces: `process::Profile::new() -> io::Result<Profile>`, `Profile::root(&self) -> &Path`, `Profile::state_dir(&self) -> PathBuf` (`<root>/state/continuo`), `Profile::state_file(&self) -> PathBuf`, `Profile::command(&self) -> Command`, `process::command_in(root: &Path) -> Command`, `process::binary() -> &'static str`. Include with `#[path = "support/process.rs"] mod process;`.
 
-The audit found seven launch sites in five files. `a_stalled_remote_open_is_quittable_before_anything_loads` currently uses the developer's real `XDG_STATE_HOME`; it is the case §12 names explicitly.
+The audit found seven launch sites in five files. `a_stalled_remote_open_is_quittable_before_anything_loads` currently uses the developer's real `XDG_STATE_HOME`; it is the case §12 names explicitly. Add `#![cfg(target_os = "linux")]` to these five subprocess suites and every later suite using `process` or `pty`. Pure library tests remain portable. The launcher also fails closed on unsupported platforms so a missing suite gate cannot launch against a real profile.
 
 - [ ] **Step 1: Write the failing audit.**
 
@@ -251,6 +259,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 pub fn binary() -> &'static str {
+    assert!(cfg!(target_os = "linux"), "subprocess profile isolation is verified only on Linux");
     env!("CARGO_BIN_EXE_continuo")
 }
 
@@ -265,10 +274,6 @@ pub fn command_in(root: &Path) -> Command {
         .env("XDG_CONFIG_HOME", root.join("config"))
         .env_remove("CONTINUO_TEST_HOOK")
         .env_remove("CONTINUO_AUDIO_OUTPUT");
-    // `directories` ignores XDG variables outside Linux and derives every
-    // location from the home directory instead.
-    #[cfg(not(target_os = "linux"))]
-    command.env("HOME", root);
     command
 }
 
@@ -317,6 +322,7 @@ fn run(args: &[&str]) -> std::process::Output {
   - `tests/m4_diagnostics.rs:769`: `process::command_in(root.path()).args(args).env("RUST_LOG", "continuo=debug").output()`.
 
 - [ ] **Step 5: Run the audit and the migrated suites.**
+Extend `launch_audit` with `subprocess_suites_are_gated_to_verified_platforms`: every top-level test file importing `mod process;` or `mod pty;` must contain `#![cfg(target_os = "linux")]` (build those search strings with `concat!` to avoid self-matches). In the ungated `launch_audit.rs`, import the helper as `unsupported_process` only under `cfg(not(target_os = "linux"))`; a non-Linux test catches the panic from `unsupported_process::binary()` and verifies refusal before constructing any child. This test must not live inside a Linux-gated suite. On Linux, launch a child with inherited `HOME` and a temporary XDG profile; verify the actual `state.json` is under `Profile::state_dir()` and not the inherited home. Later PTY launches must use the same guarded `binary()` and environment construction.
 Run: `cargo test --locked --test launch_audit --test cli --test cli_playback --test http_cli --test m4_cli --test m4_diagnostics`
 Expected: PASS.
 
@@ -398,7 +404,7 @@ git commit -m "fix: exit 2 on usage errors and 0 on help"
 
 Semantics that later tasks rely on:
 - `enqueue` appends in batch order and returns the new IDs; it rejects the whole batch with `Capacity { requested, available }` when `len + batch.len() > MAX_QUEUE_ENTRIES`.
-- IDs are never reused within a `Queue`'s lifetime: `next_id` starts at 1 and only grows; `from_parts` sets it to `max(id) + 1`.
+- IDs are never reused within a `Queue`'s lifetime: `next_id` starts at `Some(1)`; `from_parts` uses checked `max(id) + 1`, with `None` representing exhaustion. Preflight the entire batch's ID range before mutating entries or the allocator. Empty batches succeed even when exhausted.
 - `move_entry(id, Up)` swaps with the previous entry (toward index 0); at an edge it returns `Ok(false)` and changes nothing.
 - `remove(id)` returns `Removed { entry, was_active, selection }`; `selection` is the entry now at the removed index, else the new last entry, else `None`. Removing the active entry clears `active`.
 - `neighbor(anchor, Up|Down)` returns the adjacent ID without wrapping.
@@ -559,6 +565,8 @@ pub struct DisplayMetadata {
 pub enum QueueError {
     #[error("the queue holds at most {MAX_QUEUE_ENTRIES} entries; {requested} requested, {available} free")]
     Capacity { requested: usize, available: usize },
+    #[error("queue entry IDs are exhausted; cannot enqueue more entries in this session")]
+    IdExhausted,
     #[error("queue source does not match its media identity")]
     SourceMismatch,
     #[error("queue entry {} is no longer queued", .0.get())]
@@ -611,10 +619,10 @@ impl QueueEntry {
 pub struct Removed { pub entry: QueueEntry, pub was_active: bool, pub selection: Option<QueueEntryId> }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Queue { entries: Vec<QueueEntry>, active: Option<QueueEntryId>, next_id: u64 }
+pub struct Queue { entries: Vec<QueueEntry>, active: Option<QueueEntryId>, next_id: Option<u64> }
 
 impl Default for Queue {
-    fn default() -> Self { Self { entries: Vec::new(), active: None, next_id: 1 } }
+    fn default() -> Self { Self { entries: Vec::new(), active: None, next_id: Some(1) } }
 }
 
 impl Queue {
@@ -632,12 +640,17 @@ impl Queue {
         if batch.len() > available {
             return Err(QueueError::Capacity { requested: batch.len(), available });
         }
-        Ok(batch.into_iter().map(|new| {
-            let id = QueueEntryId(self.next_id);
-            self.next_id = self.next_id.saturating_add(1);
+        if batch.is_empty() { return Ok(Vec::new()); }
+        let count = u64::try_from(batch.len()).map_err(|_| QueueError::IdExhausted)?;
+        let first = self.next_id.ok_or(QueueError::IdExhausted)?;
+        let last = first.checked_add(count - 1).ok_or(QueueError::IdExhausted)?;
+        let ids = (first..=last).zip(batch).map(|(raw, new)| {
+            let id = QueueEntryId(raw);
             self.entries.push(QueueEntry { id, media: new.media, source: new.source, display: new.display });
             id
-        }).collect())
+        }).collect();
+        self.next_id = last.checked_add(1);
+        Ok(ids)
     }
 
     pub fn move_entry(&mut self, id: QueueEntryId, direction: Direction) -> Result<bool, QueueError> {
@@ -682,7 +695,7 @@ impl Queue {
     /// Persistence's constructor, used only after `queue_codec` validated
     /// uniqueness, identity and capacity.
     pub(crate) fn from_parts(entries: Vec<QueueEntry>, active: Option<QueueEntryId>) -> Self {
-        let next_id = entries.iter().map(|e| e.id.0).max().map_or(1, |max| max.saturating_add(1));
+        let next_id = entries.iter().map(|e| e.id.0).max().map_or(Some(1), |max| max.checked_add(1));
         Self { entries, active, next_id }
     }
 
@@ -692,7 +705,32 @@ impl Queue {
 }
 ```
 
-- [ ] **Step 4: Run `cargo test --locked --test m5_queue`.** Expected: PASS.
+Add this unit test inside `queue.rs`, where the allocator field is accessible:
+
+```rust
+#[cfg(test)]
+mod exhaustion_tests {
+    use super::*;
+    #[test]
+    fn exhaustion_rejects_the_whole_batch_without_reusing_an_id() {
+        let path = AbsolutePath::new("/music/a.flac".into()).expect("absolute");
+        let item = NewQueueEntry::new(MediaId::LocalFile(path.clone()),
+            QueueSource::LocalFile(path), DisplayMetadata::default()).expect("entry");
+        let mut queue = Queue { next_id: Some(u64::MAX), ..Queue::default() };
+        let before = queue.clone();
+        assert_eq!(queue.enqueue(vec![item.clone(), item.clone()]), Err(QueueError::IdExhausted));
+        assert_eq!(queue, before, "no partial append or allocator change");
+        assert_eq!(queue.enqueue(vec![item.clone()]).expect("last ID")[0].get(), u64::MAX);
+        let mut restored = Queue::from_parts(queue.entries().to_vec(), None);
+        assert_eq!(restored.enqueue(vec![item.clone()]), Err(QueueError::IdExhausted));
+        queue.clear();
+        assert_eq!(queue.enqueue(vec![item]), Err(QueueError::IdExhausted));
+        assert!(queue.enqueue(Vec::new()).expect("empty batch").is_empty());
+    }
+}
+```
+
+- [ ] **Step 4: Run `cargo test --locked --test m5_queue --lib`.** Expected: PASS.
 - [ ] **Step 5: Run `cargo clippy --locked --all-targets -- -D warnings`.** Expected: clean.
 - [ ] **Step 6: Commit.**
 
@@ -853,6 +891,25 @@ fn a_duplicate_occurrence_is_never_inferred_active_from_media() {
 ```
 
 Before running, confirm the checkpoint JSON for `position` against a file written by `StateStore::write` (serde's default `Duration` shape is `{"secs":..,"nanos":..}`); adjust `history()` if the model uses a different shape.
+
+Add a schema-boundary regression using the existing `entry` helper:
+
+```rust
+#[test]
+fn a_valid_maximum_id_is_preserved_but_cannot_be_reallocated() {
+    use continuo::queue::{DisplayMetadata, NewQueueEntry, QueueError, QueueSource};
+    use continuo::media::id::MediaId;
+    let file = json!({ "schema_version": 3, "queue": [entry(u64::MAX, "a")] });
+    let state: PersistedState = serde_json::from_value(file).expect("valid maximum ID");
+    let mut queue = state.queue().clone();
+    let before = queue.clone();
+    let MediaId::LocalFile(path) = media("b") else { unreachable!() };
+    let item = NewQueueEntry::new(media("b"), QueueSource::LocalFile(path), DisplayMetadata::default()).expect("entry");
+    assert_eq!(queue.enqueue(vec![item]), Err(QueueError::IdExhausted));
+    assert_eq!(queue, before);
+    assert_eq!(queue.entries()[0].id().get(), u64::MAX);
+}
+```
 
 - [ ] **Step 2: Run `cargo test --locked --test m5_state_schema`.** Expected: FAIL, unresolved `queue_codec` and `queue()`.
 
@@ -1201,7 +1258,7 @@ git commit -m "feat: back up repaired queue state before writing"
 - Test: `tests/engine_contract.rs`
 
 **Interfaces:**
-- Produces: `LoadRequestId` (`from_raw`, `get`); the new `Load`, `Loaded`, `StateChanged`, `Failed` shapes; `Progress::load`; `SessionFacts::load`; `TestEngine::next_request(&self) -> LoadRequestId` (sequential from 1) and `TestEngine::load_with_resume_as(&mut self, request, path, resume)`, `TestEngine::load_remote_as(&mut self, request, url, resume)`.
+- Produces: `LoadRequestId` (`from_raw`, `get`); the new `Load`, `PlayLoaded`, `Loaded`, `StateChanged`, `Failed` shapes; `Progress::load`; `SessionFacts::load`; `TestEngine::next_request(&self) -> LoadRequestId` (sequential from 1) and `TestEngine::load_with_resume_as(&mut self, request, path, resume)`, `TestEngine::load_remote_as(&mut self, request, url, resume)`.
 - Does not yet add `LoadCancelled` or protection (Task 7) or session gating (Task 8).
 
 Worker rules:
@@ -1210,6 +1267,8 @@ Worker rules:
 - `set_state` attaches `request: self.loading` only when `state == Loading`; every other state carries `None`. `play()`'s remote-reopen `Loading` therefore carries `None`.
 - `fail_with` attaches `request: self.loading.take()`, so only a failure before `Loaded` is a load failure.
 - Emitting `Loaded` takes `loading` and sets `adopted_load = Some(request)`.
+- `PlayLoaded { request }` is the automatic-start command queued after its `Load`. Dispatch it only when `adopted_load == Some(request)` and `state == Paused`; call `play()` in that case and do nothing otherwise. This worker-side guard prevents an intervening load, stop or device-open failure from turning an automatic start into a retry. It has no load outcome and adds no larger event-budget row than `Play`.
+- Change legacy `resume_commands`' third command from `Play` to `PlayLoaded { request }`, and update its sequence assertions. Explicit user `Play` retains its existing behavior; TUI retries requiring adoption always issue a fresh `Load`.
 - Both cancellation returns in `load` set `loading = None` (Task 7 turns this into `LoadCancelled`).
 - `publish_progress` mirrors `adopted_load` into `facts.load`; `WaitService` copies `facts.load` into `Progress::load`. Stop, pause, seek and device recovery never change `adopted_load`.
 - `app.rs` sends `LoadRequestId::from_raw(1)` for its single load in this task only; Task 8 replaces it with a session-registered token.
@@ -1297,6 +1356,16 @@ fn set_state(&mut self, state: PlaybackState) {
     let session_rev = self.session_rev;
     let request = if state == PlaybackState::Loading { self.loading } else { None };
     self.emit(PlaybackEvent::StateChanged { session_rev, state, request });
+}
+```
+
+Add the guarded dispatch arm (unrestricted `Play` remains the explicit-resume command):
+
+```rust
+PlaybackCommand::PlayLoaded { request } => {
+    if self.adopted_load == Some(request) && self.state == PlaybackState::Paused {
+        self.play();
+    }
 }
 ```
 
@@ -1445,6 +1514,49 @@ fn a_terminal_event_never_displaces_a_protected_one() {
 }
 ```
 
+Add the guarded-start regression using this file's `remote_load` helper. A queued volume command is the deterministic barrier proving `PlayLoaded` was dispatched; no sleep is needed.
+
+```rust
+#[test]
+fn automatic_start_does_not_reopen_a_failed_remote_load() {
+    use continuo::playback::volume::Volume;
+    let server = TestServer::start(Script::serving(Vec::new()).status(404));
+    let mut engine = TestEngine::start_idle();
+    engine.handle().set_http(Some(HttpService::spawn(Limits::brisk()).expect("http")));
+    engine.send(remote_load(71, &server.url("/missing.mp3")));
+    engine.send(PlaybackCommand::PlayLoaded { request: LoadRequestId::from_raw(71) });
+    engine.send(PlaybackCommand::SetVolume(Volume::new(0.25)));
+    engine.await_event(|event| matches!(event, PlaybackEvent::VolumeChanged { volume, .. } if volume.percent() == 25));
+    assert_eq!(server.requests().len(), 1, "failure waits for explicit retry");
+    engine.finish();
+    server.shutdown();
+}
+
+#[test]
+fn an_older_automatic_start_cannot_play_a_newer_load() {
+    use continuo::playback::state::PlaybackState;
+    use continuo::playback::volume::Volume;
+    let mut engine = TestEngine::start_idle();
+    engine.send(local_load(81));
+    engine.send(local_load(82));
+    engine.send(PlaybackCommand::PlayLoaded { request: LoadRequestId::from_raw(81) });
+    engine.send(PlaybackCommand::SetVolume(Volume::new(0.25)));
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(event) = engine.try_event() {
+            assert!(!matches!(event, PlaybackEvent::StateChanged { state: PlaybackState::Playing, .. }));
+            if matches!(event, PlaybackEvent::VolumeChanged { volume, .. } if volume.percent() == 25) { break; }
+        }
+        assert!(std::time::Instant::now() < deadline, "volume barrier never arrived");
+        std::thread::yield_now();
+    }
+    assert_eq!(engine.progress().load, Some(LoadRequestId::from_raw(82)));
+    engine.finish();
+}
+```
+
+Also exercise the same-token device-open failure followed by `PlayLoaded`: the post-load failure must remain `Failed`, with no second open attempt.
+
 - [ ] **Step 2: Run `cargo test --locked --test m5_engine_load_outcomes`.** Expected: compile FAIL, no variant `LoadCancelled`.
 
 - [ ] **Step 3: Implement.**
@@ -1536,18 +1648,20 @@ git commit -m "feat: protect load outcomes and cancel undelivered loads"
 
 **Interfaces:**
 - Consumes: `LoadRequestId`, `Progress::load`, `PlaybackEvent::load_outcome` (Tasks 6–7); `Queue` (Task 3); `PersistedState::queue_mut` (Task 4).
-- Produces: `MAX_PENDING_LOADS`, `LoadTarget`, `RegisterLoadError`, `AdoptedLoad`, `Advance`, `Session::{register_load, retract_load, pending_load_count, adopted, take_stop_request, take_advance, resume_intent}`, `session::resume_intent_for`.
+- Produces: `MAX_PENDING_LOADS`, `LoadTarget`, `RegisterLoadError`, `AdoptedLoad`, `Advance`, `Session::{register_load, retract_load, pending_load_count, adopted, accepts_media_event, take_stop_request, take_advance, resume_intent}`, `session::resume_intent_for`.
 
-New `Session` fields: `next_request: u64` (0; first token is 1), `pending: BTreeMap<LoadRequestId, PendingLoad { target, media, invalidated }>`, `adopted: Option<AdoptedLoad>`, `adopted_rev_floor: u64`, `last_loaded: Option<LoadRequestId>`, `stop_requested: bool`, `advance: Option<Advance>`, `completion_seen: Option<(LoadRequestId, u64)>`.
+New `Session` fields: `next_request: u64` (0; first token is 1), `pending: BTreeMap<LoadRequestId, PendingLoad { target, media, invalidated }>`, `adopted: Option<AdoptedLoad>`, `adopted_rev_floor: u64`, `latest_engine_rev: u64`, `last_loaded: Option<LoadRequestId>`, `stop_requested: bool`, `advance: Option<Advance>`, `completion_seen: Option<(LoadRequestId, u64)>`. The existing `session_rev` belongs to adopted playback; `latest_engine_rev` tracks recognized engine transitions, including loads that cannot be adopted.
 
 Rules:
 - `register_load` → `Busy` at 16 pending; for `Queue(id)`: `UnknownEntry` if absent, `MediaMismatch` if the entry's media differs. Tokens are strictly increasing and never reused.
 - `retract_load(request)` removes a registration (admission `Busy` or `Gone`).
-- `observe`: when `event.load_outcome()` is `Some(request)`, remove the pending registration first.
-  - `Loaded`: set `last_loaded = Some(request)`. Adopt only if a registration existed, it is not invalidated, its media equals the event's media, and (for a queue target) the entry still exists with that media. Adoption runs the existing `on_loaded` and then sets `adopted`, `adopted_rev_floor = session_rev`, and the queue's active entry (`Some(id)` for a queue target, `None` for `Legacy`). The forced submit fires when the media switched **or** the active entry changed. A registration that existed but cannot be adopted sets `stop_requested`. An unknown or duplicate token changes nothing else.
-  - `Failed { request: Some }` and `LoadCancelled` only retire the registration.
-- `tick` returns `Action::None` unless `progress.load` equals the adopted token (in addition to today's revision check). `shutdown_snapshot` applies the same token check to the live sample.
-- On `EndOfTrack { session_rev }`, after today's checkpoint handling: if `adopted` is a queue target, `last_loaded == Some(adopted.request)`, `session_rev >= adopted_rev_floor` and `completion_seen != Some((adopted.request, session_rev))`, record `completion_seen` and set `advance` to `Next(neighbor Down)` or `EndOfQueue`. Both provenances advance.
+- `observe` computes `accepts_media_event` before removing any registration, then processes load outcomes before ordinary event handlers: remove the pending registration first, even for a stale outcome. An unknown/duplicate outcome changes nothing, including revision tracking, `last_loaded`, checkpoint fields and advancement. A known outcome older than `latest_engine_rev` only retires its registration; it never stops newer playback.
+  - A current `Loaded` sets `latest_engine_rev` and `last_loaded = Some(request)`. Adopt only if its registration is not invalidated, its media matches, and its queue occurrence still exists with that media. Otherwise request a stop and return `Action::None`, retaining the old adopted checkpoint state. On adoption set `session_rev` to the event revision, capture outgoing history, mutate incoming identity/active entry/metadata, and only then construct the submission. Never return a snapshot cloned before those mutations.
+  - A current known `Failed { request: Some }` or `LoadCancelled` advances `latest_engine_rev` and clears `last_loaded`; it does not change the previous adopted checkpoint state. A `Loading` announcement for a registered request does the same before its outcome; losing that ordinary announcement is safe because the protected outcome precedes later media events.
+- Expose `Session::accepts_media_event(&self, event: &PlaybackEvent) -> bool` as the shared pre-observation ownership check. For `Loaded`, require a current, valid registered target/media; for other media events use the gate below. The runtime records this boolean before `observe` and uses it for mirror updates, so a valid `Action::None` is never mistaken for rejection. Tokenized failure/cancellation retirement and profile-wide volume handling remain separate.
+- **Before any other media-specific handler** (`StateChanged`, seek/target/restart events, `EndOfTrack`, capabilities, recovery and playback failure), require an adopted token, `last_loaded == Some(adopted.request)` and `event.session_rev() >= latest_engine_rev`. Otherwise return `Action::None` before changing revision, completion, provenance, protection, pending force or history. Accepted events update `latest_engine_rev` and `session_rev` monotonically; this permits stop and device recovery of the adopted token to advance its revision while unrelated loads remain pending. `VolumeChanged` is profile-wide and bypasses the media-ownership gate. Remove `observe`'s current unconditional revision assignment.
+- `tick` accepts a live sample only when its revision, media and token match adopted playback and `last_loaded` still names that token. `shutdown_snapshot` uses the same live gate; otherwise it may capture the last accepted sample belonging to the retained adopted playback, using that sample's provenance (`Sample` gains `provenance: PositionProvenance`, populated with each accepted sample). Rejected load events must not re-key or clear that fallback. `reconcile_shutdown` routes every event through these same gates.
+- On an eligible `EndOfTrack`, deduplicate `(adopted.request, session_rev)` **before** any checkpoint handling. Then record completion with its reported provenance and set `advance` to `Next(neighbor Down)` or `EndOfQueue` only for a queue target. Both provenances advance. Invalidated, stale and duplicate completions change neither history nor advancement.
 - `take_stop_request` and `take_advance` return and clear.
 - `resume_intent(&media)` = `resume_intent_for(self.state.entry_for(media)).unwrap_or(ResumeIntent::StartAt(Duration::ZERO))`.
 
@@ -1773,6 +1887,55 @@ fn unknown_and_duplicate_outcomes_select_nothing() {
 
 `RegisterLoadError` derives `Debug, Eq, PartialEq`. Registration checks capacity before the queue lookup, which is why the mismatch assertion runs only after two retractions leave room.
 
+Add these regressions using this file's helpers:
+
+```rust
+#[test]
+fn an_adoption_snapshot_contains_the_new_media_active_entry_and_metadata() {
+    use continuo::session::Action;
+    let clock = FakeClock::new();
+    let (mut session, ids) = queued(&["a", "b"]);
+    let a = session.register_load(LoadTarget::Queue(ids[0]), &media("a")).expect("register");
+    session.observe(&loaded(a, 1, "a"), clock.sample());
+    let b = session.register_load(LoadTarget::Queue(ids[1]), &media("b")).expect("register");
+    let mut event = loaded(b, 2, "b");
+    if let PlaybackEvent::Loaded { metadata, .. } = &mut event { metadata.title = Some("B title".into()); }
+    let Action::Submit { state, .. } = session.observe(&event, clock.sample()) else { panic!("snapshot") };
+    assert_eq!(state.current_media(), Some(&media("b")));
+    assert_eq!(state.queue().active(), Some(ids[1]));
+    assert_eq!(state.queue().get(ids[1]).and_then(|e| e.display().title.as_deref()), Some("B title"));
+    let legacy = session.register_load(LoadTarget::Legacy, &media("x")).expect("register");
+    let Action::Submit { state, .. } = session.observe(&loaded(legacy, 3, "x"), clock.sample()) else { panic!("snapshot") };
+    assert_eq!(state.current_media(), Some(&media("x")));
+    assert_eq!(state.queue().active(), None);
+}
+
+#[test]
+fn completion_for_a_removed_pending_load_cannot_write_the_previous_history() {
+    use continuo::session::Action;
+    for provenance in [PositionProvenance::Established, PositionProvenance::Estimated] {
+        let clock = FakeClock::new();
+        let (mut session, ids) = queued(&["a", "b"]);
+        let a = session.register_load(LoadTarget::Queue(ids[0]), &media("a")).expect("register");
+        session.observe(&loaded(a, 1, "a"), clock.sample());
+        session.observe(&playing(1), clock.sample());
+        clock.advance(Duration::from_secs(6));
+        session.tick(&progress(1, "a", 30, Some(a)), clock.sample());
+        let b = session.register_load(LoadTarget::Queue(ids[1]), &media("b")).expect("register");
+        session.remove_entry(ids[1], &progress(1, "a", 30, Some(a)), clock.sample()).expect("remove");
+        let before = serde_json::to_value(session.state()).expect("snapshot");
+        session.observe(&loaded(b, 2, "b"), clock.sample());
+        session.observe(&playing(2), clock.sample());
+        assert!(matches!(session.observe(&end(2, provenance), clock.sample()), Action::None));
+        assert_eq!(serde_json::to_value(session.state()).expect("snapshot"), before);
+        assert_eq!(session.take_advance(), None);
+        assert!(session.take_stop_request());
+    }
+}
+```
+
+Extend `completion_advances_once_for_either_provenance_and_never_from_a_stale_revision` to compare the serialized state before/after the stale and duplicate events, including `touch_seq` and `updated_at`, not only `take_advance()`. Replay the invalidated-load sequence through `reconcile_shutdown` too and assert A remains incomplete with its retained 30-second sample and provenance; no B checkpoint appears. Repeat with `SeekTargetStored` from the rejected revision to cover the other direct checkpoint-writing handler.
+
 - [ ] **Step 2: Run `cargo test --locked --test m5_session_adoption`.** Expected: compile FAIL, `LoadTarget` unresolved.
 
 - [ ] **Step 3: Implement the fields and rules above in `session.rs`.** `enqueue`, `move_entry` and `remove_entry` are needed by these tests; implement them here exactly as specified in Task 9's rules (Task 9 adds the rest of the queue surface and its own tests). Change `on_loaded` to take the adoption target:
@@ -1781,7 +1944,7 @@ fn unknown_and_duplicate_outcomes_select_nothing() {
 fn adopt_loaded(&mut self, request: LoadRequestId, target: LoadTarget, media: &MediaId, position: Duration,
                 disposition: &StartDisposition, metadata: &MediaMetadata, now: ClockSample) -> Action {
     let previous_active = self.state.queue().active();
-    let switching_action = self.on_loaded(media, position, disposition, now);
+    let switched_media = self.on_loaded(media, position, disposition, now);
     let active = match target { LoadTarget::Queue(id) => Some(id), LoadTarget::Legacy => None };
     // The registration was validated against the queue a moment ago in `observe`.
     let _ = self.state.queue_mut().set_active(active);
@@ -1790,13 +1953,15 @@ fn adopt_loaded(&mut self, request: LoadRequestId, target: LoadTarget, media: &M
     }
     self.adopted = Some(AdoptedLoad { request, target });
     self.adopted_rev_floor = self.session_rev;
-    match switching_action {
-        Action::Submit { .. } => switching_action,
-        Action::None if previous_active != active => self.submit(Urgency::Forced),
-        Action::None => Action::None,
+    if switched_media || previous_active != active {
+        self.submit(Urgency::Forced)
+    } else {
+        Action::None
     }
 }
 ```
+
+Change private `on_loaded` to return its existing `switching: bool` instead of `Action`. Its checkpoint/identity mutations remain, but its final `submit` moves exclusively to `adopt_loaded`, after the queue and metadata updates. Test the returned snapshot as well as the live state.
 
 `absorb_load_metadata` copies a present decoder title/artist/album into the entry's display and replaces its duration with `DisplayDuration { value, source: DurationSource::Decoded(metadata.duration_provenance) }` when the decoder reported one. (Artist/album fields arrive in Task 23; until then only title and duration are copied.)
 
@@ -2168,7 +2333,7 @@ fn the_contention_message_is_exact() {
 
 ```rust
 // tests/m5_lock_process.rs
-#![cfg(unix)]
+#![cfg(target_os = "linux")]
 #[path = "support/process.rs"] mod process;
 mod support;
 
@@ -2391,15 +2556,15 @@ git commit -m "feat: flush and exit 128+n on shutdown signals in play"
 - Modify: `src/application/mod.rs`, `src/media/mod.rs`, `src/app.rs`
 
 **Interfaces:**
-- Produces (pure moves, behavior unchanged):
+- Produces (moves plus the seek-cancellation correction):
   - `application::source::{resolve_source, is_url_spelling}` (with `resolve_url` private)
-  - `application::seek::{KeyRouter, SeekBurst}`; `app.rs` keeps `pub use crate::application::seek::KeyRouter;`
+  - `application::seek::{KeyRouter, SeekBurst}`; `app.rs` keeps `pub use crate::application::seek::KeyRouter;`. Expose the existing `KeyRouter::cancel(&mut self)` as public so the runtime can discard both an unsubmitted burst and its displayed target on superseding actions. In `observe`, `Loaded`, `LoadCancelled` and `Failed` call `cancel`, rather than merely `release`.
   - `media::display::{display_name, remote_display_name, episode_name, format_hms, fit_to_width}` as `pub fn`
 - `app.rs` imports all of them so its in-file tests (`super::*`) compile unchanged. Move each item's unit tests with it when they test only that item (`seek_target`/burst tests to `seek.rs`, URL spelling tests to `source.rs`, name/width tests to `display.rs`); leave `Mirror`/status-line tests in `app.rs`.
 
 - [ ] **Step 1: Record the baseline.** Run `cargo test --locked --lib 2>&1 | grep "test result"` and `cargo test --locked --test app_cli`; note the passing counts.
-- [ ] **Step 2: Move the code and tests** as listed. No logic edits.
-- [ ] **Step 3: Rerun both commands.** Expected: PASS with the same total test count.
+- [ ] **Step 2: Move the code and tests** as listed, plus the cancellation change above. Add `loaded_and_failed_events_cancel_unsubmitted_bursts`: accumulate a relative seek, observe each superseding outcome, assert `!router.is_seeking()`, advance beyond the coalescing window, and assert `take_due(now) == None` in the module's unit test.
+- [ ] **Step 3: Rerun both commands.** Expected: all original tests plus the new cancellation regression pass.
 - [ ] **Step 4: Run `cargo clippy --locked --all-targets -- -D warnings`.** Expected: clean.
 - [ ] **Step 5: Commit.**
 
@@ -2654,11 +2819,11 @@ pub struct PlayerView {
 
 Runtime rules:
 - **Lazy engine.** `ensure_engine()` calls the factory on the first load, then sends `SetVolume(session volume)`. Volume changes without an engine go through `Session::set_volume`; with one, through the engine (whose `VolumeChanged` reaches `Session` as today).
-- **Commands that touch transport** build a `TransportSituation` (phase from `phase()`, below) and act on `decide`: `Load(id)` → `load_entry(id)`; `TogglePause`/`Play`/`SeekBy`/`Restart` → `KeyRouter::route` (so bursts and out-of-band submission behave exactly as in `play`); `SeekTo(t)` → `engine.submit_seek(t)` only when the adopted playback has a known duration and seek support is not `Unsupported`, else status `Play a track before seeking`; `Notice(text)` → status; `Stop` → `engine.interrupt_stop()` when an engine exists.
-- **`load_entry(id)`**: look up the entry; build the location (`LocalFile` → `LocalPath`, `RemoteUrl` → `Http(Url::parse(normalized))`, `Podcast` → `resolve_podcast` when `library` is `Some`, otherwise `Saved`; `Current` with a refreshed fallback calls `Session::update_podcast_fallback`; `Saved` sets status `SAVED_SOURCE_NOTICE`; errors set status and return). Register the load (`Busy` → status `Too many pending loads`). Ensure engine; for HTTP ensure an `HttpService` (spawned once with `http_limits`) and `set_http`. `engine.submit(Load { request, media, source, resume: session.resume_intent(&media) })`; non-`Accepted` → `retract_load` and status `Player is busy`. Then `engine.submit_play()`. Record `last_requested = Some(id)` and clear `load_failed`.
-- **`pump()`**: flush the seek burst; drain every event: `Session::observe` → submit; `KeyRouter::observe`; apply to the mirror (a `Loaded` updates the mirror only if `session.adopted()` now carries its token; `Failed { request: Some }` sets `load_failed` and status to the message; `Failed { request: None }` sets status). Then `take_stop_request()` → `interrupt_stop`; `take_advance()` → `Next(id)` calls `load_entry(id)`, `EndOfQueue` does nothing. Then sample `engine.progress()`, `Session::tick` → submit, and copy progress into the mirror only when its revision and token match.
-- **`phase()`**: `Loading` if `pending_load_count() > 0`; else `Unloaded` or `LoadFailed` (when `load_failed`) if nothing is adopted; else from the mirror state (`Ended` → `Ended`, `Paused` → `Paused`, `Stopped`/`Failed` → `Stopped`, `Playing` → `Playing`, `Idle`/`Loading` → `Loading`).
-- **Queue commands**: `Enqueue` resolves every item first (paths through `resolve_source`, URLs through `resolve_source`, episodes need an enclosure or report `NotPlayable`), builds `NewQueueEntry`s with display from the item (`Episode` → title and `DurationSource::Declared`), then one `Session::enqueue` (capacity errors become status `Queue is full (256 entries)`); any resolution error rejects the whole batch with that error's text. `Remove` and `ClearQueue` pass the latest `engine.progress()` (or a zero progress with `load: None` when no engine exists), call `interrupt_stop` when `stop_playback`, and store the selection hint. `Move` submits.
+- **Commands that touch transport** build a `TransportSituation` and act on `decide`: `Load(id)` → `load_entry(id)`; `TogglePause`/`Play`/`SeekBy`/`Restart` → `KeyRouter::route`; `SeekTo(t)` → cancel the router, then `engine.submit_seek(t)` only when adopted playback has a known duration and seek support is not `Unsupported`, else status `Play a track before seeking`; `Notice(text)` → status; `Stop` → cancel the router, then `engine.interrupt_stop()` when an engine exists. Restart and shutdown also cancel. Discard bursts before active removal/clear, and before submitting an accepted new load. Cancelling must not submit the old target first.
+- **`load_entry(id)`**: look up the entry and record `last_requested = Some(id)` before resolving it. Build the location (`LocalFile` → `LocalPath`, `RemoteUrl` → `Http(Url::parse(normalized))`, `Podcast` → `resolve_podcast` when `library` is `Some`, otherwise `Saved`; apply a refreshed fallback through Session; `Saved` sets `SAVED_SOURCE_NOTICE`). Resolution or HTTP-service startup errors set `load_failed = true` and status, then return without adopting. Register the load (`Busy` → status `Too many pending loads`); ensure engine/HTTP service, retracting on setup failure. Submit `Load { request, media, source, resume: session.resume_intent(&media) }`; non-`Accepted` retracts, reports busy and returns without any play command. On acceptance cancel the seek router, clear `load_failed`, then submit `PlayLoaded { request }`. Never queue unrestricted `Play` as part of a load. If automatic-start admission is busy, leave the successfully loaded track paused and report `Player is busy`; do not retry with unrestricted `Play`.
+- **`pump()`**: first drain every event: save `session.accepts_media_event(&event)`, then `Session::observe` → submit; `KeyRouter::observe`; update the playback mirror only for events accepted by that pre-observation check (and, for `Loaded`, only when Session adopted its token); update profile-wide volume separately. A current `Failed { request: Some }` sets `load_failed` and status; playback failures set status. Then `take_stop_request()` → cancel router and `interrupt_stop`; `take_advance()` → `Next(id)` calls `load_entry(id)`, `EndOfQueue` does nothing. Flush the router only after those transitions and only when the transport decision table allows seeking. Finally sample progress, submit `Session::tick`, and update the mirror only when revision and token match. Never flush an old burst into a new or still-loading track.
+- **`phase()`**: `Loading` while pending loads exist; otherwise `LoadFailed` when the latest requested load failed, even if an older occurrence is still adopted; otherwise `Unloaded` if nothing is adopted; otherwise map mirror state (`Ended`, `Paused`, `Playing` directly, `Stopped`/`Failed` → `Stopped`, `Idle`/`Loading` → `Loading`). A later successfully adopted request clears `load_failed`; an earlier outcome cannot overwrite a later request's success/failure. Store `last_attempt_token: Option<LoadRequestId>` alongside `last_requested`: clear it at the start of each attempt, set it on accepted load admission, and change `load_failed` from an outcome only when its token equals this value. Do not match by media ID. A resolution failure has no token but still takes precedence over older in-flight outcomes. Space/p after failure must retry `last_requested` with a fresh token; Enter chooses selection.
+- **Queue commands**: `Enqueue` resolves every item first (paths through `resolve_source`, URLs through `resolve_source`, episodes need an enclosure or report `NotPlayable`), builds `NewQueueEntry`s with display from the item (`Episode` → title and `DurationSource::Declared`), then one `Session::enqueue` (only `QueueError::Capacity` becomes status `Queue is full (256 entries)`; `IdExhausted` and other errors retain their own message); any resolution error rejects the whole batch with that error's text. `Remove` and `ClearQueue` pass the latest `engine.progress()` (or a zero progress with `load: None` when no engine exists), call `interrupt_stop` when `stop_playback`, and store the selection hint. `Move` submits.
 - **View**: rows in queue order; titles via `display.title` or `display_name(media)` / `episode_name`, always passed through `commands::displayable`; `saved` from `saved_history(state.entry_for(media))`. `now_playing` follows the active entry; before loading it has `loaded: false` and its saved history. `persistence` is `Unsaved` when `persisting` is false.
 - **`shutdown`**: if an engine exists: `interrupt_shutdown`, in-band `Shutdown`, `join`, `reconcile_shutdown`, forced submit. Then `writer.shutdown()`, classified like `app::classify_flush`.
 
@@ -2840,6 +3005,12 @@ Add unit tests in `view.rs`:
 - `saved_history`/`format_saved`: completed → `played`; estimated 62 s → `~01:02 saved`; position 62 s → `01:02 saved`; neither → `position unknown`; no entry → `None`.
 - `a_title_with_terminal_controls_is_rendered_inert`: a queue entry whose display title is `"evil\u{1b}[2Jtitle"` produces a `QueueRow::title` containing no `'\u{1b}'` character.
 
+Add runtime regressions with these exact sequences:
+- `seek_then_load_discards_the_old_target`: enqueue two 5-second fixtures; play A, issue `SeekBy(10)` then `PlayEntry(B)` before the burst deadline, pump for at least 250 ms; B remains playing near zero, no old seek is submitted and its saved position is not advanced to A's target. Repeat with Stop, active removal, clear and mouse `SeekTo` superseding a burst.
+- `space_retries_a_failed_switch_with_a_fresh_token`: seed a queue with playable 5-second A and missing local B, play A, request B, wait for `LoadFailed`; active stays A. Create B by copying the fixture, press Space with selection still on A, then assert B is adopted under a fresh token. Repeat with `Play`, and with two duplicate-media occurrences to ensure matching uses tokens.
+- `a_resolution_failure_is_retryable_without_losing_the_previous_adoption`: use the podcast resolver's corrupt-cache fixture for B after A is adopted; repair the cache and press p with A selected; B must load. Older pending outcomes cannot clear the later resolution failure.
+- `automatic_start_handles_intervening_outcomes`: submit A and B before pumping; both `Loaded` events adopt their own occurrence in order, but a delayed `PlayLoaded(A)` never starts B. Make B fail and verify no implicit retry. On start-command admission failure, the loaded track remains paused with a visible busy status.
+
 - [ ] **Step 2: Run `cargo test --locked --test m5_runtime`.** Expected: FAIL, module missing.
 - [ ] **Step 3: Implement** `runtime.rs` and `view.rs` per the rules. Keep the runtime free of Ratatui and crossterm types.
 - [ ] **Step 4: Run.** `cargo test --locked --test m5_runtime --test m5_transport_rules --lib` → PASS (run twice to catch timing flakiness).
@@ -2865,7 +3036,7 @@ git commit -m "feat: add the terminal-free player runtime"
 ```rust
 // hooks.rs
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum TestHook { None, PanicBeforeRedirect, PanicAfterRedirect, PanicAfterTerminal, StderrProbe, ArtworkJobPanic, MetadataJobPanic, WorkerPanic }
+pub enum TestHook { None, PanicBeforeRedirect, PanicAfterRedirect, PanicAfterTerminal, StderrProbe, ArtworkJobPanic, ArtworkEncodingPanic, MetadataJobPanic, WorkerPanic }
 impl TestHook {
     pub fn parse(value: Option<&str>) -> Self;   // exact kebab-case names from decision 8; anything else → None
     pub fn from_env() -> Self;                   // reads CONTINUO_TEST_HOOK once
@@ -3657,6 +3828,7 @@ git commit -m "feat: browse local directories and cached episodes on demand"
 ### Task 23: Local tag probe and background metadata enrichment
 
 **Files:**
+- Modify: `Cargo.toml`, `Cargo.lock` (`image = { version = "0.25.10", default-features = false, features = ["jpeg", "png"] }`)
 - Create: `src/media/tags.rs`, `src/application/enrich.rs`, `tests/support/tagged_flac.rs`, `tests/m5_metadata.rs`
 - Modify: `src/media/mod.rs`, `src/media/metadata.rs` (`artist`, `album`), `src/playback/decode.rs` (extract artist/album), `src/session.rs` (`absorb_load_metadata` copies artist/album), `src/application/runtime.rs` (request enrichment, apply results), every `MediaMetadata { .. }` literal (`src/app.rs`, `src/playback/engine.rs` tests, `tests/domain_values.rs`)
 
@@ -3691,7 +3863,9 @@ Rules (§8, §9, §11):
 - The runtime requests enrichment for `LocalFile` entries whose display title is `None`, after `Enqueue` and once at construction for restored entries; results call `Session::update_display` (title/artist/album only when `Some`; duration as `Decoded(provenance)`). `URL` and podcast entries are never probed. Enrichment for a removed media is harmless because `update_display` finds no entry.
 - `tests/support/tagged_flac.rs`: `pub fn tagged_flac(dir: &Path, title: &str, artist: &str, album: &str, cover_png: Option<&[u8]>) -> PathBuf` copies `tests/fixtures/sine.flac`, walks its metadata blocks (4-byte header: last-flag bit + 7-bit type, 24-bit big-endian length), clears the last flag on the final block, and appends a `VORBIS_COMMENT` block (type 4: little-endian vendor length + vendor, count, `TITLE=`, `ARTIST=`, `ALBUM=` entries) and, when given, a `PICTURE` block (type 6: big-endian picture type 3, MIME `image/png`, empty description, width, height, depth 32, colors 0, data length, data), marking the new final block as last.
 
-- [ ] **Step 1: Write failing tests.**
+- [ ] **Step 1: Add `image` with the exact dependency line above and update only its required lockfile entries.** `cargo check --locked` must resolve it before the metadata test starts; the test encodes its PNG fixture in this task.
+
+- [ ] **Step 2: Write failing tests.**
 
 ```rust
 // tests/m5_metadata.rs
@@ -3770,13 +3944,13 @@ fn cancelled_results_are_discarded() {
 
 Add one runtime test to `tests/m5_runtime.rs`: `enqueueing_a_tagged_local_file_fills_title_and_artist_in_the_background` (enqueue the generated tagged FLAC, pump until the row title is `Morning Tide` and the row subtitle contains `Harbor`).
 
-- [ ] **Step 2: Run `cargo test --locked --test m5_metadata`.** Expected: FAIL.
-- [ ] **Step 3: Implement** the probe, fields, workers and runtime wiring. `tui::run` passes `default_probe(hook)`; `RuntimeParts` gains `metadata_probe: Option<TagProbe>` and `hook: TestHook` (`None` disables enrichment); add `metadata_probe: None, hook: TestHook::None` to every `RuntimeParts` literal in `tests/m5_runtime.rs` and `tests/m5_no_network.rs`, except in the tagged-file test, which passes `Some(default_probe(TestHook::None))`.
-- [ ] **Step 4: Run.** `cargo test --locked --test m5_metadata --test m5_runtime --test domain_values --test decode_fixtures --lib` → PASS.
-- [ ] **Step 5: Commit.**
+- [ ] **Step 3: Run `cargo test --locked --test m5_metadata`.** Expected: FAIL.
+- [ ] **Step 4: Implement** the probe, fields, workers and runtime wiring. `tui::run` passes `default_probe(hook)`; `RuntimeParts` gains `metadata_probe: Option<TagProbe>` and `hook: TestHook` (`None` disables enrichment); add `metadata_probe: None, hook: TestHook::None` to every `RuntimeParts` literal in `tests/m5_runtime.rs` and `tests/m5_no_network.rs`, except in the tagged-file test, which passes `Some(default_probe(TestHook::None))`.
+- [ ] **Step 5: Run.** `cargo test --locked --test m5_metadata --test m5_runtime --test domain_values --test decode_fixtures --lib` → PASS.
+- [ ] **Step 6: Commit.**
 
 ```bash
-git add src tests/support/tagged_flac.rs tests/m5_metadata.rs tests/m5_runtime.rs tests/domain_values.rs
+git add Cargo.toml Cargo.lock src tests/support/tagged_flac.rs tests/m5_metadata.rs tests/m5_runtime.rs tests/domain_values.rs
 git commit -m "feat: enrich local queue entries with tags in contained workers"
 ```
 
@@ -3787,7 +3961,7 @@ git commit -m "feat: enrich local queue entries with tags in contained workers"
 
 **Files:**
 - Create: `src/artwork/mod.rs`, `src/artwork/resolve.rs`, `src/artwork/decode.rs`, `src/artwork/worker.rs`, `tests/m5_artwork.rs`
-- Modify: `Cargo.toml`, `Cargo.lock` (`image = { version = "0.25.10", default-features = false, features = ["jpeg", "png"] }`), `src/lib.rs` (`pub mod artwork;`)
+- Modify: `src/lib.rs` (`pub mod artwork;`). The `image` dependency and lockfile entries already arrive in Task 23.
 
 **Interfaces:**
 - Consumes: `probe_local_tags`, `CoverBytes` (Task 23); `run_contained`, `TestHook` (Task 16).
@@ -3939,7 +4113,7 @@ fn a_panicking_decode_is_a_placeholder_and_the_next_job_succeeds() {
 - [ ] **Step 5: Commit.**
 
 ```bash
-git add Cargo.toml Cargo.lock src/artwork src/lib.rs tests/m5_artwork.rs
+git add src/artwork src/lib.rs tests/m5_artwork.rs
 git commit -m "feat: resolve and decode local cover art within fixed limits"
 ```
 
@@ -3950,7 +4124,7 @@ git commit -m "feat: resolve and decode local cover art within fixed limits"
 - Modify: `Cargo.toml`, `Cargo.lock` (`ratatui-image = { version = "11.0.8", default-features = false, features = ["crossterm"] }`), `src/cli.rs` (`--artwork`), `src/tui/mod.rs`, `src/tui/render.rs` (`CoverView::Image`)
 
 **Interfaces:**
-- Consumes: `ArtworkWorker` (Task 24), `Regions::cover` (Task 19), `TerminalCleanup::set_kitty_images` (Task 16).
+- Consumes: `ArtworkWorker`, `ArtworkError` (Task 24), `Regions::cover` (Task 19), `run_contained` and `TerminalCleanup::set_kitty_images` (Task 16).
 - Produces:
 
 ```rust
@@ -3961,12 +4135,13 @@ CliCommand::Tui { mouse, #[arg(long, value_enum, default_value_t = ArtworkMode::
 
 // tui/images.rs
 pub const DETECTION_TIMEOUT: Duration = Duration::from_millis(250);
+pub fn prepare_contained<T>(job: impl FnOnce() -> Result<T, ArtworkError>) -> Result<T, ArtworkError>;
 pub fn picker_for(mode: ArtworkMode, query: impl FnOnce(Duration) -> Option<Picker>) -> Option<Picker>;
     // Off → None; Blocks → Picker::halfblocks(); Auto → query(DETECTION_TIMEOUT) or Picker::halfblocks()
 #[derive(Clone, Debug, Eq, PartialEq)] pub struct CoverKey { pub media: MediaId, pub mode: ArtworkMode, pub area: Rect }
-pub struct CoverCache { /* key, prepared Protocol, image Arc, placement_dirty: bool */ }
+pub struct CoverCache { /* key, prepared Protocol, image Arc, placement_dirty: bool, panic_next_encoding: bool */ }
 impl CoverCache {
-    pub fn new() -> Self;
+    pub fn new(hook: TestHook) -> Self;  // records whether to inject one ArtworkEncodingPanic
     pub fn set_image(&mut self, media: MediaId, image: Option<Arc<DynamicImage>>);
     pub fn prepare(&mut self, picker: Option<&Picker>, mode: ArtworkMode, area: Option<Rect>) -> bool;  // true when it (re)encoded
     pub fn invalidate(&mut self);                     // Ctrl-L and resize
@@ -3977,8 +4152,16 @@ impl CoverCache {
 
 Rules (§9, §11):
 - Detection runs once, after entering the alternate screen and before reading input: `Picker::from_query_stdio_with_options` with a `QueryStdioOptions` timeout of `DETECTION_TIMEOUT` (confirm field names in ratatui-image 11.0.8 docs). Any error or timeout → halfblocks. When the detected protocol is Kitty, call `TerminalCleanup::set_kitty_images(true)` so exit deletes placements.
-- Preparation happens in the loop **before** `terminal.draw`, never inside the draw closure: when `CoverKey` changes, build `picker.new_protocol(image, area, Resize::Fit(None))` and keep it until the media, mode or area changes.
+- Preparation happens in the loop **before** `terminal.draw`, never inside the draw closure. When `CoverKey` changes, build `picker.new_protocol(image, area, Resize::Fit(None))` inside `prepare_contained`, including all resizing/encoding. Build a disposable candidate without mutating the cache or holding shared locks; install it only on success and log `tracing::debug!("artwork encoding completed")`. Any error or unwind clears the prepared image, requests placement cleanup, remembers the failed key to avoid retrying every draw, and shows the placeholder. Another media/mode/area or explicit invalidation permits a new attempt. Rendering, Session and worker orchestration remain outside containment.
+
+```rust
+pub fn prepare_contained<T>(job: impl FnOnce() -> Result<T, ArtworkError>) -> Result<T, ArtworkError> {
+    crate::lifecycle::panic::run_contained("artwork encoding", job)
+        .map_err(|_| ArtworkError::Panicked)?
+}
+```
 - A replacement, resize or `invalidate` sets `placement_dirty`; the loop answers `take_placement_cleanup()` with `terminal.clear()` before the next draw so stale placements cannot persist. Resize events and Ctrl-L both call `invalidate`.
+- `tui::run` constructs `CoverCache::new(hook)`. On preparation, take `panic_next_encoding` before entering `prepare_contained`; if true, panic inside the contained job before encoding. The flag is consumed once, so the next media/key can prepare successfully. This implements the `artwork-encoding-panic` process hook without wrapping cache mutation or rendering in containment.
 - The loop requests artwork for the active local entry when its media changes; remote and podcast entries and every error show the placeholder. `--artwork off` never starts the worker.
 
 - [ ] **Step 1: Write failing tests.**
@@ -4004,7 +4187,7 @@ fn off_disables_images_blocks_never_queries_and_auto_falls_back() {
 #[test]
 fn a_prepared_cover_is_reused_until_media_mode_or_area_changes() {
     let picker = Picker::halfblocks();
-    let mut cache = CoverCache::new();
+    let mut cache = CoverCache::new(continuo::lifecycle::hooks::TestHook::None);
     let area = Some(Rect::new(0, 0, 14, 7));
     cache.set_image(media("a"), Some(Arc::new(image::DynamicImage::new_rgb8(8, 8))));
     assert!(cache.prepare(Some(&picker), ArtworkMode::Blocks, area));
@@ -4023,13 +4206,31 @@ fn a_prepared_cover_is_reused_until_media_mode_or_area_changes() {
 #[test]
 fn no_image_or_no_area_renders_the_placeholder() {
     let picker = Picker::halfblocks();
-    let mut cache = CoverCache::new();
+    let mut cache = CoverCache::new(continuo::lifecycle::hooks::TestHook::None);
     cache.set_image(media("a"), None);
     assert!(!cache.prepare(Some(&picker), ArtworkMode::Blocks, Some(Rect::new(0, 0, 14, 7))));
     assert!(cache.widget().is_none());
     cache.set_image(media("a"), Some(Arc::new(image::DynamicImage::new_rgb8(8, 8))));
     assert!(!cache.prepare(Some(&picker), ArtworkMode::Blocks, None), "minimal tier has no cover area");
     assert!(cache.widget().is_none());
+}
+```
+
+Add this test and a cache unit test using an injected encoder in the same preparation path: seed a prepared cover, panic on replacement, assert `widget().is_none()` and one placement-cleanup request, then succeed on the next key. In the PTY containment suite, run an encoding panic inside this boundary while the terminal is active and assert continued rendering, unchanged stderr redirection and successful later preparation.
+
+```rust
+#[test]
+fn an_encoding_panic_is_contained_and_a_later_preparation_succeeds() {
+    use continuo::artwork::decode::ArtworkError;
+    use continuo::lifecycle::panic::in_contained_job;
+    use continuo::tui::images::prepare_contained;
+    let failed = prepare_contained(|| -> Result<(), ArtworkError> {
+        assert!(in_contained_job());
+        panic!("encoding panic");
+    });
+    assert_eq!(failed, Err(ArtworkError::Panicked));
+    assert!(!in_contained_job());
+    assert_eq!(prepare_contained(|| Ok(7)), Ok(7));
 }
 ```
 
@@ -4337,8 +4538,10 @@ impl TapRegistry {
 
 // worker.rs
 pub const MAX_FRAMES_PER_SECOND: u32 = 20;
+pub const FRAME_MAX_AGE: Duration = Duration::from_millis(150);
+pub fn frame_is_fresh(frame: &SpectrumFrame, now: Instant) -> bool;
 #[derive(Clone, Debug, PartialEq)]
-pub struct SpectrumFrame { pub session_rev: u64, pub bands: Vec<(f64, f64)>, pub levels: Vec<f32>, pub at: Nanos }
+pub struct SpectrumFrame { pub session_rev: u64, pub bands: Vec<(f64, f64)>, pub levels: Vec<f32>, pub at: Nanos, pub published_at: Instant }
 #[derive(Clone)]
 pub struct SpectrumHandle;   // set_enabled(&self, bool); latest(&self) -> Option<SpectrumFrame>; registry(&self) -> &TapRegistry
 impl EngineHandle { pub fn spectrum(&self) -> SpectrumHandle }
@@ -4349,8 +4552,14 @@ Rules (§10):
 - `open_transport` assigns `instance = next_tap_instance` (monotonic `u64`, never reused), builds `tap_pair`, sends the reader over the attach channel, attaches the writer with `CallbackCore::with_tap`, and stores `instance` and `session_rev` in `TransportCore`.
 - **Before** every `Run` publication — `prime_and_run`'s `start_running`, `play`'s `release`, and `TransportCore::release` on the hook's thaw path — publish `TapMapping { instance, generation, epoch: handshake.upcoming_epoch(), session_rev, sample_rate, channels }`.
 - `teardown` retires the instance. A load, stop or shutdown therefore invalidates every mapping of the old transport; a seek's reinstall publishes a newer generation, which retires the older one.
-- The worker loop: when disabled, drain and discard readers' blocks and sleep 50 ms. Otherwise read blocks; `lookup` failure → discard. Reset the analyzer when the mapping key `(instance, generation, epoch)`, sample rate, channel count, or `discontinuity` changes (build a new analyzer when rate/channels change). Each window result becomes a pending frame stamped with the block's `predicted` instant; publish it into the latest slot once the device clock reaches that instant and at least `1 s / MAX_FRAMES_PER_SECOND` has passed since the last publication. Smooth as `level = max(new, previous × 0.85)`. At least every 50 ms, even when no block arrives, look up the mapping of the frame in the latest slot and clear the slot when that mapping has been retired, so a stopped or replaced transport's spectrum disappears without new audio.
-- TUI: enable analysis only while the spectrum rectangle exists for the current tier and the phase is `Playing`; draw a frame only when `frame.session_rev == now_playing.session_rev` and `now_playing.load == session.adopted` token; otherwise decay the displayed levels by 0.85 per draw toward zero (paused, stopped, starved, or no frame).
+- The worker loop: when disabled, clear the latest/pending frames and analyzer, drain and discard readers' blocks and sleep 50 ms. Otherwise read blocks; `lookup` failure → discard. Reset the analyzer when the mapping key `(instance, generation, epoch)`, sample rate, channel count, or `discontinuity` changes (build a new analyzer when rate/channels change). Each newly analyzed window becomes a pending frame stamped with the block's `predicted` instant; publish it into the latest slot once the device clock reaches that instant and at least `1 s / MAX_FRAMES_PER_SECOND` has passed since the last publication. Smooth as `level = max(new, previous × 0.85)`. At least every 50 ms, even when no block arrives, look up the mapping of the frame in the latest slot and clear the slot when that mapping has been retired, so a stopped or replaced transport's spectrum disappears without new audio. Stamp `published_at = Instant::now()` only when publishing a new audible frame; never refresh it while returning/reusing the latest value. Clear expired frames after `FRAME_MAX_AGE` using monotonic wall time even if the output clock stops. A pending frame also expires 150 ms after its predicted output time is first reached; replacing/reusing a pending frame must not make old PCM fresh. Track that ready instant separately from its device timestamp.
+- TUI: enable analysis only while the spectrum rectangle exists and the phase is `Playing`. Draw levels only when the phase is still `Playing`, the revision/token match adopted playback and `frame_is_fresh(frame, Instant::now())`. Otherwise decay displayed levels by 0.85 per draw, including pause, stop and starvation with an unchanged valid mapping. The view's clock check prevents a delayed worker cleanup from freezing the display.
+
+```rust
+pub fn frame_is_fresh(frame: &SpectrumFrame, now: Instant) -> bool {
+    now.checked_duration_since(frame.published_at).is_some_and(|age| age < FRAME_MAX_AGE)
+}
+```
 
 - [ ] **Step 1: Write failing tests.**
 
@@ -4429,6 +4638,22 @@ Confirm `force_device_loss` and `await_recovery_capture` behave as their names s
 
 Add to `tests/m5_tui_render.rs`: `the_spectrum_row_draws_levels_and_nothing_in_minimal` — `Visuals { spectrum: Some(&[1.0; 12]), .. }` at 100×30 renders at least one `█`; at 45×16 renders none.
 
+Add the deterministic freshness test below. Also exercise `pause_without_transport_retirement_decays` and `starvation_without_new_pcm_expires_the_latest_frame`: publish a nonzero frame, retain its mapping, stop providing PCM while advancing the injected monotonic time past 150 ms, and assert no fresh levels are drawn; a new window resumes the display. Repeat with analysis disabled/re-enabled and ensure the old latest/pending frame is never revived.
+
+```rust
+#[test]
+fn an_unchanged_frame_expires_even_when_its_revision_still_matches() {
+    use continuo::playback::output::Nanos;
+    use continuo::playback::spectrum::worker::{SpectrumFrame, FRAME_MAX_AGE, frame_is_fresh};
+    let now = Instant::now();
+    let frame = SpectrumFrame { session_rev: 1, bands: vec![(40.0, 85.0)],
+        levels: vec![1.0], at: Nanos(0), published_at: now };
+    assert!(frame_is_fresh(&frame, now));
+    assert!(!frame_is_fresh(&frame, now + FRAME_MAX_AGE));
+    assert!(!frame_is_fresh(&frame, now + Duration::from_secs(10)));
+}
+```
+
 - [ ] **Step 2: Run `cargo test --locked --test m5_spectrum_engine`.** Expected: FAIL.
 - [ ] **Step 3: Implement** the registry, worker, engine wiring and TUI enabling/decay.
 - [ ] **Step 4: Run the engine suites for regressions.**
@@ -4464,7 +4689,7 @@ Each case below is its own subprocess, with its own `Profile`, so a panic, a sig
   5. `a_panic_before_redirection_reaches_the_terminal` — hook `panic-before-redirect`; exit code 101; PTY output contains `continuo test hook: panic-before-redirect`; no `logs/` file contains it.
   6. `a_panic_right_after_redirection_is_printed_on_restored_stderr` — hook `panic-after-redirect`; exit code 101; PTY output contains the hook message.
   7. `a_panic_after_terminal_entry_leaves_the_alternate_screen_first` — hook `panic-after-terminal`; exit 101; in PTY output the last `\x1b[?1049l` appears before the hook message.
-  8. `contained_artwork_and_metadata_panics_keep_the_player_running` — for hooks `artwork-job-panic` and `metadata-job-panic`, `RUST_LOG=continuo=debug`: queue two tagged FLACs with covers (Task 23 helper) and select the active one; wait 2 s; send `q`; exit 0; the log contains `contained panic in background job` and a later successful-job debug line (`artwork job completed` / `metadata job completed`, emitted by the workers at debug level); PTY output does not contain the hook message.
+  8. `contained_artwork_and_metadata_panics_keep_the_player_running` — for hooks `artwork-job-panic`, `artwork-encoding-panic` and `metadata-job-panic`, `RUST_LOG=continuo=debug`: queue two tagged FLACs with covers (Task 23 helper), restore the first active entry and wait for its contained failure; press Down then Enter to activate the second entry and wait for its successful job; send `q`; exit 0; the log contains `contained panic in background job` and a later successful-job debug line (`artwork job completed` / `artwork encoding completed` / `metadata job completed`, emitted at debug level by the corresponding successful job); PTY output does not contain the hook message.
   9. `an_uncontained_worker_panic_restores_the_terminal_and_fails` — hook `worker-panic` (the metadata worker panics outside `run_contained` on its first job); exit code nonzero; `\x1b[?1049l` precedes `a background worker panicked` in PTY output.
   10. `a_play_without_a_terminal_still_honours_signals` is already covered by Task 12; do not duplicate it.
 - [ ] **Step 2: Run `cargo test --locked --test m5_tui_process`.** Expected: the new cases FAIL only where wiring is missing (for example the `worker-panic` hook site or the job-completed debug lines). Implement those missing pieces in the owning modules, keeping each one's own tests green.
@@ -4513,5 +4738,6 @@ git commit -m "test: prove M5 lifecycle guarantees and document the terminal pla
 
 - **Coverage:** every §12 evidence bullet maps to a named test: queue (Tasks 3, 8, 9, 15), state (4, 5, 9, 11), engine/session tokens (7, 8), Ratatui buffers and input (19–21), podcast resolver and no-network (10, 22), artwork (24, 25, 29), spectrum (26–28), subprocess/PTY/signal/redirect/panic (12, 18, 29), manual terminals (29), gates (29).
 - **Placeholders:** no step defers behavior to "later" without naming the task that owns it. Tasks 21, 22 and 29 list their test cases as exact inputs and expected outputs rather than full listings; they reuse helpers defined in Tasks 18–20.
-- **Names checked across tasks:** `LoadRequestId`, `Progress::load`, `LoadTarget`, `RegisterLoadError`, `Advance`, `Removal`, `DisplayUpdate`, `PlaybackPhase`, `TransportDecision`, `AppCommand`, `EnqueueItem`, `PlayerView`, `NowPlaying`, `SavedHistory`, `UiState`, `Overlay`, `Effect`, `HitMap`, `TakeOnceSlot`, `TestHook`, `ArtworkMode`, `CoverCache`, `TapWriter`, `TapRegistry`, `SpectrumHandle` are defined once and used with the same signatures.
-- **Known judgment calls** are listed as Implementation decisions 1–18; any change to them needs a note in the executing task's review.
+- **Names checked across tasks:** `LoadRequestId`, `Progress::load`, `LoadTarget`, `RegisterLoadError`, `Advance`, `Removal`, `DisplayUpdate`, `PlaybackPhase`, `TransportDecision`, `AppCommand`, `EnqueueItem`, `PlayerView`, `NowPlaying`, `SavedHistory`, `UiState`, `Overlay`, `Effect`, `HitMap`, `TakeOnceSlot`, `TestHook`, `ArtworkMode`, `CoverCache`, `prepare_contained`, `TapWriter`, `TapRegistry`, `SpectrumHandle`, `PlayLoaded`, `accepts_media_event`, `frame_is_fresh` are defined once and used with the same signatures.
+- **Review regressions:** Tasks 1 (verified-platform launch isolation), 3–4 (ID exhaustion), 6 and 15 (guarded automatic start and retries), 8 (atomic adoption snapshots and checkpoint ownership), 13 and 15 (seek cancellation), 23 (dependency order), 25 (encoding containment), and 28 (frame expiry) carry the ten review fixes and their checks.
+- **Known judgment calls** are listed as Implementation decisions 1–25; any change to them needs a note in the executing task's review.
