@@ -42,7 +42,7 @@ pub const CACHE_SCHEMA_VERSION: u32 = 1;
 /// mismatch means the file was written by a parser this build no longer
 /// trusts to have produced it — distinct from an unsupported schema, and
 /// recovered by an unconditional refetch rather than a quarantine (§5.4).
-pub const PARSER_VERSION: u32 = 1;
+pub const PARSER_VERSION: u32 = 2;
 
 /// One cached episode: [`Self::episode`]'s exact inputs, plus the enclosure
 /// metadata that is a claim rather than evidence (§2.1) and so never reaches

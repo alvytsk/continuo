@@ -8,6 +8,7 @@
 #[path = "support/feeds.rs"]
 mod feeds;
 
+use continuo::feed::cache::PARSER_VERSION;
 use continuo::feed::error::FeedError;
 use continuo::media::id::{EpisodeKey, FeedId, MediaId};
 use continuo::subscription::model::Subscription;
@@ -215,7 +216,8 @@ fn a_parser_version_mismatch_is_reported_distinctly() -> Result<(), Box<dyn std:
     assert!(
         matches!(
             &error,
-            FeedError::CacheParserMismatch { slug, found: 99, expected: 1 } if *slug == sub.slug
+            FeedError::CacheParserMismatch { slug, found: 99, expected }
+                if *slug == sub.slug && *expected == PARSER_VERSION
         ),
         "expected CacheParserMismatch, got {error:?}"
     );
