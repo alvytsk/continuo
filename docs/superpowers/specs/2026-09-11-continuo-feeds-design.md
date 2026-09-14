@@ -20,7 +20,7 @@ Five new commands, plus a second form for the existing `play`.
 | `continuo unsubscribe <slug>` | Remove the subscription, then delete its cache. Checkpoints are **not** deleted |
 | `continuo feeds` | List subscriptions: slug, retained episode count, when last refreshed, title |
 | `continuo refresh [<slug>]` | Conditional GET one feed, or every feed when no slug is given. One outcome per feed |
-| `continuo episodes <slug> [-n N]` | Read the cache only, never the network. Numbered listing with progress |
+| `continuo episodes <slug> [-n N] [--reverse]` | Read the cache only, never the network. Numbered listing with progress |
 | `continuo play <slug> <index> [--probe-only]` | Resolve to a `MediaId::PodcastEpisode` plus its enclosure, then run the existing playback path |
 
 `play` distinguishes its two forms by arity: one positional is a path or an HTTP(S) URL — the M1–M3 behavior,
@@ -37,6 +37,13 @@ Numbering is contiguous over the **retained** list — after unusable items are 
 episode keys deduplicated (§4.7). Index 1 is the first retained item, with **no chronological guarantee**.
 Feeds are conventionally newest-first, so it is usually the newest episode, but nothing here promises that.
 `-n N` truncates the displayed list without changing any index (§6.3).
+
+**`--reverse`, added after M4's first real feeds.** Document order is not a fixed direction: Radio-T is
+newest-first, but web-standards is oldest-first, so its newest episode is index 542 and `-n 5` showed its
+five oldest. `--reverse` displays the retained list from its end, and `-n` then counts from that end. It
+changes display order only — every row keeps the index `play <slug> <index>` resolves — and it is not a
+date sort, because this section has already declined to trust those dates. On a newest-first feed it puts
+the oldest episode on top, which is correct: it reverses the feed, it does not guess its direction.
 
 ### 1.3 Targeted changes to existing code
 
@@ -85,7 +92,7 @@ Two, both direct:
 ### 1.5 Non-goals
 
 No queue or autoplay-next — M4 adds no field to `PersistedState`. No background or automatic refresh, no
-episode download or offline audio, no OPML import or export, no search or filtering beyond `-n`, no
+episode download or offline audio, no OPML import or export, no search or filtering beyond `-n` (and `--reverse`, which orders rather than filters — see §1.2), no
 mark-played, no rename command, no unreferenced-cache sweep, no locking against concurrent processes, and
 no TUI.
 

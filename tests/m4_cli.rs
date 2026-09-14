@@ -22,6 +22,46 @@ fn play_selectors_are_positive_and_single_source_still_parses()
     Ok(())
 }
 
+/// `--reverse` belongs to `episodes`, after the subcommand, and composes with
+/// `-n` in either position.
+#[test]
+fn reverse_is_an_episodes_option_that_composes_with_the_limit()
+-> Result<(), Box<dyn std::error::Error>> {
+    for args in [
+        vec!["continuo", "episodes", "web-standarts", "--reverse"],
+        vec!["continuo", "episodes", "--reverse", "web-standarts"],
+        vec![
+            "continuo",
+            "episodes",
+            "web-standarts",
+            "--reverse",
+            "-n",
+            "5",
+        ],
+        vec![
+            "continuo",
+            "episodes",
+            "web-standarts",
+            "-n",
+            "5",
+            "--reverse",
+        ],
+    ] {
+        let parsed = Cli::try_parse_from(&args)?;
+        assert!(
+            matches!(parsed.command, CliCommand::Episodes { reverse: true, .. }),
+            "{args:?}"
+        );
+    }
+    let plain = Cli::try_parse_from(["continuo", "episodes", "web-standarts"])?;
+    assert!(matches!(
+        plain.command,
+        CliCommand::Episodes { reverse: false, .. }
+    ));
+    assert!(Cli::try_parse_from(["continuo", "--reverse", "episodes", "web-standarts"]).is_err());
+    Ok(())
+}
+
 /// The two `play` forms are one and two positionals; a third is not a
 /// spelling this CLI has, and accepting it silently would mean an ignored
 /// argument rather than a reported mistake.
@@ -129,7 +169,8 @@ fn episodes_requires_a_slug_and_a_positive_limit() -> Result<(), Box<dyn std::er
         bare.command,
         CliCommand::Episodes {
             ref slug,
-            limit: None
+            limit: None,
+            reverse: false,
         } if slug == "radio-t"
     ));
 

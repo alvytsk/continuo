@@ -63,6 +63,7 @@ confirmed position.
     continuo subscribe http://feeds.rucast.net/radio-t --as radio-t
     continuo feeds
     continuo episodes radio-t -n 5
+    continuo episodes web-standarts --reverse -n 5
     continuo play radio-t 3
     continuo play radio-t 3 --probe-only
     continuo refresh radio-t
@@ -135,6 +136,14 @@ Episode indices are 1-based and follow **feed order** — the order the
 document listed its items, never re-sorted by date or title. `-n 5` changes
 how many rows are displayed, never what an index means: index 3 is the third
 item in the cached list whether you print five rows or all of them.
+
+Feeds are not all ordered the same way. Radio-T lists its newest episode first;
+web-standards lists its first episode of 2016 first, so its newest is index 542.
+`--reverse` starts from the end of the feed instead, and `-n` then counts from
+the end: `continuo episodes web-standarts --reverse -n 5` shows its five newest.
+Every row keeps its index, so `play` still resolves the number you read. It is
+the feed's own order reversed, not a sort by date — on Radio-T it puts the
+oldest episode on top.
 
 Indices renumber only when a `refresh` replaces the cache. Between refreshes
 they are stable, so `continuo episodes radio-t` followed by `continuo play

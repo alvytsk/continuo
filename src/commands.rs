@@ -42,14 +42,22 @@ pub fn run(command: CliCommand) -> Result<(), FeedError> {
             let (subs, cache) = platform_subscription_stores()?;
             write_feeds(&mut out, &crate::library::list_feeds(&subs, &cache)?)
         }
-        CliCommand::Episodes { slug, limit } => {
+        CliCommand::Episodes {
+            slug,
+            limit,
+            reverse,
+        } => {
             let (subs, cache) = platform_subscription_stores()?;
             // Read before listing, and surfaced rather than defaulted: a
             // state file that cannot be read is not "nothing has played",
             // and printing every episode as unplayed would misreport a
             // listener's whole history as empty (§5.5).
             let state = platform_state_store()?.read_snapshot()?;
-            let rows = crate::library::list_episodes(&subs, &cache, &state, &slug, limit)?;
+            // Reversing has to see every row before `-n` truncates, or it would
+            // reverse the first N rather than show the last N.
+            let fetch = if reverse { None } else { limit };
+            let rows = crate::library::list_episodes(&subs, &cache, &state, &slug, fetch)?;
+            let rows = if reverse { reversed(rows, limit) } else { rows };
             write_episodes(&mut out, &rows)
         }
         CliCommand::Subscribe { url, slug } => {
@@ -218,6 +226,20 @@ fn date_text(value: OffsetDateTime) -> String {
 /// the terminal, so every character that can do either becomes a visible
 /// escape; all the rest — Cyrillic, CJK, emoji — pass through exactly as
 /// stored, since transliterating a title would make it someone else's title.
+/// The listing in reverse, cut to `limit` from the end.
+///
+/// §1.2 keeps feed document order and never renumbers, so this changes only
+/// the order rows are shown in: each row keeps the index `play <slug> <index>`
+/// resolves. It is deliberately not called newest-first. Reversing an
+/// oldest-first feed such as web-standards does put the newest episode on top,
+/// but reversing a newest-first feed such as Radio-T puts the oldest there, and
+/// §1.2 declines to guess which kind a feed is from dates it does not trust.
+fn reversed(mut rows: Vec<EpisodeRow>, limit: Option<std::num::NonZeroUsize>) -> Vec<EpisodeRow> {
+    rows.reverse();
+    rows.truncate(limit.map_or(usize::MAX, std::num::NonZeroUsize::get));
+    rows
+}
+
 pub(crate) fn displayable(text: &str) -> String {
     if !text.chars().any(needs_escape) {
         return text.to_string();
@@ -692,6 +714,43 @@ mod tests {
             "SLUG        EPISODES  REFRESHED (UTC)   TITLE\n\
              radio-t          412  2026-09-11 09:14  Радио-Т\n\
              sysdesign          —  never             System Design\n"
+        );
+        Ok(())
+    }
+
+    /// `--reverse` is display order only: `play <slug> <index>` resolves the
+    /// index a row shows, so a reversed listing that renumbered would send the
+    /// listener to a different episode than the one they read.
+    #[test]
+    fn reversing_keeps_every_index_and_counts_the_limit_from_the_end() -> Fallible {
+        let rows = (1..=6)
+            .map(|index| {
+                Ok(EpisodeRow {
+                    index,
+                    media: media(&format!("https://cdn.example.org/{index}.mp3"))?,
+                    title: Some(format!("{index}.")),
+                    published: None,
+                    declared_duration: None,
+                    playable: true,
+                    progress: Progress::None,
+                })
+            })
+            .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
+
+        let all: Vec<usize> = reversed(rows.clone(), None)
+            .iter()
+            .map(|row| row.index)
+            .collect();
+        assert_eq!(all, vec![6, 5, 4, 3, 2, 1]);
+
+        let last_two: Vec<usize> = reversed(rows, std::num::NonZeroUsize::new(2))
+            .iter()
+            .map(|row| row.index)
+            .collect();
+        assert_eq!(
+            last_two,
+            vec![6, 5],
+            "-n counts from the end, not the first N reversed"
         );
         Ok(())
     }

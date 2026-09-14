@@ -56,6 +56,11 @@ pub enum CliCommand {
         /// Display only the first N episodes. Indices never change (§6.3).
         #[arg(short = 'n', value_parser = positive_count)]
         limit: Option<NonZeroUsize>,
+        /// Start from the end of the feed. Every episode keeps its index, and
+        /// `-n` then counts from the end. Feeds are not always newest-first,
+        /// so this is the feed's order reversed, not a sort by date.
+        #[arg(long)]
+        reverse: bool,
     },
 }
 
