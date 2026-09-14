@@ -9,6 +9,7 @@ pub mod library;
 pub mod media;
 pub mod persistence;
 pub mod playback;
+pub mod queue;
 pub mod resume;
 pub mod session;
 pub mod subscription;
