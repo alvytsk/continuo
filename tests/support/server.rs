@@ -80,6 +80,25 @@ impl RecordedRequest {
     }
 }
 
+/// One scripted document response, matched by request path (§3.2/§3.3
+/// harness support for Task 6+).
+///
+/// `conditional: true` makes the route answer 304 when the incoming request
+/// carries a validator that matches this route's own `ETag`/`Last-Modified`
+/// header (checked in that order — an `If-None-Match` match wins outright;
+/// only its absence falls back to comparing `If-Modified-Since`). The 304
+/// still carries whatever `ETag`/`Last-Modified` are present in `headers`,
+/// unchanged — this harness never fabricates a different value for it.
+#[derive(Clone, Debug)]
+pub struct DocumentReply {
+    pub path: String,
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+    pub conditional: bool,
+    pub header_delay: Duration,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Script {
     body: Vec<u8>,
@@ -105,6 +124,10 @@ pub struct Script {
     // Not in the brief's outline, but `trickle` is in the Interfaces block,
     // which the task ruling makes binding: pacing needs its own state.
     trickle: Option<(usize, Duration)>,
+    // `Some` routes every request through `write_document_reply` by path
+    // instead of the media-serving logic below; `None` leaves every existing
+    // `Script` behavior untouched.
+    documents: Option<Vec<DocumentReply>>,
 }
 
 impl Script {
@@ -221,6 +244,17 @@ impl Script {
     pub fn stall_headers(mut self) -> Self {
         self.stall_headers = true;
         self
+    }
+
+    /// A server that answers document (feed) requests by path, per
+    /// `DocumentReply`, instead of serving the single ranged `body` the rest
+    /// of `Script` is built around. A request path with no matching route
+    /// gets a plain 404.
+    pub fn documents(replies: Vec<DocumentReply>) -> Self {
+        Self {
+            documents: Some(replies),
+            ..Default::default()
+        }
     }
 
     /// Pace the scripted body: emit `bytes` at a time, `gap` apart.
@@ -397,8 +431,12 @@ fn reason_phrase(code: u16) -> &'static str {
     match code {
         200 => "OK",
         206 => "Partial Content",
+        301 => "Moved Permanently",
         302 => "Found",
+        303 => "See Other",
         304 => "Not Modified",
+        307 => "Temporary Redirect",
+        308 => "Permanent Redirect",
         400 => "Bad Request",
         401 => "Unauthorized",
         403 => "Forbidden",
@@ -469,6 +507,77 @@ fn write_redirect(stream: &mut TcpStream, location: &str) {
         "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
     );
     let _ = stream.write_all(response.as_bytes());
+}
+
+/// Looks up the route matching `path`, exactly, among `documents`.
+fn find_document_reply<'a>(
+    documents: &'a [DocumentReply],
+    path: &str,
+) -> Option<&'a DocumentReply> {
+    documents.iter().find(|reply| reply.path == path)
+}
+
+/// Writes one scripted document response: applies the route's own header
+/// delay, decides whether an eligible `conditional` route answers 304, then
+/// writes headers plus `Content-Length` — computed from the actual bytes
+/// about to be sent, never trusted to anything the route author typed — and
+/// the body only when the response carries one at all.
+///
+/// Called only once `stall_headers`/`release` have already run their course
+/// for this connection (`handle_connection` checks that first), so a test
+/// can still stall an entire connection before any document route answers.
+fn write_document_reply(
+    stream: &mut TcpStream,
+    reply: &DocumentReply,
+    request: &RecordedRequest,
+) -> std::io::Result<()> {
+    if !reply.header_delay.is_zero() {
+        std::thread::sleep(reply.header_delay);
+    }
+
+    let route_header = |name: &str| -> Option<&str> {
+        reply
+            .headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    };
+
+    let mut status = reply.status;
+    if reply.conditional {
+        let route_etag = route_header("etag");
+        let route_last_modified = route_header("last-modified");
+        let matched = match (request.header("if-none-match"), route_etag) {
+            (Some(inm), Some(etag)) => inm == etag,
+            (None, _) => matches!(
+                (request.header("if-modified-since"), route_last_modified),
+                (Some(ims), Some(lm)) if ims == lm
+            ),
+            _ => false,
+        };
+        if matched {
+            status = 304;
+        }
+    }
+
+    // A 304 never carries a body, whatever the route was scripted with.
+    let body: &[u8] = if status == 304 { &[] } else { &reply.body };
+
+    let mut header = format!(
+        "HTTP/1.1 {status} {reason}\r\n",
+        reason = reason_phrase(status)
+    );
+    for (name, value) in &reply.headers {
+        header.push_str(&format!("{name}: {value}\r\n"));
+    }
+    header.push_str(&format!("Content-Length: {}\r\n", body.len()));
+    header.push_str("Connection: close\r\n\r\n");
+
+    stream.write_all(header.as_bytes())?;
+    if !body.is_empty() {
+        stream.write_all(body)?;
+    }
+    Ok(())
 }
 
 fn write_416(stream: &mut TcpStream, len: usize) {
@@ -687,10 +796,31 @@ fn handle_connection(
 
     if script.stall_headers {
         gate.park();
-        return;
+        // Every media-serving test below relies on a stalled connection
+        // simply closing once released — the client never receives a byte
+        // (see `http_cancellation.rs`'s case 3). A scripted `documents`
+        // route is the one deliberate exception: `write_document_reply`'s
+        // own doc comment already describes it — a document response
+        // answered only once `stall_headers`/`release` have run their
+        // course — which is what lets a commit-boundary failure injection
+        // (M4 Task 12) prove a request left the client before its response
+        // exists at all, then let that response land for real afterward.
+        if script.documents.is_none() {
+            return;
+        }
     }
 
     let stream = reader.get_mut();
+
+    if let Some(documents) = &script.documents {
+        match find_document_reply(documents, &recorded.path) {
+            Some(reply) => {
+                let _ = write_document_reply(stream, reply, &recorded);
+            }
+            None => write_status_only(stream, 404),
+        }
+        return;
+    }
 
     if let Some(code) = script.status_override {
         write_status_only(stream, code);

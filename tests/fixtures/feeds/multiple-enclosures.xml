@@ -1,0 +1,13 @@
+<?xml version="1.0"?>
+<rss version="2.0">
+  <channel>
+    <title>Many enclosures</title>
+    <item>
+      <guid>many</guid>
+      <enclosure url="gopher://example.org/skipped.mp3"/>
+      <enclosure url="https://example.org/chosen.mp3" length="7" type="audio/mpeg"/>
+      <enclosure url="https://example.org/extra.mp3"/>
+      <enclosure url="https://example.org/also-extra.mp3"/>
+    </item>
+  </channel>
+</rss>

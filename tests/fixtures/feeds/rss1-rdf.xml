@@ -1,0 +1,11 @@
+<?xml version="1.0"?>
+<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#" xmlns="http://purl.org/rss/1.0/">
+  <channel rdf:about="https://example.org/">
+    <title>RSS 1.0</title>
+    <link>https://example.org/</link>
+  </channel>
+  <item rdf:about="https://example.org/1">
+    <title>One</title>
+    <link>https://example.org/1</link>
+  </item>
+</rdf:RDF>

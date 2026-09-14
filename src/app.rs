@@ -42,16 +42,67 @@ const VOLUME_STEP: f32 = 0.05;
 const HELP_LINE: &str =
     "space pause · ←/→ seek 10s · Home restart · -/+ volume · s stop · p play · q quit";
 
-/// Runs the parsed CLI to completion.
-pub fn run(cli: cli::Cli) -> Result<(), PlaybackError> {
-    let CliCommand::Play { source, probe_only } = cli.command;
-
-    if probe_only {
-        return run_probe_only(&source);
+/// Runs the parsed CLI to completion (design doc §6.5).
+///
+/// Both `play` forms resolve their `(MediaId, SourceLocation)` pair *before*
+/// entering the shared playback body: one positional through the existing
+/// [`resolve_source`], two through [`crate::library::resolve_episode`].
+/// `resolve_source` itself is unchanged; it gained a sibling. Everything
+/// else dispatches to [`crate::commands`], which owns every line this
+/// program prints for a feed command, the one synchronous bridge into the
+/// HTTP runtime, and the exit status a partial failure has to carry.
+pub fn run(cli: cli::Cli) -> Result<(), crate::error::AppError> {
+    match cli.command {
+        CliCommand::Play {
+            source,
+            index: None,
+            probe_only,
+        } => {
+            if probe_only {
+                return run_probe_only(&source).map_err(Into::into);
+            }
+            let (media, location) = resolve_source(&source)?;
+            run_resolved(media, location).map_err(Into::into)
+        }
+        CliCommand::Play {
+            source: slug,
+            index: Some(index),
+            probe_only,
+        } => {
+            // No `EngineHandle`, no `AudioOutput` and no `HttpService` exist
+            // yet, which is what keeps `NotPlayable` (§6.4) a resolution
+            // failure rather than a playback one.
+            let (subs, cache) = crate::commands::platform_subscription_stores()?;
+            let (media, location) =
+                crate::library::resolve_episode(&subs, &cache, &slug, index.get())?;
+            if probe_only {
+                // §6.3: the probe applies *after* resolution, over the
+                // enclosure this episode actually points at. The `RemoteUrl`
+                // identity `run_probe_only` derives internally is never
+                // persisted — the probe writes no state at all — so the
+                // podcast identity resolved above is not diluted by it.
+                if let SourceLocation::Http(url) = &location {
+                    return run_probe_only(url.as_str()).map_err(Into::into);
+                }
+                return Err(crate::feed::error::FeedError::Malformed {
+                    detail: "podcast cache contained a non-HTTP source".into(),
+                }
+                .into());
+            }
+            // The podcast `MediaId` travels on unchanged: what is played is
+            // the enclosure, what is checkpointed is the episode.
+            run_resolved(media, location).map_err(Into::into)
+        }
+        command => crate::commands::run(command).map_err(Into::into),
     }
+}
 
-    let (media, location) = resolve_source(&source)?;
-
+/// The shared playback body: persistence open, engine assembly, resume,
+/// session, both key loops and the shutdown. Unchanged from when it was
+/// `run`'s own tail — it only stopped resolving its own source, so that one
+/// caller can hand it a local file or a URL and the other a podcast episode
+/// and nothing downstream can tell which.
+fn run_resolved(media: MediaId, location: SourceLocation) -> Result<(), PlaybackError> {
     // Persistence opens before the engine: the resume candidate is an
     // argument to the load, and the restored volume is a command that
     // precedes it.
@@ -1056,7 +1107,10 @@ impl Mirror {
                 ..
             } => {
                 self.session_rev = session_rev;
-                self.name = Some(display_name(&media));
+                self.name = Some(match &media {
+                    MediaId::PodcastEpisode { .. } => episode_name(metadata.title.as_deref()),
+                    other => display_name(other),
+                });
                 self.duration = metadata.duration;
                 self.capabilities = Some(capabilities);
                 self.position = position;
@@ -1147,6 +1201,22 @@ impl Mirror {
     }
 }
 
+/// What the status row calls a podcast episode: its title.
+///
+/// `display_name` gives a local file its basename and a remote URL its last
+/// path segment, and a podcast episode fell through to the canonical id —
+/// `podcast:<feed>/guid:https:%2F%2F…`, about 110 characters of identifier and
+/// nothing a listener recognises. The decoder's title is the same name
+/// `--probe-only` prints and the one `continuo episodes` lists, so `play
+/// radio-t 1` now reads the way the listing that chose it did. Untitled audio
+/// gets the `(untitled)` spelling the probe and the listing already use.
+fn episode_name(title: Option<&str>) -> String {
+    title
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+        .map_or_else(|| "(untitled episode)".to_owned(), str::to_owned)
+}
+
 fn display_name(media: &MediaId) -> String {
     match media {
         MediaId::LocalFile(path) => path
@@ -1207,22 +1277,71 @@ fn to_command(key: KeyEvent, mirror: &Mirror) -> Option<PlaybackCommand> {
 
 fn render(mirror: &Mirror) -> Result<(), PlaybackError> {
     let mut out = std::io::stdout();
+    // The frame is two rows that are repainted in place: clear a row, print,
+    // then step back up one. That arithmetic only holds while each row
+    // occupies exactly one physical line, so anything wider than the terminal
+    // has to be cut before it is printed (see `fit_to_width`).
+    let width = crossterm::terminal::size()
+        .map(|(columns, _)| usize::from(columns))
+        .unwrap_or(80);
     execute!(
         out,
         cursor::MoveToColumn(0),
         Clear(ClearType::CurrentLine),
-        Print(status_line(mirror)),
+        Print({
+            let (name, fields) = status_parts(mirror);
+            fit_status(&name, &fields, width)
+        }),
         Print("\r\n"),
         Clear(ClearType::CurrentLine),
-        Print(HELP_LINE),
+        Print(fit_to_width(HELP_LINE, width)),
         cursor::MoveToColumn(0),
         cursor::MoveUp(1),
     )?;
     Ok(())
 }
 
+/// Cut `text` to `width` terminal columns, marking the cut with an ellipsis.
+///
+/// A row wider than the terminal wraps onto a second physical line, and
+/// `render`'s `MoveUp(1)` then lands inside the frame it was trying to
+/// overwrite, so every repaint walks one row further down the screen. A
+/// podcast episode's canonical id runs to about 110 characters and makes that
+/// reachable with ordinary input, but a long enough filename always could.
+///
+/// Counting is by `char`, which keeps multi-byte titles intact — Cyrillic
+/// episode names are the common case here. It still treats a wide glyph as one
+/// column, so a CJK title can cut one row short of the edge; erring narrow
+/// keeps the redraw correct, which is the property that matters.
+fn fit_to_width(text: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    if text.chars().count() <= width {
+        return text.to_owned();
+    }
+    text.chars()
+        .take(width.saturating_sub(1))
+        .chain(std::iter::once('…'))
+        .collect()
+}
+
+/// The status row joined, unfitted — what the row says before `render` fits
+/// it to a terminal. Only the tests read the whole row as one string.
+#[cfg(test)]
 fn status_line(mirror: &Mirror) -> String {
-    let name = mirror.name.as_deref().unwrap_or("(no media)");
+    let (name, fields) = status_parts(mirror);
+    format!("{name}{fields}")
+}
+
+/// The status row as its two halves: the name, and the fields after it.
+///
+/// They are kept apart so `render` can decide which to shorten. The name is
+/// escaped here, at the row's formatting boundary: an episode title is decoder
+/// metadata from the network, and the escaping is `commands::displayable`, the
+/// same policy the listings apply to feed titles.
+fn status_parts(mirror: &Mirror) -> (String, String) {
+    let name = crate::commands::displayable(mirror.name.as_deref().unwrap_or("(no media)"));
     let position = format_hms(mirror.position);
     // Two independent marks for two independent facts (§3): a degraded
     // quality says the played-so-far estimate may be off, while `~est` says
@@ -1255,10 +1374,28 @@ fn status_line(mirror: &Mirror) -> String {
     if mirror.buffering && mirror.state == PlaybackState::Playing {
         label.push_str(" buffering");
     }
-    format!(
-        "{name} [{label}]{seek_note} {position}{suffix} / {duration}  vol {}%",
+    let fields = format!(
+        " [{label}]{seek_note} {position}{suffix} / {duration}  vol {}%",
         mirror.volume.percent(),
-    )
+    );
+    (name, fields)
+}
+
+/// Fit a status row into `width` columns by shortening the name first.
+///
+/// State, position, duration and volume are what the row is read for; the name
+/// only says what is playing. So the fields keep their full width while they
+/// fit at all, and the name gives way — cutting from the right of the whole
+/// row instead kept a hundred characters of identifier and discarded the
+/// position. If even the fields alone are wider than the terminal, the row is
+/// still cut rather than wrapped, because a wrapped row is what breaks the
+/// in-place repaint.
+fn fit_status(name: &str, fields: &str, width: usize) -> String {
+    let fields_width = fields.chars().count();
+    if fields_width >= width {
+        return fit_to_width(&format!("{name}{fields}"), width);
+    }
+    format!("{}{fields}", fit_to_width(name, width - fields_width))
 }
 
 fn format_hms(duration: Duration) -> String {
@@ -1274,6 +1411,7 @@ mod tests {
     use super::*;
     use crate::clock::FakeClock;
     use crate::media::capabilities::{Continuity, MediaCapabilities, SeekSupport};
+    use crate::media::id::{EpisodeKey, FeedId};
     use crate::media::metadata::MediaMetadata;
     use crate::playback::checkpoint::PlaybackCheckpoint;
     use crate::playback::event::StartDisposition;
@@ -1322,6 +1460,46 @@ mod tests {
         // lowers it: an unshifted key exists for each.
         assert!(volume_after(KeyCode::Char('='), 0.5).is_some());
         assert!(volume_after(KeyCode::Char('-'), 0.5).is_some());
+    }
+
+    /// §6.5's handoff: `run_resolved` plays whatever pair it is handed, and
+    /// the identity in the `Load` it issues is that pair's own — never one
+    /// re-derived from the source. For a podcast episode the two differ:
+    /// what is played is the enclosure, what is checkpointed is the episode,
+    /// and only the latter survives a feed moving its audio to another CDN.
+    #[test]
+    fn a_resolved_podcast_pair_loads_the_episode_identity_not_the_enclosure() {
+        let enclosure = "https://cdn.example.org/987.mp3";
+        let (feed, episode) = match (
+            FeedId::new("0123456789abcdef0123456789abcdef".to_string()),
+            EpisodeKey::resolve(Some("ep-987"), None, None),
+        ) {
+            (Ok(feed), Ok(episode)) => (feed, episode),
+            (feed, episode) => panic!("literal identities must parse: {feed:?} {episode:?}"),
+        };
+        let media = MediaId::PodcastEpisode { feed, episode };
+        let location = match Url::parse(enclosure) {
+            Ok(url) => SourceLocation::Http(url),
+            Err(error) => panic!("a literal URL must parse: {error}"),
+        };
+
+        let commands = resume_commands(media.clone(), location, None, Volume::FULL);
+        match &commands[1] {
+            PlaybackCommand::Load {
+                media: loaded,
+                source,
+                resume,
+            } => {
+                assert_eq!(loaded, &media);
+                assert!(matches!(source, SourceLocation::Http(url) if url.as_str() == enclosure));
+                assert!(matches!(resume, ResumeIntent::StartAt(at) if *at == Duration::ZERO));
+                match NormalizedUrl::parse(enclosure) {
+                    Ok(url) => assert_ne!(loaded, &MediaId::RemoteUrl(url)),
+                    Err(error) => panic!("a literal URL must normalize: {error}"),
+                }
+            }
+            other => panic!("the second command must be the load: {other:?}"),
+        }
     }
 
     fn local(path: &str) -> MediaId {
@@ -1760,6 +1938,112 @@ mod tests {
                 .unwrap_or_else(|error| panic!("a well-formed URL must parse: {error}")),
         );
         assert_eq!(display_name(&media), "cdn.example.com");
+    }
+
+    // -------------------------------------------------------- fit_to_width
+
+    /// The bug this exists for: a podcast episode's canonical id is far wider
+    /// than a terminal, and an over-wide row made `render`'s repaint walk down
+    /// the screen instead of overwriting itself.
+    #[test]
+    fn a_media_id_wider_than_the_terminal_is_cut_to_one_row() {
+        let media = MediaId::PodcastEpisode {
+            feed: FeedId::new("beface6be47994b61e579fb92384dfb9".to_owned())
+                .expect("a valid feed id"),
+            episode: EpisodeKey::resolve(
+                Some("https://radio-t.com/p/2026/09/12//podcast-1030/"),
+                None,
+                None,
+            )
+            .expect("a valid episode key"),
+        };
+        let name = display_name(&media);
+        assert!(name.chars().count() > 80, "precondition: {name}");
+        let fitted = fit_to_width(&name, 80);
+        assert_eq!(fitted.chars().count(), 80);
+        assert!(fitted.ends_with('…'));
+    }
+
+    /// Counting by `char` rather than by byte: a byte-wise cut lands inside a
+    /// two-byte Cyrillic letter and panics, and Cyrillic episode titles are
+    /// the common case for the feed that surfaced this.
+    #[test]
+    fn a_cyrillic_row_is_cut_between_characters_not_inside_one() {
+        let fitted = fit_to_width("Радио-Т 1030 играет прямо сейчас", 10);
+        assert_eq!(fitted.chars().count(), 10);
+        assert_eq!(fitted, "Радио-Т 1…");
+    }
+
+    #[test]
+    fn a_row_that_already_fits_is_left_exactly_alone() {
+        assert_eq!(fit_to_width("short", 80), "short");
+        assert_eq!(fit_to_width("exactly-ten", 11), "exactly-ten");
+        assert_eq!(fit_to_width("anything", 0), "");
+    }
+
+    // ------------------------------------------------ episode name and fit
+
+    #[test]
+    fn a_podcast_episode_is_named_by_its_title_not_its_canonical_id() {
+        assert_eq!(episode_name(Some("Радио-Т 1030")), "Радио-Т 1030");
+        assert_eq!(episode_name(Some("  padded  ")), "padded");
+        assert_eq!(episode_name(None), "(untitled episode)");
+        assert_eq!(episode_name(Some("   ")), "(untitled episode)");
+    }
+
+    /// The regression the first fix introduced: cutting the whole row from the
+    /// right kept ~110 characters of identifier and discarded the position,
+    /// which is the one thing a listener reads the row for.
+    #[test]
+    fn a_long_name_gives_way_so_the_position_stays_visible() {
+        let name = "x".repeat(200);
+        let fields = " [playing] 00:00:04 / 03:07:31  vol 80%";
+        let row = fit_status(&name, fields, 80);
+        assert_eq!(row.chars().count(), 80);
+        assert!(
+            row.ends_with(fields),
+            "the fields must survive whole: {row}"
+        );
+        assert!(row.contains('…'), "the name is what was cut: {row}");
+    }
+
+    #[test]
+    fn a_row_narrower_than_its_own_fields_is_still_cut_not_wrapped() {
+        let row = fit_status(
+            "Радио-Т 1030",
+            " [playing] 00:00:04 / 03:07:31  vol 80%",
+            12,
+        );
+        assert_eq!(row.chars().count(), 12);
+    }
+
+    #[test]
+    fn a_row_that_fits_keeps_its_whole_name() {
+        let fields = " [playing] 00:00:04 / 03:07:31  vol 80%";
+        assert_eq!(
+            fit_status("Радио-Т 1030", fields, 80),
+            format!("Радио-Т 1030{fields}")
+        );
+    }
+
+    /// An episode title is decoder metadata off the network, so it reaches the
+    /// terminal through the same escaping the listings give feed titles.
+    #[test]
+    fn a_title_carrying_a_terminal_escape_is_rendered_inert() {
+        let mirror = Mirror {
+            name: Some("Радио-Т\u{1b}[2J\u{202e}1030".to_owned()),
+            ..Mirror::default()
+        };
+        let (name, _) = status_parts(&mirror);
+        assert!(
+            !name.contains('\u{1b}'),
+            "raw ESC reached the row: {name:?}"
+        );
+        assert!(
+            !name.contains('\u{202e}'),
+            "raw bidi override reached the row: {name:?}"
+        );
+        assert!(name.starts_with("Радио-Т"));
     }
 
     // --------------------------------------------------------- status_line

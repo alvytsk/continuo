@@ -5,6 +5,7 @@
 //! worker does everything else.
 
 pub mod channel;
+pub mod document;
 pub mod error;
 pub mod limits;
 pub mod response;

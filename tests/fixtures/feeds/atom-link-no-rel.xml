@@ -1,0 +1,15 @@
+<?xml version="1.0"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <title>Links without rel</title>
+  <link href="https://example.org/site/"/>
+  <entry>
+    <title>Alternate by default</title>
+    <link href="https://example.org/episodes/1"/>
+  </entry>
+  <entry>
+    <title>The first alternate wins</title>
+    <link rel="related" href="https://example.org/related"/>
+    <link href="https://example.org/episodes/2"/>
+    <link rel="alternate" href="https://example.org/episodes/2b"/>
+  </entry>
+</feed>

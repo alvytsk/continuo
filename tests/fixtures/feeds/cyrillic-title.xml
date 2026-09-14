@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>Радио «Континуо» — сезон 1</title>
+    <link>https://example.org/</link>
+    <item>
+      <guid>urn:example:пролог</guid>
+      <title>Пролог: тишина и шум</title>
+    </item>
+  </channel>
+</rss>

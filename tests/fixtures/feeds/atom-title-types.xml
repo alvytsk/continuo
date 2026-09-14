@@ -1,0 +1,16 @@
+<?xml version="1.0"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <title type="text">Plain &amp; simple &lt;b&gt;</title>
+  <entry>
+    <id>absent-type</id>
+    <title>No type at all &amp; fine</title>
+  </entry>
+  <entry>
+    <id>html</id>
+    <title type="html">Part &lt;b&gt;one&lt;/b&gt; &amp; two</title>
+  </entry>
+  <entry>
+    <id>xhtml</id>
+    <title type="xhtml"><div xmlns="http://www.w3.org/1999/xhtml">Part <b>one</b> &amp; <i>two</i></div></title>
+  </entry>
+</feed>

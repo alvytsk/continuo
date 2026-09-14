@@ -34,6 +34,9 @@ pub struct Limits {
     /// One application transfer chunk, on top of `buffer_bytes`.
     pub chunk_bytes: usize,
     pub max_redirects: u8,
+    /// Caps a feed document's whole body (§3.4), enforced while streaming —
+    /// never trusted to a declared `Content-Length` alone.
+    pub document_bytes: usize,
 }
 
 impl Default for Limits {
@@ -47,6 +50,7 @@ impl Default for Limits {
             buffer_bytes: 1 << 20,
             chunk_bytes: 64 << 10,
             max_redirects: 5,
+            document_bytes: 8 << 20,
         }
     }
 }

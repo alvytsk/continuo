@@ -95,6 +95,27 @@ impl HttpService {
         &self.limits
     }
 
+    /// The runtime handle `fetch_document`'s caller blocks on.
+    ///
+    /// `fetch_document` itself never blocks: the CLI bridge calls
+    /// `service.handle().block_on(service.fetch_document(req))`, and M5
+    /// awaits the same future on this handle's runtime without blocking its
+    /// own event loop (§3.1).
+    pub fn handle(&self) -> tokio::runtime::Handle {
+        self.runtime.handle().clone()
+    }
+
+    /// One whole-body, unranged document GET — the feed transport beside
+    /// `fetch`'s media one. Reuses this service's client and `Limits`, never
+    /// its runtime: the returned future is driven by whatever runtime the
+    /// caller awaits it on.
+    pub async fn fetch_document(
+        &self,
+        request: super::document::DocumentRequest,
+    ) -> Result<super::document::DocumentOutcome, RemoteFailure> {
+        super::document::fetch_document(self.client.clone(), self.limits, request).await
+    }
+
     /// One request. Follows redirects manually, validates the response, and
     /// spawns the task that streams the body into `channel`.
     ///
@@ -157,7 +178,7 @@ impl HeaderWait {
 /// embed verbatim — which, for a signed media URL, is a query string a
 /// diagnostic must never carry (§11). `redact_url` reattaches a safe form of
 /// the same URL when the error had one at all.
-fn transport_detail(error: reqwest::Error) -> String {
+pub(super) fn transport_detail(error: reqwest::Error) -> String {
     let redacted = error.url().map(|url| redact_url(url.as_str()));
     let message = error.without_url().to_string();
     match redacted {
