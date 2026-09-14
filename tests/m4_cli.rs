@@ -9,7 +9,7 @@
 //! the wrong arguments.
 
 #[path = "support/process.rs"]
-mod process_helper;
+mod process;
 
 use clap::Parser;
 use continuo::cli::{Cli, CliCommand};
@@ -240,7 +240,7 @@ mod support;
 /// rely on are covered platform-independently by the unit tests inside
 /// `src/commands.rs`, against injected writers rather than a process.
 #[cfg(target_os = "linux")]
-mod process {
+mod cli_process {
     use std::path::{Path, PathBuf};
     use std::process::{Child, Command, Output, Stdio};
     use std::time::{Duration, Instant};
@@ -255,7 +255,7 @@ mod process {
     const CHILD_PATIENCE: Duration = Duration::from_secs(20);
 
     fn command(root: &Path, args: &[&str]) -> Command {
-        let mut command = super::process_helper::command_in(root);
+        let mut command = super::process::command_in(root);
         command.args(args).env("RUST_LOG", "continuo=warn");
         command
     }

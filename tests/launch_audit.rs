@@ -3,6 +3,8 @@
 
 use std::path::{Path, PathBuf};
 
+mod support;
+#[cfg(target_os = "linux")]
 #[path = "support/process.rs"]
 mod unsupported_process;
 
@@ -54,13 +56,17 @@ fn subprocess_suites_are_gated_to_verified_platforms() -> Result<(), Box<dyn std
 
     let offenders: Vec<_> = files
         .into_iter()
-        .filter(|path| {
-            std::fs::read_to_string(path)
-                .is_ok_and(|text| text.contains(process_import) || text.contains(pty_import))
-        })
-        .filter(|path| {
-            std::fs::read_to_string(path)
-                .is_ok_and(|text| !text.contains(linux_gate) && !text.ends_with("launch_audit.rs"))
+        .filter(|path| !path.ends_with("launch_audit.rs"))
+        .filter_map(|path| {
+            std::fs::read_to_string(&path).ok().and_then(|text| {
+                if (text.contains(process_import) || text.contains(pty_import))
+                    && !text.contains(linux_gate)
+                {
+                    Some(path)
+                } else {
+                    None
+                }
+            })
         })
         .collect();
     assert!(
@@ -78,27 +84,62 @@ fn subprocess_suites_are_gated_to_verified_platforms() -> Result<(), Box<dyn std
         );
     }
 
-    // On Linux, verify profile isolation works: the process should write its
-    // state to Profile::state_dir(), not the inherited HOME.
+    // On Linux, verify profile isolation works: the binary writes its
+    // state under Profile::state_dir(), not the inherited HOME.
     #[cfg(target_os = "linux")]
     {
         let profile = unsupported_process::Profile::new()?;
-        let state_file = profile.state_file();
-        // The state.json file won't exist until continuo actually runs and
-        // initializes state, but the directory structure is ready.
-        let state_dir = profile.state_dir();
-        assert!(
-            state_dir
-                .to_string_lossy()
-                .contains(state_file.parent().unwrap().to_string_lossy().as_ref()),
-            "state_file must be under state_dir"
-        );
-        // Verify that state_dir uses the temporary root, not the inherited HOME.
         let root = profile.root();
+        let state_dir = profile.state_dir();
+        let state_file = profile.state_file();
+
+        // Verify that the expected directories are configured under the
+        // temporary root and not inherited from HOME.
         assert!(
             state_dir.starts_with(root),
-            "state directory must be under the temporary root, not HOME"
+            "state_dir {} should be under root {}",
+            state_dir.display(),
+            root.display()
         );
+
+        assert!(
+            state_file.starts_with(root),
+            "state_file {} should be under root {}",
+            state_file.display(),
+            root.display()
+        );
+
+        // Verify state directories are not under the inherited HOME.
+        if let Ok(home) = std::env::var("HOME") {
+            assert!(
+                !state_dir.starts_with(&home),
+                "state_dir {} should not be under HOME {}",
+                state_dir.display(),
+                home
+            );
+        }
+
+        // Launch continuo with the `feeds` command to verify the binary respects
+        // the isolated profile. The command succeeds whether the library is empty
+        // or not, proving the binary can run and access its directories.
+        let output = profile.command().args(["feeds"]).output()?;
+
+        assert!(
+            output.status.success(),
+            "continuo feeds failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        // If state.json is created during the run, it must be in our isolated
+        // state directory, not in HOME.
+        if state_file.exists() {
+            assert!(
+                state_file.starts_with(root),
+                "state.json {} should be under temp root {}, not HOME",
+                state_file.display(),
+                root.display()
+            );
+        }
     }
 
     Ok(())
