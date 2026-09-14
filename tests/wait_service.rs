@@ -60,6 +60,7 @@ fn servicing_publishes_the_position_the_timeline_reports() {
         quality: PositionQuality::Exact,
         provenance: PositionProvenance::Established,
         buffering: false,
+        load: None,
     }));
     let facts = Arc::new(Mutex::new(SessionFacts {
         session_rev: 4,
@@ -69,6 +70,7 @@ fn servicing_publishes_the_position_the_timeline_reports() {
         playing: true,
         provenance: PositionProvenance::Established,
         frozen_by_hook: false,
+        load: None,
     }));
     let (interrupt, events, outbox, backlog_empty) = inert();
     let service = WaitService::new(
@@ -114,6 +116,7 @@ fn a_degraded_quality_does_not_imply_estimated_provenance() {
         quality: PositionQuality::Exact,
         provenance: PositionProvenance::Established,
         buffering: false,
+        load: None,
     }));
     let facts = Arc::new(Mutex::new(SessionFacts {
         session_rev: 1,
@@ -123,6 +126,7 @@ fn a_degraded_quality_does_not_imply_estimated_provenance() {
         playing: true,
         provenance: PositionProvenance::Established,
         frozen_by_hook: false,
+        load: None,
     }));
     let (interrupt, events, outbox, backlog_empty) = inert();
     let service = WaitService::new(
@@ -168,6 +172,7 @@ fn servicing_a_freeze_parks_the_output_and_announces_paused() {
         playing: true,
         provenance: PositionProvenance::Established,
         frozen_by_hook: false,
+        load: None,
     }));
     let service = WaitService::new(
         Arc::new(Mutex::new(None)),
@@ -178,6 +183,7 @@ fn servicing_a_freeze_parks_the_output_and_announces_paused() {
             quality: PositionQuality::Exact,
             provenance: PositionProvenance::Established,
             buffering: false,
+            load: None,
         })),
         Arc::clone(&facts),
         Arc::clone(&interrupt),
@@ -193,6 +199,7 @@ fn servicing_a_freeze_parks_the_output_and_announces_paused() {
         Ok(PlaybackEvent::StateChanged {
             session_rev: 3,
             state: PlaybackState::Paused,
+            request: None,
         }) => {}
         other => panic!("expected StateChanged{{Paused}}, got {other:?}"),
     }
@@ -209,6 +216,7 @@ fn servicing_a_freeze_parks_the_output_and_announces_paused() {
         Ok(PlaybackEvent::StateChanged {
             session_rev: 3,
             state: PlaybackState::Playing,
+            request: None,
         }) => {}
         other => panic!("expected StateChanged{{Playing}}, got {other:?}"),
     }
@@ -232,6 +240,7 @@ fn a_hook_announcement_goes_to_the_outbox_when_the_workers_backlog_is_not_empty(
             quality: PositionQuality::Exact,
             provenance: PositionProvenance::Established,
             buffering: false,
+            load: None,
         })),
         Arc::new(Mutex::new(SessionFacts {
             session_rev: 1,
@@ -241,6 +250,7 @@ fn a_hook_announcement_goes_to_the_outbox_when_the_workers_backlog_is_not_empty(
             playing: true,
             provenance: PositionProvenance::Established,
             frozen_by_hook: false,
+            load: None,
         })),
         Arc::clone(&interrupt),
         events_tx,
@@ -278,6 +288,7 @@ fn servicing_with_no_transport_is_harmless_and_repeatable() {
         quality: PositionQuality::Exact,
         provenance: PositionProvenance::Established,
         buffering: false,
+        load: None,
     }));
     let facts = Arc::new(Mutex::new(SessionFacts {
         session_rev: 1,
@@ -287,6 +298,7 @@ fn servicing_with_no_transport_is_harmless_and_repeatable() {
         playing: false,
         provenance: PositionProvenance::Established,
         frozen_by_hook: false,
+        load: None,
     }));
     let (interrupt, events, outbox, backlog_empty) = inert();
     let service = WaitService::new(
@@ -346,6 +358,7 @@ fn servicing_a_blocked_read_advances_the_position_as_the_clock_advances() {
         quality: PositionQuality::Exact,
         provenance: PositionProvenance::Established,
         buffering: false,
+        load: None,
     }));
     let facts = Arc::new(Mutex::new(SessionFacts {
         session_rev: 5,
@@ -355,6 +368,7 @@ fn servicing_a_blocked_read_advances_the_position_as_the_clock_advances() {
         playing: true,
         provenance: PositionProvenance::Established,
         frozen_by_hook: false,
+        load: None,
     }));
     let (interrupt, events, outbox, backlog_empty) = inert();
     let now = Arc::new(AtomicU64::new(100_000_000)); // 100ms into the span

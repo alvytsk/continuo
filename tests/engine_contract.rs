@@ -4,7 +4,9 @@
 
 use std::time::Duration;
 
-use continuo::playback::command::{PlaybackCommand, ResumeIntent};
+use continuo::media::id::MediaId;
+use continuo::media::source::SourceLocation;
+use continuo::playback::command::{LoadRequestId, PlaybackCommand, ResumeIntent};
 use continuo::playback::event::{PlaybackEvent, StartDisposition};
 use continuo::playback::provenance::PositionProvenance;
 use continuo::playback::state::PlaybackState;
@@ -575,4 +577,81 @@ fn an_explicit_restart_announces_that_it_established() {
     engine.send(PlaybackCommand::Restart);
     let established = engine.await_restart_established();
     assert_eq!(established, Duration::ZERO);
+}
+
+fn local_load(request: u64, name: &str) -> PlaybackCommand {
+    let path = support::fixture(name);
+    PlaybackCommand::Load {
+        request: LoadRequestId::from_raw(request),
+        media: MediaId::LocalFile(path.clone()),
+        source: SourceLocation::LocalPath(path.as_path().to_path_buf()),
+        resume: ResumeIntent::StartAt(Duration::ZERO),
+    }
+}
+
+#[test]
+fn a_load_echoes_its_request_on_loading_loaded_and_progress() {
+    let mut engine = TestEngine::start_idle();
+    engine.send(local_load(41, "sine.flac"));
+    let loading = engine.await_event(|e| {
+        matches!(
+            e,
+            PlaybackEvent::StateChanged {
+                state: PlaybackState::Loading,
+                ..
+            }
+        )
+    });
+    assert!(
+        matches!(loading, PlaybackEvent::StateChanged { request: Some(r), .. } if r.get() == 41)
+    );
+    let loaded = engine.await_event(|e| matches!(e, PlaybackEvent::Loaded { .. }));
+    assert!(matches!(loaded, PlaybackEvent::Loaded { request, .. } if request.get() == 41));
+    engine.await_state(PlaybackState::Paused);
+    assert_eq!(engine.progress().load.map(LoadRequestId::get), Some(41));
+    engine.interrupt_stop();
+    engine.await_state(PlaybackState::Stopped);
+    assert_eq!(
+        engine.progress().load.map(LoadRequestId::get),
+        Some(41),
+        "stop keeps the adopted load"
+    );
+    engine.finish();
+}
+
+#[test]
+fn an_open_failure_is_the_load_outcome_for_its_request() {
+    let mut engine = TestEngine::start_idle();
+    let missing = std::env::temp_dir().join("continuo-m5-definitely-missing.flac");
+    engine.send(PlaybackCommand::Load {
+        request: LoadRequestId::from_raw(42),
+        media: MediaId::LocalFile(
+            continuo::media::id::AbsolutePath::new(missing.clone()).expect("absolute"),
+        ),
+        source: SourceLocation::LocalPath(missing),
+        resume: ResumeIntent::StartAt(Duration::ZERO),
+    });
+    let failed = engine.await_event(|e| matches!(e, PlaybackEvent::Failed { .. }));
+    assert!(matches!(failed, PlaybackEvent::Failed { request: Some(r), .. } if r.get() == 42));
+    engine.finish();
+}
+
+#[test]
+fn a_device_failure_after_loaded_is_not_a_load_outcome() {
+    let report = support::failed_device_session("sine.flac", 6, Duration::ZERO);
+    let loaded = report
+        .events
+        .iter()
+        .position(|e| matches!(e, PlaybackEvent::Loaded { .. }))
+        .expect("loaded");
+    let failed = report
+        .events
+        .iter()
+        .position(|e| matches!(e, PlaybackEvent::Failed { .. }))
+        .expect("failed");
+    assert!(loaded < failed);
+    assert!(matches!(
+        report.events[failed],
+        PlaybackEvent::Failed { request: None, .. }
+    ));
 }

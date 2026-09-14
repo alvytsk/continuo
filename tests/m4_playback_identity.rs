@@ -71,7 +71,9 @@ fn playback_persists_the_podcast_id_not_the_enclosure_url() -> Fallible {
     engine
         .handle()
         .set_http(Some(HttpService::spawn(Limits::brisk())?));
+    let request = engine.next_request();
     engine.send(PlaybackCommand::Load {
+        request,
         media: media.clone(),
         source,
         resume: ResumeIntent::StartAt(Duration::ZERO),

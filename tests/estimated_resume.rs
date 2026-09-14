@@ -494,7 +494,9 @@ fn a_relaunch_refused_past_an_estimated_ceiling_leaves_the_stored_checkpoint_unt
         Ok(parsed) => parsed,
         Err(error) => panic!("test URL {url:?} must parse: {error}"),
     };
+    let request = engine.next_request();
     engine.send(PlaybackCommand::Load {
+        request,
         media: media.clone(),
         source: SourceLocation::Http(parsed),
         resume: ResumeIntent::Candidate(

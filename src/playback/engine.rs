@@ -29,7 +29,7 @@ use crate::media::source::SourceLocation;
 use crate::resume::{KnownDuration, ResumeDecision, decide_resume};
 
 use super::callback::CallbackCore;
-use super::command::{Admission, PlaybackCommand, ResumeIntent};
+use super::command::{Admission, LoadRequestId, PlaybackCommand, ResumeIntent};
 use super::decode::{DecodedSource, SeekOutcome};
 use super::error::PlaybackError;
 use super::event::{PlaybackEvent, Progress, ShutdownReport, StartDisposition};
@@ -209,6 +209,7 @@ impl EngineHandle {
             quality: PositionQuality::Exact,
             provenance: PositionProvenance::Established,
             buffering: false,
+            load: None,
         }));
         let interrupt = Arc::new(AtomicU8::new(0));
         // One real capacity for the worker's whole life (Carried Finding 2):
@@ -551,6 +552,15 @@ struct Worker {
     position_provenance: PositionProvenance,
     requested_target: Option<Duration>,
     media: Option<MediaId>,
+    /// The load currently in flight, set by `load` before `StateChanged`
+    /// announces `Loading` and taken (cleared) the moment that load reaches
+    /// an outcome: `Loaded` takes it into `adopted_load`, and both
+    /// cancellation returns plus `fail_with` clear it directly (M5 §6).
+    loading: Option<LoadRequestId>,
+    /// The load whose media the worker currently holds, set when `Loaded` is
+    /// emitted. Stop, pause, seek and device recovery never touch it; only
+    /// the next `load` clears it, before announcing its own `Loading`.
+    adopted_load: Option<LoadRequestId>,
     volume: Volume,
     generation: u16,
     pushed_total: u64,
@@ -635,6 +645,7 @@ impl Worker {
             playing: false,
             provenance: PositionProvenance::Established,
             frozen_by_hook: false,
+            load: None,
         }));
         let backlog_empty = Arc::new(AtomicBool::new(true));
         let outbox = Arc::new(Mutex::new(VecDeque::new()));
@@ -678,6 +689,8 @@ impl Worker {
             position_provenance: PositionProvenance::Established,
             requested_target: None,
             media: None,
+            loading: None,
+            adopted_load: None,
             volume: Volume::FULL,
             generation: 0,
             pushed_total: 0,
@@ -966,7 +979,21 @@ impl Worker {
         }
         self.state = state;
         let session_rev = self.session_rev;
-        self.emit(PlaybackEvent::StateChanged { session_rev, state });
+        // Only a `Loading` announcement carries a token: it is the one state
+        // change a load itself causes, so `play()`'s remote-reopen `Loading`
+        // - reached with `self.loading` already `None` because `Loaded`
+        // already took it - correctly carries `None` too, with no special
+        // casing here (M5 §6, Decision 2).
+        let request = if state == PlaybackState::Loading {
+            self.loading
+        } else {
+            None
+        };
+        self.emit(PlaybackEvent::StateChanged {
+            session_rev,
+            state,
+            request,
+        });
     }
 
     fn fail(&mut self, message: String) {
@@ -998,10 +1025,16 @@ impl Worker {
         self.source_interrupt.retire();
         self.retire_remote_source();
         let session_rev = self.session_rev;
+        // `take`, not a read: only a failure while a load was still in
+        // flight is that load's outcome (M5 §6). Taking it here means a
+        // later fault on the same session - after `Loaded` already took
+        // `loading` for itself - correctly reports no request at all.
+        let request = self.loading.take();
         self.emit(PlaybackEvent::Failed {
             session_rev,
             message,
             cause,
+            request,
         });
         self.set_state(PlaybackState::Failed);
     }
@@ -1088,6 +1121,7 @@ impl Worker {
             // `frozen_by_hook` is deliberately left untouched here: it is the
             // hook's own bookkeeping (Ruling 1's `SessionFacts` lives in
             // `wait.rs`), and this pass has nothing new to tell it.
+            facts.load = self.adopted_load;
         }
         self.service.service_as(Servicing::WorkerLoop);
         // Read back whatever the shared recompute settled on, so
@@ -1802,11 +1836,17 @@ impl Worker {
     fn dispatch(&mut self, command: PlaybackCommand) {
         match command {
             PlaybackCommand::Load {
+                request,
                 media,
                 source,
                 resume,
-            } => self.load(media, source, resume),
+            } => self.load(request, media, source, resume),
             PlaybackCommand::Play => self.play(),
+            PlaybackCommand::PlayLoaded { request } => {
+                if self.adopted_load == Some(request) && self.state == PlaybackState::Paused {
+                    self.play();
+                }
+            }
             PlaybackCommand::Pause => self.pause(),
             PlaybackCommand::TogglePause => match self.state {
                 PlaybackState::Playing => self.pause(),
@@ -1840,12 +1880,23 @@ impl Worker {
         }
     }
 
-    fn load(&mut self, media: MediaId, source: SourceLocation, resume: ResumeIntent) {
+    fn load(
+        &mut self,
+        request: LoadRequestId,
+        media: MediaId,
+        source: SourceLocation,
+        resume: ResumeIntent,
+    ) {
         self.capture_and_teardown();
         self.source = None;
         self.session_rev += 1;
         self.media = Some(media.clone());
         self.requested_target = None;
+        // This load's media is not yet held until `Loaded` says so, and its
+        // token is now the one in flight - both before `set_state(Loading)`
+        // reads `self.loading` for the announcement below (M5 §6).
+        self.adopted_load = None;
+        self.loading = Some(request);
         // A caller-decided start is already the position that will be asked
         // for, so it is pinned BEFORE opening: if the load fails, Failed must
         // carry it so a retry can resume there. Zeroing here loses it for
@@ -1880,7 +1931,10 @@ impl Worker {
             // still `Loading` here (set above), so leaving it alone is what
             // lets the very next pass's `do_stop` actually run instead of
             // early-returning on a `Failed` it did not ask for.
-            Err(error) if is_cancelled(&error) => return,
+            Err(error) if is_cancelled(&error) => {
+                self.loading = None;
+                return;
+            }
             Err(error) => {
                 self.fail_from(error);
                 return;
@@ -1999,7 +2053,10 @@ impl Worker {
                 }
                 // Abandon the load, leaving no decoder open. The interrupt
                 // still stands and the loop's next pass acts on it.
-                Err(error) if is_cancelled(&error) => return,
+                Err(error) if is_cancelled(&error) => {
+                    self.loading = None;
+                    return;
+                }
                 Err(error) => {
                     self.fail_from(error);
                     return;
@@ -2009,8 +2066,13 @@ impl Worker {
         let session_rev = self.session_rev;
         let position = self.position;
         let capabilities = self.capabilities;
+        // Takes `loading`: this outcome closes it. `adopted_load` now holds
+        // the same token until the next `load` clears it (M5 §6, Decision 2).
+        self.loading = None;
+        self.adopted_load = Some(request);
         self.emit(PlaybackEvent::Loaded {
             session_rev,
+            request,
             media,
             metadata: decoded.metadata().clone(),
             capabilities,

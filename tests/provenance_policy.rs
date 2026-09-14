@@ -18,6 +18,7 @@ use continuo::media::id::MediaId;
 use continuo::media::metadata::MediaMetadata;
 use continuo::persistence::model::PersistedState;
 use continuo::playback::checkpoint::PlaybackCheckpoint;
+use continuo::playback::command::LoadRequestId;
 use continuo::playback::event::{PlaybackEvent, Progress, StartDisposition};
 use continuo::playback::provenance::PositionProvenance;
 use continuo::playback::state::PlaybackState;
@@ -30,6 +31,7 @@ use support::media;
 fn loaded(session_rev: u64, name: &str, position: Duration) -> PlaybackEvent {
     PlaybackEvent::Loaded {
         session_rev,
+        request: LoadRequestId::from_raw(1),
         media: media(name),
         metadata: MediaMetadata::default(),
         capabilities: MediaCapabilities {
@@ -42,7 +44,11 @@ fn loaded(session_rev: u64, name: &str, position: Duration) -> PlaybackEvent {
 }
 
 fn state_changed(session_rev: u64, state: PlaybackState) -> PlaybackEvent {
-    PlaybackEvent::StateChanged { session_rev, state }
+    PlaybackEvent::StateChanged {
+        session_rev,
+        state,
+        request: None,
+    }
 }
 
 fn progress(session_rev: u64, name: &str, secs: u64, provenance: PositionProvenance) -> Progress {
@@ -53,6 +59,7 @@ fn progress(session_rev: u64, name: &str, secs: u64, provenance: PositionProvena
         quality: PositionQuality::Exact,
         provenance,
         buffering: false,
+        load: None,
     }
 }
 

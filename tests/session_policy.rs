@@ -8,6 +8,7 @@ use continuo::media::id::MediaId;
 use continuo::media::metadata::MediaMetadata;
 use continuo::persistence::model::PersistedState;
 use continuo::persistence::writer::Urgency;
+use continuo::playback::command::LoadRequestId;
 use continuo::playback::event::{PlaybackEvent, Progress, StartDisposition};
 use continuo::playback::provenance::PositionProvenance;
 use continuo::playback::state::PlaybackState;
@@ -22,6 +23,7 @@ use support::media;
 fn loaded(session_rev: u64, name: &str, position: Duration) -> PlaybackEvent {
     PlaybackEvent::Loaded {
         session_rev,
+        request: LoadRequestId::from_raw(1),
         media: media(name),
         metadata: MediaMetadata::default(),
         capabilities: MediaCapabilities {
@@ -37,7 +39,11 @@ fn loaded(session_rev: u64, name: &str, position: Duration) -> PlaybackEvent {
 }
 
 fn state_changed(session_rev: u64, state: PlaybackState) -> PlaybackEvent {
-    PlaybackEvent::StateChanged { session_rev, state }
+    PlaybackEvent::StateChanged {
+        session_rev,
+        state,
+        request: None,
+    }
 }
 
 /// A `Loaded` for `media`, fixed at the revision every protection test in this
@@ -46,6 +52,7 @@ fn state_changed(session_rev: u64, state: PlaybackState) -> PlaybackEvent {
 fn loaded_unavailable(media: &MediaId, retained: Duration) -> PlaybackEvent {
     PlaybackEvent::Loaded {
         session_rev: 1,
+        request: LoadRequestId::from_raw(1),
         media: media.clone(),
         metadata: MediaMetadata::default(),
         capabilities: MediaCapabilities {
@@ -62,6 +69,7 @@ fn loaded_unavailable(media: &MediaId, retained: Duration) -> PlaybackEvent {
 fn loaded_fresh(media: &MediaId) -> PlaybackEvent {
     PlaybackEvent::Loaded {
         session_rev: 1,
+        request: LoadRequestId::from_raw(1),
         media: media.clone(),
         metadata: MediaMetadata::default(),
         capabilities: MediaCapabilities {
@@ -81,6 +89,7 @@ fn progress(session_rev: u64, name: &str, secs: u64) -> Progress {
         quality: PositionQuality::Exact,
         provenance: PositionProvenance::Established,
         buffering: false,
+        load: None,
     }
 }
 
@@ -697,6 +706,7 @@ fn a_launch_that_never_establishes_writes_no_checkpoint() {
             session_rev: 1,
             message: "cannot open the audio device".into(),
             cause: None,
+            request: None,
         },
         clock.sample(),
     );
@@ -740,6 +750,7 @@ fn a_switch_away_from_a_media_that_never_established_records_nothing_for_it() {
             session_rev: 1,
             message: "cannot open the audio device".into(),
             cause: None,
+            request: None,
         },
         clock.sample(),
     );
@@ -1337,6 +1348,7 @@ fn a_resumed_estimated_load_sets_up_no_fallback_protection() {
     let _ = session.observe(
         &PlaybackEvent::Loaded {
             session_rev: 1,
+            request: LoadRequestId::from_raw(1),
             media: media("ep1"),
             metadata: MediaMetadata::default(),
             capabilities: MediaCapabilities {

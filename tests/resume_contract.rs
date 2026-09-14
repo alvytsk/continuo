@@ -17,7 +17,7 @@ use continuo::persistence::model::{PersistedCheckpoint, PersistedState, SCHEMA_V
 use continuo::persistence::store::StateStore;
 use continuo::persistence::writer::Urgency;
 use continuo::playback::checkpoint::PlaybackCheckpoint;
-use continuo::playback::command::PlaybackCommand;
+use continuo::playback::command::{LoadRequestId, PlaybackCommand};
 use continuo::playback::decode::DecodedSource;
 use continuo::playback::event::{PlaybackEvent, Progress, StartDisposition};
 use continuo::playback::provenance::PositionProvenance;
@@ -600,6 +600,7 @@ fn a_stored_estimate_with_no_established_position_reports_none_for_it_after_a_re
 fn loaded_fresh_for(session_rev: u64, media: &MediaId, position: Duration) -> PlaybackEvent {
     PlaybackEvent::Loaded {
         session_rev,
+        request: LoadRequestId::from_raw(1),
         media: media.clone(),
         metadata: MediaMetadata::default(),
         capabilities: MediaCapabilities {
@@ -612,7 +613,11 @@ fn loaded_fresh_for(session_rev: u64, media: &MediaId, position: Duration) -> Pl
 }
 
 fn state_changed_to(session_rev: u64, state: PlaybackState) -> PlaybackEvent {
-    PlaybackEvent::StateChanged { session_rev, state }
+    PlaybackEvent::StateChanged {
+        session_rev,
+        state,
+        request: None,
+    }
 }
 
 fn established_progress(session_rev: u64, media: &MediaId, secs: u64) -> Progress {
@@ -623,6 +628,7 @@ fn established_progress(session_rev: u64, media: &MediaId, secs: u64) -> Progres
         quality: PositionQuality::Exact,
         provenance: PositionProvenance::Established,
         buffering: false,
+        load: None,
     }
 }
 

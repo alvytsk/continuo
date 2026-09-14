@@ -25,7 +25,7 @@ use crate::persistence::PersistenceError;
 use crate::persistence::model::{PersistedCheckpoint, PersistedState};
 use crate::persistence::store::{LoadReason, QueueBackup, StateStore};
 use crate::persistence::writer::{ShutdownOutcome, StateSink, Urgency, WriterHandle};
-use crate::playback::command::{Admission, PlaybackCommand, ResumeIntent};
+use crate::playback::command::{Admission, LoadRequestId, PlaybackCommand, ResumeIntent};
 use crate::playback::engine::EngineHandle;
 use crate::playback::error::PlaybackError;
 use crate::playback::event::{PlaybackEvent, Progress};
@@ -822,14 +822,18 @@ fn resume_commands(
     // `EstimatedCandidate` (§4.3) — this function's only job left is the
     // "nothing at all" case.
     let resume = resume.unwrap_or(ResumeIntent::StartAt(Duration::ZERO));
+    // Task 6 only: a fixed token for the session's single load. Task 8
+    // replaces this with a session-registered `LoadRequestId`.
+    let request = LoadRequestId::from_raw(1);
     [
         PlaybackCommand::SetVolume(volume),
         PlaybackCommand::Load {
+            request,
             media,
             source,
             resume,
         },
-        PlaybackCommand::Play,
+        PlaybackCommand::PlayLoaded { request },
     ]
 }
 
@@ -1154,7 +1158,9 @@ impl Mirror {
                 // not only a limitation.
                 self.buffering = false;
             }
-            PlaybackEvent::StateChanged { session_rev, state } => {
+            PlaybackEvent::StateChanged {
+                session_rev, state, ..
+            } => {
                 self.session_rev = session_rev;
                 self.state = state;
             }
@@ -1510,6 +1516,7 @@ mod tests {
                 media: loaded,
                 source,
                 resume,
+                ..
             } => {
                 assert_eq!(loaded, &media);
                 assert!(matches!(source, SourceLocation::Http(url) if url.as_str() == enclosure));
@@ -1538,6 +1545,7 @@ mod tests {
         let mut mirror = Mirror::default();
         mirror.apply(PlaybackEvent::Loaded {
             session_rev: 3,
+            request: LoadRequestId::from_raw(1),
             media: local("/music/sonata.flac"),
             metadata: MediaMetadata {
                 title: None,
@@ -1583,7 +1591,7 @@ mod tests {
             [
                 PlaybackCommand::SetVolume(volume),
                 PlaybackCommand::Load { resume, .. },
-                PlaybackCommand::Play,
+                PlaybackCommand::PlayLoaded { .. },
             ] => {
                 assert_eq!(*volume, Volume::new(0.25), "the stored gain, unchanged");
                 assert_eq!(
@@ -2176,6 +2184,7 @@ mod tests {
         };
         mirror.apply(PlaybackEvent::Loaded {
             session_rev: 3,
+            request: LoadRequestId::from_raw(1),
             media: local("/music/sonata.flac"),
             metadata: MediaMetadata {
                 title: None,
@@ -2208,6 +2217,7 @@ mod seek_burst_tests {
             quality: PositionQuality::Exact,
             provenance: PositionProvenance::Established,
             buffering: false,
+            load: None,
         }
     }
 
