@@ -1,3 +1,5 @@
+#![cfg(target_os = "linux")]
+
 //! The M4 command surface (design doc §6.1–§6.5): argument parsing, the
 //! five feed commands as whole processes, and the two `play` forms.
 //!
@@ -5,6 +7,9 @@
 //! filesystem — so an arity or value-parser regression is reported as a
 //! parse failure rather than as whatever the command would have done with
 //! the wrong arguments.
+
+#[path = "support/process.rs"]
+mod process_helper;
 
 use clap::Parser;
 use continuo::cli::{Cli, CliCommand};
@@ -250,14 +255,8 @@ mod process {
     const CHILD_PATIENCE: Duration = Duration::from_secs(20);
 
     fn command(root: &Path, args: &[&str]) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_continuo"));
-        command
-            .args(args)
-            .env("XDG_DATA_HOME", root.join("data"))
-            .env("XDG_CACHE_HOME", root.join("cache"))
-            .env("XDG_STATE_HOME", root.join("state"))
-            .env("XDG_CONFIG_HOME", root.join("config"))
-            .env("RUST_LOG", "continuo=warn");
+        let mut command = super::process_helper::command_in(root);
+        command.args(args).env("RUST_LOG", "continuo=warn");
         command
     }
 

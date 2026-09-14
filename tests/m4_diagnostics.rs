@@ -1,3 +1,5 @@
+#![cfg(target_os = "linux")]
+
 //! §7.2's redaction rule, audited through the code paths that actually
 //! construct these errors.
 //!
@@ -29,6 +31,8 @@
 //!   they survive — otherwise "no secret in the message" could be passed by
 //!   a message that says nothing at all. None of the three is ever a URL.
 
+#[path = "support/process.rs"]
+mod process;
 mod support;
 
 #[path = "support/feeds.rs"]
@@ -767,12 +771,8 @@ fn debug_logging_records_no_document_request_or_validator() -> Fallible {
     }]));
 
     let run = |args: &[&str]| -> std::io::Result<std::process::Output> {
-        std::process::Command::new(env!("CARGO_BIN_EXE_continuo"))
+        process::command_in(root.path())
             .args(args)
-            .env("XDG_DATA_HOME", root.path().join("data"))
-            .env("XDG_CACHE_HOME", root.path().join("cache"))
-            .env("XDG_STATE_HOME", root.path().join("state"))
-            .env("XDG_CONFIG_HOME", root.path().join("config"))
             .env("RUST_LOG", "continuo=debug")
             .output()
     };

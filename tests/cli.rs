@@ -1,10 +1,15 @@
-use std::process::Command;
+#![cfg(target_os = "linux")]
+
+#[path = "support/process.rs"]
+mod process;
 
 #[test]
 fn bare_invocation_prints_help_and_reports_filter_errors() {
     // A bare invocation now prints help and exits nonzero rather than running
     // the old M0 startup message: `continuo` requires the `play` subcommand.
-    let bare = Command::new(env!("CARGO_BIN_EXE_continuo"))
+    let profile = process::Profile::new().unwrap();
+    let bare = profile
+        .command()
         .env("RUST_LOG", "continuo=info")
         .output()
         .unwrap();
@@ -18,7 +23,9 @@ fn bare_invocation_prints_help_and_reports_filter_errors() {
 
     // The RUST_LOG filter-error path predates the CLI and still applies: it
     // fires during `telemetry::init`, before argument parsing runs.
-    let failure = Command::new(env!("CARGO_BIN_EXE_continuo"))
+    let profile = process::Profile::new().unwrap();
+    let failure = profile
+        .command()
         .env("RUST_LOG", "continuo=not-a-level")
         .output()
         .unwrap();
