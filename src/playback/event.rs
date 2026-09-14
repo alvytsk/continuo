@@ -139,6 +139,14 @@ pub enum PlaybackEvent {
         session_rev: u64,
         message: String,
     },
+    /// A `Load` accepted but abandoned before it produced `Loaded` or
+    /// `Failed` — a stop or shutdown landed during the open (M5 §6). The
+    /// load's one guaranteed outcome in that case; nothing else is emitted
+    /// for it.
+    LoadCancelled {
+        session_rev: u64,
+        request: LoadRequestId,
+    },
     Failed {
         session_rev: u64,
         message: String,
@@ -175,6 +183,7 @@ impl PlaybackEvent {
             | Self::CapabilitiesChanged { session_rev, .. }
             | Self::RestartEstablished { session_rev, .. }
             | Self::Warning { session_rev, .. }
+            | Self::LoadCancelled { session_rev, .. }
             | Self::Failed { session_rev, .. } => *session_rev,
         }
     }
@@ -195,6 +204,22 @@ impl PlaybackEvent {
             ),
             _ => false,
         }
+    }
+
+    /// The load this event concludes, if it is a load outcome (M5 §6). Each
+    /// accepted `Load` produces exactly one.
+    pub fn load_outcome(&self) -> Option<LoadRequestId> {
+        match self {
+            Self::Loaded { request, .. } | Self::LoadCancelled { request, .. } => Some(*request),
+            Self::Failed { request, .. } => *request,
+            _ => None,
+        }
+    }
+
+    /// Protected outcomes are never dropped or displaced, and may use the
+    /// reserved tail: correlation cannot be inferred from anything later.
+    pub fn is_protected(&self) -> bool {
+        self.load_outcome().is_some()
     }
 }
 

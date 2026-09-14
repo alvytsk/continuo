@@ -1221,6 +1221,7 @@ impl Mirror {
             | PlaybackEvent::SeekRejected { session_rev, .. }
             | PlaybackEvent::SeekCancelled { session_rev, .. }
             | PlaybackEvent::Warning { session_rev, .. }
+            | PlaybackEvent::LoadCancelled { session_rev, .. }
             | PlaybackEvent::Failed { session_rev, .. } => {
                 self.session_rev = session_rev;
             }

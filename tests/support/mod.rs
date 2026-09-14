@@ -24,7 +24,7 @@
 pub mod server;
 
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -126,10 +126,25 @@ struct Device {
 
 struct HarnessOutput {
     device: Arc<Mutex<Device>>,
+    /// Counts calls to `negotiate` - the first step of every open attempt -
+    /// so a test can prove a later command did not reopen a device that
+    /// already failed (M5 §6). `Arc`-shared rather than plain, so a test can
+    /// keep reading it after this harness has moved into the engine thread.
+    negotiations: Arc<AtomicUsize>,
+}
+
+impl HarnessOutput {
+    fn new(device: Arc<Mutex<Device>>) -> Self {
+        Self {
+            device,
+            negotiations: Arc::new(AtomicUsize::new(0)),
+        }
+    }
 }
 
 impl AudioOutput for HarnessOutput {
     fn negotiate(&mut self, request: &OutputRequest) -> Result<NegotiatedOutput, PlaybackError> {
+        self.negotiations.fetch_add(1, Ordering::Relaxed);
         lock(&self.device).output.negotiate(request)
     }
 
@@ -303,12 +318,8 @@ impl TestEngine {
             link: None,
         }));
         let (fault_tx, fault_rx) = crossbeam_channel::bounded(16);
-        let handle = EngineHandle::spawn_with(
-            Box::new(HarnessOutput {
-                device: Arc::clone(&device),
-            }),
-            fault_rx,
-        );
+        let handle =
+            EngineHandle::spawn_with(Box::new(HarnessOutput::new(Arc::clone(&device))), fault_rx);
         let driver = Arc::new(Driver {
             device: Arc::clone(&device),
             mode: AtomicU8::new(FROZEN),
@@ -1142,12 +1153,8 @@ pub fn load_failure_on_device(name: &str, channels: u16) -> String {
     }));
     // Held for the call's duration, so the worker's fault receiver stays live.
     let (_faults, fault_rx) = crossbeam_channel::bounded(16);
-    let handle = EngineHandle::spawn_with(
-        Box::new(HarnessOutput {
-            device: Arc::clone(&device),
-        }),
-        fault_rx,
-    );
+    let handle =
+        EngineHandle::spawn_with(Box::new(HarnessOutput::new(Arc::clone(&device))), fault_rx);
     let path = fixture(name);
     let sent = handle.commands().send(PlaybackCommand::Load {
         request: LoadRequestId::from_raw(1),
@@ -1188,12 +1195,8 @@ pub fn failed_load_position(
         link: None,
     }));
     let (_faults, fault_rx) = crossbeam_channel::bounded(16);
-    let handle = EngineHandle::spawn_with(
-        Box::new(HarnessOutput {
-            device: Arc::clone(&device),
-        }),
-        fault_rx,
-    );
+    let handle =
+        EngineHandle::spawn_with(Box::new(HarnessOutput::new(Arc::clone(&device))), fault_rx);
     let id = MediaId::LocalFile(
         continuo::media::id::AbsolutePath::new(missing.to_path_buf()).expect("absolute path"),
     );
@@ -1239,12 +1242,8 @@ pub fn failed_device_session(name: &str, channels: u16, start_at: Duration) -> S
     }));
     // Held for the call's duration, so the worker's fault receiver stays live.
     let (_faults, fault_rx) = crossbeam_channel::bounded(16);
-    let handle = EngineHandle::spawn_with(
-        Box::new(HarnessOutput {
-            device: Arc::clone(&device),
-        }),
-        fault_rx,
-    );
+    let handle =
+        EngineHandle::spawn_with(Box::new(HarnessOutput::new(Arc::clone(&device))), fault_rx);
     let path = fixture(name);
     let sent = handle.commands().send(PlaybackCommand::Load {
         request: LoadRequestId::from_raw(1),
@@ -1279,4 +1278,80 @@ pub fn failed_device_session(name: &str, channels: u16, start_at: Duration) -> S
     events.extend(std::mem::take(&mut report.events));
     report.events = events;
     report
+}
+
+/// Like `failed_device_session`, but also sends `PlayLoaded` for the same
+/// token, followed by a `SetVolume` barrier, to prove that a later
+/// `PlayLoaded` does not reopen a device that already failed (M5 §6): the
+/// `adopted_load == Some(request) && state == Paused` gate in `dispatch`
+/// never sees `Paused` here, since the load's own synchronous open already
+/// failed. Hands back every event up to the volume barrier, plus however
+/// many times the device was asked to negotiate - exactly once is the direct
+/// evidence "no second open attempt" needs, since a silent reopen that fails
+/// the same way would be invisible in the event stream alone.
+pub fn failed_device_session_with_play_loaded(
+    name: &str,
+    channels: u16,
+) -> (Vec<PlaybackEvent>, usize) {
+    let device = Arc::new(Mutex::new(Device {
+        output: TestOutput::new(channels, RATE, BUFFER_FRAMES, LATENCY),
+        link: None,
+    }));
+    let harness = HarnessOutput::new(Arc::clone(&device));
+    let negotiations = Arc::clone(&harness.negotiations);
+    // Held for the call's duration, so the worker's fault receiver stays live.
+    let (_faults, fault_rx) = crossbeam_channel::bounded(16);
+    let handle = EngineHandle::spawn_with(Box::new(harness), fault_rx);
+    let path = fixture(name);
+    let request = LoadRequestId::from_raw(1);
+    if handle
+        .commands()
+        .send(PlaybackCommand::Load {
+            request,
+            media: MediaId::LocalFile(path.clone()),
+            source: SourceLocation::LocalPath(path.as_path().to_path_buf()),
+            resume: ResumeIntent::StartAt(Duration::ZERO),
+        })
+        .is_err()
+    {
+        panic!("the engine stopped accepting commands");
+    }
+    if handle
+        .commands()
+        .send(PlaybackCommand::PlayLoaded { request })
+        .is_err()
+    {
+        panic!("the engine stopped accepting commands");
+    }
+    if handle
+        .commands()
+        .send(PlaybackCommand::SetVolume(Volume::new(0.25)))
+        .is_err()
+    {
+        panic!("the engine stopped accepting commands");
+    }
+
+    let mut events = Vec::new();
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        while let Ok(event) = handle.events().try_recv() {
+            events.push(event);
+        }
+        if events
+            .iter()
+            .any(|event| matches!(event, PlaybackEvent::VolumeChanged { .. }))
+        {
+            break;
+        }
+        if Instant::now() >= deadline {
+            panic!("the volume barrier never arrived; saw {events:?}");
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    handle.interrupt_shutdown();
+    let mut report = handle.join();
+    events.extend(std::mem::take(&mut report.events));
+
+    (events, negotiations.load(Ordering::Relaxed))
 }

@@ -69,8 +69,9 @@ pub(crate) const RESERVED_EVENT_SLOTS: usize = 9;
 pub(crate) const EVENT_CAPACITY: usize = 64;
 const PENDING_CAP: usize = 128;
 
-// Reserve budget. Terminal outcomes may occupy the reserved tail; ordinary
-// events may not. The worst case is one loop iteration emitting, at most:
+// Reserve budget. Terminal or protected outcomes may occupy the reserved
+// tail; ordinary events may not. The worst case is one loop iteration
+// emitting, at most:
 //
 //   stop interrupt        1  StateChanged{Stopped}
 //   a serviced fault      2  Failed + StateChanged, or DeviceRecovered + StateChanged
@@ -86,19 +87,32 @@ const PENDING_CAP: usize = 128;
 //                        10 (naive union)
 //
 // 10 looks like it breaks `RESERVED_EVENT_SLOTS == 9`, but the reserve only
-// has to be as large as the TERMINAL share of that union: an ordinary event
-// that cannot flush is merely held in `pending_events` (bounded separately,
-// by `PENDING_CAP`) until the reserve clears - never lost, and so never in
-// need of reservation. Only a terminal outcome, which the reserved tail
-// exists to guarantee delivery for even under a full ordinary backlog, must
-// actually fit. Row by row, the terminal-maximizing variant is: stop's
-// StateChanged{Stopped} (1), a fatal fault's Failed + StateChanged{Failed}
-// (2), Load's failure tail above (2, not the success tail's 0), and end of
-// track's pair (2) - 7 terminal events at most, comfortably under 9 with two
-// to spare. Those four are still not mutually exclusive in a single pass, so
-// the union is the bound rather than the maximum of them; command admission
-// closes while a backlog exists, and `service_faults` defers a fault whose
-// events would not fit, so neither source can outrun the drain.
+// has to be as large as the TERMINAL-OR-PROTECTED share of that union: an
+// ordinary event that cannot flush is merely held in `pending_events`
+// (bounded separately, by `PENDING_CAP`) until the reserve clears - never
+// lost, and so never in need of reservation. Only a terminal or protected
+// outcome, which the reserved tail exists to guarantee delivery for even
+// under a full ordinary backlog, must actually fit (Decision 4, Decision 5).
+// Row by row:
+//
+//   stop interrupt        1  StateChanged{Stopped} (terminal)
+//   a fatal fault          2  Failed + StateChanged{Failed} (both terminal)
+//   a dispatched load      3  Loaded (protected, M5 §6) + Failed +
+//                             StateChanged{Failed} (both terminal) - `Loaded`
+//                             itself is not terminal but must still fit, so
+//                             this row's share is now one wider than a
+//                             fault's.
+//   end of track           2  EndOfTrack + StateChanged{Ended} (both terminal)
+//                        --
+//                         8 <= RESERVED_EVENT_SLOTS (9)
+//
+// A cancelled load - a stop or shutdown landing during the open - emits only
+// `LoadCancelled` (1, protected), well under the dispatched-load row's own
+// share, so it never raises the bound. These four rows are still not
+// mutually exclusive in a single pass, so the union is the bound rather than
+// the maximum of them; command admission closes while a backlog exists, and
+// `service_faults` defers a fault whose events would not fit, so neither
+// source can outrun the drain.
 //
 // `RestartEstablished` and `SeekCancelled` both belong to commands narrower
 // than `Load` (their own event plus a `StateChanged`, at most 2, and neither
@@ -830,14 +844,17 @@ impl Worker {
     // ----------------------------------------------------------------- events
 
     fn emit(&mut self, event: PlaybackEvent) {
-        if self.pending_events.len() >= PENDING_CAP {
+        // Protected events — load outcomes — bypass `PENDING_CAP` entirely
+        // (Decision 4): correlation cannot be inferred from anything later,
+        // so one is always pushed, never dropped or counted as such.
+        if self.pending_events.len() >= PENDING_CAP && !event.is_protected() {
             if !event.is_terminal() {
                 self.dropped_events += 1;
                 return;
             }
             // A terminal outcome displaces the oldest ordinary event rather
             // than being dropped: nothing that follows implies it.
-            match self.pending_events.iter().position(|e| !e.is_terminal()) {
+            match displacement_victim(&self.pending_events) {
                 Some(index) => {
                     self.pending_events.remove(index);
                     self.dropped_events += 1;
@@ -850,6 +867,20 @@ impl Worker {
         }
         self.pending_events.push_back(event);
         self.note_backlog();
+    }
+
+    /// Emits `LoadCancelled` for the load still in flight, if any — the one
+    /// outcome a `Load` abandoned mid-open owes its caller (M5 §6). Called
+    /// from both cancellation returns in `load`, and from `shutdown`'s drain
+    /// of undelivered `Load` commands.
+    fn cancel_load(&mut self) {
+        if let Some(request) = self.loading.take() {
+            let session_rev = self.session_rev;
+            self.emit(PlaybackEvent::LoadCancelled {
+                session_rev,
+                request,
+            });
+        }
     }
 
     /// Drain `WaitService`'s outbox onto the back of `pending_events`. Called
@@ -888,7 +919,8 @@ impl Worker {
     fn flush_events(&mut self) {
         while let Some(front) = self.pending_events.front() {
             let free = self.free_event_slots();
-            if free == 0 || (!front.is_terminal() && free <= RESERVED_EVENT_SLOTS) {
+            let may_use_reserve = front.is_terminal() || front.is_protected();
+            if free == 0 || (!may_use_reserve && free <= RESERVED_EVENT_SLOTS) {
                 break;
             }
             let Some(event) = self.pending_events.pop_front() else {
@@ -1567,6 +1599,18 @@ impl Worker {
         // (neither calls `self.emit` directly), so nothing between here and
         // `publish_progress` can reorder ahead of what was just drained.
         self.drain_outbox();
+        // Accepted but never dispatched: each still owes its caller an
+        // outcome. Every other undelivered command is simply discarded -
+        // nothing else in `PlaybackCommand` promises one.
+        while let Ok(command) = self.commands.try_recv() {
+            if let PlaybackCommand::Load { request, .. } = command {
+                let session_rev = self.session_rev;
+                self.emit(PlaybackEvent::LoadCancelled {
+                    session_rev,
+                    request,
+                });
+            }
+        }
         let captured_exactly = self.capture_position();
         self.teardown();
         self.source = None;
@@ -1932,7 +1976,7 @@ impl Worker {
             // lets the very next pass's `do_stop` actually run instead of
             // early-returning on a `Failed` it did not ask for.
             Err(error) if is_cancelled(&error) => {
-                self.loading = None;
+                self.cancel_load();
                 return;
             }
             Err(error) => {
@@ -2054,7 +2098,7 @@ impl Worker {
                 // Abandon the load, leaving no decoder open. The interrupt
                 // still stands and the loop's next pass acts on it.
                 Err(error) if is_cancelled(&error) => {
-                    self.loading = None;
+                    self.cancel_load();
                     return;
                 }
                 Err(error) => {
@@ -3039,6 +3083,16 @@ fn adopt_preserved(promised: Duration, actual: Duration) -> Duration {
     }
 }
 
+/// The oldest event `Worker::emit` may displace to make room for a terminal
+/// arrival at `PENDING_CAP`: neither terminal (already guaranteed delivery
+/// some other way) nor protected (never displaced — Decision 4). A free
+/// function so the unit test below can exercise it directly.
+fn displacement_victim(pending: &VecDeque<PlaybackEvent>) -> Option<usize> {
+    pending
+        .iter()
+        .position(|event| !event.is_terminal() && !event.is_protected())
+}
+
 /// An estimated duration is not a ceiling (§5.5): `clamp_target` must treat
 /// it exactly like an absent one, the same shape `decide_resume` uses for
 /// `KnownDuration`. Clamping to an estimate would silently relocate a seek
@@ -3061,6 +3115,31 @@ fn established_duration(metadata: &MediaMetadata) -> Option<Duration> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A terminal, non-protected event may be displaced to make room for
+    /// another terminal event at `PENDING_CAP`; a protected one — a load
+    /// outcome — never may, since correlation cannot be inferred from
+    /// anything later (Decision 4).
+    #[test]
+    fn a_terminal_event_never_displaces_a_protected_one() {
+        let mut pending = VecDeque::new();
+        pending.push_back(PlaybackEvent::LoadCancelled {
+            session_rev: 1,
+            request: LoadRequestId::from_raw(1),
+        });
+        pending.push_back(PlaybackEvent::EndOfTrack {
+            session_rev: 1,
+            position: Duration::ZERO,
+            provenance: PositionProvenance::Established,
+        });
+        pending.push_back(PlaybackEvent::Warning {
+            session_rev: 1,
+            message: String::new(),
+        });
+        assert_eq!(displacement_victim(&pending), Some(2));
+        pending.pop_back();
+        assert_eq!(displacement_victim(&pending), None);
+    }
 
     /// Fix round 2: proves the exact `store`/`fetch_max` composition
     /// `open_transport`, `CallbackCore::fill` and `Worker::publish_progress`
