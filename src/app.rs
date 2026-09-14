@@ -1258,18 +1258,50 @@ fn to_command(key: KeyEvent, mirror: &Mirror) -> Option<PlaybackCommand> {
 
 fn render(mirror: &Mirror) -> Result<(), PlaybackError> {
     let mut out = std::io::stdout();
+    // The frame is two rows that are repainted in place: clear a row, print,
+    // then step back up one. That arithmetic only holds while each row
+    // occupies exactly one physical line, so anything wider than the terminal
+    // has to be cut before it is printed (see `fit_to_width`).
+    let width = crossterm::terminal::size()
+        .map(|(columns, _)| usize::from(columns))
+        .unwrap_or(80);
     execute!(
         out,
         cursor::MoveToColumn(0),
         Clear(ClearType::CurrentLine),
-        Print(status_line(mirror)),
+        Print(fit_to_width(&status_line(mirror), width)),
         Print("\r\n"),
         Clear(ClearType::CurrentLine),
-        Print(HELP_LINE),
+        Print(fit_to_width(HELP_LINE, width)),
         cursor::MoveToColumn(0),
         cursor::MoveUp(1),
     )?;
     Ok(())
+}
+
+/// Cut `text` to `width` terminal columns, marking the cut with an ellipsis.
+///
+/// A row wider than the terminal wraps onto a second physical line, and
+/// `render`'s `MoveUp(1)` then lands inside the frame it was trying to
+/// overwrite, so every repaint walks one row further down the screen. A
+/// podcast episode's canonical id runs to about 110 characters and makes that
+/// reachable with ordinary input, but a long enough filename always could.
+///
+/// Counting is by `char`, which keeps multi-byte titles intact — Cyrillic
+/// episode names are the common case here. It still treats a wide glyph as one
+/// column, so a CJK title can cut one row short of the edge; erring narrow
+/// keeps the redraw correct, which is the property that matters.
+fn fit_to_width(text: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    if text.chars().count() <= width {
+        return text.to_owned();
+    }
+    text.chars()
+        .take(width.saturating_sub(1))
+        .chain(std::iter::once('…'))
+        .collect()
 }
 
 fn status_line(mirror: &Mirror) -> String {
@@ -1852,6 +1884,47 @@ mod tests {
                 .unwrap_or_else(|error| panic!("a well-formed URL must parse: {error}")),
         );
         assert_eq!(display_name(&media), "cdn.example.com");
+    }
+
+    // -------------------------------------------------------- fit_to_width
+
+    /// The bug this exists for: a podcast episode's canonical id is far wider
+    /// than a terminal, and an over-wide row made `render`'s repaint walk down
+    /// the screen instead of overwriting itself.
+    #[test]
+    fn a_media_id_wider_than_the_terminal_is_cut_to_one_row() {
+        let media = MediaId::PodcastEpisode {
+            feed: FeedId::new("beface6be47994b61e579fb92384dfb9".to_owned())
+                .expect("a valid feed id"),
+            episode: EpisodeKey::resolve(
+                Some("https://radio-t.com/p/2026/09/12//podcast-1030/"),
+                None,
+                None,
+            )
+            .expect("a valid episode key"),
+        };
+        let name = display_name(&media);
+        assert!(name.chars().count() > 80, "precondition: {name}");
+        let fitted = fit_to_width(&name, 80);
+        assert_eq!(fitted.chars().count(), 80);
+        assert!(fitted.ends_with('…'));
+    }
+
+    /// Counting by `char` rather than by byte: a byte-wise cut lands inside a
+    /// two-byte Cyrillic letter and panics, and Cyrillic episode titles are
+    /// the common case for the feed that surfaced this.
+    #[test]
+    fn a_cyrillic_row_is_cut_between_characters_not_inside_one() {
+        let fitted = fit_to_width("Радио-Т 1030 играет прямо сейчас", 10);
+        assert_eq!(fitted.chars().count(), 10);
+        assert_eq!(fitted, "Радио-Т 1…");
+    }
+
+    #[test]
+    fn a_row_that_already_fits_is_left_exactly_alone() {
+        assert_eq!(fit_to_width("short", 80), "short");
+        assert_eq!(fit_to_width("exactly-ten", 11), "exactly-ten");
+        assert_eq!(fit_to_width("anything", 0), "");
     }
 
     // --------------------------------------------------------- status_line
