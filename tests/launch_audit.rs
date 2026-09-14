@@ -4,7 +4,6 @@
 use std::path::{Path, PathBuf};
 
 mod support;
-#[cfg(target_os = "linux")]
 #[path = "support/process.rs"]
 mod unsupported_process;
 
@@ -84,60 +83,69 @@ fn subprocess_suites_are_gated_to_verified_platforms() -> Result<(), Box<dyn std
         );
     }
 
-    // On Linux, verify profile isolation works: the binary writes its
-    // state under Profile::state_dir(), not the inherited HOME.
+    // On Linux, verify profile isolation works: the binary writes
+    // subscriptions and data under profile directories, not under the
+    // inherited HOME. We test with subscriptions.json because no command
+    // yet exercises a headless state.json write (that lands with a later
+    // task's NullOutput virtual device); subscriptions.json is written by
+    // the subscribe command today and resolves through the same
+    // directories::ProjectDirs-based path logic, so it verifies the same
+    // redirection mechanism.
     #[cfg(target_os = "linux")]
     {
+        use support::server::{Script, TestServer};
+
         let profile = unsupported_process::Profile::new()?;
         let root = profile.root();
-        let state_dir = profile.state_dir();
-        let state_file = profile.state_file();
 
-        // Verify that the expected directories are configured under the
-        // temporary root and not inherited from HOME.
-        assert!(
-            state_dir.starts_with(root),
-            "state_dir {} should be under root {}",
-            state_dir.display(),
-            root.display()
-        );
+        // Create a test server serving a minimal RSS feed.
+        let feed = TestServer::start(Script::serving(
+            b"<rss><channel><title>Test</title></channel></rss>".to_vec(),
+        ));
+        let feed_url = feed.url("/feed");
 
-        assert!(
-            state_file.starts_with(root),
-            "state_file {} should be under root {}",
-            state_file.display(),
-            root.display()
-        );
+        // Subscribe to the feed; this writes subscriptions.json under the
+        // profile's data directory via the same ProjectDirs logic.
+        let output = profile
+            .command()
+            .args(["subscribe", &feed_url, "--as", "test"])
+            .output()?;
 
-        // Verify state directories are not under the inherited HOME.
-        if let Ok(home) = std::env::var("HOME") {
-            assert!(
-                !state_dir.starts_with(&home),
-                "state_dir {} should not be under HOME {}",
-                state_dir.display(),
-                home
-            );
-        }
-
-        // Launch continuo with the `feeds` command to verify the binary respects
-        // the isolated profile. The command succeeds whether the library is empty
-        // or not, proving the binary can run and access its directories.
-        let output = profile.command().args(["feeds"]).output()?;
+        feed.shutdown();
 
         assert!(
             output.status.success(),
-            "continuo feeds failed: {}",
+            "subscribe failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
 
-        // If state.json is created during the run, it must be in our isolated
-        // state directory, not in HOME.
-        if state_file.exists() {
+        // Verify that subscriptions.json was written to the isolated profile's
+        // data directory, not to the inherited HOME.
+        let subscriptions_file = root
+            .join("data")
+            .join("continuo")
+            .join("subscriptions.json");
+
+        assert!(
+            subscriptions_file.exists(),
+            "subscriptions.json not found at {}",
+            subscriptions_file.display()
+        );
+
+        assert!(
+            subscriptions_file.starts_with(root),
+            "subscriptions.json {} should be under profile root {}, not HOME",
+            subscriptions_file.display(),
+            root.display()
+        );
+
+        // Also verify it's not under the inherited HOME.
+        if let Ok(home) = std::env::var("HOME") {
             assert!(
-                state_file.starts_with(root),
-                "state.json {} should be under temp root {}, not HOME",
-                state_file.display(),
-                root.display()
+                !subscriptions_file.starts_with(&home),
+                "subscriptions.json {} should not be under HOME {}",
+                subscriptions_file.display(),
+                home
             );
         }
     }
