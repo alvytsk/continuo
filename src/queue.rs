@@ -17,7 +17,6 @@ impl QueueEntryId {
     pub fn get(self) -> u64 {
         self.0
     }
-    #[allow(dead_code)]
     pub(crate) fn from_raw(raw: u64) -> Self {
         Self(raw)
     }
@@ -294,7 +293,6 @@ impl Queue {
 
     /// Persistence's constructor, used only after `queue_codec` validated
     /// uniqueness, identity and capacity.
-    #[allow(dead_code)]
     pub(crate) fn from_parts(entries: Vec<QueueEntry>, active: Option<QueueEntryId>) -> Self {
         let next_id = entries
             .iter()
@@ -308,7 +306,6 @@ impl Queue {
         }
     }
 
-    #[allow(dead_code)]
     pub(crate) fn entry_from_parts(
         id: QueueEntryId,
         media: MediaId,

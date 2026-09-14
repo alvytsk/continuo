@@ -684,8 +684,8 @@ fn a_session_opened_on_a_v1_file_keeps_persisting_as_v2_with_every_entry_intact(
     let bytes = std::fs::read(dir.path().join("state.json")).unwrap();
     let raw: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(
-        raw["schema_version"], 2,
-        "the file on disk must claim v2 once a v2-aware Session has written through it: {raw}"
+        raw["schema_version"], 3,
+        "the file on disk must claim the current schema once a Session has written through it: {raw}"
     );
 
     let reloaded = reload(dir.path());

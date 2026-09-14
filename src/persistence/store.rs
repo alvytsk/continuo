@@ -13,7 +13,7 @@ use crate::media::id::MediaId;
 
 use super::PersistenceError;
 use super::atomic::replace_bytes;
-use super::model::{PersistedCheckpoint, PersistedState, SCHEMA_VERSION};
+use super::model::{PersistedCheckpoint, PersistedState, RawState, SCHEMA_VERSION};
 
 /// How many `-2`, `-3`, … candidates a quarantine will try before giving up.
 pub const MAX_QUARANTINE_CANDIDATES: u32 = 100;
@@ -43,7 +43,18 @@ struct VersionEnvelope {
 /// Does not touch the filesystem at all: no read, no quarantine, no write.
 /// What each caller does with a rejection — quarantine and keep writing,
 /// disable writing, or simply return `Err` — is entirely theirs.
-fn decode_state(path: &Path, bytes: &[u8]) -> Result<PersistedState, PersistenceError> {
+///
+/// `accept_queue` gates whether schema 3's `queue`/`active_entry` fields are
+/// decoded at all: [`StateStore::load`] passes `true`, and
+/// [`StateStore::read_snapshot`] passes `false`, since a listing never
+/// examines queue data (task brief recovery rules 1-2). The queue's own
+/// recovery outcome is not yet surfaced to either caller — a later M5 task
+/// consumes it for the sanitized startup warning (§6).
+fn decode_state(
+    path: &Path,
+    bytes: &[u8],
+    accept_queue: bool,
+) -> Result<PersistedState, PersistenceError> {
     let envelope = serde_json::from_slice::<VersionEnvelope>(bytes)
         .map_err(|source| malformed(path, &source))?;
 
@@ -63,8 +74,9 @@ fn decode_state(path: &Path, bytes: &[u8]) -> Result<PersistedState, Persistence
         });
     }
 
-    let mut state = serde_json::from_slice::<PersistedState>(bytes)
-        .map_err(|source| malformed(path, &source))?;
+    let raw =
+        serde_json::from_slice::<RawState>(bytes).map_err(|source| malformed(path, &source))?;
+    let (mut state, _queue_reset) = raw.into_state(accept_queue);
 
     // A v1 file's shape already deserialises cleanly into the current
     // `PersistedState` (§4.5): `position` lands in `Some`, and the absent
@@ -196,7 +208,7 @@ impl StateStore {
             }
         };
 
-        match decode_state(&self.path, &bytes) {
+        match decode_state(&self.path, &bytes, true) {
             Ok(state) => LoadOutcome {
                 state,
                 writable: true,
@@ -238,7 +250,7 @@ impl StateStore {
             }
         };
 
-        decode_state(&self.path, &bytes).map(StateSnapshot)
+        decode_state(&self.path, &bytes, false).map(StateSnapshot)
     }
 
     pub fn write(&self, state: &PersistedState) -> Result<(), PersistenceError> {
