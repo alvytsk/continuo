@@ -1,6 +1,6 @@
 # Continuo M5: compact Ratatui player
 
-Status: layout A selected by the user; this written specification is ready for review. The detailed behavior below is the proposed implementation contract, not an assertion that it already exists.
+Status: layout A selected by the user; revised after the first technical review and ready for review. The detailed behavior below is the proposed implementation contract, not an assertion that it already exists.
 
 Branch: `feat/ratatui-player`.
 
@@ -28,8 +28,9 @@ Keep the existing crate initially. Use focused modules instead of splitting into
 
 | Area | Responsibility | Boundary |
 | --- | --- | --- |
-| Application runtime | Own engine handle, session policy, HTTP service, persistence writer, queue, and current application state | Accept semantic commands; expose state and operation outcomes without terminal types |
-| Queue | Ordered entries, stable entry IDs, active entry, mutations, successor decisions | Pure data and policy; no rendering, decoding, or filesystem I/O |
+| Application runtime | Own engine handle, `Session`, HTTP service, persistence writer, and orchestration | Route mutations through `Session`; expose state and operation outcomes without terminal types |
+| Session | Sole owner of mutable `PersistedState`, including queue, active reference, volume, and checkpoints; sole builder of persistence snapshots | Serialize queue commands, metadata/source updates, playback events, and checkpoint ticks into one authoritative state |
+| Queue | Ordered entries, stable entry IDs, active entry, mutations, successor decisions | Pure data and policy stored inside Session's state; no separate mutable runtime copy, rendering, decoding, or filesystem I/O |
 | Existing playback engine | Decode, seek, buffer, output, report actual playback and capabilities | Continue using the existing admission, revision, cancellation, and event contracts |
 | Existing media/library services | Resolve paths, URLs, and cached podcast identities; read subscriptions and episodes | Reuse `library` operations without routing through printable CLI output |
 | Artwork worker | Read and decode supported artwork with bounded resource use | Return image data independently of terminal graphics encoding |
@@ -40,25 +41,44 @@ Candidate source locations are `src/application/`, `src/queue.rs`, `src/artwork/
 
 Application commands describe intent such as enqueue, play entry, pause, seek, reorder, remove, stop, and shutdown. No command accepts a Ratatui widget, terminal key event, Tauri handle, or serialized network message. UI selection and an optimistic seek target are presentation state; they must not become authoritative checkpoints.
 
+The application may keep immutable view snapshots and an in-flight load target. It must not own a second writable queue. All persistent changes go through `Session` on the application thread; only `Session` produces `Action::Submit` snapshots. Thus a periodic checkpoint includes the latest queue, and a queue mutation includes the latest accepted checkpoint. Background workers send results to the application rather than constructing snapshots themselves.
+
 ## 4. Entry points and lifecycle
 
-Add an explicit `continuo tui` entry point. Keep existing `continuo play`, feed commands, and `--probe-only` behavior compatible. A bare `continuo` can retain its current CLI help behavior for this milestone.
+Add an explicit `continuo tui` entry point. Keep existing `continuo play`, feed commands, and `--probe-only` behavior compatible. A bare `continuo` retains the required-subcommand usage error and exit code 2; `continuo --help` remains the successful help entry point.
 
 Opening the TUI restores the queue, active entry, volume, and checkpoints without automatically playing. An empty queue opens an idle interface. The audio device can be created lazily on the first play action; the interface must be usable when no output device is available.
 
-`q` or Ctrl-C exits the TUI, gracefully stops the local engine, captures and flushes state, and restores the terminal. A suspended or detached multiplexer session can keep the process alive, but Continuo itself does not become a daemon.
+Before loading, show the restored active entry's title and saved resume candidate labeled `saved`, including `~` for an estimated candidate, `played` for completion, and `position unknown` when appropriate. This is saved history, not live engine progress or proof that the source is still available. With no active entry, show an idle player; a selected queue row can show its own saved history without becoming active.
+
+Pre-load and end-of-queue input has explicit semantics:
+
+| Situation | Space or p | Enter | Home and Left/Right |
+| --- | --- | --- | --- |
+| Restored active entry, no loaded media | Load the active entry with resume/replay policy, regardless of selection | Load the selected entry | No-op with `Play a track before seeking`; do not open media or change a checkpoint |
+| No active entry, nonempty queue | Load the selected entry; default selection is the first row | Load the selected entry | Same unloaded no-op |
+| Empty queue | No-op with `Queue is empty` | Same | Same; no seek command sent |
+| Last entry ended | Replay the ended active entry from the beginning under completed-entry policy | Play selected entry with resume/replay policy | Home explicitly restarts the active entry; Left/Right no-op with `Track ended; press play to replay` |
+
+While loading, Home and Left/Right do not accumulate a future seek; report `Still loading`. After a loaded track is stopped or paused, retain existing engine restart/seek semantics. While playing, Space toggles pause; `p` is idempotent play/resume. A failed load is retried with Space/p using the last requested entry when still queued; Enter always chooses the selected row. Previous/next before loading use the restored active entry, or selection if there is none, as their navigation anchor; a missing neighbor is a no-op.
+
+`q`, the Ctrl-C key, and OS shutdown requests converge on one idempotent application shutdown path. On Unix, register SIGINT, SIGHUP, and SIGTERM through the safe `signal-hook` iterator API before state loading, terminal setup, or spawning playback workers. A dedicated listener records a shutdown request and wakes the application; it never renders, loads state, or flushes inside a raw signal handler. Installation failure aborts startup before entering the alternate screen. This does not depend on Tokio's currently disabled signal feature. Gate Unix signal code by platform.
+
+On a request, cancel source preparation/reads through the existing engine interrupt path, drain terminal lifecycle outcomes, capture the final available checkpoint, flush and join the writer, and attempt terminal restoration even if the pane's PTY has gone away. Keep the profile lock through the final writer shutdown. Close and join the signal listener during teardown; repeated signals do not initiate concurrent flushes. Exit normally for `q`/key Ctrl-C; exit with `128 + signal_number` after OS-signal shutdown. SIGKILL, process abort, and power loss cannot run this path and retain only the last durable write. A suspended or detached multiplexer session can keep the process alive, but Continuo itself does not become a daemon.
 
 ## 5. Queue behavior
 
 Each queue entry stores a stable `QueueEntryId`, the existing `MediaId`, a resolvable source reference, and display metadata. IDs identify occurrences: duplicate entries for the same media are allowed. Checkpoints remain keyed by `MediaId`, so duplicates share listening history while retaining independent queue positions.
 
-For a local file, preserve the normalized absolute path; for a direct URL, preserve the normalized source URL. A podcast entry retains its episode identity and the resolved enclosure source, rather than a mutable display index. Refreshing a feed must not silently substitute another episode for a queued entry.
+For a local file, preserve the normalized absolute path; for a direct URL, preserve the normalized source URL. A podcast entry retains its `(FeedId, EpisodeKey)` identity and the last resolved enclosure as a fallback, rather than a mutable display index.
+
+Before each podcast load, read the current local cache for that feed and match the exact episode identity. If present with a usable enclosure, use that URL and update the fallback through `Session`; rotated or signed URLs do not change `MediaId` or checkpoints. If the episode or subscription is absent, or the cache file is missing, use the saved URL and show `Using saved episode source`. If the episode is present but has no usable enclosure, report `NotPlayable` instead of reviving a removed enclosure. Corrupt, unreadable, or unsupported cache data is an explicit resolution error, not evidence that the episode is absent. Never match by title, list index, or publication date; never fetch or refresh a feed implicitly. An expired fallback fails through normal playback error handling.
 
 Proposed rules:
 
-- Enqueue appends without changing playback. Explicitly playing an entry uses existing resume/replay policy.
+- Enqueue appends without changing playback. Every entry load uses existing resume/replay policy, including explicit play, previous/next, and automatic advancement: resume half-listened media; replay completed media from zero; preserve the established/estimated and unavailable-resume protection rules.
 - Selection can move independently of the playing entry. Reordering preserves both IDs and does not reload audio.
-- A revision-matched, verified `EndOfTrack` advances once to the next queue entry. A stale completion event cannot advance the new track.
+- An engine `EndOfTrack` for the current playback revision advances once to the next queue entry, after `Session` observes completion and captures the outgoing state. The engine emits it after output drains; the application does not infer completion from a duration, byte count, or timer. Both `Established` and `Estimated` provenance advance. Estimated completion still cannot overwrite an established checkpoint position. Deduplicate completion by the adopted playback revision; a stale completion event cannot advance the new track.
 - The last entry ends playback; there is no wrapping, shuffle, or repeat in this milestone.
 - Playback failure leaves the queue and checkpoint intact, reports the error, and waits for an explicit retry or another selection. It does not silently skip entries.
 - Removing a nonplaying entry leaves playback alone. Removing the active entry captures its checkpoint, stops it, removes it, clears the active-entry reference, and selects its successor (or predecessor at the end), without starting that selection automatically. Selection alone never establishes a new active entry.
@@ -66,6 +86,8 @@ Proposed rules:
 - Explicit previous/next actions move to adjacent entries without wrapping and use the same playback preparation and checkpoint path as playing a selected entry.
 
 The browser sketch is illustrative: its wrapping skip buttons and automatic replacement after active-entry removal do not define production semantics.
+
+The queue is capped at 256 occurrences, including duplicates. Reject an enqueue operation that would exceed the cap in full, with a visible capacity message; do not silently truncate a batch. On-disk queues over the cap are invalid state handled by the existing malformed-state policy. The checkpoint cap stays at 512 media identities with the existing eviction policy: queue membership does not pin a checkpoint. A queued track's history can therefore be evicted after enough other media are played, including through legacy `play`. The entry remains queued and a later load with no checkpoint starts from zero. Queue capacity bounds snapshot work; it does not promise indefinite history retention.
 
 ## 6. Durable state
 
@@ -75,9 +97,11 @@ Migrate schemas 1 and 2 by retaining their existing state and introducing an emp
 
 The legacy `continuo play` command plays outside the queue: retain queue entries, clear the active queue-entry reference when adopting that explicit source, and persist its current media and progress normally. Restoring the TUI must not infer a queue occurrence from `MediaId`, because duplicate occurrences are valid.
 
-Persist queue mutations through the existing single writer. Preserve checkpoint capture order, established-versus-estimated provenance, protected resume points, malformed/unsupported file handling, and graceful flush reporting. A queue mutation must not bypass the writer with an independent file write.
+Persist queue mutations through Session's authoritative state and the existing single writer. The writer accepts immutable `Action::Submit` snapshots in application order and may coalesce them; it never merges independently built queue and checkpoint copies. Preserve checkpoint capture order, established-versus-estimated provenance, protected resume points, malformed/unsupported file handling, and graceful flush reporting. A queue mutation must not bypass Session or the writer with an independent file write. Adopt a new active entry and its `current_media` together when the corresponding load is accepted into application state; an in-flight request cannot create a persisted mismatch.
 
-Prevent concurrent playback applications from writing the same state profile by acquiring an exclusive process-lifetime lock before opening the writer. Read-only feed listing and probe operations do not acquire that playback-writer lock. Release it automatically when the owning process exits. This is local persistence protection, not a server/session feature.
+Prevent concurrent playback applications from using stale state by acquiring an exclusive process-lifetime lock **before any state read, load, migration, quarantine, or writer creation**. Resolve the profile path, open a stable sibling `state.lock`, acquire its nonblocking advisory lock, and only then call `StateStore::load`. Do not lock the atomically replaced `state.json` inode, and do not unlink/recreate the lock file on unlock. Retain the same guard through initialization, final snapshot capture, writer flush/join, and teardown. A later invocation must load afresh after obtaining the lock; it cannot reuse a snapshot from before acquisition.
+
+If the lock is held, both a second `tui` and a second `play` refuse to start, exit nonzero, and report `Another Continuo player is using this state profile` before opening an audio device or entering raw mode. Do not use the `writable = false` path for contention. Failure to resolve/create/lock the state profile is also a startup error for these playback commands. This intentionally replaces the existing no-state-directory unsaved fallback. After successful lock acquisition, the existing read-only/disabled-writer handling for unsupported or unreadable state remains, with a visible unsaved-session warning. Read-only feed listing and probe operations do not acquire this lock; their snapshots are never promoted into a playback writer. These locks coordinate updated Continuo processes; older binaries that ignore the lock remain outside the guarantee.
 
 ## 7. Terminal layout and controls
 
@@ -90,17 +114,17 @@ Normal layout, at least 80 columns by 28 rows:
 3. The queue fills the remaining space, with a separate playing marker and selected-row highlight.
 4. A short keyboard/status footer.
 
-At 50–79 columns or 18–27 rows, reduce artwork size and spectrum height, remove secondary metadata, and use single-line queue entries when necessary. Below 50 columns or 18 rows, hide artwork and spectrum; retain title, playback state, usable queue rows, and essential controls. Below 30 columns or 8 rows, show a resize message while preserving quit and playback controls. Drawing must remain valid even at zero-sized terminal rectangles.
+The smallest tier matched by either dimension wins. Evaluate in this order: below 30 columns **or** 8 rows shows the resize message; otherwise below 50 columns **or** 18 rows uses the minimal tier; otherwise below 80 columns **or** 28 rows uses the compact tier; otherwise use normal. Thus 100×20 is compact. Compact reduces artwork and spectrum height, removes secondary metadata, and uses single-line queue entries when needed. Minimal hides artwork and spectrum while retaining title, playback state, queue rows, and essential controls. The resize-message tier preserves quit and playback controls. Drawing remains valid even at zero-sized terminal rectangles.
 
 | Input | Action |
 | --- | --- |
-| Space | Pause/resume |
+| Space | Pause/resume; unloaded/ended behavior follows §4 |
 | Enter | Play selected queue entry |
 | Up/Down or j/k | Move selection |
 | J/K | Move selected entry down/up |
 | Left/Right | Seek backward/forward 10 seconds using existing burst handling |
 | Home | Explicit restart from beginning |
-| -/+ | Adjust volume |
+| - or _ / + or = | Decrease / increase volume; keep the existing aliases |
 | s / p | Stop / play |
 | [ / ] | Previous / next queue entry |
 | d | Remove selected entry |
@@ -108,10 +132,12 @@ At 50–79 columns or 18–27 rows, reduce artwork size and spectrum height, rem
 | a | Open path/URL input |
 | c | Request queue clear with confirmation |
 | ? | Show help |
+| m | Toggle mouse capture; status/footer shows on or off |
+| Ctrl-L | Clear Ratatui's screen buffer, invalidate image placements, and redraw the whole view |
 | Esc | Close the active overlay or cancel input |
 | q / Ctrl-C | Graceful quit |
 
-Text entry consumes printable keys so typing a URL cannot trigger player shortcuts. Mouse support covers queue selection, activation, scrolling, and transport hit regions. Seeking with the mouse follows the same capability checks as keyboard seeking. No operation depends on mouse availability.
+Text entry consumes printable keys so typing a URL cannot trigger player shortcuts. Mouse support covers queue selection, activation, scrolling, and transport hit regions. Seeking with the mouse follows the same capability checks as keyboard seeking. Mouse capture defaults on, can be toggled with `m` outside text entry, and can be disabled at launch with `--mouse off`. Turning it off sends the protocol's disable sequences so terminal/multiplexer text selection works normally; it does not interrupt playback. No operation depends on mouse availability.
 
 Duration, seekability, estimated position, buffering, and playback failure must remain honestly represented. Use an unknown-duration display instead of an invented denominator; do not present a feed's declared duration as decoder-confirmed.
 
@@ -121,7 +147,7 @@ The on-demand browser offers local directories and cached subscriptions/episodes
 
 Preserve manual feed refresh: opening the browser or listing episodes never refreshes a feed. Existing subscribe, unsubscribe, and refresh commands remain available through the CLI; full subscription management screens are outside this milestone.
 
-Use available title, artist, and album tags for local media. Use a filename or existing sanitized display-name fallback when metadata is absent. Queued entries may initially lack duration; background metadata can fill it without opening an audio device. Display strings must not emit raw terminal control characters or expose URL credentials.
+Use available title, artist, and album tags for local media. Use a filename or existing sanitized display-name fallback when metadata is absent. **Background metadata enrichment is local-file-only**, with at most two cancellable workers and no audio device. Enqueueing, restoring, or browsing a URL/podcast entry performs no metadata network requests and no remote duration probes. Use already-cached feed metadata with declared-duration provenance preserved; otherwise show unknown fields. An explicit playback load may fill remote metadata as a byproduct of the existing bounded HTTP preparation/decode path. Persist enrichment results only through `Session`. Display strings must not emit raw terminal control characters or expose URL credentials.
 
 ## 9. Artwork
 
@@ -135,9 +161,24 @@ Read and decode on a worker. Resize and encode the terminal representation outsi
 
 The real visualizer uses audio samples, not the browser's simulated animation. Analyze PCM associated with output consumption rather than decoding far ahead of playback.
 
-An optional tap copies complete sample frames into a bounded, preallocated ring. The output callback remains allocation-free, lock-free, and I/O-free; it does not compute FFTs, wait for analysis, or publish terminal updates. If the tap has no room, drop visualization data and reset the worker's analysis window across the discontinuity. Playback and existing position-span publication take precedence.
+An optional tap copies post-gain output PCM into a bounded, preallocated ring. The output callback remains allocation-free, lock-free, and I/O-free; it does not compute FFTs, wait for analysis, or publish terminal updates. One audio frame contains every output channel. Reserve a chunk with `rtrb::Producer::write_chunk` for an integral number of complete frames, fill it, and commit only a multiple of the channel count. A short reservation is never completed by individual `push` calls. The implementation must pair sample chunks and their timing/generation descriptors atomically from the consumer's perspective: reserve capacity for both first, commit PCM first, then publish its descriptor, and consume only described PCM. If either capacity is unavailable, drop the complete tap block. Attach a discontinuity sequence to the next accepted descriptor and reset the worker's FFT window when it changes. No orphan PCM, partial channel frame, or unmatched descriptor may be exposed. Playback and existing position-span publication take precedence.
 
-On a worker, use a 2048-sample Hann window and 24 logarithmic frequency bands between 40 Hz and the lesser of 16 kHz or Nyquist. Combine stereo channels by spectral power so opposite-phase material does not vanish through a mono sum. Publish at most 20 frames per second, with bounded smoothing and a latest-value result. Associate frames with the playback revision and output timing; do not show another track's spectrum after a seek or load.
+The callback labels tap descriptors with its output generation, the control epoch, an immutable transport-instance ID assigned when that tap is constructed, channel count, sample rate, discontinuity sequence, and predicted output timestamp. It does **not** know or fabricate `session_rev`. Before enabling a transport, the playback worker publishes the mapping from `(transport-instance ID, generation, control epoch)` to `session_rev` and its output clock domain. The spectrum worker uses that mapping to label results; unknown or retired mappings are discarded. A unique transport-instance ID prevents a wrapped generation or recreated device from matching old samples. Reset accumulation on mapping/format changes and discontinuities; invalidate old results on load, seek, and transport retirement, even when a seek preserves the logical media identity.
+
+Keep the **2048-sample Hann window and merge narrow bands**. Start with 24 nominal logarithmic intervals from 40 Hz to the lesser of 16 kHz or Nyquist. Assign positive-frequency FFT bin centers to half-open intervals, with the last upper edge inclusive. Walk intervals from low to high, merging adjacent intervals until a band contains at least two bin centers. Merge any remaining underfilled tail into the preceding band; if the entire range contains fewer than two centers, publish unavailable/silence rather than an empty-band display. The result has at most 24 bands, with explicit lower/upper edges in each frame. Average bin power within each merged band and average spectral power across **all output channels**, so opposite-phase channels do not cancel. Do not stretch the result into 24 duplicate low-frequency bars. Fewer, wider low bands are intentional; a 2048-sample transform cannot claim finer frequency resolution.
+
+At 44.1/48 kHz the FFT spacing is approximately 21.5/23.4 Hz; the nominal first interval is only about 11.3 Hz wide. Band merging is therefore required even at these ordinary sample rates, and must be computed from the actual device sample rate. Publish at most 20 frames per second, with bounded smoothing and a latest-value result. Schedule frames against their mapped output clock/timestamps; never display another transport's spectrum under the current track.
+
+A numerical check of this interval-merging rule gives the following expected geometry. These are specification checks, not a benchmark of an implemented visualizer.
+
+| Output sample rate | Emitted bands | First merged interval |
+| --- | --- | --- |
+| 44.1 kHz | 21 | 40–65.9 Hz |
+| 48 kHz | 21 | 40–84.6 Hz |
+| 96 kHz | 19 | 40–108.6 Hz |
+| 192 kHz | 16 | 40–229.6 Hz |
+
+Each band contains at least two bin centers; all eligible centers are assigned exactly once. The much wider low band at 192 kHz explicitly reflects the short window's limited resolution.
 
 The display represents signal level after player gain. Paused, stopped, or starved playback decays to silence. Hidden or disabled visualization suspends analysis. Tauri can later render the same band data without depending on the terminal widget.
 
@@ -145,9 +186,13 @@ The display represents signal level after player gain. Paused, stopped, or starv
 
 Application state changes stay ordered around the existing engine events. Drain lifecycle events before sampling progress, and reject stale revisions. Track changes capture outgoing checkpoints before adopting incoming identity. UI predictions never overwrite authoritative position.
 
-Media opening, browsing, artwork, or device failures keep the TUI usable and expose a concise status message. Artwork failure does not become playback failure. Persistence failure remains visible; the interface must not claim state was saved when flushing failed. Send diagnostic logs to a file or another sink that cannot corrupt the alternate screen.
+After successful startup, media opening, browsing, artwork, or device failures keep the TUI usable and expose a concise status message. Artwork failure does not become playback failure. Persistence failure remains visible; the interface must not claim state was saved when flushing failed.
 
-Terminal setup uses a guard that restores raw mode, mouse capture, cursor visibility, image placement, and the alternate screen on normal exit and unwind. Restore the terminal before printing a final fatal error. No terminal cleanup path skips the engine/writer shutdown sequence.
+**Redirect process fd 2 for the TUI lifetime**, including messages emitted directly by ALSA or other C libraries. Use the safe `gag::Redirect::stderr` API with a per-run append log under the profile's `logs/` directory; keep `unsafe_code = "forbid"` in Continuo. Set up the log and redirection before entering raw/alternate-screen mode or constructing the audio device; failure aborts startup visibly. All worker logs, including `tracing`, must remain off the live terminal. Plain CLI commands retain their current stderr output. Hold the redirect through engine/device destruction and writer shutdown; then restore the terminal and original fd 2 before printing any final error. This is fd redirection, not merely changing the Rust tracing subscriber. At startup under the profile lock, retain the five most recent prior logs and create a new uniquely named log. The active file has no size cap in this milestone; do not claim that ordinary tracing rotation also bounds direct C-library writes.
+
+Terminal setup uses idempotent cleanup for raw mode, mouse capture, cursor visibility, image placement, and the alternate screen. A pane closing may make these writes fail; continue engine shutdown and persistence flush anyway. On normal exit and SIGHUP/SIGTERM/SIGINT, use the §4 shutdown path before releasing persistence ownership. Ctrl-L and resize clear Ratatui's cached buffer and reprepare image placements; this is recovery support, not the chosen solution for C-library stderr.
+
+Install a panic hook before entering the alternate screen, retaining the previous hook. The hook first marks rendering disabled, performs best-effort terminal restoration and fd-2 restoration, and only then invokes the previous/default hook so the panic diagnostic is visible on the primary screen. It must run for panics from worker threads as well as the UI thread, never wait for the application state/writer, and never panic itself. Do not rely on a guard dropping after the default hook prints. Keep an independently accessible, nonblocking, idempotent terminal/redirect restoration handle; ordinary rendering must stop once panic cleanup begins. After an unwind on the application thread, an outer unwind boundary attempts normal engine/writer teardown and resumes unwinding without reporting success. Worker panics must wake/fail the application so it tears down. Panic cleanup is best effort for remaining valid state; do not promise a fresh checkpoint from corrupted state or an aborting process.
 
 ## 12. Validation and delivery order
 
@@ -156,11 +201,13 @@ Implement in reviewable increments: extract the shared runtime and add queue/sta
 Required evidence:
 
 - Existing playback, cancellation, provenance, HTTP, feed, and persistence suites remain green.
-- Queue tests cover duplicate media entries, reorder without reload, active removal, end-of-queue, failure behavior, and stale/double completion events.
-- State tests cover v1/v2 migration, queue restoration, malformed active references, duplicate entry IDs, single-writer ownership, and persistence failure.
-- Ratatui buffer tests cover normal, compact, tiny, empty, loading, failed, unknown-duration, and estimated-position screens; selection remains distinct from playback.
+- Queue tests cover duplicate media entries, reorder without reload, active removal, end-of-queue, failure behavior, stale/double completion events, both completion provenances, auto-advance into partial/completed episodes, the 256-entry cap, atomic rejection of oversized batches, and checkpoint eviction of queued media.
+- State tests cover v1/v2 migration, queue restoration, malformed active references, duplicate entry IDs, single-writer ownership, and persistence failure. A process test holds A's lock through a final newer checkpoint, proves B cannot load while it is held, and verifies a fresh B invocation reads that checkpoint after A exits. Test contention for both `tui` and `play`, lock errors, initialization failure release, and queue/checkpoint interleaving through Session with deliberately delayed writes.
+- Ratatui buffer/input tests cover normal, compact, tiny, empty, loading, failed, unknown-duration, and estimated-position screens; selection remains distinct from playback. Include mixed dimensions (100×20 and 60×40), saved-but-unloaded state, all §4 transport rules, volume aliases, mouse-capture toggle, and full redraw invalidation.
+- Podcast resolver fixtures cover a rotated enclosure under the same episode key, reordered feeds, absent episode/subscription/cache fallback, present-but-unplayable entries, corrupt-cache failure, and stable checkpoint identity. Assert no network calls from restoration/browsing/enqueueing remote metadata; only explicit play uses remote preparation.
 - Artwork fixtures cover supported images, fallback ordering, missing/corrupt/oversized input, and terminal resize cleanup.
-- Spectrum tests use known tones, silence, opposite-phase stereo, dropped samples, and stale revisions; a saturated visualization channel cannot block playback.
+- Spectrum tests use known tones, silence, opposite-phase channels, mono/stereo/multichannel output, dropped samples, ring wraparound, and stale revisions. At 44.1, 48, 96, and 192 kHz, assert every emitted band owns at least two bin centers, bands do not overlap, and no bin is duplicated; verify the merged low bands react to low-frequency tones. Test transport-instance/generation/epoch mappings across seek, device recreation, and generation reuse, sample/descriptor capacity exhaustion, frame alignment, and saturated visualization channels without blocking playback.
+- Subprocess/PTY tests send SIGHUP and SIGTERM during playback and stalled HTTP preparation, verify shutdown flush and exit status, and verify the next invocation can acquire the lock. Send a direct fd-2 write from a child/helper to verify it reaches the log rather than the PTY while the TUI is active. Verify normal restoration, a closed PTY that cannot be restored, and a deliberate panic whose default-hook diagnostic appears after the alternate screen is left. Use a subprocess per signal/redirect/panic case so tests cannot damage the test runner's process state.
 - Manually exercise the result in Ghostty directly, Ghostty with Zellij, and Ghostty with Herdr: images, fallback, resize, pane switching, keyboard, mouse, and exit restoration. Browser checks do not satisfy these terminal checks.
 - Run `cargo fmt --check`, `cargo clippy --locked --all-targets --all-features -- -D warnings`, and `cargo test --locked` for implementation acceptance.
 
@@ -176,3 +223,7 @@ The foundation scope excluded visualizers. This conversation explicitly adds a f
 - [Ghostty terminal features](https://ghostty.org/docs/features)
 - [Zellij 0.45 image support](https://zellij.dev/news/nested-sessions-kitty-graphics-new-ui/)
 - [Herdr 0.9 release](https://github.com/herdrdev/herdr/releases/tag/v0.9.0)
+- [signal-hook signal iterator](https://docs.rs/signal-hook/latest/signal_hook/iterator/struct.SignalsInfo.html)
+- [gag stderr redirection](https://docs.rs/gag/latest/gag/struct.Redirect.html)
+- [rtrb chunk operations](https://docs.rs/rtrb/latest/rtrb/chunks/index.html)
+- [Rust panic hook order](https://doc.rust-lang.org/std/panic/fn.set_hook.html)
