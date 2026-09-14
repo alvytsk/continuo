@@ -218,7 +218,7 @@ fn date_text(value: OffsetDateTime) -> String {
 /// the terminal, so every character that can do either becomes a visible
 /// escape; all the rest — Cyrillic, CJK, emoji — pass through exactly as
 /// stored, since transliterating a title would make it someone else's title.
-fn displayable(text: &str) -> String {
+pub(crate) fn displayable(text: &str) -> String {
     if !text.chars().any(needs_escape) {
         return text.to_string();
     }

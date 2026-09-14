@@ -1107,7 +1107,10 @@ impl Mirror {
                 ..
             } => {
                 self.session_rev = session_rev;
-                self.name = Some(display_name(&media));
+                self.name = Some(match &media {
+                    MediaId::PodcastEpisode { .. } => episode_name(metadata.title.as_deref()),
+                    other => display_name(other),
+                });
                 self.duration = metadata.duration;
                 self.capabilities = Some(capabilities);
                 self.position = position;
@@ -1198,6 +1201,22 @@ impl Mirror {
     }
 }
 
+/// What the status row calls a podcast episode: its title.
+///
+/// `display_name` gives a local file its basename and a remote URL its last
+/// path segment, and a podcast episode fell through to the canonical id —
+/// `podcast:<feed>/guid:https:%2F%2F…`, about 110 characters of identifier and
+/// nothing a listener recognises. The decoder's title is the same name
+/// `--probe-only` prints and the one `continuo episodes` lists, so `play
+/// radio-t 1` now reads the way the listing that chose it did. Untitled audio
+/// gets the `(untitled)` spelling the probe and the listing already use.
+fn episode_name(title: Option<&str>) -> String {
+    title
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+        .map_or_else(|| "(untitled episode)".to_owned(), str::to_owned)
+}
+
 fn display_name(media: &MediaId) -> String {
     match media {
         MediaId::LocalFile(path) => path
@@ -1269,7 +1288,10 @@ fn render(mirror: &Mirror) -> Result<(), PlaybackError> {
         out,
         cursor::MoveToColumn(0),
         Clear(ClearType::CurrentLine),
-        Print(fit_to_width(&status_line(mirror), width)),
+        Print({
+            let (name, fields) = status_parts(mirror);
+            fit_status(&name, &fields, width)
+        }),
         Print("\r\n"),
         Clear(ClearType::CurrentLine),
         Print(fit_to_width(HELP_LINE, width)),
@@ -1304,8 +1326,22 @@ fn fit_to_width(text: &str, width: usize) -> String {
         .collect()
 }
 
+/// The status row joined, unfitted — what the row says before `render` fits
+/// it to a terminal. Only the tests read the whole row as one string.
+#[cfg(test)]
 fn status_line(mirror: &Mirror) -> String {
-    let name = mirror.name.as_deref().unwrap_or("(no media)");
+    let (name, fields) = status_parts(mirror);
+    format!("{name}{fields}")
+}
+
+/// The status row as its two halves: the name, and the fields after it.
+///
+/// They are kept apart so `render` can decide which to shorten. The name is
+/// escaped here, at the row's formatting boundary: an episode title is decoder
+/// metadata from the network, and the escaping is `commands::displayable`, the
+/// same policy the listings apply to feed titles.
+fn status_parts(mirror: &Mirror) -> (String, String) {
+    let name = crate::commands::displayable(mirror.name.as_deref().unwrap_or("(no media)"));
     let position = format_hms(mirror.position);
     // Two independent marks for two independent facts (§3): a degraded
     // quality says the played-so-far estimate may be off, while `~est` says
@@ -1338,10 +1374,28 @@ fn status_line(mirror: &Mirror) -> String {
     if mirror.buffering && mirror.state == PlaybackState::Playing {
         label.push_str(" buffering");
     }
-    format!(
-        "{name} [{label}]{seek_note} {position}{suffix} / {duration}  vol {}%",
+    let fields = format!(
+        " [{label}]{seek_note} {position}{suffix} / {duration}  vol {}%",
         mirror.volume.percent(),
-    )
+    );
+    (name, fields)
+}
+
+/// Fit a status row into `width` columns by shortening the name first.
+///
+/// State, position, duration and volume are what the row is read for; the name
+/// only says what is playing. So the fields keep their full width while they
+/// fit at all, and the name gives way — cutting from the right of the whole
+/// row instead kept a hundred characters of identifier and discarded the
+/// position. If even the fields alone are wider than the terminal, the row is
+/// still cut rather than wrapped, because a wrapped row is what breaks the
+/// in-place repaint.
+fn fit_status(name: &str, fields: &str, width: usize) -> String {
+    let fields_width = fields.chars().count();
+    if fields_width >= width {
+        return fit_to_width(&format!("{name}{fields}"), width);
+    }
+    format!("{}{fields}", fit_to_width(name, width - fields_width))
 }
 
 fn format_hms(duration: Duration) -> String {
@@ -1925,6 +1979,71 @@ mod tests {
         assert_eq!(fit_to_width("short", 80), "short");
         assert_eq!(fit_to_width("exactly-ten", 11), "exactly-ten");
         assert_eq!(fit_to_width("anything", 0), "");
+    }
+
+    // ------------------------------------------------ episode name and fit
+
+    #[test]
+    fn a_podcast_episode_is_named_by_its_title_not_its_canonical_id() {
+        assert_eq!(episode_name(Some("Радио-Т 1030")), "Радио-Т 1030");
+        assert_eq!(episode_name(Some("  padded  ")), "padded");
+        assert_eq!(episode_name(None), "(untitled episode)");
+        assert_eq!(episode_name(Some("   ")), "(untitled episode)");
+    }
+
+    /// The regression the first fix introduced: cutting the whole row from the
+    /// right kept ~110 characters of identifier and discarded the position,
+    /// which is the one thing a listener reads the row for.
+    #[test]
+    fn a_long_name_gives_way_so_the_position_stays_visible() {
+        let name = "x".repeat(200);
+        let fields = " [playing] 00:00:04 / 03:07:31  vol 80%";
+        let row = fit_status(&name, fields, 80);
+        assert_eq!(row.chars().count(), 80);
+        assert!(
+            row.ends_with(fields),
+            "the fields must survive whole: {row}"
+        );
+        assert!(row.contains('…'), "the name is what was cut: {row}");
+    }
+
+    #[test]
+    fn a_row_narrower_than_its_own_fields_is_still_cut_not_wrapped() {
+        let row = fit_status(
+            "Радио-Т 1030",
+            " [playing] 00:00:04 / 03:07:31  vol 80%",
+            12,
+        );
+        assert_eq!(row.chars().count(), 12);
+    }
+
+    #[test]
+    fn a_row_that_fits_keeps_its_whole_name() {
+        let fields = " [playing] 00:00:04 / 03:07:31  vol 80%";
+        assert_eq!(
+            fit_status("Радио-Т 1030", fields, 80),
+            format!("Радио-Т 1030{fields}")
+        );
+    }
+
+    /// An episode title is decoder metadata off the network, so it reaches the
+    /// terminal through the same escaping the listings give feed titles.
+    #[test]
+    fn a_title_carrying_a_terminal_escape_is_rendered_inert() {
+        let mirror = Mirror {
+            name: Some("Радио-Т\u{1b}[2J\u{202e}1030".to_owned()),
+            ..Mirror::default()
+        };
+        let (name, _) = status_parts(&mirror);
+        assert!(
+            !name.contains('\u{1b}'),
+            "raw ESC reached the row: {name:?}"
+        );
+        assert!(
+            !name.contains('\u{202e}'),
+            "raw bidi override reached the row: {name:?}"
+        );
+        assert!(name.starts_with("Радио-Т"));
     }
 
     // --------------------------------------------------------- status_line
