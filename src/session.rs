@@ -343,7 +343,8 @@ impl Session {
     pub fn accepts_media_event(&self, event: &PlaybackEvent) -> bool {
         match event {
             PlaybackEvent::Loaded { request, media, .. } => {
-                self.registered_target(*request, media).is_some()
+                event.session_rev() >= self.latest_engine_rev
+                    && self.registered_target(*request, media).is_some()
             }
             PlaybackEvent::VolumeChanged { .. } => true,
             _ => self.owns_adopted(event.session_rev()),
@@ -557,6 +558,12 @@ impl Session {
         } = event
             && self.pending.contains_key(request)
         {
+            // Not history, but the engine really is loading: without this,
+            // `self.playback` would still read whatever it was for the
+            // *previous* adopted media, and the launch `Paused` that follows
+            // this new load would misread `previous == Playing` and raise a
+            // pending force nothing asked for.
+            self.playback = PlaybackState::Loading;
             let event_rev = event.session_rev();
             if event_rev >= self.latest_engine_rev {
                 self.latest_engine_rev = event_rev;
@@ -595,6 +602,12 @@ impl Session {
                 self.resolve_target();
                 self.established = true;
                 self.completed = false;
+                // Re-establishment: the same (adopted token, session_rev) can
+                // legitimately complete again after this landing — a
+                // finished track can be sought back into and replayed to the
+                // end without either changing (D3's key would otherwise
+                // treat the second EndOfTrack as the first's duplicate).
+                self.completion_seen = None;
                 self.position_provenance = *provenance;
                 if *provenance == PositionProvenance::Established {
                     // An established user seek (§10): the listener steered
@@ -626,6 +639,10 @@ impl Session {
                 self.resolve_target();
                 self.established = true;
                 self.completed = false;
+                // See the identical note on `SeekCompleted`: an explicit
+                // restart is exactly the "finish, Home, play again" sequence
+                // this dedup must not suppress a second time.
+                self.completion_seen = None;
                 self.position_provenance = *provenance;
                 if *provenance == PositionProvenance::Established {
                     self.protected = None;
@@ -644,6 +661,8 @@ impl Session {
                 // beside `completed` would be thrown away by the resume it
                 // exists to steer.
                 self.completed = false;
+                // See the identical note on `SeekCompleted`.
+                self.completion_seen = None;
                 // R5: a stored target is arithmetic on whatever position was
                 // current when the seek was accepted — target = that position
                 // plus or minus a listener-chosen delta — and arithmetic
@@ -894,6 +913,10 @@ impl Session {
                 // §12: a successful establishment after a completed state
                 // clears it. Persistence restoration alone does not.
                 self.completed = false;
+                // See the identical note on `SeekCompleted`: `Playing`
+                // landing here (a bare Play from Ended, with no seek or
+                // restart event of its own) is itself a re-establishment.
+                self.completion_seen = None;
                 self.last_capture = Some(now.monotonic);
             }
             // A pause that interrupts no playback is not a checkpoint: every

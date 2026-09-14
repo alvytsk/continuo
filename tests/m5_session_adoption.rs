@@ -238,14 +238,20 @@ fn completion_advances_once_for_either_provenance_and_never_from_a_stale_revisio
             .register_load(LoadTarget::Queue(ids[0]), &media("a"))
             .expect("registered");
         session.observe(&loaded(first, 3, "a"), clock.sample());
+
+        let before_stale = serde_json::to_value(session.state()).expect("snapshot");
         session.observe(&end(2, provenance), clock.sample());
         assert_eq!(session.take_advance(), None, "stale revision");
+        assert_eq!(
+            serde_json::to_value(session.state()).expect("snapshot"),
+            before_stale,
+            "a stale-revision EndOfTrack must write nothing, including touch_seq/updated_at"
+        );
 
-        let before = serde_json::to_value(session.state()).expect("snapshot");
         session.observe(&end(3, provenance), clock.sample());
         assert_eq!(session.take_advance(), Some(Advance::Next(ids[1])));
         let after = serde_json::to_value(session.state()).expect("snapshot");
-        assert_ne!(after, before, "the completion must actually write");
+        assert_ne!(after, before_stale, "the completion must actually write");
 
         let recorded = after.clone();
         session.observe(&end(3, provenance), clock.sample());
@@ -464,5 +470,173 @@ fn a_seek_target_stored_from_a_rejected_revision_writes_nothing() {
     assert_eq!(
         serde_json::to_value(session.state()).expect("snapshot"),
         before
+    );
+}
+
+/// Fix round 1, Important 1: the engine bumps `session_rev` only on
+/// `rebuild`, `load` and `do_stop` — not on `EndOfTrack`, a restart or a
+/// seek. A listener who finishes a track, presses Home and plays it to the
+/// end again produces two `EndOfTrack`s under the *same* `(adopted token,
+/// session_rev)` key. The dedup must not treat the second as a duplicate of
+/// the first: every accepted event that re-establishes playback
+/// (`SeekCompleted`, `RestartEstablished`, `Playing` in `on_state`,
+/// `SeekTargetStored` — everywhere `self.completed` is cleared) must also
+/// clear `completion_seen`.
+#[test]
+fn a_restart_after_completion_lets_the_second_playthrough_complete_and_advance() {
+    let clock = FakeClock::new();
+    let (mut session, ids) = queued(&["a", "b"]);
+    let request = session
+        .register_load(LoadTarget::Queue(ids[0]), &media("a"))
+        .expect("registered");
+    session.observe(&loaded(request, 1, "a"), clock.sample());
+
+    session.observe(&end(1, PositionProvenance::Established), clock.sample());
+    assert!(
+        session.state().completed_for(&media("a")),
+        "the first playthrough's completion must be recorded"
+    );
+    assert_eq!(
+        session.take_advance(),
+        Some(Advance::Next(ids[1])),
+        "the first completion must advance"
+    );
+
+    // Home: an explicit restart re-establishes playback at the very same
+    // revision the engine never bumped for EndOfTrack alone.
+    session.observe(
+        &PlaybackEvent::RestartEstablished {
+            session_rev: 1,
+            position: Duration::ZERO,
+            provenance: PositionProvenance::Established,
+        },
+        clock.sample(),
+    );
+    session.observe(&playing(1), clock.sample());
+
+    session.observe(&end(1, PositionProvenance::Established), clock.sample());
+    assert!(
+        session.state().completed_for(&media("a")),
+        "the second playthrough's completion must be recorded, not swallowed by a stale dedup key"
+    );
+    assert_eq!(
+        session.take_advance(),
+        Some(Advance::Next(ids[1])),
+        "the second playthrough must advance the queue too"
+    );
+}
+
+/// Fix round 1, Important 2: `self.playback` must track the `Loading`
+/// announcement for a registered-but-not-yet-adopted load, or the launch
+/// `Paused` that follows the new load misreads `previous == Playing` (left
+/// over from the *previous* adopted media) and raises a pending force
+/// nothing asked for — breaking the invariant
+/// `a_pause_that_interrupts_no_playback_raises_nothing` pins in
+/// `session_policy.rs`.
+#[test]
+fn a_loading_announcement_for_a_registered_load_does_not_raise_a_spurious_pause_force() {
+    use continuo::session::Action;
+    let clock = FakeClock::new();
+    let (mut session, ids) = queued(&["a", "b"]);
+    let a = session
+        .register_load(LoadTarget::Queue(ids[0]), &media("a"))
+        .expect("registered");
+    session.observe(&loaded(a, 1, "a"), clock.sample());
+    session.observe(&playing(1), clock.sample());
+
+    let b = session
+        .register_load(LoadTarget::Queue(ids[1]), &media("b"))
+        .expect("registered");
+    session.observe(
+        &PlaybackEvent::StateChanged {
+            session_rev: 2,
+            state: PlaybackState::Loading,
+            request: Some(b),
+        },
+        clock.sample(),
+    );
+
+    // Ownership moved off "a": a tick at its old revision is rejected, and
+    // its own EndOfTrack at the new revision changes nothing.
+    assert!(matches!(
+        session.tick(&progress(1, "a", 40, Some(a)), clock.sample()),
+        Action::None
+    ));
+    assert!(matches!(
+        session.observe(&end(2, PositionProvenance::Established), clock.sample()),
+        Action::None
+    ));
+
+    // B's own load lands, then the launch Paused nobody asked for.
+    session.observe(&loaded(b, 2, "b"), clock.sample());
+    session.observe(
+        &PlaybackEvent::StateChanged {
+            session_rev: 2,
+            state: PlaybackState::Paused,
+            request: None,
+        },
+        clock.sample(),
+    );
+    // Without the fix, `self.playback` would have stayed `Playing` across
+    // the `Loading` announcement, the Paused above would misread
+    // `previous == Playing` and raise a pending force, and this tick would
+    // write B's still-unvalidated launch position as a forced checkpoint.
+    assert!(matches!(
+        session.tick(&progress(2, "b", 0, Some(b)), clock.sample()),
+        Action::None
+    ));
+}
+
+/// A `Loading` announcement whose token this session never registered (or
+/// has already retired) must not be mistaken for one of its own in-flight
+/// loads: only the early-retirement branch for a *still-pending*
+/// registration may clear `last_loaded`. Ownership of the already-adopted
+/// media must survive it untouched.
+#[test]
+fn a_loading_announcement_for_an_unregistered_token_does_not_break_ownership() {
+    use continuo::session::Action;
+    let clock = FakeClock::new();
+    let (mut session, ids) = queued(&["a"]);
+    let first = session
+        .register_load(LoadTarget::Queue(ids[0]), &media("a"))
+        .expect("registered");
+    session.observe(&loaded(first, 1, "a"), clock.sample());
+    session.observe(&playing(1), clock.sample());
+
+    session.observe(
+        &PlaybackEvent::StateChanged {
+            session_rev: 1,
+            state: PlaybackState::Loading,
+            request: Some(LoadRequestId::from_raw(999)),
+        },
+        clock.sample(),
+    );
+
+    let action = session.observe(&end(1, PositionProvenance::Established), clock.sample());
+    assert!(
+        matches!(action, Action::Submit { .. }),
+        "ownership of the adopted media must still stand"
+    );
+}
+
+/// Fix round 1, Important 3: `accepts_media_event` must require currency,
+/// not only a valid registration, for `Loaded` — matching the brief's "a
+/// current, valid registered target/media."
+#[test]
+fn accepts_media_event_rejects_a_loaded_from_a_stale_revision() {
+    let clock = FakeClock::new();
+    let (mut session, ids) = queued(&["a", "b"]);
+    let first = session
+        .register_load(LoadTarget::Queue(ids[0]), &media("a"))
+        .expect("registered");
+    session.observe(&loaded(first, 3, "a"), clock.sample());
+
+    let second = session
+        .register_load(LoadTarget::Queue(ids[1]), &media("b"))
+        .expect("registered");
+    let stale = loaded(second, 2, "b");
+    assert!(
+        !session.accepts_media_event(&stale),
+        "a known Loaded behind latest_engine_rev must not read as accepted"
     );
 }
