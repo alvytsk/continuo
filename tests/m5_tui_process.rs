@@ -18,6 +18,24 @@ const CONTENDED: &str = "Another Continuo player is using this state profile";
 const LEAVE_ALT: &str = "\x1b[?1049l";
 
 #[test]
+fn pty_children_never_see_the_host_terminal_or_multiplexer() {
+    let profile = process::Profile::new().expect("profile");
+    let command = pty::command(profile.root(), &["tui"], &[]);
+    assert_eq!(
+        command.get_env("TERM").and_then(|term| term.to_str()),
+        Some("xterm-256color")
+    );
+    for variable in ["TMUX", "TMUX_PANE", "TERM_PROGRAM"] {
+        assert!(command.get_env(variable).is_none(), "{variable} is removed");
+    }
+    assert_eq!(
+        command.get_env("XDG_STATE_HOME"),
+        Some(profile.root().join("state").as_os_str()),
+        "still launched with the isolated profile"
+    );
+}
+
+#[test]
 fn tui_opens_idle_on_an_empty_queue_and_q_restores_the_terminal() {
     let profile = process::Profile::new().expect("profile");
     let mut child = PtyChild::spawn(profile.root(), &["tui"], &[], 100, 30).expect("spawn");

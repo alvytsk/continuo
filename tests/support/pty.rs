@@ -30,6 +30,12 @@ const KILL_PATIENCE: Duration = Duration::from_secs(2);
 /// Variables a test must opt into explicitly: an inherited hook or output
 /// selection would silently change what the child does.
 const OPT_IN_VARIABLES: [&str; 2] = ["CONTINUO_TEST_HOOK", "CONTINUO_AUDIO_OUTPUT"];
+/// The terminal every child is told it runs in, whatever terminal runs the
+/// suite. Under tmux, image protocol detection runs
+/// `tmux set -p allow-passthrough on`, which would change the developer's own
+/// pane; without `TMUX` and `TERM_PROGRAM` the child cannot tell it is there.
+const CHILD_TERM: &str = "xterm-256color";
+const HOST_TERMINAL_VARIABLES: [&str; 3] = ["TMUX", "TMUX_PANE", "TERM_PROGRAM"];
 
 pub struct PtyChild {
     child: Box<dyn Child + Send + Sync>,
@@ -56,6 +62,26 @@ fn io_error(error: impl std::fmt::Display) -> std::io::Error {
     std::io::Error::other(error.to_string())
 }
 
+/// The command `PtyChild::spawn` runs: `continuo <args>` in `root` with its
+/// isolated profile, the opt-in variables removed, a fixed terminal type and
+/// no trace of a multiplexer, then `env` on top.
+pub fn command(root: &Path, args: &[&str], env: &[(&str, &str)]) -> CommandBuilder {
+    let mut command = CommandBuilder::new(process::binary());
+    command.args(args);
+    command.cwd(root);
+    for (key, value) in process::profile_env(root) {
+        command.env(key, value);
+    }
+    for key in OPT_IN_VARIABLES.into_iter().chain(HOST_TERMINAL_VARIABLES) {
+        command.env_remove(key);
+    }
+    command.env("TERM", CHILD_TERM);
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    command
+}
+
 impl PtyChild {
     /// Launches `continuo <args>` on a new `cols`×`rows` PTY under the
     /// profile at `root`. `CONTINUO_TEST_HOOK` and `CONTINUO_AUDIO_OUTPUT`
@@ -76,20 +102,10 @@ impl PtyChild {
             })
             .map_err(io_error)?;
 
-        let mut command = CommandBuilder::new(process::binary());
-        command.args(args);
-        command.cwd(root);
-        for (key, value) in process::profile_env(root) {
-            command.env(key, value);
-        }
-        for key in OPT_IN_VARIABLES {
-            command.env_remove(key);
-        }
-        for (key, value) in env {
-            command.env(key, value);
-        }
-
-        let child = pair.slave.spawn_command(command).map_err(io_error)?;
+        let child = pair
+            .slave
+            .spawn_command(command(root, args, env))
+            .map_err(io_error)?;
         // The child holds its own copies; keeping ours open would stop the
         // reader from ever seeing end of file.
         drop(pair.slave);
