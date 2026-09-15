@@ -483,10 +483,12 @@ impl PlayerRuntime {
             phase: self.phase(),
             volume: self.volume,
             status: self.status.as_deref().map(displayable),
-            persistence: if self.persisting {
-                PersistenceStatus::Saving
-            } else {
+            persistence: if !self.persisting {
                 PersistenceStatus::Unsaved
+            } else if self.writer.is_failing() {
+                PersistenceStatus::Failing
+            } else {
+                PersistenceStatus::Saving
             },
             last_requested: self.last_requested,
         }

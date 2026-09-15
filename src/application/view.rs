@@ -93,7 +93,10 @@ pub struct NowPlaying {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PersistenceStatus {
     Saving,
+    /// Nothing this session writes reaches the disk.
     Unsaved,
+    /// Writes should reach the disk, but the latest attempt failed.
+    Failing,
 }
 
 #[derive(Clone, Debug)]

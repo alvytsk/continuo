@@ -288,9 +288,14 @@ fn draw_status(buffer: &mut Buffer, area: Rect, view: &PlayerView, ui: &UiState,
         format!("vol {}% · mouse {mouse}", view.volume.percent()),
         muted,
     )];
-    if view.persistence == PersistenceStatus::Unsaved {
+    let persistence = match view.persistence {
+        PersistenceStatus::Saving => None,
+        PersistenceStatus::Unsaved => Some("unsaved"),
+        PersistenceStatus::Failing => Some("not saving"),
+    };
+    if let Some(label) = persistence {
         spans.push(Span::styled(" · ", muted));
-        spans.push(Span::styled("unsaved", Style::new().fg(theme.amber)));
+        spans.push(Span::styled(label, Style::new().fg(theme.amber)));
     }
     Line::from(spans)
         .alignment(Alignment::Right)

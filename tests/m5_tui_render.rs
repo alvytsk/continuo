@@ -307,6 +307,27 @@ fn buffering_and_unsaved_are_labelled() {
 }
 
 #[test]
+fn failing_persistence_is_labelled_apart_from_unsaved() {
+    let mut v = view(PlaybackPhase::Unloaded, None);
+    v.persistence = PersistenceStatus::Failing;
+    let screen = text(&v, &UiState::new(true), 100, 30);
+    let status = screen.lines().next().expect("status row");
+    assert!(
+        status.contains("vol 80%") && status.contains("not saving"),
+        "{status}"
+    );
+    assert!(!status.contains("unsaved"), "{status}");
+
+    v.persistence = PersistenceStatus::Saving;
+    let screen = text(&v, &UiState::new(true), 100, 30);
+    let status = screen.lines().next().expect("status row");
+    assert!(
+        !status.contains("saving") && !status.contains("unsaved"),
+        "{status}"
+    );
+}
+
+#[test]
 fn empty_loading_and_failed_screens() {
     let mut empty = view(PlaybackPhase::Unloaded, None);
     empty.rows.clear();

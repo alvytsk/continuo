@@ -18,7 +18,7 @@ use continuo::application::runtime::{
     AppCommand, EnqueueItem, FlushReport, LibraryStores, PlayerRuntime,
 };
 use continuo::application::transport::PlaybackPhase;
-use continuo::application::view::{NowPlaying, PlayerView};
+use continuo::application::view::{NowPlaying, PersistenceStatus, PlayerView};
 use continuo::clock::SystemClock;
 use continuo::feed::cache::CacheStore;
 use continuo::lifecycle::hooks::TestHook;
@@ -328,6 +328,25 @@ fn a_failed_final_flush_is_reported_not_claimed_as_saved() {
         null_engine(),
     ));
     runtime.handle(AppCommand::AdjustVolume(-0.1));
+    assert!(matches!(runtime.shutdown(), FlushReport::Failed(_)));
+}
+
+#[test]
+fn a_failing_writer_is_shown_while_the_session_runs() {
+    let clock: Arc<dyn continuo::clock::Clock> = Arc::new(SystemClock);
+    let writer = WriterHandle::spawn(Box::new(FailingSink), clock.clone());
+    let mut runtime = PlayerRuntime::new(parts(
+        PersistedState::default(),
+        writer,
+        clock,
+        None,
+        null_engine(),
+    ));
+    assert_eq!(runtime.view().persistence, PersistenceStatus::Saving);
+    runtime.handle(AppCommand::AdjustVolume(-0.1));
+    pump_until(&mut runtime, "the failed write is shown", |view| {
+        view.persistence == PersistenceStatus::Failing
+    });
     assert!(matches!(runtime.shutdown(), FlushReport::Failed(_)));
 }
 
