@@ -55,6 +55,24 @@ fn is_ctrl_c(key: &KeyEvent) -> bool {
     key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL)
 }
 
+fn is_ctrl_l(key: &KeyEvent) -> bool {
+    key.code == KeyCode::Char('l') && key.modifiers.contains(KeyModifiers::CONTROL)
+}
+
+/// Whether `key` carries a modifier that must turn off every ordinary
+/// binding: CONTROL or ALT. Crossterm's legacy decoding reports Ctrl+letter
+/// as the same `KeyCode::Char` the plain letter uses (Ctrl-D looks like
+/// `d`), so without this check a Ctrl chord would silently fire a shortcut
+/// — including a destructive one like `Remove` on Ctrl-D. SHIFT is exempt:
+/// some terminals report `K`, `J`, `+`, `_`, `?`, `[` and `]` only with
+/// SHIFT set, and those must keep working. The two exceptions that need
+/// CONTROL — Ctrl-C and Ctrl-L — are checked before this and never reach
+/// the callers of this function.
+fn blocks_ordinary_bindings(key: &KeyEvent) -> bool {
+    key.modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+}
+
 /// Printable characters append to `ui.input` (so `q`, space and `+` never
 /// act as shortcuts here); a control character is dropped rather than
 /// stored, since typed input is user text that later reaches the screen and
@@ -82,7 +100,7 @@ fn input_overlay(key: KeyEvent, ui: &mut UiState) -> Vec<Effect> {
             ui.input.clear();
             Vec::new()
         }
-        KeyCode::Char(c) if !c.is_control() => {
+        KeyCode::Char(c) if !c.is_control() && !blocks_ordinary_bindings(&key) => {
             ui.input.push(c);
             Vec::new()
         }
@@ -90,11 +108,11 @@ fn input_overlay(key: KeyEvent, ui: &mut UiState) -> Vec<Effect> {
     }
 }
 
-/// `y` clears the queue; any other key closes the confirmation without
-/// effect.
+/// `y` (unmodified or shifted) clears the queue; any other key, including a
+/// Ctrl/Alt chord on `y`, closes the confirmation without effect.
 fn confirm_overlay(key: KeyEvent, ui: &mut UiState) -> Vec<Effect> {
     ui.overlay = Overlay::None;
-    if key.code == KeyCode::Char('y') {
+    if key.code == KeyCode::Char('y') && !blocks_ordinary_bindings(&key) {
         vec![Effect::App(AppCommand::ClearQueue)]
     } else {
         Vec::new()
@@ -110,6 +128,16 @@ fn help_overlay(key: KeyEvent, ui: &mut UiState) -> Vec<Effect> {
 }
 
 fn no_overlay(key: KeyEvent, ui: &mut UiState, view: &PlayerView) -> Vec<Effect> {
+    if is_ctrl_l(&key) {
+        return vec![Effect::FullRedraw];
+    }
+    // Ctrl-C and Ctrl-L are the only chords with an effect here, and both
+    // are handled above `no_overlay` (Ctrl-C) or by the check just above
+    // (Ctrl-L); every other CONTROL or ALT chord — Ctrl-D, Alt-d, and so on
+    // — must not fall through to the plain-letter bindings below.
+    if blocks_ordinary_bindings(&key) {
+        return Vec::new();
+    }
     match key.code {
         KeyCode::Char(' ') => vec![Effect::App(AppCommand::PlayPause {
             selected: ui.selected,
@@ -163,9 +191,6 @@ fn no_overlay(key: KeyEvent, ui: &mut UiState, view: &PlayerView) -> Vec<Effect>
         KeyCode::Char('m') => {
             ui.mouse_capture = !ui.mouse_capture;
             vec![Effect::SetMouseCapture(ui.mouse_capture)]
-        }
-        KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            vec![Effect::FullRedraw]
         }
         KeyCode::Esc => Vec::new(),
         KeyCode::Char('q') => vec![Effect::Quit],

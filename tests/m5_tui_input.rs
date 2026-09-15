@@ -15,6 +15,14 @@ fn ctrl(c: char) -> KeyEvent {
     KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
 }
 
+fn alt(c: char) -> KeyEvent {
+    KeyEvent::new(KeyCode::Char(c), KeyModifiers::ALT)
+}
+
+fn shift(c: char) -> KeyEvent {
+    KeyEvent::new(KeyCode::Char(c), KeyModifiers::SHIFT)
+}
+
 fn app(effects: &[Effect]) -> Vec<&AppCommand> {
     effects
         .iter()
@@ -175,4 +183,47 @@ fn enter_on_an_empty_queue_is_a_notice_not_a_command() {
         other => panic!("expected a single Notice effect, got {other:?}"),
     }
     assert!(app(&effects).is_empty());
+}
+
+#[test]
+fn ctrl_and_alt_chords_never_fire_the_plain_letter_shortcut() {
+    let view = sample_view();
+    let mut ui = UiState::new(true);
+    ui.selected = Some(view.rows[0].id);
+
+    // Ctrl-D would otherwise remove the selected row.
+    assert!(handle_key(ctrl('d'), &mut ui, &view).is_empty());
+    assert_eq!(ui.selected, Some(view.rows[0].id), "nothing was removed");
+
+    // Ctrl-S would otherwise stop playback.
+    assert!(handle_key(ctrl('s'), &mut ui, &view).is_empty());
+
+    // Alt-D must be blocked the same way as Ctrl-D.
+    assert!(handle_key(alt('d'), &mut ui, &view).is_empty());
+    assert_eq!(
+        ui.selected,
+        Some(view.rows[0].id),
+        "still nothing was removed"
+    );
+}
+
+#[test]
+fn shift_still_reaches_bindings_that_need_an_uppercase_or_symbol_key() {
+    let view = sample_view();
+    let mut ui = UiState::new(true);
+    ui.selected = Some(view.rows[1].id);
+    assert!(matches!(
+        app(&handle_key(shift('K'), &mut ui, &view))[..],
+        [AppCommand::Move(_, continuo::queue::Direction::Up)]
+    ));
+}
+
+#[test]
+fn a_ctrl_chord_on_y_does_not_confirm_the_clear() {
+    let view = sample_view();
+    let mut ui = UiState::new(true);
+    handle_key(key(KeyCode::Char('c')), &mut ui, &view);
+    assert_eq!(ui.overlay, Overlay::ConfirmClear);
+    assert!(app(&handle_key(ctrl('y'), &mut ui, &view)).is_empty());
+    assert_eq!(ui.overlay, Overlay::None, "any key closes the confirmation");
 }
