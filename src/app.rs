@@ -18,6 +18,7 @@ use crate::http::channel::{SourceInterrupt, WaitHook};
 use crate::http::limits::Limits;
 use crate::http::service::HttpService;
 use crate::lifecycle::RunOutcome;
+use crate::lifecycle::input::InputReader;
 use crate::lifecycle::signals::ShutdownSignals;
 use crate::media::capabilities::{MediaCapabilities, SeekSupport};
 use crate::media::display::{display_name, episode_name, fit_to_width, format_hms};
@@ -232,7 +233,7 @@ fn run_resolved_locked(
         if signals.requested() {
             break Phase::Done(Ok(()));
         }
-        if handle_keys(&engine, &mut router, &mut mirror, raw.is_some(), signals) {
+        if handle_keys(&engine, &mut router, &mut mirror, keys(&raw), signals) {
             break Phase::Done(Ok(()));
         }
         router.flush(&engine, Instant::now());
@@ -264,7 +265,7 @@ fn run_resolved_locked(
             if signals.requested() {
                 break Ok(());
             }
-            if handle_keys(&engine, &mut router, &mut mirror, raw.is_some(), signals) {
+            if handle_keys(&engine, &mut router, &mut mirror, keys(&raw), signals) {
                 break Ok(());
             }
             router.flush(&engine, Instant::now());
@@ -375,7 +376,11 @@ fn finish(
 /// must stop: an explicit quit, Ctrl-C (`to_command` already maps it to
 /// `Shutdown`), or the input stream ending or failing.
 ///
-/// With no raw terminal (`raw` false) there are no keys to read, and calling
+/// Keys come from `input`'s reader thread, never from crossterm on this
+/// thread: on a hung-up terminal crossterm's poll never returns, and the loop
+/// must still see the hangup's SIGHUP and flush.
+///
+/// With no raw terminal (`input` is `None`) there are no keys to read, and calling
 /// into crossterm anyway does not answer "nothing ready" — with no tty to
 /// open it fails outright (verified empirically against this crossterm
 /// version), which would misreport a CI run with no controlling terminal as
@@ -393,51 +398,52 @@ fn handle_keys(
     engine: &EngineHandle,
     router: &mut KeyRouter,
     mirror: &mut Mirror,
-    raw: bool,
+    input: Option<&InputReader>,
     signals: &ShutdownSignals,
 ) -> bool {
     // Capped by whatever is sooner: the ordinary tick, or an open burst's own
     // deadline. Without the cap a window expiring just after a block began
     // would go unnoticed for a further full block.
     let budget = router.poll_budget(Instant::now(), Duration::from_millis(100));
-    if !raw {
+    let Some(input) = input else {
         let _ = signals.wake().recv_timeout(budget);
         return false;
-    }
-    match crossterm::event::poll(budget) {
-        Ok(true) => match crossterm::event::read() {
-            Ok(Event::Key(key)) => match to_command(key, mirror) {
-                Some(PlaybackCommand::Shutdown) => true,
-                Some(command) => {
-                    let optimistic = router.route(
-                        engine,
-                        mirror.state == PlaybackState::Playing,
-                        mirror.position,
-                        mirror.duration,
-                        Instant::now(),
-                        command,
-                    );
-                    // The jump that makes a single arrow press feel immediate
-                    // even though its fetch waits out the quiet window. It is
-                    // a prediction until the seek lands, so it is marked
-                    // `Estimated` and reaches only the display: the checkpoint
-                    // path reads `Progress`, never the mirror.
-                    if let Some(position) = optimistic {
-                        mirror.position = position;
-                        mirror.provenance = PositionProvenance::Estimated;
-                    }
-                    false
+    };
+    match input.next(budget) {
+        Ok(Some(Event::Key(key))) => match to_command(key, mirror) {
+            Some(PlaybackCommand::Shutdown) => true,
+            Some(command) => {
+                let optimistic = router.route(
+                    engine,
+                    mirror.state == PlaybackState::Playing,
+                    mirror.position,
+                    mirror.duration,
+                    Instant::now(),
+                    command,
+                );
+                // The jump that makes a single arrow press feel immediate
+                // even though its fetch waits out the quiet window. It is
+                // a prediction until the seek lands, so it is marked
+                // `Estimated` and reaches only the display: the checkpoint
+                // path reads `Progress`, never the mirror.
+                if let Some(position) = optimistic {
+                    mirror.position = position;
+                    mirror.provenance = PositionProvenance::Estimated;
                 }
-                None => false,
-            },
-            Ok(_) => false,
-            // The input stream ended or failed; there is nothing left to
-            // read keys from, so shut down as cleanly as `q` would.
-            Err(_) => true,
+                false
+            }
+            None => false,
         },
-        Ok(false) => false,
+        Ok(_) => false,
+        // The input stream ended or failed; there is nothing left to read
+        // keys from, so shut down as cleanly as `q` would.
         Err(_) => true,
     }
+}
+
+/// The key reader of a raw terminal, if there is one.
+fn keys(raw: &Option<RawModeGuard>) -> Option<&InputReader> {
+    raw.as_ref().map(|raw| &raw.input)
 }
 
 /// §5/H15: opens and classifies `source` on the calling thread. No
@@ -648,20 +654,32 @@ fn report_flush(outcome: ShutdownOutcome, persisting: bool) {
 /// Installs raw mode and restores it on drop. `finish` drops it explicitly, so
 /// the writer's shutdown bound is never spent with the terminal still raw; the
 /// `Drop` covers a panic, which is the only way out of either loop that does
-/// not reach that line.
-struct RawModeGuard;
+/// not reach that line. It owns the thread that reads keys while the terminal
+/// is raw.
+struct RawModeGuard {
+    input: InputReader,
+}
+
+/// How many keys may wait unread before the reader stops reading.
+const KEY_BACKLOG: usize = 64;
 
 impl RawModeGuard {
     /// `None` when there is no controlling terminal — `enable_raw_mode` fails
     /// for want of a tty, which is the CI case this type exists to keep out
     /// of raw-mode restoration's way (Ruling 1). Such a session reads no
     /// keys; `Loading` and any failure still print, and nothing here is left
-    /// toggled for `finish` to restore.
+    /// toggled for `finish` to restore. A key reader thread that cannot be
+    /// started leaves the terminal as it was and the session the same way.
     fn enable() -> Option<Self> {
-        match crossterm::terminal::enable_raw_mode() {
-            Ok(()) => Some(Self),
+        if let Err(error) = crossterm::terminal::enable_raw_mode() {
+            tracing::debug!(%error, "no controlling terminal; running without raw mode");
+            return None;
+        }
+        match InputReader::spawn(KEY_BACKLOG) {
+            Ok(input) => Some(Self { input }),
             Err(error) => {
-                tracing::debug!(%error, "no controlling terminal; running without raw mode");
+                let _ = crossterm::terminal::disable_raw_mode();
+                tracing::warn!(%error, "cannot read keys; running without raw mode");
                 None
             }
         }

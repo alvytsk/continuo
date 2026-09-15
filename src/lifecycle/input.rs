@@ -1,12 +1,13 @@
-//! Terminal input read on a thread of its own, handed to the event loop over
-//! a bounded channel (design doc M5 §4).
+//! Terminal input read on a thread of its own, handed to the player's loop
+//! over a bounded channel — `tui`'s event loop and `play`'s key loop alike
+//! (design doc M5 §4).
 //!
 //! crossterm 0.29 retries a tty read that returns end of file or an I/O
 //! error without end, inside `event::poll`, so on a hung-up terminal the
-//! thread that polls never returns. Were that the event loop, it would never
-//! again see a signal, pump the runtime or draw: the profile lock would stay
-//! held and nothing would be flushed. Reading here leaves the loop waiting on
-//! the channel instead, so the hangup's SIGHUP, or the next draw's failed
+//! thread that polls never returns. Were that a player's loop, it would never
+//! again see a signal, pump playback or draw: the profile lock would stay
+//! held and nothing would be flushed. Reading here leaves the loop waiting
+//! on the channel instead, so the hangup's SIGHUP, or the next draw's failed
 //! write, still ends the run.
 //!
 //! The reader thread is never joined. After a hangup it stays inside
@@ -25,7 +26,7 @@ use crossterm::event::{self, Event};
 /// How long the reader waits for input before checking it is still wanted.
 const READ_POLL: Duration = Duration::from_millis(50);
 
-/// The event loop's end of the reader thread. Dropping it stops the thread.
+/// The loop's end of the reader thread. Dropping it stops the thread.
 pub struct InputReader {
     events: Receiver<io::Result<Event>>,
     stop: Arc<AtomicBool>,
@@ -35,8 +36,9 @@ impl InputReader {
     /// Starts reading terminal input. At most `capacity` events wait unread;
     /// past that the reader stops reading until the loop catches up.
     ///
-    /// Must not start before anything else has finished reading stdin — the
-    /// cover-art protocol query — or it would take that answer as input.
+    /// Must not start before anything else has finished reading stdin — such
+    /// as `tui`'s cover-art protocol query — or it would take that answer as
+    /// input.
     pub fn spawn(capacity: usize) -> io::Result<Self> {
         let (sender, events) = crossbeam_channel::bounded(capacity);
         let stop = Arc::new(AtomicBool::new(false));
