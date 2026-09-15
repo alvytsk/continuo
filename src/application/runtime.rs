@@ -40,6 +40,7 @@ use crate::playback::engine::EngineHandle;
 use crate::playback::error::PlaybackError;
 use crate::playback::event::{PlaybackEvent, Progress};
 use crate::playback::provenance::PositionProvenance;
+use crate::playback::spectrum::worker::SpectrumHandle;
 use crate::playback::state::PlaybackState;
 use crate::playback::timeline::PositionQuality;
 use crate::playback::volume::Volume;
@@ -333,6 +334,13 @@ impl PlayerRuntime {
 
     pub fn session(&self) -> &Session {
         &self.session
+    }
+
+    /// The engine's spectrum analysis worker; `None` until the first load
+    /// creates the engine. Terminal-free: a front end enables analysis and
+    /// reads frames through it.
+    pub fn spectrum(&self) -> Option<SpectrumHandle> {
+        self.engine.as_ref().map(EngineHandle::spectrum)
     }
 
     pub fn set_status(&mut self, message: impl Into<String>) {

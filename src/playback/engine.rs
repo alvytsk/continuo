@@ -41,6 +41,10 @@ use super::output::{AudioOutput, Nanos, NegotiatedOutput, OutputRequest, SpanRec
 use super::prepare::{PrepareContext, prepare};
 use super::provenance::PositionProvenance;
 use super::resample::Converter;
+use super::spectrum::registry::{TapMapping, TapRegistry};
+use super::spectrum::worker::{
+    self as spectrum_worker, SpectrumHandle, SpectrumPort, SpectrumThread,
+};
 use super::state::PlaybackState;
 use super::timeline::{PositionQuality, Timeline};
 use super::volume::Volume;
@@ -185,6 +189,12 @@ pub struct EngineHandle {
     /// `Worker::load` can build a `PrepareContext` from whatever is
     /// installed at the moment it runs.
     http: Arc<Mutex<Option<Arc<HttpService>>>>,
+    /// The analysis worker's application side (§10), handed out by
+    /// [`Self::spectrum`].
+    spectrum: SpectrumHandle,
+    /// The `continuo-spectrum` thread: stopped and joined by [`Self::join`]
+    /// and by `Drop`, so it never outlives the engine.
+    spectrum_thread: SpectrumThread,
 }
 
 impl EngineHandle {
@@ -246,6 +256,11 @@ impl EngineHandle {
         // to sit here only so `WaitService` had something to poll.
         let source_interrupt = SourceInterrupt::new(Limits::default().buffer_bytes);
         let http = Arc::new(Mutex::new(None));
+        // Shared by the callback (writer), the decode worker, `WaitService`
+        // and the spectrum worker, which schedules frames against it.
+        let device_clock = Arc::new(AtomicU64::new(0));
+        let (spectrum, spectrum_port, spectrum_thread) =
+            spectrum_worker::spawn(Arc::clone(&device_clock));
         let worker = Worker::new(
             output,
             faults,
@@ -257,6 +272,8 @@ impl EngineHandle {
             Arc::clone(&interrupt),
             Arc::clone(&source_interrupt),
             Arc::clone(&http),
+            device_clock,
+            spectrum_port,
         );
         let join = std::thread::Builder::new()
             .name("continuo-decode".into())
@@ -274,7 +291,15 @@ impl EngineHandle {
             worker: join,
             source_interrupt,
             http,
+            spectrum,
+            spectrum_thread,
         }
+    }
+
+    /// The spectrum analysis worker: enable it, read its latest frame.
+    /// Analysis starts disabled.
+    pub fn spectrum(&self) -> SpectrumHandle {
+        self.spectrum.clone()
     }
 
     pub fn commands(&self) -> &Sender<PlaybackCommand> {
@@ -438,6 +463,8 @@ impl EngineHandle {
             },
             None => Vec::new(),
         };
+        // After the decode worker, whose teardown retires the last mapping.
+        self.spectrum_thread.stop();
         let mut events = Vec::new();
         while let Ok(event) = self.stream.events.try_recv() {
             events.push(event);
@@ -453,6 +480,9 @@ impl EngineHandle {
 impl Drop for EngineHandle {
     fn drop(&mut self) {
         self.interrupt_shutdown();
+        // Idempotent after `join`. The spectrum thread wakes on this at once
+        // and never waits on the decode worker, so this cannot hang.
+        self.spectrum_thread.stop();
     }
 }
 
@@ -491,6 +521,18 @@ pub struct TransportCore {
     /// Media position the current generation's frame counting starts from.
     anchor: Duration,
     sample_rate: u32,
+    /// This transport's spectrum tap, when it has one: what every `Run`
+    /// publication must map first (decision 18).
+    tap: Option<TransportTap>,
+}
+
+/// What a transport needs to publish its tap mappings: the registry, its
+/// never-reused instance ID, and the revision and channel count it plays.
+pub(crate) struct TransportTap {
+    registry: TapRegistry,
+    instance: u64,
+    session_rev: u64,
+    channels: u16,
 }
 
 impl TransportCore {
@@ -510,7 +552,49 @@ impl TransportCore {
             timeline,
             anchor,
             sample_rate,
+            tap: None,
         }
+    }
+
+    /// Attaches the spectrum tap's mapping state. Builder-style, so `new`
+    /// keeps its public signature.
+    pub(crate) fn with_tap(mut self, tap: TransportTap) -> Self {
+        self.tap = Some(tap);
+        self
+    }
+
+    /// Publishes the mapping for the `Run` about to be published for
+    /// `generation`, under the epoch that publication will use. Must run
+    /// immediately before `start_running` or `release` (decision 18).
+    fn publish_tap_mapping(&self, generation: u16) {
+        if let Some(tap) = &self.tap {
+            tap.registry.publish(TapMapping {
+                instance: tap.instance,
+                generation,
+                epoch: self.handshake.upcoming_epoch(),
+                session_rev: tap.session_rev,
+                sample_rate: self.sample_rate,
+                channels: tap.channels,
+            });
+        }
+    }
+
+    /// Retires every mapping of this transport's tap, for teardown.
+    fn retire_tap(&self) {
+        if let Some(tap) = &self.tap {
+            tap.registry.retire_instance(tap.instance);
+        }
+    }
+
+    /// Publishes `Run` for `generation`, mapping it first.
+    fn start_running(&mut self, generation: u16) {
+        self.publish_tap_mapping(generation);
+        let Self {
+            handshake,
+            timeline,
+            ..
+        } = self;
+        handshake.start_running(generation, timeline);
     }
 
     /// Drain spans and return the position implied by what has actually
@@ -534,8 +618,10 @@ impl TransportCore {
             .is_ok()
     }
 
-    /// Release a parked callback, for the hook's thaw arm.
+    /// Release a parked callback: the hook's thaw arm and `Worker::play`'s
+    /// resume. The mapping goes out first (decision 18).
     pub(crate) fn release(&mut self) {
+        self.publish_tap_mapping(self.handshake.generation());
         self.handshake.release();
     }
 }
@@ -647,6 +733,9 @@ struct Worker {
     /// can tell whether jumping the worker's own backlog would misreport
     /// event order. Maintained after every mutation of `pending_events`.
     backlog_empty: Arc<AtomicBool>,
+    /// Builds each transport's spectrum tap and holds the registry its
+    /// mappings are published to.
+    spectrum: SpectrumPort,
 }
 
 impl Worker {
@@ -662,6 +751,8 @@ impl Worker {
         interrupt: Arc<AtomicU8>,
         source_interrupt: Arc<SourceInterrupt>,
         http: Arc<Mutex<Option<Arc<HttpService>>>>,
+        device_clock: Arc<AtomicU64>,
+        spectrum: SpectrumPort,
     ) -> Self {
         let transport = Arc::new(Mutex::new(None));
         let facts = Arc::new(Mutex::new(SessionFacts {
@@ -676,7 +767,6 @@ impl Worker {
         }));
         let backlog_empty = Arc::new(AtomicBool::new(true));
         let outbox = Arc::new(Mutex::new(VecDeque::new()));
-        let device_clock = Arc::new(AtomicU64::new(0));
         let clock: Arc<dyn Fn() -> Nanos + Send + Sync> = {
             let device_clock = Arc::clone(&device_clock);
             Arc::new(move || Nanos(device_clock.load(Ordering::Relaxed)))
@@ -748,6 +838,7 @@ impl Worker {
             http,
             device_clock,
             backlog_empty,
+            spectrum,
         }
     }
 
@@ -1369,6 +1460,10 @@ impl Worker {
             // during that block (see `CallbackCore::fill`'s doc comment).
             Arc::clone(&self.device_clock),
         );
+        // A fresh instance per transport, its reader already with the
+        // analysis worker before the callback can write a block.
+        let (tap_instance, tap_writer) = self.spectrum.open_tap(channels, config.sample_rate);
+        let core = core.with_tap(tap_writer);
         // Plain `store`, deliberately, not `fetch_max`: everywhere else in
         // this file `fetch_max` is correct precisely because writer and
         // reader stay inside one clock domain, but opening a stream *changes*
@@ -1410,7 +1505,14 @@ impl Worker {
         self.pcm = Some(pcm_tx);
         let sample_rate = config.sample_rate;
         self.config = Some(config);
-        *lock(&self.transport) = Some(TransportCore::new(handshake, timeline, anchor, sample_rate));
+        let tap = TransportTap {
+            registry: self.spectrum.registry().clone(),
+            instance: tap_instance,
+            session_rev: self.session_rev,
+            channels,
+        };
+        *lock(&self.transport) =
+            Some(TransportCore::new(handshake, timeline, anchor, sample_rate).with_tap(tap));
         self.prime_and_run(playing);
         Ok(())
     }
@@ -1506,12 +1608,7 @@ impl Worker {
         let mut guard = lock(&self.transport);
         if let Some(core) = guard.as_mut() {
             let generation = core.handshake.generation();
-            let TransportCore {
-                handshake,
-                timeline,
-                ..
-            } = core;
-            handshake.start_running(generation, timeline);
+            core.start_running(generation);
         }
     }
 
@@ -1592,7 +1689,11 @@ impl Worker {
         self.output.close();
         retire_faults(&mut self.deferred_fault, &self.faults);
         let link = self.link.take();
-        *lock(&self.transport) = None;
+        // A load, stop, recovery or shutdown invalidates every mapping of the
+        // old transport, so its spectrum disappears without new audio.
+        if let Some(core) = lock(&self.transport).take() {
+            core.retire_tap();
+        }
         self.pcm = None;
         self.config = None;
         self.converter = None;
@@ -2194,7 +2295,7 @@ impl Worker {
                 {
                     let mut guard = lock(&self.transport);
                     if let Some(core) = guard.as_mut() {
-                        core.handshake.release();
+                        core.release();
                     }
                 }
                 self.set_state(PlaybackState::Playing);

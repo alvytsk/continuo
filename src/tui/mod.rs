@@ -19,12 +19,17 @@
 //! loaded for the active local entry on an [`ArtworkWorker`] started the
 //! first time one needs it, and prepared by [`images::CoverCache`] before
 //! each draw — never inside it.
+//!
+//! The spectrum row (§10) enables the engine's analysis worker only while
+//! the row exists and playback is `Playing`, and its levels are chosen and
+//! decayed by [`spectrum::SpectrumDisplay`] before each draw, the same way.
 
 pub mod browser;
 pub mod images;
 pub mod input;
 pub mod layout;
 pub mod render;
+pub mod spectrum;
 pub mod state;
 pub mod theme;
 
@@ -32,7 +37,7 @@ use std::any::Any;
 use std::io::{self, Stdout, Write};
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::cursor::Hide;
 use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event};
@@ -48,6 +53,7 @@ use crate::application::enrich::default_probe;
 use crate::application::runtime::{
     AppCommand, FlushReport, LibraryStores, PlayerRuntime, RuntimeParts,
 };
+use crate::application::view::PlayerView;
 use crate::artwork::worker::{ArtworkWorker, default_loader};
 use crate::cli::{ArtworkMode, MouseMode};
 use crate::clock::{Clock, SystemClock};
@@ -69,6 +75,7 @@ use crate::tui::images::{CoverCache, failure_status, picker_for, query_terminal}
 use crate::tui::input::{Effect, handle_key, handle_mouse, routes_to_browser};
 use crate::tui::layout::{regions, tier_for};
 use crate::tui::render::{CoverView, HitMap, Visuals};
+use crate::tui::spectrum::{DrawSource, SpectrumDisplay, wants_analysis};
 use crate::tui::state::{Overlay, UiState};
 
 /// How long one loop pass waits for terminal input before pumping the
@@ -345,6 +352,7 @@ fn run_loop(
     // Where the last frame put its clickable parts, for mouse input (Task 21).
     let mut hits = HitMap::default();
     let mut browsing = Browsing::default();
+    let mut spectrum = SpectrumDisplay::default();
     loop {
         let mut front = Front {
             runtime,
@@ -373,13 +381,16 @@ fn run_loop(
         }
         let view = runtime.view();
         ui.reconcile(&view, None);
+        if let Err(error) = update_spectrum(runtime, terminal, &view, &mut spectrum) {
+            return Ending::Failed(LifecycleError::Terminal(error).into());
+        }
         let visuals = Visuals {
             cover: artwork
                 .covers
                 .widget()
                 .map_or(CoverView::Placeholder, CoverView::Image),
             browser: browsing.state.as_ref(),
-            ..Visuals::default()
+            spectrum: spectrum.levels(),
         };
         if let Err(error) = terminal.draw(|frame| {
             hits = render::draw(frame, &view, &ui, &visuals);
@@ -387,6 +398,35 @@ fn run_loop(
             return Ending::Failed(LifecycleError::Terminal(error).into());
         }
     }
+}
+
+/// Runs analysis only while this frame has a spectrum row and playback is
+/// `Playing`, then settles the levels the row will draw: the latest frame's
+/// when it is fresh and belongs to the adopted playback, otherwise the
+/// previous levels decayed.
+fn update_spectrum(
+    runtime: &PlayerRuntime,
+    terminal: &Tty,
+    view: &PlayerView,
+    display: &mut SpectrumDisplay,
+) -> io::Result<()> {
+    let size = terminal.size()?;
+    let area = Rect::new(0, 0, size.width, size.height);
+    let row = regions(area, tier_for(area.width, area.height)).spectrum;
+    let frame = runtime.spectrum().and_then(|handle| {
+        handle.set_enabled(wants_analysis(row, view.phase));
+        handle.latest()
+    });
+    display.update(
+        &DrawSource {
+            phase: view.phase,
+            now_playing: view.now_playing.as_ref(),
+            adopted: runtime.session().adopted().map(|load| load.request),
+            frame: frame.as_ref(),
+        },
+        Instant::now(),
+    );
+    Ok(())
 }
 
 /// Cover art for the active entry: the detected picker (none under

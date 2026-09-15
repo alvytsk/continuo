@@ -842,3 +842,32 @@ fn automatic_start_handles_intervening_outcomes() {
     both_loads_adopt_their_own_occurrence_in_order();
     a_failed_second_load_is_not_retried_implicitly();
 }
+
+#[test]
+fn the_spectrum_exists_once_the_engine_does_and_labels_the_adopted_revision() {
+    let mut rig = rig_with(PersistedState::default());
+    assert!(rig.runtime.spectrum().is_none(), "no engine yet");
+    rig.runtime
+        .handle(AppCommand::Enqueue(vec![EnqueueItem::Path(FIVE.into())]));
+    let ids = row_ids(&rig.runtime);
+    rig.runtime.handle(AppCommand::PlayEntry(ids[0]));
+    pump_until(&mut rig.runtime, "playing", |view| is_playing(view, ids[0]));
+    let spectrum = rig.runtime.spectrum().expect("the load created the engine");
+    spectrum.set_enabled(true);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        rig.runtime.pump();
+        let view = rig.runtime.view();
+        if let (Some(frame), Some(now)) = (spectrum.latest(), view.now_playing.as_ref())
+            && frame.session_rev == now.session_rev
+        {
+            assert!(!frame.levels.is_empty());
+            break;
+        }
+        assert!(Instant::now() < deadline, "no spectrum frame while playing");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    spectrum.set_enabled(false);
+    assert!(spectrum.latest().is_none());
+    assert!(matches!(rig.runtime.shutdown(), FlushReport::Written));
+}

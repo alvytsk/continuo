@@ -375,3 +375,192 @@ fn selection_reconciles_to_the_hint_then_a_surviving_row_then_the_first() {
     ui.reconcile(&v, Some(ids()[1]));
     assert_eq!((ui.selected, ui.queue_offset), (None, 0));
 }
+
+#[test]
+fn the_spectrum_row_draws_levels_and_nothing_in_minimal() {
+    let v = view(
+        PlaybackPhase::Playing,
+        Some(playing(ids()[0], true, Some(decoded(185)), false)),
+    );
+    let levels = [1.0_f32; 12];
+    let visuals = Visuals {
+        spectrum: Some(&levels),
+        ..Default::default()
+    };
+    let (normal, _) = render(&v, &UiState::new(true), &visuals, 100, 30);
+    assert!(screen(&normal).contains('█'), "{}", screen(&normal));
+    let (minimal, _) = render(&v, &UiState::new(true), &visuals, 45, 16);
+    assert!(!screen(&minimal).contains('█'), "{}", screen(&minimal));
+}
+
+// ----------------------------------------- what the spectrum row is fed
+
+mod spectrum_display {
+    use std::time::{Duration, Instant};
+
+    use continuo::application::transport::PlaybackPhase;
+    use continuo::application::view::NowPlaying;
+    use continuo::playback::command::LoadRequestId;
+    use continuo::playback::output::Nanos;
+    use continuo::playback::spectrum::worker::SpectrumFrame;
+    use continuo::tui::layout::{Tier, regions};
+    use continuo::tui::spectrum::{DrawSource, SpectrumDisplay, wants_analysis};
+    use ratatui::layout::Rect;
+
+    use super::views::{ids, playing};
+
+    const TOKEN: LoadRequestId = LoadRequestId::from_raw(4);
+
+    fn now_playing() -> NowPlaying {
+        NowPlaying {
+            session_rev: 9,
+            load: Some(TOKEN),
+            ..playing(ids()[0], true, None, false)
+        }
+    }
+
+    fn frame(published_at: Instant, level: f32) -> SpectrumFrame {
+        SpectrumFrame {
+            session_rev: 9,
+            bands: vec![(40.0, 85.0), (85.0, 170.0)],
+            levels: vec![level, level],
+            at: Nanos(0),
+            published_at,
+        }
+    }
+
+    fn source<'a>(
+        phase: PlaybackPhase,
+        now_playing: &'a NowPlaying,
+        frame: Option<&'a SpectrumFrame>,
+    ) -> DrawSource<'a> {
+        DrawSource {
+            phase,
+            now_playing: Some(now_playing),
+            adopted: Some(TOKEN),
+            frame,
+        }
+    }
+
+    fn levels(display: &SpectrumDisplay) -> Vec<f32> {
+        display.levels().map(<[f32]>::to_vec).unwrap_or_default()
+    }
+
+    fn decayed(display: &SpectrumDisplay, from: f32) -> bool {
+        levels(display)
+            .iter()
+            .all(|level| (level - from * 0.85).abs() < 1e-6)
+    }
+
+    #[test]
+    fn a_fresh_matching_frame_is_drawn() {
+        let t0 = Instant::now();
+        let np = now_playing();
+        let fresh = frame(t0, 0.6);
+        let mut display = SpectrumDisplay::default();
+        display.update(&source(PlaybackPhase::Playing, &np, Some(&fresh)), t0);
+        assert_eq!(levels(&display), vec![0.6, 0.6]);
+    }
+
+    #[test]
+    fn pause_without_transport_retirement_decays() {
+        let t0 = Instant::now();
+        let np = now_playing();
+        let fresh = frame(t0, 0.8);
+        let mut display = SpectrumDisplay::default();
+        display.update(&source(PlaybackPhase::Playing, &np, Some(&fresh)), t0);
+        // Paused: the mapping and the frame are still there and still fresh.
+        display.update(
+            &source(PlaybackPhase::Paused, &np, Some(&fresh)),
+            t0 + Duration::from_millis(10),
+        );
+        assert!(decayed(&display, 0.8), "{:?}", levels(&display));
+        // And past 150 ms, still paused, it keeps falling.
+        for step in 0..40 {
+            display.update(
+                &source(PlaybackPhase::Paused, &np, Some(&fresh)),
+                t0 + Duration::from_millis(200 + step),
+            );
+        }
+        assert!(levels(&display).iter().all(|level| *level < 0.01));
+    }
+
+    #[test]
+    fn starvation_without_new_pcm_expires_the_latest_frame() {
+        let t0 = Instant::now();
+        let np = now_playing();
+        let stale = frame(t0, 0.8);
+        let mut display = SpectrumDisplay::default();
+        display.update(&source(PlaybackPhase::Playing, &np, Some(&stale)), t0);
+        // Still Playing, same revision and token, same frame: only the clock
+        // moved. A delayed worker cleanup must not freeze the display.
+        let later = t0 + Duration::from_millis(150);
+        display.update(&source(PlaybackPhase::Playing, &np, Some(&stale)), later);
+        assert!(decayed(&display, 0.8), "{:?}", levels(&display));
+        // A new window resumes the display.
+        let resumed = frame(later, 0.5);
+        display.update(&source(PlaybackPhase::Playing, &np, Some(&resumed)), later);
+        assert_eq!(levels(&display), vec![0.5, 0.5]);
+    }
+
+    #[test]
+    fn a_frame_for_another_revision_or_token_decays() {
+        let t0 = Instant::now();
+        let np = now_playing();
+        let fresh = frame(t0, 0.8);
+        let mut display = SpectrumDisplay::default();
+        display.update(&source(PlaybackPhase::Playing, &np, Some(&fresh)), t0);
+
+        let other_rev = SpectrumFrame {
+            session_rev: 10,
+            ..frame(t0, 1.0)
+        };
+        display.update(&source(PlaybackPhase::Playing, &np, Some(&other_rev)), t0);
+        assert!(decayed(&display, 0.8), "{:?}", levels(&display));
+
+        let mut display = SpectrumDisplay::default();
+        display.update(&source(PlaybackPhase::Playing, &np, Some(&fresh)), t0);
+        let unadopted = DrawSource {
+            adopted: Some(LoadRequestId::from_raw(5)),
+            ..source(PlaybackPhase::Playing, &np, Some(&fresh))
+        };
+        display.update(&unadopted, t0);
+        assert!(decayed(&display, 0.8), "{:?}", levels(&display));
+    }
+
+    #[test]
+    fn disabled_analysis_decays_and_re_enabling_draws_only_a_new_frame() {
+        let t0 = Instant::now();
+        let np = now_playing();
+        let old = frame(t0, 0.8);
+        let mut display = SpectrumDisplay::default();
+        display.update(&source(PlaybackPhase::Playing, &np, Some(&old)), t0);
+        // Disabled: the handle reports no frame.
+        display.update(&source(PlaybackPhase::Playing, &np, None), t0);
+        assert!(decayed(&display, 0.8));
+        // Re-enabled without new audio: still nothing, and the old frame is
+        // stale by now even if something handed it back.
+        let later = t0 + Duration::from_millis(300);
+        display.update(&source(PlaybackPhase::Playing, &np, Some(&old)), later);
+        assert!(levels(&display).iter().all(|level| *level < 0.8 * 0.85));
+        let new = frame(later, 0.3);
+        display.update(&source(PlaybackPhase::Playing, &np, Some(&new)), later);
+        assert_eq!(levels(&display), vec![0.3, 0.3]);
+    }
+
+    #[test]
+    fn analysis_runs_only_while_the_row_exists_and_playback_is_playing() {
+        let normal = regions(Rect::new(0, 0, 100, 30), Tier::Normal).spectrum;
+        let minimal = regions(Rect::new(0, 0, 45, 16), Tier::Minimal).spectrum;
+        assert!(wants_analysis(normal, PlaybackPhase::Playing));
+        assert!(!wants_analysis(minimal, PlaybackPhase::Playing));
+        for phase in [
+            PlaybackPhase::Paused,
+            PlaybackPhase::Stopped,
+            PlaybackPhase::Loading,
+            PlaybackPhase::Ended,
+        ] {
+            assert!(!wants_analysis(normal, phase), "{phase:?}");
+        }
+    }
+}

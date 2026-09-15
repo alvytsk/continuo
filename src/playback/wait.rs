@@ -161,6 +161,9 @@ impl WaitService {
 
     /// Release a parked callback. A no-op with no transport open — there is
     /// nothing to release, and nothing downstream treats that as a failure.
+    ///
+    /// Goes through `TransportCore::release`, which publishes the spectrum
+    /// tap's mapping for the thaw's `Run` before releasing (decision 18).
     fn release(&self) {
         let mut guard = lock(&self.transport);
         if let Some(core) = guard.as_mut() {

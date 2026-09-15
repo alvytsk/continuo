@@ -167,6 +167,13 @@ impl TapWriter {
 }
 
 impl TapReader {
+    /// Whether the writer is gone and every block it described has been
+    /// read: nothing will ever arrive here again. Checked in that order, so
+    /// a block published just before the writer dropped is never missed.
+    pub fn is_finished(&self) -> bool {
+        self.descriptors.is_abandoned() && self.descriptors.is_empty()
+    }
+
     /// Pops the next described block, appending its samples to `out`.
     ///
     /// Never allocates when `out` already has spare capacity: both halves of
