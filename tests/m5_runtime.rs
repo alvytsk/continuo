@@ -292,14 +292,7 @@ fn supersede_a_burst(how: Superseding) {
     let (_media, root) = media_dir(&["a.flac", "b.flac"]);
     let (a_path, b_path) = (root.join("a.flac"), root.join("b.flac"));
     // Answers only after the burst's quiet window has long passed.
-    let server = TestServer::start(Script::documents(vec![DocumentReply {
-        path: "/b.flac".into(),
-        status: 200,
-        headers: vec![("Content-Type".into(), "audio/flac".into())],
-        body: std::fs::read(FIVE).unwrap_or_else(|error| panic!("fixture: {error}")),
-        conditional: false,
-        header_delay: Duration::from_millis(600),
-    }]));
+    let server = delayed_fixture("/b.flac", Duration::from_millis(600));
     let b_item = match how {
         Superseding::StalledLoad => EnqueueItem::Url(server.url("/b.flac")),
         _ => EnqueueItem::Path(b_path.clone()),
@@ -413,6 +406,102 @@ fn seek_then_load_discards_the_old_target() {
     ] {
         supersede_a_burst(how);
     }
+}
+
+/// A remote document of the 5-second fixture whose headers arrive only
+/// after `delay`, so its load stays pending that long.
+fn delayed_fixture(path: &str, delay: Duration) -> TestServer {
+    TestServer::start(Script::documents(vec![DocumentReply {
+        path: path.into(),
+        status: 200,
+        headers: vec![("Content-Type".into(), "audio/flac".into())],
+        body: std::fs::read(FIVE).unwrap_or_else(|error| panic!("fixture: {error}")),
+        conditional: false,
+        header_delay: delay,
+    }]))
+}
+
+#[test]
+fn a_refused_load_drained_with_a_later_adoption_does_not_stop_the_adopted_track() {
+    let (_media, root) = media_dir(&["a.flac", "b.flac"]);
+    let mut rig = rig_with(seeded(vec![
+        local_entry(&root.join("a.flac")),
+        local_entry(&root.join("b.flac")),
+    ]));
+    let ids = row_ids(&rig.runtime);
+    rig.runtime.handle(AppCommand::PlayEntry(ids[0]));
+    // Invalidates A's pending load; its `Loaded` asks for a stop.
+    rig.runtime.handle(AppCommand::Remove(ids[0]));
+    rig.runtime.handle(AppCommand::PlayEntry(ids[1]));
+    // Both outcomes are waiting when the first pump drains them together.
+    std::thread::sleep(Duration::from_secs(1));
+    pump_until(&mut rig.runtime, "B playing", |view| {
+        is_playing(view, ids[1])
+    });
+    pump_for(&mut rig.runtime, Duration::from_millis(300));
+    let view = rig.runtime.view();
+    assert!(is_playing(&view, ids[1]), "B keeps playing: {view:?}");
+    let _ = rig.runtime.shutdown();
+}
+
+#[test]
+fn removing_the_active_entry_does_not_cancel_a_newer_load_in_flight() {
+    let server = delayed_fixture("/b.flac", Duration::from_millis(600));
+    let (_media, root) = media_dir(&["a.flac"]);
+    let mut rig = rig_with(seeded(vec![local_entry(&root.join("a.flac"))]));
+    rig.runtime
+        .handle(AppCommand::Enqueue(vec![EnqueueItem::Url(
+            server.url("/b.flac"),
+        )]));
+    let ids = row_ids(&rig.runtime);
+    rig.runtime.handle(AppCommand::PlayEntry(ids[0]));
+    pump_until(&mut rig.runtime, "A playing", |view| {
+        is_playing(view, ids[0])
+    });
+
+    rig.runtime.handle(AppCommand::PlayEntry(ids[1]));
+    pump_for(&mut rig.runtime, Duration::from_millis(200));
+    assert_eq!(rig.runtime.view().phase, PlaybackPhase::Loading);
+    rig.runtime.handle(AppCommand::Remove(ids[0]));
+    pump_until(&mut rig.runtime, "B playing", |view| {
+        is_playing(view, ids[1])
+    });
+    assert_eq!(rig.runtime.view().active, Some(ids[1]));
+    let _ = rig.runtime.shutdown();
+    server.shutdown();
+}
+
+#[test]
+fn clearing_during_a_load_never_adopts_the_invalidated_load() {
+    let server = delayed_fixture("/b.flac", Duration::from_millis(600));
+    let (_media, root) = media_dir(&["a.flac"]);
+    let mut rig = rig_with(seeded(vec![local_entry(&root.join("a.flac"))]));
+    rig.runtime
+        .handle(AppCommand::Enqueue(vec![EnqueueItem::Url(
+            server.url("/b.flac"),
+        )]));
+    let ids = row_ids(&rig.runtime);
+    rig.runtime.handle(AppCommand::PlayEntry(ids[0]));
+    pump_until(&mut rig.runtime, "A playing", |view| {
+        is_playing(view, ids[0])
+    });
+
+    rig.runtime.handle(AppCommand::PlayEntry(ids[1]));
+    pump_for(&mut rig.runtime, Duration::from_millis(200));
+    rig.runtime.handle(AppCommand::ClearQueue);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while rig.runtime.session().pending_load_count() > 0 {
+        rig.runtime.pump();
+        assert!(Instant::now() < deadline, "B's load never resolved");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    pump_for(&mut rig.runtime, Duration::from_millis(300));
+    let view = rig.runtime.view();
+    assert_eq!(view.phase, PlaybackPhase::Unloaded, "{view:?}");
+    assert!(view.rows.is_empty());
+    assert!(rig.runtime.session().adopted().is_none());
+    let _ = rig.runtime.shutdown();
+    server.shutdown();
 }
 
 /// Plays A, requests the missing B (or two occurrences of it), waits for the

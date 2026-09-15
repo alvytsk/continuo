@@ -357,18 +357,12 @@ impl PlayerRuntime {
             .and_then(|engine| engine.events().try_recv().ok())
         {
             self.observe_event(&event);
+            // Answered right after the event that raised it, while any newer
+            // load still counts as pending: once that load's own `Loaded` is
+            // drained, an unscoped stop would end the newly adopted track.
+            self.answer_stop_request();
         }
 
-        if self.session.take_stop_request() {
-            self.router.cancel();
-            // A load still pending tears the unadopted playback down anyway
-            // when it runs; stopping now could cancel that newer load instead.
-            if self.session.pending_load_count() == 0
-                && let Some(engine) = &self.engine
-            {
-                engine.interrupt_stop();
-            }
-        }
         if let Some(Advance::Next(id)) = self.session.take_advance() {
             self.load_entry(id);
         }
@@ -389,6 +383,22 @@ impl PlayerRuntime {
             && progress.load == Some(mirror.load)
         {
             mirror.apply_progress(&progress, self.router.is_seeking());
+        }
+    }
+
+    /// Stops playback `Session` refused to adopt. The router is cancelled
+    /// either way; the engine is only interrupted when no load is pending,
+    /// because a pending load tears that playback down when it runs, and an
+    /// interrupt now could cancel the pending load instead.
+    fn answer_stop_request(&mut self) {
+        if !self.session.take_stop_request() {
+            return;
+        }
+        self.router.cancel();
+        if self.session.pending_load_count() == 0
+            && let Some(engine) = &self.engine
+        {
+            engine.interrupt_stop();
         }
     }
 
@@ -781,10 +791,13 @@ impl PlayerRuntime {
     fn apply_removal(&mut self, removal: Removal) {
         self.submit(removal.action);
         // Only playback the engine still holds for the released entry is
-        // stopped: a displaced one is already gone, and stopping then would
-        // cancel whatever newer load displaced it.
+        // stopped, and only when no load is pending: a displaced playback is
+        // already gone, and a pending load either tears the released
+        // playback down when it runs or, invalidated by this release, raises
+        // its own stop request. An interrupt now would cancel that load.
         if removal.stop_playback
             && self.mirror.is_some()
+            && self.session.pending_load_count() == 0
             && let Some(engine) = &self.engine
         {
             engine.interrupt_stop();
