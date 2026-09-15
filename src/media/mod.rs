@@ -1,4 +1,5 @@
 pub mod capabilities;
+pub mod display;
 pub mod id;
 pub mod metadata;
 pub mod source;
