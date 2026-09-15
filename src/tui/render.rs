@@ -121,7 +121,7 @@ pub fn draw(
     let regions = regions(area, tier);
     let theme = Theme::default();
     let buffer = frame.buffer_mut();
-    buffer.set_style(area, Style::new().bg(theme.background).fg(theme.text));
+    buffer.set_style(area, Style::new().fg(theme.text));
 
     if tier == Tier::Resize {
         draw_resize(buffer, &regions, &theme);
@@ -200,7 +200,6 @@ fn draw_confirm_overlay(buffer: &mut Buffer, area: Rect, theme: &Theme) {
     Block::bordered()
         .title(" confirm ")
         .border_style(Style::new().fg(theme.amber))
-        .style(Style::new().bg(theme.background))
         .render(box_area, buffer);
     Paragraph::new(CONFIRM_CLEAR_TEXT)
         .style(Style::new().fg(theme.cream))
@@ -221,7 +220,6 @@ fn draw_help_overlay(buffer: &mut Buffer, area: Rect, theme: &Theme) {
     Block::bordered()
         .title(" help — ? or Esc to close ")
         .border_style(Style::new().fg(theme.line))
-        .style(Style::new().bg(theme.background))
         .render(box_area, buffer);
     Paragraph::new(HELP_LINES.join("\n"))
         .style(Style::new().fg(theme.text))
@@ -238,7 +236,6 @@ fn draw_input_overlay(buffer: &mut Buffer, area: Rect, input: &str, theme: &Them
     Block::bordered()
         .title(" add path or URL — Enter to add, Esc to cancel ")
         .border_style(Style::new().fg(theme.green))
-        .style(Style::new().bg(theme.background))
         .render(box_area, buffer);
     Paragraph::new(format!("{input}▏"))
         .style(Style::new().fg(theme.cream))
@@ -622,7 +619,7 @@ fn draw_queue_row(
     theme: &Theme,
 ) {
     let (base, accent, muted) = if selected {
-        let on_green = Style::new().bg(theme.green).fg(theme.background);
+        let on_green = Style::new().bg(theme.green).fg(theme.ink);
         (on_green, on_green, on_green)
     } else {
         (

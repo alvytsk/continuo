@@ -139,6 +139,22 @@ fn normal_layout_shows_cover_metadata_and_distinct_playing_and_selected_rows() {
 }
 
 #[test]
+fn the_player_leaves_the_terminal_background_unpainted() {
+    let v = view(
+        PlaybackPhase::Playing,
+        Some(playing(ids()[0], true, Some(decoded(185)), false)),
+    );
+    let (buffer, _) = render(&v, &UiState::new(true), &Visuals::default(), 100, 30);
+    let corners = [(0, 0), (99, 0), (0, 29), (99, 29)];
+    for (x, y) in corners {
+        assert_eq!(
+            buffer.cell((x, y)).expect("cell").bg,
+            ratatui::style::Color::Reset
+        );
+    }
+}
+
+#[test]
 fn the_selected_row_is_highlighted_apart_from_the_playing_marker() {
     let v = view(
         PlaybackPhase::Playing,

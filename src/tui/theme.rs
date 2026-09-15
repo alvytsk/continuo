@@ -1,11 +1,13 @@
-//! The compact reference palette (design doc M5 §7): a dark ground, subtle
-//! borders, cream text and muted green highlights.
+//! The compact reference palette (design doc M5 §7): subtle borders, cream
+//! text and muted green highlights. The player paints no background of its
+//! own, so the terminal's background shows through.
 
 use ratatui::style::Color;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Theme {
-    pub background: Color,
+    /// Dark text drawn on green highlights.
+    pub ink: Color,
     pub panel: Color,
     pub line: Color,
     pub muted: Color,
@@ -19,7 +21,7 @@ pub struct Theme {
 impl Default for Theme {
     fn default() -> Self {
         Self {
-            background: Color::Rgb(0x10, 0x18, 0x1a),
+            ink: Color::Rgb(0x10, 0x18, 0x1a),
             panel: Color::Rgb(0x19, 0x1e, 0x21),
             line: Color::Rgb(0x34, 0x41, 0x45),
             muted: Color::Rgb(0x93, 0xa1, 0x9f),

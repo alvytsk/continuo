@@ -37,7 +37,7 @@ pub(super) fn draw_browser(buffer: &mut Buffer, area: Rect, browser: &BrowserSta
     Block::bordered()
         .title(" browse ")
         .border_style(Style::new().fg(theme.green))
-        .style(Style::new().bg(theme.background).fg(theme.text))
+        .style(Style::new().fg(theme.text))
         .render(box_area, buffer);
     let body = inset(box_area);
     if body.is_empty() {
@@ -67,7 +67,7 @@ fn tabs(active: BrowserTab, theme: &Theme) -> Line<'static> {
         if tab == active {
             Style::new()
                 .bg(theme.green)
-                .fg(theme.background)
+                .fg(theme.ink)
                 .add_modifier(Modifier::BOLD)
         } else {
             Style::new().fg(theme.muted)
@@ -205,7 +205,7 @@ fn draw_row(
     theme: &Theme,
 ) {
     let style = if under_cursor {
-        cells.style.bg(theme.green).fg(theme.background)
+        cells.style.bg(theme.green).fg(theme.ink)
     } else {
         cells.style
     };
