@@ -9,6 +9,7 @@ use crate::playback::link::OutputLink;
 // integration tests drive the engine through it from outside the crate, so it
 // has to be part of the public module tree declared here.
 pub mod cpal_output;
+pub mod null_output;
 pub mod test_output;
 
 /// A point on the output device's clock, in nanoseconds.

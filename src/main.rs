@@ -36,7 +36,7 @@ fn main() -> ExitCode {
     };
 
     match app::run(cli) {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(outcome) => ExitCode::from(outcome.exit_status()),
         Err(error) => {
             eprintln!("continuo: {error}");
             tracing::error!(error = ?error, "playback failed");

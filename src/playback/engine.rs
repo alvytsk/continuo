@@ -36,6 +36,7 @@ use super::event::{PlaybackEvent, Progress, ShutdownReport, StartDisposition};
 use super::handshake::Handshake;
 use super::link::OutputLink;
 use super::output::cpal_output::{CpalOutput, OutputFault};
+use super::output::null_output::NullOutput;
 use super::output::{AudioOutput, Nanos, NegotiatedOutput, OutputRequest, SpanRecord};
 use super::prepare::{PrepareContext, prepare};
 use super::provenance::PositionProvenance;
@@ -199,6 +200,18 @@ impl EngineHandle {
         let (wake_tx, wake_rx) = crossbeam_channel::bounded(64);
         output.set_wake(wake_tx.clone());
         Self::assemble(Box::new(output), faults, wake_tx, wake_rx)
+    }
+
+    /// Spawn over whichever output the environment calls for: the paced,
+    /// deviceless [`NullOutput`] when `CONTINUO_AUDIO_OUTPUT=null` (what a
+    /// subprocess test sets on a CI machine with no sound device), otherwise
+    /// the real default device.
+    pub fn spawn_for_environment() -> Self {
+        if std::env::var("CONTINUO_AUDIO_OUTPUT").as_deref() == Ok("null") {
+            Self::spawn(Box::new(NullOutput::new()))
+        } else {
+            Self::spawn_cpal()
+        }
     }
 
     /// Spawn a worker over any output, plus the fault stream it publishes to.

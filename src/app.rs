@@ -18,6 +18,8 @@ use crate::http::channel::{SourceInterrupt, WaitHook};
 use crate::http::error::{RemoteFailure, redact_url};
 use crate::http::limits::Limits;
 use crate::http::service::HttpService;
+use crate::lifecycle::RunOutcome;
+use crate::lifecycle::signals::ShutdownSignals;
 use crate::media::capabilities::{MediaCapabilities, SeekSupport};
 use crate::media::id::{AbsolutePath, MediaId, NormalizedUrl};
 use crate::media::source::SourceLocation;
@@ -50,7 +52,7 @@ const HELP_LINE: &str =
 /// else dispatches to [`crate::commands`], which owns every line this
 /// program prints for a feed command, the one synchronous bridge into the
 /// HTTP runtime, and the exit status a partial failure has to carry.
-pub fn run(cli: cli::Cli) -> Result<(), crate::error::AppError> {
+pub fn run(cli: cli::Cli) -> Result<RunOutcome, crate::error::AppError> {
     match cli.command {
         CliCommand::Play {
             source,
@@ -58,7 +60,9 @@ pub fn run(cli: cli::Cli) -> Result<(), crate::error::AppError> {
             probe_only,
         } => {
             if probe_only {
-                return run_probe_only(&source).map_err(Into::into);
+                return run_probe_only(&source)
+                    .map(|()| RunOutcome::Completed)
+                    .map_err(Into::into);
             }
             let (media, location) = resolve_source(&source)?;
             run_resolved(media, location)
@@ -81,7 +85,9 @@ pub fn run(cli: cli::Cli) -> Result<(), crate::error::AppError> {
                 // persisted — the probe writes no state at all — so the
                 // podcast identity resolved above is not diluted by it.
                 if let SourceLocation::Http(url) = &location {
-                    return run_probe_only(url.as_str()).map_err(Into::into);
+                    return run_probe_only(url.as_str())
+                        .map(|()| RunOutcome::Completed)
+                        .map_err(Into::into);
                 }
                 return Err(crate::feed::error::FeedError::Malformed {
                     detail: "podcast cache contained a non-HTTP source".into(),
@@ -92,20 +98,36 @@ pub fn run(cli: cli::Cli) -> Result<(), crate::error::AppError> {
             // the enclosure, what is checkpointed is the episode.
             run_resolved(media, location)
         }
-        command => crate::commands::run(command).map_err(Into::into),
+        command => crate::commands::run(command)
+            .map(|()| RunOutcome::Completed)
+            .map_err(Into::into),
     }
 }
 
-/// The source is resolved first (the caller already has it), the exclusive
-/// profile lock is taken next, and only then is `state.json` loaded: a
-/// rejected source is reported before a second player would ever be told the
-/// profile is contended, and no process reads or writes state that another
-/// player still holds. The lock is bound here, not in
+/// Signals are installed before anything else that could fail (source
+/// resolution is the caller's job, done before this is ever called), the
+/// exclusive profile lock is taken next, and only then is `state.json`
+/// loaded: a rejected source is reported before a second player would ever
+/// be told the profile is contended, and no process reads or writes state
+/// that another player still holds. The lock is bound here, not in
 /// [`run_resolved_locked`], so it stays held for that whole call and is only
 /// released once this function returns — after `finish`'s `report_flush`.
-fn run_resolved(media: MediaId, location: SourceLocation) -> Result<(), crate::error::AppError> {
+///
+/// A signal recorded during the run wins over whatever `run_resolved_locked`
+/// itself returned, playback error included (design doc M5 §6.5) — the
+/// listener that recorded it neither loaded state nor rendered anything, so
+/// a signal arriving the same instant as, say, a device fault is still
+/// reported as the shutdown it actually was. `signals.outcome()` is read
+/// before `close()`, which only tears the listener down and cannot change
+/// what it already recorded.
+fn run_resolved(
+    media: MediaId,
+    location: SourceLocation,
+) -> Result<RunOutcome, crate::error::AppError> {
     use crate::error::LifecycleError;
     use crate::lifecycle::lock::{LockError, ProfileLock};
+
+    let signals = ShutdownSignals::install().map_err(LifecycleError::Signals)?;
 
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let state_path = StateStore::platform_path()
@@ -113,7 +135,13 @@ fn run_resolved(media: MediaId, location: SourceLocation) -> Result<(), crate::e
     let _lock = ProfileLock::acquire(&state_path).map_err(LifecycleError::from)?;
     let store = StateStore::new(state_path, Arc::clone(&clock));
 
-    run_resolved_locked(media, location, clock, store).map_err(Into::into)
+    let outcome = run_resolved_locked(media, location, clock, store, &signals);
+    let signalled = signals.outcome();
+    signals.close();
+    match signalled {
+        RunOutcome::Signalled(number) => Ok(RunOutcome::Signalled(number)),
+        RunOutcome::Completed => outcome.map(|()| RunOutcome::Completed).map_err(Into::into),
+    }
 }
 
 /// The shared playback body: persistence open, engine assembly, resume,
@@ -126,6 +154,7 @@ fn run_resolved_locked(
     location: SourceLocation,
     clock: Arc<dyn Clock>,
     store: StateStore,
+    signals: &ShutdownSignals,
 ) -> Result<(), PlaybackError> {
     // Persistence opens before the engine: the resume candidate is an
     // argument to the load, and the restored volume is a command that
@@ -148,7 +177,7 @@ fn run_resolved_locked(
         SourceLocation::LocalPath(_) => None,
     };
 
-    let engine = EngineHandle::spawn_cpal();
+    let engine = EngineHandle::spawn_for_environment();
     if let Some(service) = http {
         engine.set_http(Some(service));
     }
@@ -191,7 +220,14 @@ fn run_resolved_locked(
     // line above is rendered. `Loaded` hands off to loop B; `Failed` or a
     // quit decides the run's outcome here, before loop B ever starts.
     let phase = loop {
-        if handle_keys(&engine, &mut router, &mut mirror, raw.is_some()) {
+        // Checked before anything else in the pass (Ruling 2): a signal
+        // recorded here breaks straight into `finish` rather than waiting for
+        // this pass's own render or event drain, neither of which a shutdown
+        // needs.
+        if signals.requested() {
+            break Phase::Done(Ok(()));
+        }
+        if handle_keys(&engine, &mut router, &mut mirror, raw.is_some(), signals) {
             break Phase::Done(Ok(()));
         }
         router.flush(&engine, Instant::now());
@@ -220,7 +256,10 @@ fn run_resolved_locked(
         Phase::Done(outcome) => outcome,
         // Loop B: the existing key/render/checkpoint loop.
         Phase::Loaded => loop {
-            if handle_keys(&engine, &mut router, &mut mirror, raw.is_some()) {
+            if signals.requested() {
+                break Ok(());
+            }
+            if handle_keys(&engine, &mut router, &mut mirror, raw.is_some(), signals) {
                 break Ok(());
             }
             router.flush(&engine, Instant::now());
@@ -254,6 +293,14 @@ fn run_resolved_locked(
             // from here and bypassing the flush path (D18).
             if let Err(error) = render(&mirror) {
                 break Err(error);
+            }
+            // With no controlling terminal there is no key left to read that
+            // could ever end this run (`q`/Ctrl-C need a tty), so a session
+            // that has reached the end of its one track is otherwise stuck
+            // rendering an unchanging frame forever. A signal still ends it
+            // sooner; this is what ends it at all when none arrives.
+            if raw.is_none() && mirror.state == PlaybackState::Ended {
+                break Ok(());
             }
         },
     };
@@ -343,18 +390,26 @@ fn finish(
 /// someone having pressed `q`. Waiting out one tick and reporting nothing to
 /// do is what actually matches "no keys", leaving the event drain in each
 /// loop as the only thing such a session can still notice.
+///
+/// That wait is where a shutdown signal arriving during a stalled open (no
+/// media loaded yet, nothing else in this loop pass blocks) would otherwise
+/// sit unnoticed for up to a full tick: it races the ordinary sleep against
+/// [`ShutdownSignals::wake`] rather than sleeping blind, so the signal ends
+/// the wait the moment it arrives and the top-of-pass `requested()` check
+/// sees it on the very next iteration.
 fn handle_keys(
     engine: &EngineHandle,
     router: &mut KeyRouter,
     mirror: &mut Mirror,
     raw: bool,
+    signals: &ShutdownSignals,
 ) -> bool {
     // Capped by whatever is sooner: the ordinary tick, or an open burst's own
     // deadline. Without the cap a window expiring just after a block began
     // would go unnoticed for a further full block.
     let budget = router.poll_budget(Instant::now(), Duration::from_millis(100));
     if !raw {
-        std::thread::sleep(budget);
+        let _ = signals.wake().recv_timeout(budget);
         return false;
     }
     match crossterm::event::poll(budget) {
