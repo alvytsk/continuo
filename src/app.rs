@@ -61,7 +61,7 @@ pub fn run(cli: cli::Cli) -> Result<(), crate::error::AppError> {
                 return run_probe_only(&source).map_err(Into::into);
             }
             let (media, location) = resolve_source(&source)?;
-            run_resolved(media, location).map_err(Into::into)
+            run_resolved(media, location)
         }
         CliCommand::Play {
             source: slug,
@@ -90,29 +90,52 @@ pub fn run(cli: cli::Cli) -> Result<(), crate::error::AppError> {
             }
             // The podcast `MediaId` travels on unchanged: what is played is
             // the enclosure, what is checkpointed is the episode.
-            run_resolved(media, location).map_err(Into::into)
+            run_resolved(media, location)
         }
         command => crate::commands::run(command).map_err(Into::into),
     }
 }
 
+/// Task 11's addition to the legacy order: resolve the source (the caller
+/// already has), acquire the exclusive profile lock, *then* load
+/// `state.json` — never the other way around, or a second player could read
+/// or write state a first player still holds. The lock is bound here, not in
+/// [`run_resolved_locked`], so it stays held for that whole call and is only
+/// released once this function returns — after `finish`'s `report_flush`.
+fn run_resolved(media: MediaId, location: SourceLocation) -> Result<(), crate::error::AppError> {
+    use crate::error::LifecycleError;
+    use crate::lifecycle::lock::{LockError, ProfileLock};
+
+    let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+    let state_path = StateStore::platform_path()
+        .map_err(|_| LifecycleError::from(LockError::NoStateDirectory))?;
+    let _lock = ProfileLock::acquire(&state_path).map_err(LifecycleError::from)?;
+    let store = StateStore::new(state_path, Arc::clone(&clock));
+
+    run_resolved_locked(media, location, clock, store).map_err(Into::into)
+}
+
 /// The shared playback body: persistence open, engine assembly, resume,
-/// session, both key loops and the shutdown. Unchanged from when it was
-/// `run`'s own tail — it only stopped resolving its own source, so that one
-/// caller can hand it a local file or a URL and the other a podcast episode
-/// and nothing downstream can tell which.
-fn run_resolved(media: MediaId, location: SourceLocation) -> Result<(), PlaybackError> {
+/// session, both key loops and the shutdown. Unchanged from before Task 11
+/// except that it now receives the already-locked `StateStore` instead of
+/// resolving one of its own (§13: `platform_path` still has exactly one
+/// caller, just moved up into [`run_resolved`]).
+fn run_resolved_locked(
+    media: MediaId,
+    location: SourceLocation,
+    clock: Arc<dyn Clock>,
+    store: StateStore,
+) -> Result<(), PlaybackError> {
     // Persistence opens before the engine: the resume candidate is an
     // argument to the load, and the restored volume is a command that
     // precedes it.
-    let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let Persistence {
         mut session,
         writer,
         resume,
         volume,
         persisting,
-    } = open_persistence(platform_store(&clock), &media, &clock);
+    } = open_persistence(store, &media, &clock);
 
     // Built before the engine spawns: `EngineHandle::set_http`'s default is
     // `None`, which fails every remote `Load` with "no HTTP service in this
@@ -708,6 +731,16 @@ fn resolve_source(input: &str) -> Result<(MediaId, SourceLocation), PlaybackErro
         path: path.clone(),
         source,
     })?;
+    let metadata = std::fs::metadata(&canonical).map_err(|source| PlaybackError::Open {
+        path: canonical.clone(),
+        source,
+    })?;
+    if !metadata.is_file() {
+        return Err(PlaybackError::UnsupportedInput {
+            path: canonical,
+            reason: "not a regular file".into(),
+        });
+    }
     let absolute =
         AbsolutePath::new(canonical.clone()).map_err(|error| PlaybackError::UnsupportedInput {
             path: path.clone(),
@@ -847,10 +880,12 @@ fn resume_commands(
     ]
 }
 
-/// Writing is off for this session — an unsupported file, a quarantine that
-/// could not be performed, or no state directory at all. The session runs
-/// normally with in-memory state; only the disk write is suppressed, and the
-/// reason has already been logged once (D3).
+/// Writing is off for this session — an unsupported file, or a quarantine
+/// that could not be performed. The session runs normally with in-memory
+/// state; only the disk write is suppressed, and the reason has already
+/// been logged once (D3). `play` always has a state directory by the time
+/// persistence opens: a missing one fails at the profile lock instead
+/// (`LockError::NoStateDirectory`), before any state is read.
 struct DisabledSink;
 
 impl StateSink for DisabledSink {
@@ -879,78 +914,52 @@ struct Persistence {
     persisting: bool,
 }
 
-/// The store on the platform's state path, or `None` when the platform offers
-/// no state directory at all. Path discovery is kept out of `open_persistence`
-/// so that everything downstream of it — the load classification and the sink
-/// selection — can be driven from a store in a tempdir, and so that
-/// `platform_path` keeps exactly one caller in the program (§13).
-fn platform_store(clock: &Arc<dyn Clock>) -> Option<StateStore> {
-    match StateStore::platform_path() {
-        Ok(path) => Some(StateStore::new(path, Arc::clone(clock))),
-        Err(error) => {
-            tracing::warn!(%error, "no state directory; this session will not be persisted");
-            None
+fn open_persistence(store: StateStore, media: &MediaId, clock: &Arc<dyn Clock>) -> Persistence {
+    let outcome = store.load();
+    match &outcome.reason {
+        LoadReason::Loaded => tracing::debug!(path = ?store.path(), "state restored"),
+        LoadReason::Missing => tracing::debug!(path = ?store.path(), "no state yet"),
+        LoadReason::Quarantined { moved_to } => {
+            tracing::warn!(
+                ?moved_to,
+                "state file was unreadable and has been moved aside"
+            );
+        }
+        LoadReason::QuarantineFailed => {
+            tracing::warn!("state file is unreadable and could not be moved aside; not writing");
+        }
+        LoadReason::UnsupportedVersion { found } => {
+            tracing::warn!(
+                found,
+                "state file is from a newer build; preserving it and not writing"
+            );
+        }
+        LoadReason::Unreadable => {
+            tracing::warn!("state file could not be read; preserving it and not writing");
         }
     }
-}
-
-fn open_persistence(
-    store: Option<StateStore>,
-    media: &MediaId,
-    clock: &Arc<dyn Clock>,
-) -> Persistence {
-    let (state, writable) = match &store {
-        Some(store) => {
-            let outcome = store.load();
-            match &outcome.reason {
-                LoadReason::Loaded => tracing::debug!(path = ?store.path(), "state restored"),
-                LoadReason::Missing => tracing::debug!(path = ?store.path(), "no state yet"),
-                LoadReason::Quarantined { moved_to } => {
-                    tracing::warn!(
-                        ?moved_to,
-                        "state file was unreadable and has been moved aside"
-                    );
-                }
-                LoadReason::QuarantineFailed => {
-                    tracing::warn!(
-                        "state file is unreadable and could not be moved aside; not writing"
-                    );
-                }
-                LoadReason::UnsupportedVersion { found } => {
-                    tracing::warn!(
-                        found,
-                        "state file is from a newer build; preserving it and not writing"
-                    );
-                }
-                LoadReason::Unreadable => {
-                    tracing::warn!("state file could not be read; preserving it and not writing");
-                }
+    // §6: a repaired queue logs here too, distinct from the warning
+    // `StateStore::load` already emits — that one is unconditional, this
+    // one is what the TUI's status line (Task 17) will surface.
+    if let Some(repair) = &outcome.queue_repair {
+        match &repair.backup {
+            QueueBackup::Saved(path) => {
+                tracing::warn!(
+                    fields = repair.reset.fields_reset(),
+                    backup = ?path,
+                    "queue data in the state file was reset"
+                );
             }
-            // §6: a repaired queue logs here too, distinct from the warning
-            // `StateStore::load` already emits — that one is unconditional,
-            // this one is what the TUI's status line (Task 17) will surface.
-            if let Some(repair) = &outcome.queue_repair {
-                match &repair.backup {
-                    QueueBackup::Saved(path) => {
-                        tracing::warn!(
-                            fields = repair.reset.fields_reset(),
-                            backup = ?path,
-                            "queue data in the state file was reset"
-                        );
-                    }
-                    QueueBackup::Failed => {
-                        tracing::warn!(
-                            fields = repair.reset.fields_reset(),
-                            "queue data in the state file was reset; the backup could not be \
-                             written, so persistence is disabled for this session"
-                        );
-                    }
-                }
+            QueueBackup::Failed => {
+                tracing::warn!(
+                    fields = repair.reset.fields_reset(),
+                    "queue data in the state file was reset; the backup could not be \
+                     written, so persistence is disabled for this session"
+                );
             }
-            (outcome.state, outcome.writable)
         }
-        None => (PersistedState::default(), false),
-    };
+    }
+    let (state, writable) = (outcome.state, outcome.writable);
 
     // No `ResumeDecision` is logged here any more: the decision needs a
     // duration, this call site has none, and logging one taken with
@@ -966,9 +975,10 @@ fn open_persistence(
     // build.
     let resume = resume_intent_for(state.entry_for(media));
     let volume = state.volume();
-    let sink: Box<dyn StateSink> = match (store, writable) {
-        (Some(store), true) => Box::new(store),
-        _ => Box::new(DisabledSink),
+    let sink: Box<dyn StateSink> = if writable {
+        Box::new(store)
+    } else {
+        Box::new(DisabledSink)
     };
 
     Persistence {
@@ -1613,7 +1623,7 @@ mod tests {
         );
         store.write(&stored).unwrap();
 
-        let persistence = open_persistence(Some(store), &media, &clock);
+        let persistence = open_persistence(store, &media, &clock);
 
         assert_eq!(
             persistence.resume,
@@ -1656,7 +1666,7 @@ mod tests {
         );
         store.write(&stored).unwrap();
 
-        let persistence = open_persistence(Some(store), &media, &clock);
+        let persistence = open_persistence(store, &media, &clock);
 
         assert_eq!(
             persistence.resume,
@@ -1687,7 +1697,7 @@ mod tests {
         );
         store.write(&stored).unwrap();
 
-        let persistence = open_persistence(Some(store), &media, &clock);
+        let persistence = open_persistence(store, &media, &clock);
 
         assert_eq!(
             persistence.resume,
@@ -1719,7 +1729,7 @@ mod tests {
         );
         store.write(&stored).unwrap();
 
-        let persistence = open_persistence(Some(store), &media, &clock);
+        let persistence = open_persistence(store, &media, &clock);
 
         assert_eq!(
             persistence.resume,
@@ -1753,7 +1763,7 @@ mod tests {
         );
         store.write(&stored).unwrap();
 
-        let mut persistence = open_persistence(Some(store), &media, &clock);
+        let mut persistence = open_persistence(store, &media, &clock);
         assert!(persistence.persisting);
 
         // The listener got another minute in, and the volume moved with them.
@@ -1803,7 +1813,7 @@ mod tests {
         let (store, clock) = store_at(&path);
         let media = local("/music/sonata.flac");
 
-        let mut persistence = open_persistence(Some(store), &media, &clock);
+        let mut persistence = open_persistence(store, &media, &clock);
 
         assert!(!persistence.persisting);
         assert_eq!(

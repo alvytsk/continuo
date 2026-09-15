@@ -20,6 +20,23 @@ pub enum DomainError {
     InvalidMediaId { input: String, reason: &'static str },
 }
 
+/// Startup failures around a `play` invocation's shared lifecycle: the
+/// profile lock (Task 11) and, in later tasks, signal installation, the
+/// session log, and terminal setup.
+#[derive(Debug, thiserror::Error)]
+pub enum LifecycleError {
+    #[error(transparent)]
+    Lock(#[from] crate::lifecycle::lock::LockError),
+    #[error("cannot install signal handling")]
+    Signals(#[source] std::io::Error),
+    #[error("cannot open the session log")]
+    Log(#[source] std::io::Error),
+    #[error("cannot redirect stderr to the session log")]
+    Redirect(#[source] std::io::Error),
+    #[error("cannot set up the terminal")]
+    Terminal(#[source] std::io::Error),
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum TelemetryError {
     #[error("invalid tracing filter")]
@@ -39,4 +56,6 @@ pub enum AppError {
     Playback(#[from] crate::playback::error::PlaybackError),
     #[error(transparent)]
     Feed(#[from] crate::feed::error::FeedError),
+    #[error(transparent)]
+    Lifecycle(#[from] LifecycleError),
 }

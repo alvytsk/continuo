@@ -74,7 +74,7 @@ pub(crate) fn sync_parent_best_effort(dir: &Path) {
 }
 
 #[cfg(unix)]
-fn prepare_directory(dir: &Path) -> Result<(), PersistenceError> {
+pub(crate) fn prepare_directory(dir: &Path) -> Result<(), PersistenceError> {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 
     if !dir.exists() {
@@ -122,7 +122,7 @@ fn prepare_directory(dir: &Path) -> Result<(), PersistenceError> {
 }
 
 #[cfg(not(unix))]
-fn prepare_directory(dir: &Path) -> Result<(), PersistenceError> {
+pub(crate) fn prepare_directory(dir: &Path) -> Result<(), PersistenceError> {
     // Platform defaults: a documented gap (§17, D12).
     fs::create_dir_all(dir).map_err(|source| PersistenceError::Io {
         path: dir.to_path_buf(),
