@@ -15,17 +15,17 @@
 //! control channel until [`SpectrumHandle::set_enabled`], a reader attach or
 //! shutdown wakes it, and forgets every frame, window and block it held.
 //!
-//! **Panic containment.** Only the pure FFT step - building a
-//! [`SpectrumAnalyzer`] and pushing one block of samples into it - runs inside
-//! [`run_contained`]. That step touches nothing but the thread's own
-//! disposable analyzer and a borrowed sample slice: no lock, no registry, no
-//! latest slot, no engine state. It is the same shape as an artwork decode
-//! job, not "the audio engine" or "shared-state orchestration" (§9/§11), so
-//! a panic there discards the analyzer and its pending windows and the worker
-//! carries on. Everything else - registry lookups, publishing, the control
-//! channel - stays outside the boundary: a panic there is a bug, ends only
-//! this thread (never the decode worker or the callback), and takes the
-//! ordinary fatal path in the terminal player.
+//! **Panics are not contained.** This thread belongs to the engine, and the
+//! contained-panic boundary is reserved for artwork decoding/encoding and
+//! metadata probing (§9, §11); "panics outside these job boundaries must
+//! still take the fatal path" (§12). A panic anywhere here - the FFT
+//! included - unwinds and ends this thread, and in the terminal player the
+//! §11 panic hook fails the application. The engine's own shutdown still
+//! completes: [`SpectrumThread::stop`] only sets a flag, sends on a channel
+//! whose failure is ignored, and joins a thread that has already exited,
+//! logging the panic rather than propagating it. A dead thread's control
+//! channel is disconnected, so later attaches and wakes are dropped, and its
+//! taps' rings simply fill and drop whole blocks on the callback side.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -38,7 +38,6 @@ use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use super::analyzer::SpectrumAnalyzer;
 use super::registry::{TapMapping, TapRegistry};
 use super::tap::{DESCRIPTOR_CAPACITY, TapDescriptor, TapReader, TapWriter, tap_pair};
-use crate::lifecycle::panic::run_contained;
 use crate::playback::output::Nanos;
 
 pub const MAX_FRAMES_PER_SECOND: u32 = 20;
@@ -294,41 +293,11 @@ fn interval_nanos() -> u64 {
 
 // ------------------------------------------------------------- analysis
 
-/// The FFT step, behind a seam so a test can make it panic.
-pub(crate) trait WindowAnalyzer: Send {
-    fn push_interleaved(&mut self, samples: &[f32]) -> Option<Vec<f32>>;
-    fn reset(&mut self);
-    fn band_edges(&self) -> Vec<(f64, f64)>;
-}
-
-impl WindowAnalyzer for SpectrumAnalyzer {
-    fn push_interleaved(&mut self, samples: &[f32]) -> Option<Vec<f32>> {
-        SpectrumAnalyzer::push_interleaved(self, samples)
-    }
-
-    fn reset(&mut self) {
-        SpectrumAnalyzer::reset(self);
-    }
-
-    fn band_edges(&self) -> Vec<(f64, f64)> {
-        self.bands()
-            .iter()
-            .map(|band| (band.low_hz, band.high_hz))
-            .collect()
-    }
-}
-
-type AnalyzerFactory = fn(u32, u16) -> Box<dyn WindowAnalyzer>;
-
-fn fft_analyzer(sample_rate: u32, channels: u16) -> Box<dyn WindowAnalyzer> {
-    Box::new(SpectrumAnalyzer::new(sample_rate, channels))
-}
-
 /// Turns labelled blocks into windows for the schedule, resetting whenever
 /// the mapping, the format or the discontinuity sequence changes.
+#[derive(Default)]
 struct Analysis {
-    factory: AnalyzerFactory,
-    analyzer: Option<Box<dyn WindowAnalyzer>>,
+    analyzer: Option<SpectrumAnalyzer>,
     bands: Vec<(f64, f64)>,
     format: Option<(u32, u16)>,
     key: Option<MappingKey>,
@@ -336,17 +305,6 @@ struct Analysis {
 }
 
 impl Analysis {
-    fn new(factory: AnalyzerFactory) -> Self {
-        Self {
-            factory,
-            analyzer: None,
-            bands: Vec::new(),
-            format: None,
-            key: None,
-            discontinuity: 0,
-        }
-    }
-
     /// Drops the analyzer and everything it had buffered.
     fn clear(&mut self) {
         self.analyzer = None;
@@ -381,39 +339,31 @@ impl Analysis {
         self.format = Some(format);
         self.discontinuity = descriptor.discontinuity;
 
-        let factory = self.factory;
-        let slot = &mut self.analyzer;
         let bands = &mut self.bands;
-        let outcome = run_contained("spectrum analysis", || {
-            let analyzer = slot.get_or_insert_with(|| {
-                let analyzer = factory(format.0, format.1);
-                *bands = analyzer.band_edges();
-                analyzer
-            });
-            analyzer.push_interleaved(samples)
+        let analyzer = self.analyzer.get_or_insert_with(|| {
+            let analyzer = SpectrumAnalyzer::new(format.0, format.1);
+            *bands = analyzer
+                .bands()
+                .iter()
+                .map(|band| (band.low_hz, band.high_hz))
+                .collect();
+            analyzer
         });
-        match outcome {
-            Ok(Some(mut levels)) => {
-                for level in &mut levels {
-                    if !level.is_finite() {
-                        *level = 0.0;
-                    }
-                }
-                schedule.offer(AnalyzedWindow {
-                    key,
-                    session_rev: mapping.session_rev,
-                    bands: self.bands.clone(),
-                    levels,
-                    predicted: descriptor.predicted,
-                });
-            }
-            Ok(None) => {}
-            Err(panic) => {
-                tracing::warn!(%panic, "spectrum analysis failed; restarting it");
-                self.clear();
-                schedule.discard_pending();
+        let Some(mut levels) = analyzer.push_interleaved(samples) else {
+            return;
+        };
+        for level in &mut levels {
+            if !level.is_finite() {
+                *level = 0.0;
             }
         }
+        schedule.offer(AnalyzedWindow {
+            key,
+            session_rev: mapping.session_rev,
+            bands: self.bands.clone(),
+            levels,
+            predicted: descriptor.predicted,
+        });
     }
 }
 
@@ -547,7 +497,7 @@ pub(crate) fn spawn(
         control: control_rx,
         device_clock,
         readers: Vec::new(),
-        analysis: Analysis::new(fft_analyzer),
+        analysis: Analysis::default(),
         schedule: FrameSchedule::default(),
         seen_switches: 0,
         next_retirement_check: Instant::now(),
@@ -710,44 +660,17 @@ impl Runner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicUsize;
 
-    static BUILT: AtomicUsize = AtomicUsize::new(0);
-
-    /// The first analyzer built panics on its first block; later ones emit a
-    /// window for every block.
-    struct Flaky {
-        panics: bool,
-    }
-
-    impl WindowAnalyzer for Flaky {
-        fn push_interleaved(&mut self, samples: &[f32]) -> Option<Vec<f32>> {
-            assert!(!self.panics, "analyzer bug");
-            Some(vec![samples.first().copied().unwrap_or(f32::NAN); 2])
-        }
-
-        fn reset(&mut self) {}
-
-        fn band_edges(&self) -> Vec<(f64, f64)> {
-            vec![(40.0, 85.0), (85.0, 170.0)]
-        }
-    }
-
-    fn flaky(_rate: u32, _channels: u16) -> Box<dyn WindowAnalyzer> {
-        let panics = BUILT.fetch_add(1, Ordering::SeqCst) == 0;
-        Box::new(Flaky { panics })
-    }
-
-    fn descriptor(predicted_ms: u64) -> TapDescriptor {
+    fn descriptor(discontinuity: u32) -> TapDescriptor {
         TapDescriptor {
             instance: 1,
             generation: 1,
             epoch: 2,
-            channels: 2,
+            channels: 1,
             sample_rate: 48_000,
-            discontinuity: 0,
-            predicted: Nanos(predicted_ms * 1_000_000),
-            samples: 2,
+            discontinuity,
+            predicted: Nanos(0),
+            samples: 0,
         }
     }
 
@@ -757,24 +680,63 @@ mod tests {
         epoch: 2,
         session_rev: 3,
         sample_rate: 48_000,
-        channels: 2,
+        channels: 1,
     };
 
     #[test]
-    fn a_panicking_analyzer_is_discarded_and_analysis_carries_on() {
-        let mut analysis = Analysis::new(flaky);
+    fn a_window_is_labelled_through_its_mapping_with_finite_levels() {
+        let mut analysis = Analysis::default();
         let mut schedule = FrameSchedule::default();
-        let now = Instant::now();
-        analysis.accept(&descriptor(0), &MAPPING, &[0.5, 0.5], &mut schedule);
-        assert_eq!(schedule.tick(now, Nanos(0)), SlotUpdate::Keep);
-
-        analysis.accept(&descriptor(0), &MAPPING, &[f32::NAN, 0.5], &mut schedule);
-        let SlotUpdate::Publish(frame) = schedule.tick(now, Nanos(0)) else {
-            panic!("the rebuilt analyzer's window was not published");
+        let mut samples = vec![0.25_f32; super::super::bands::WINDOW];
+        samples[7] = f32::NAN;
+        analysis.accept(&descriptor(0), &MAPPING, &samples, &mut schedule);
+        let SlotUpdate::Publish(frame) = schedule.tick(Instant::now(), Nanos(0)) else {
+            panic!("a full window was not published");
         };
         assert_eq!(frame.session_rev, 3);
-        assert_eq!(frame.levels, vec![0.0, 0.0], "non-finite levels become 0");
-        assert_eq!(frame.bands.len(), 2);
+        assert_eq!(frame.levels.len(), frame.bands.len());
+        assert!(frame.levels.iter().all(|level| level.is_finite()));
+    }
+
+    /// §12: an analysis panic takes the fatal path, so the thread is simply
+    /// gone by the time the engine shuts down. Stopping it must neither hang
+    /// nor re-panic, however many times it is asked.
+    #[test]
+    fn stopping_a_spectrum_thread_that_already_panicked_completes() {
+        let shared = Arc::new(Shared {
+            enabled: Arc::new(AtomicBool::new(true)),
+            switches: AtomicU64::new(0),
+            latest: Mutex::new(None),
+            shutdown: AtomicBool::new(false),
+        });
+        let (control, receiver) = crossbeam_channel::unbounded::<Control>();
+        let join = std::thread::Builder::new()
+            .name("continuo-spectrum".into())
+            .spawn(move || {
+                let _receiver = receiver;
+                panic!("analysis bug");
+            })
+            .ok();
+        let mut thread = SpectrumThread {
+            shared,
+            control: control.clone(),
+            join,
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while thread.join.as_ref().is_some_and(|join| !join.is_finished()) {
+            assert!(
+                Instant::now() < deadline,
+                "the panicking thread never ended"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            control.send(Control::Wake).is_err(),
+            "a dead thread's channel is disconnected"
+        );
+        thread.stop();
+        thread.stop();
+        assert!(thread.join.is_none());
     }
 
     #[test]
