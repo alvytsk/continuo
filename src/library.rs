@@ -224,6 +224,45 @@ pub fn list_episodes(
     Ok(rows)
 }
 
+/// One candidate for the later on-demand episode browser (§6.6, plan
+/// decision 14): unlike [`EpisodeRow`], carries the enclosure URL itself,
+/// since choosing what to queue next needs it and a row built only for
+/// display deliberately does not.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EpisodeCandidate {
+    pub media: MediaId,
+    pub enclosure: Option<Url>,
+    pub title: Option<String>,
+    pub declared_duration: Option<Duration>,
+}
+
+/// Candidates for `slug`, in the same stored (never re-sorted) order as
+/// [`list_episodes`], from which this mirrors every step but the enclosure
+/// column.
+pub fn episode_candidates(
+    subs: &SubscriptionStore,
+    cache: &CacheStore,
+    slug: &str,
+) -> Result<Vec<EpisodeCandidate>, FeedError> {
+    let snapshot = subs.read_snapshot()?;
+    let subscription = find_subscription(&snapshot, slug)?;
+    let cached = cache.read(&subscription)?;
+
+    Ok(cached
+        .episodes
+        .iter()
+        .map(|cached_episode| {
+            let episode = cached_episode.episode();
+            EpisodeCandidate {
+                media: episode.id,
+                enclosure: cached_episode.enclosure_url.clone(),
+                title: episode.title,
+                declared_duration: episode.declared_duration,
+            }
+        })
+        .collect())
+}
+
 /// `continuo play <slug> <index>`'s resolution step (§6.4, §6.5, §6.6): the
 /// only thing this function does is decide *which* `(MediaId,
 /// SourceLocation)` pair to play, or that none exists — no `EngineHandle`,
