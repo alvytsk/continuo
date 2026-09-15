@@ -652,33 +652,35 @@ fn podcast_rss(enclosure: &str) -> Vec<u8> {
     .into_bytes()
 }
 
-#[test]
-fn a_resolution_failure_is_retryable_without_losing_the_previous_adoption() {
-    let server = TestServer::start(Script::from_fixture("sine-5s.flac"));
-    let enclosure = server.url("/ep.flac");
-    let library = feeds::Rig::new().expect("feeds rig");
+/// A subscribed feed whose cache file is corrupt, the queued episode it
+/// lists, and the library stores reading it: resolving that episode fails
+/// before any load reaches the engine.
+fn corrupt_podcast(enclosure: &str) -> (feeds::Rig, NewQueueEntry, LibraryStores) {
+    let library = feeds::Rig::new().unwrap_or_else(|error| panic!("feeds rig: {error}"));
     let subscription = library
-        .seed(&podcast_rss(&enclosure), FEED_URL)
-        .expect("seed");
+        .seed(&podcast_rss(enclosure), FEED_URL)
+        .unwrap_or_else(|error| panic!("seed: {error}"));
     let cache_path = library
         .cache
         .path_for(&subscription.feed_id)
-        .expect("cache path");
-    std::fs::write(&cache_path, b"{").expect("corrupt the cache");
+        .unwrap_or_else(|error| panic!("cache path: {error}"));
+    std::fs::write(&cache_path, b"{").unwrap_or_else(|error| panic!("corrupt the cache: {error}"));
 
-    let (_media, root) = media_dir(&["a.flac"]);
     let episode = MediaId::PodcastEpisode {
-        feed: FeedId::new(feeds::FEED_ID.into()).expect("feed id"),
-        episode: EpisodeKey::resolve(Some("e1"), None, None).expect("episode key"),
+        feed: FeedId::new(feeds::FEED_ID.into()).unwrap_or_else(|error| panic!("feed id: {error}")),
+        episode: EpisodeKey::resolve(Some("e1"), None, None)
+            .unwrap_or_else(|error| panic!("episode key: {error}")),
     };
     let podcast = NewQueueEntry::new(
         episode,
         QueueSource::Podcast {
-            fallback: enclosure.parse().expect("url"),
+            fallback: enclosure
+                .parse()
+                .unwrap_or_else(|error| panic!("url: {error}")),
         },
         Default::default(),
     )
-    .expect("podcast entry");
+    .unwrap_or_else(|error| panic!("podcast entry: {error}"));
     let clock: Arc<dyn continuo::clock::Clock> = Arc::new(SystemClock);
     let stores = LibraryStores {
         subscriptions: SubscriptionStore::new(
@@ -687,6 +689,110 @@ fn a_resolution_failure_is_retryable_without_losing_the_previous_adoption() {
         ),
         cache: CacheStore::new(library.root.path().join("cache/continuo/feeds")),
     };
+    (library, podcast, stores)
+}
+
+#[test]
+fn a_failure_before_admission_leaves_the_transport_with_the_playing_track() {
+    let (_library, podcast, stores) = corrupt_podcast("https://media.example/ep.flac");
+    let (_media, root) = media_dir(&["a.flac"]);
+    let mut rig = rig_with_parts(
+        seeded(vec![local_entry(&root.join("a.flac")), podcast]),
+        Some(stores),
+        null_engine(),
+    );
+    let ids = row_ids(&rig.runtime);
+    let (a, b) = (ids[0], ids[1]);
+    rig.runtime.handle(AppCommand::PlayEntry(a));
+    pump_until(&mut rig.runtime, "A playing with a duration", |view| {
+        is_playing(view, a)
+            && view
+                .now_playing
+                .as_ref()
+                .is_some_and(|now| now.duration.is_some())
+    });
+    let a_token = now_playing(&rig.runtime.view()).load;
+
+    // A forward burst is standing when B's resolution fails.
+    rig.runtime.handle(AppCommand::SeekBy(1));
+    let target = now_playing(&rig.runtime.view()).position;
+    rig.runtime.handle(AppCommand::PlayEntry(b));
+    let view = rig.runtime.view();
+    let failure = view
+        .status
+        .clone()
+        .expect("the resolution failure is shown");
+    assert_eq!(view.last_requested, Some(b));
+    assert_eq!(rig.runtime.session().pending_load_count(), 0);
+    assert!(is_playing(&view, a), "A keeps the transport: {view:?}");
+
+    // The burst aimed before the switch is gone: the very next pump shows
+    // the worker's own position rather than holding the burst's target, and
+    // progress keeps reaching the display.
+    rig.runtime.pump();
+    let now = now_playing(&rig.runtime.view());
+    assert!(
+        !now.estimated_position && now.position < target,
+        "the burst was cancelled: {now:?}"
+    );
+    pump_for(&mut rig.runtime, Duration::from_millis(400));
+    let before = now_playing(&rig.runtime.view()).position;
+    pump_until(&mut rig.runtime, "A's position advancing", |view| {
+        view.now_playing
+            .as_ref()
+            .is_some_and(|now| now.position >= before + Duration::from_millis(200))
+    });
+
+    // Space pauses A rather than retrying B, and `p` resumes it.
+    rig.runtime
+        .handle(AppCommand::PlayPause { selected: Some(b) });
+    assert_eq!(rig.runtime.session().pending_load_count(), 0, "no retry");
+    pump_until(&mut rig.runtime, "A paused", |view| {
+        view.phase == PlaybackPhase::Paused
+    });
+    rig.runtime.handle(AppCommand::Play { selected: Some(b) });
+    assert_eq!(rig.runtime.session().pending_load_count(), 0, "no retry");
+    pump_until(&mut rig.runtime, "A playing again", |view| {
+        is_playing(view, a)
+    });
+
+    // A seek is accepted, lands, and progress continues from it.
+    let from = now_playing(&rig.runtime.view()).position;
+    rig.runtime.handle(AppCommand::SeekBy(2));
+    pump_until(&mut rig.runtime, "the seek landed", |view| {
+        view.now_playing.as_ref().is_some_and(|now| {
+            !now.estimated_position && now.position >= from + Duration::from_millis(1500)
+        })
+    });
+    let landed = now_playing(&rig.runtime.view()).position;
+    pump_until(
+        &mut rig.runtime,
+        "position advancing after the seek",
+        |view| {
+            view.now_playing
+                .as_ref()
+                .is_some_and(|now| now.position >= landed + Duration::from_millis(200))
+        },
+    );
+
+    let view = rig.runtime.view();
+    assert!(is_playing(&view, a), "{view:?}");
+    assert_eq!(now_playing(&view).load, a_token, "A was never reloaded");
+    assert_eq!(view.last_requested, Some(b));
+    assert_eq!(
+        view.status.as_deref(),
+        Some(failure.as_str()),
+        "the failure stays visible and no seek notice replaced it"
+    );
+    let _ = rig.runtime.shutdown();
+}
+
+#[test]
+fn a_resolution_failure_is_retryable_without_losing_the_previous_adoption() {
+    let server = TestServer::start(Script::from_fixture("sine-5s.flac"));
+    let enclosure = server.url("/ep.flac");
+    let (library, podcast, stores) = corrupt_podcast(&enclosure);
+    let (_media, root) = media_dir(&["a.flac"]);
     let mut rig = rig_with_parts(
         seeded(vec![
             local_entry(&root.join("a.flac")),

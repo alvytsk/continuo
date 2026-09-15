@@ -511,10 +511,27 @@ impl PlayerRuntime {
         if self.session.pending_load_count() > 0 {
             return PlaybackPhase::Loading;
         }
-        if self.load_failed {
+        let state = self.mirror.as_ref().map(|mirror| mirror.state);
+        // A failure only takes Space/p over while nothing live answers them.
+        // A failure after admission tore the adopted playback down, so its
+        // mirror is gone; one before admission never reached the engine, and
+        // the track still opening, playing, paused or stopped keeps its
+        // controls. The failure stays retryable once that playback ends,
+        // fails or goes away.
+        let live = matches!(
+            state,
+            Some(
+                PlaybackState::Idle
+                    | PlaybackState::Loading
+                    | PlaybackState::Playing
+                    | PlaybackState::Paused
+                    | PlaybackState::Stopped
+            )
+        );
+        if self.load_failed && !live {
             return PlaybackPhase::LoadFailed;
         }
-        match self.mirror.as_ref().map(|mirror| mirror.state) {
+        match state {
             None => PlaybackPhase::Unloaded,
             Some(PlaybackState::Ended) => PlaybackPhase::Ended,
             Some(PlaybackState::Paused) => PlaybackPhase::Paused,
@@ -620,8 +637,7 @@ impl PlayerRuntime {
         let location = match self.locate(id, &media, &source) {
             Ok(location) => location,
             Err(message) => {
-                self.load_failed = true;
-                self.status = Some(message);
+                self.fail_before_admission(message);
                 return;
             }
         };
@@ -646,8 +662,7 @@ impl PlayerRuntime {
             && let Err(error) = self.ensure_http()
         {
             self.session.retract_load(request);
-            self.load_failed = true;
-            self.status = Some(PlaybackError::from(error).to_string());
+            self.fail_before_admission(PlaybackError::from(error).to_string());
             return;
         }
         let Some(engine) = &self.engine else {
@@ -675,6 +690,17 @@ impl PlayerRuntime {
         if start(engine, request) != Admission::Accepted {
             self.status = Some(PLAYER_BUSY.to_owned());
         }
+    }
+
+    /// An attempt that failed before the engine saw it. The engine still
+    /// holds whatever it held, so this only reports the failure and keeps it
+    /// retryable; `phase` leaves live playback its own controls. A burst
+    /// accumulated before the switch was aimed at the track the listener
+    /// chose to leave, so it is discarded rather than landed later.
+    fn fail_before_admission(&mut self, message: String) {
+        self.router.cancel();
+        self.load_failed = true;
+        self.status = Some(message);
     }
 
     /// Where `media` plays from right now. `Err` carries the message to show.
