@@ -65,7 +65,7 @@ use crate::persistence::writer::{DisabledSink, StateSink, WriterHandle};
 use crate::playback::engine::EngineHandle;
 use crate::session::Session;
 use crate::tui::browser::{BrowserEffect, BrowserState};
-use crate::tui::images::{CoverCache, picker_for, query_terminal};
+use crate::tui::images::{CoverCache, failure_status, picker_for, query_terminal};
 use crate::tui::input::{Effect, handle_key, handle_mouse, routes_to_browser};
 use crate::tui::layout::{regions, tier_for};
 use crate::tui::render::{CoverView, HitMap, Visuals};
@@ -367,11 +367,12 @@ fn run_loop(
         if cleanup.rendering_disabled() {
             continue;
         }
-        let view = runtime.view();
-        ui.reconcile(&view, None);
-        if let Err(error) = artwork.prepare(terminal, &ui) {
+        // Before the view, so an encoding failure's status shows this frame.
+        if let Err(error) = artwork.prepare(runtime, terminal, &ui) {
             return Ending::Failed(LifecycleError::Terminal(error).into());
         }
+        let view = runtime.view();
+        ui.reconcile(&view, None);
         let visuals = Visuals {
             cover: artwork
                 .covers
@@ -418,8 +419,10 @@ impl Artwork {
     /// Requests the cover when the active local entry's media changes, shows
     /// the placeholder meanwhile and for every other entry, and installs a
     /// finished cover if it is still for the active entry. A failed load
-    /// leaves the placeholder.
-    fn poll(&mut self, runtime: &PlayerRuntime) {
+    /// leaves the placeholder and, unless there simply is no artwork, a
+    /// status message; a result for an entry no longer active is dropped
+    /// silently.
+    fn poll(&mut self, runtime: &mut PlayerRuntime) {
         if self.mode == ArtworkMode::Off {
             return;
         }
@@ -449,10 +452,17 @@ impl Artwork {
             if self.requested.as_ref() != Some(&result.media) {
                 continue;
             }
-            let image = result.image.map_err(|error| {
-                tracing::debug!(%error, "no cover art for the active entry");
-            });
-            self.covers.set_image(result.media, image.ok());
+            let image = match result.image {
+                Ok(image) => Some(image),
+                Err(error) => {
+                    tracing::debug!(%error, "no cover art for the active entry");
+                    if let Some(status) = failure_status(&error) {
+                        runtime.set_status(status);
+                    }
+                    None
+                }
+            };
+            self.covers.set_image(result.media, image);
         }
     }
 
@@ -461,8 +471,14 @@ impl Artwork {
     ///
     /// Sixel and iTerm2 images are drawn over the cells rather than in them,
     /// so an overlay could not hide one: while an overlay is open those
-    /// protocols show the placeholder instead.
-    fn prepare(&mut self, terminal: &mut Tty, ui: &UiState) -> io::Result<()> {
+    /// protocols show the placeholder instead. A failed encoding sets a
+    /// status message, once per failed key.
+    fn prepare(
+        &mut self,
+        runtime: &mut PlayerRuntime,
+        terminal: &mut Tty,
+        ui: &UiState,
+    ) -> io::Result<()> {
         let size = terminal.size()?;
         let area = Rect::new(0, 0, size.width, size.height);
         let covered = ui.overlay != Overlay::None
@@ -476,6 +492,9 @@ impl Artwork {
             .cover
             .filter(|_| !covered);
         self.covers.prepare(self.picker.as_ref(), self.mode, cover);
+        if let Some(status) = self.covers.take_failure().as_ref().and_then(failure_status) {
+            runtime.set_status(status);
+        }
         if self.covers.take_placement_cleanup() {
             if self
                 .picker

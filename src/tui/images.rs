@@ -56,27 +56,51 @@ pub fn picker_for(
     }
 }
 
-/// Asks the terminal on stdio which image protocol it supports, waiting at
-/// most `timeout` for an answer. `None` when it did not answer or the query
-/// failed; a picker built without any reported capability is a guess, not
-/// a detection, and counts as no answer.
+/// How long the library's capability query may take once the terminal has
+/// answered the status-report probe. The library's timeout restarts with
+/// every chunk of its answer.
+const ANSWERED_QUERY_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Asks the terminal on stdio which image protocol it supports. A terminal
+/// that answers nothing within `timeout` gets `None` at once; one that
+/// answered has [`ANSWERED_QUERY_TIMEOUT`] to answer the full query. `None`
+/// too when the query failed; a picker built without any reported
+/// capability is a guess, not a detection, and counts as no answer.
 ///
 /// `Picker::from_query_stdio_with_options` reads the answer on a thread it
-/// never joins. When the terminal answers nothing at all, that thread stays
-/// blocked reading stdin after the timeout and swallows every key typed
-/// afterwards, so the query is sent only to a terminal that has just
-/// answered a status report ([`terminal_answers`]). A terminal that answers
-/// late still answers, which lets that thread finish.
+/// never joins, which stops only once it reads the status report that ends
+/// its query. If this side gave up first, that thread would keep reading
+/// stdin next to the input reader: should the input reader take the final
+/// report, the thread would swallow every later key for the rest of the run,
+/// and a thread that did finish after teardown would restore its raw-mode
+/// terminal settings. So the query goes only to a terminal that has just
+/// answered a status report ([`terminal_answers`]), and it gets a timeout far
+/// beyond that answer's delay, so its thread has read the final report
+/// before this returns. The remaining risk is a terminal that answers the
+/// probe but then takes longer than [`ANSWERED_QUERY_TIMEOUT`] between two
+/// chunks of the query's answer, or drops the query's own status report.
 pub fn query_terminal(timeout: Duration) -> Option<Picker> {
     if !terminal_answers(timeout) {
         return None;
     }
-    let options = QueryStdioOptions {
-        timeout,
-        ..QueryStdioOptions::default()
-    };
-    let picker = Picker::from_query_stdio_with_options(options).ok()?;
+    let picker = Picker::from_query_stdio_with_options(answered_query_options()).ok()?;
     (!picker.capabilities().is_empty()).then_some(picker)
+}
+
+fn answered_query_options() -> QueryStdioOptions {
+    QueryStdioOptions {
+        timeout: ANSWERED_QUERY_TIMEOUT,
+        ..QueryStdioOptions::default()
+    }
+}
+
+/// The status line for an artwork failure on the active entry (§11): `None`
+/// when there simply is no artwork, otherwise the error's own description.
+pub fn failure_status(error: &ArtworkError) -> Option<String> {
+    match error {
+        ArtworkError::Missing => None,
+        error => Some(format!("Cover art unavailable: {error}")),
+    }
 }
 
 /// Device Status Report, which terminal emulators answer with `ESC [ 0 n`.
@@ -96,10 +120,9 @@ const ANSWER_POLL: Duration = Duration::from_millis(5);
 #[cfg(unix)]
 fn terminal_answers(timeout: Duration) -> bool {
     use std::fs::{File, OpenOptions};
-    use std::io::{ErrorKind, IsTerminal, Read, Write};
+    use std::io::{IsTerminal, Write};
     use std::os::fd::OwnedFd;
     use std::os::unix::net::UnixStream;
-    use std::time::Instant;
 
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         return false;
@@ -119,6 +142,16 @@ fn terminal_answers(timeout: Duration) -> bool {
     {
         return false;
     }
+
+    await_status_report(&mut tty, timeout)
+}
+
+/// Reads the non-blocking `tty` until a status report arrives (`true`) or
+/// `timeout` passes, the input ends or a read fails (`false`).
+#[cfg_attr(not(unix), allow(dead_code))]
+fn await_status_report(tty: &mut impl std::io::Read, timeout: Duration) -> bool {
+    use std::io::ErrorKind;
+    use std::time::Instant;
 
     let deadline = Instant::now() + timeout;
     let mut reply = Vec::new();
@@ -199,6 +232,8 @@ pub struct CoverCache {
     /// frame; any other key, a new image or `invalidate` allows a retry.
     failed: Option<CoverKey>,
     placement_dirty: bool,
+    /// Why the last preparation failed, until the loop takes it.
+    failure: Option<ArtworkError>,
     /// The `artwork-encoding-panic` hook, consumed by the first preparation.
     panic_next_encoding: bool,
     encoder: Encoder,
@@ -217,6 +252,7 @@ impl CoverCache {
             prepared: None,
             failed: None,
             placement_dirty: false,
+            failure: None,
             panic_next_encoding: hook == TestHook::ArtworkEncodingPanic,
             encoder,
         }
@@ -229,6 +265,7 @@ impl CoverCache {
         self.media = Some(media);
         self.image = image;
         self.failed = None;
+        self.failure = None;
         self.drop_prepared();
     }
 
@@ -289,6 +326,7 @@ impl CoverCache {
                 self.drop_prepared();
                 self.placement_dirty = true;
                 self.failed = Some(key);
+                self.failure = Some(error);
                 false
             }
         }
@@ -299,6 +337,7 @@ impl CoverCache {
     pub fn invalidate(&mut self) {
         self.drop_prepared();
         self.failed = None;
+        self.failure = None;
         self.placement_dirty = true;
     }
 
@@ -307,6 +346,12 @@ impl CoverCache {
     /// placement survives.
     pub fn take_placement_cleanup(&mut self) -> bool {
         std::mem::take(&mut self.placement_dirty)
+    }
+
+    /// Why the last preparation failed, once: a failed key is not prepared
+    /// again, so each failure is reported a single time.
+    pub fn take_failure(&mut self) -> Option<ArtworkError> {
+        self.failure.take()
     }
 
     pub fn widget(&self) -> Option<&dyn CoverWidget> {
@@ -355,6 +400,67 @@ mod tests {
         Some(Arc::new(DynamicImage::new_rgb8(width, width)))
     }
 
+    /// Replays scripted reads; `None` is a read that would block.
+    struct ScriptedTty(std::collections::VecDeque<Option<&'static [u8]>>);
+
+    impl std::io::Read for ScriptedTty {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            match self.0.pop_front() {
+                Some(Some(bytes)) => {
+                    buf[..bytes.len()].copy_from_slice(bytes);
+                    Ok(bytes.len())
+                }
+                Some(None) | None => Err(std::io::ErrorKind::WouldBlock.into()),
+            }
+        }
+    }
+
+    #[test]
+    fn an_answering_terminal_is_recognised_across_split_and_late_reads() {
+        let mut tty =
+            ScriptedTty([None, Some(&b"k\x1b["[..]), None, None, Some(&b"0n"[..])].into());
+        assert!(await_status_report(&mut tty, Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn a_silent_terminal_gives_up_at_the_deadline() {
+        let started = std::time::Instant::now();
+        let mut tty = ScriptedTty([Some(&b"typed keys"[..])].into());
+        assert!(!await_status_report(&mut tty, Duration::from_millis(30)));
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "gives up promptly"
+        );
+    }
+
+    #[test]
+    fn the_library_query_outwaits_a_terminal_that_answered_the_probe() {
+        assert!(ANSWERED_QUERY_TIMEOUT >= Duration::from_secs(2));
+        assert!(ANSWERED_QUERY_TIMEOUT > DETECTION_TIMEOUT * 4);
+        assert_eq!(answered_query_options().timeout, ANSWERED_QUERY_TIMEOUT);
+    }
+
+    #[test]
+    fn only_real_artwork_failures_become_a_status() {
+        assert_eq!(failure_status(&ArtworkError::Missing), None);
+        assert_eq!(
+            failure_status(&ArtworkError::Corrupt).as_deref(),
+            Some("Cover art unavailable: artwork could not be decoded")
+        );
+        for error in [
+            ArtworkError::TooLarge,
+            ArtworkError::TooManyPixels,
+            ArtworkError::Unsupported,
+            ArtworkError::Corrupt,
+            ArtworkError::Io,
+            ArtworkError::Panicked,
+            ArtworkError::Encoding,
+        ] {
+            let status = failure_status(&error).unwrap();
+            assert_eq!(status, format!("Cover art unavailable: {error}"));
+        }
+    }
+
     #[test]
     fn a_status_report_is_recognised_among_other_input() {
         assert!(has_status_report(b"\x1b[0n"));
@@ -388,11 +494,17 @@ mod tests {
             !cache.take_placement_cleanup(),
             "exactly one cleanup request"
         );
+        assert_eq!(
+            cache.take_failure(),
+            Some(ArtworkError::Panicked),
+            "the failure is reported"
+        );
         assert!(
             !cache.prepare(Some(&picker), ArtworkMode::Blocks, area),
             "the failed key is not retried"
         );
         assert_eq!(ENCODINGS.load(Ordering::SeqCst), before + 1);
+        assert_eq!(cache.take_failure(), None, "and reported once");
 
         cache.set_image(media("next"), square(8));
         assert!(cache.prepare(Some(&picker), ArtworkMode::Blocks, area));
