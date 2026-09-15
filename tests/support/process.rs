@@ -5,6 +5,7 @@
 
 #![allow(dead_code)]
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -17,15 +18,24 @@ pub fn binary() -> &'static str {
     env!("CARGO_BIN_EXE_continuo")
 }
 
-/// A command for `continuo` whose profile lives under `root`, laid out the
+/// The environment that isolates a child's profile under `root`, laid out the
 /// way the M4 CLI tests already seed it: `root/{state,data,cache,config}`.
+/// Shared by [`command_in`] and the PTY helper, so both launch paths isolate
+/// the same directories.
+pub fn profile_env(root: &Path) -> Vec<(&'static str, OsString)> {
+    vec![
+        ("XDG_STATE_HOME", root.join("state").into_os_string()),
+        ("XDG_DATA_HOME", root.join("data").into_os_string()),
+        ("XDG_CACHE_HOME", root.join("cache").into_os_string()),
+        ("XDG_CONFIG_HOME", root.join("config").into_os_string()),
+    ]
+}
+
+/// A command for `continuo` whose profile lives under `root`.
 pub fn command_in(root: &Path) -> Command {
     let mut command = Command::new(binary());
     command
-        .env("XDG_STATE_HOME", root.join("state"))
-        .env("XDG_DATA_HOME", root.join("data"))
-        .env("XDG_CACHE_HOME", root.join("cache"))
-        .env("XDG_CONFIG_HOME", root.join("config"))
+        .envs(profile_env(root))
         .env_remove("CONTINUO_TEST_HOOK")
         .env_remove("CONTINUO_AUDIO_OUTPUT");
     command

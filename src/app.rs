@@ -23,10 +23,8 @@ use crate::media::capabilities::{MediaCapabilities, SeekSupport};
 use crate::media::display::{display_name, episode_name, fit_to_width, format_hms};
 use crate::media::id::MediaId;
 use crate::media::source::SourceLocation;
-use crate::persistence::PersistenceError;
-use crate::persistence::model::PersistedState;
 use crate::persistence::store::{LoadReason, QueueBackup, StateStore};
-use crate::persistence::writer::{ShutdownOutcome, StateSink, WriterHandle};
+use crate::persistence::writer::{DisabledSink, ShutdownOutcome, StateSink, WriterHandle};
 use crate::playback::command::{LoadRequestId, PlaybackCommand, ResumeIntent};
 use crate::playback::engine::EngineHandle;
 use crate::playback::error::PlaybackError;
@@ -102,6 +100,7 @@ pub fn run(cli: cli::Cli) -> Result<RunOutcome, crate::error::AppError> {
             // the enclosure, what is checkpointed is the episode.
             run_resolved(media, location)
         }
+        CliCommand::Tui { mouse } => crate::tui::run(crate::tui::TuiOptions { mouse }),
         command => crate::commands::run(command)
             .map(|()| RunOutcome::Completed)
             .map_err(Into::into),
@@ -531,20 +530,6 @@ fn resume_commands(
     ]
 }
 
-/// Writing is off for this session — an unsupported file, or a quarantine
-/// that could not be performed. The session runs normally with in-memory
-/// state; only the disk write is suppressed, and the reason has already
-/// been logged once (D3). `play` always has a state directory by the time
-/// persistence opens: a missing one fails at the profile lock instead
-/// (`LockError::NoStateDirectory`), before any state is read.
-struct DisabledSink;
-
-impl StateSink for DisabledSink {
-    fn write(&self, _state: &PersistedState) -> Result<(), PersistenceError> {
-        Ok(())
-    }
-}
-
 struct Persistence {
     session: Session,
     writer: WriterHandle,
@@ -970,6 +955,7 @@ mod tests {
     use crate::media::capabilities::{Continuity, MediaCapabilities, SeekSupport};
     use crate::media::id::{AbsolutePath, EpisodeKey, FeedId, NormalizedUrl};
     use crate::media::metadata::MediaMetadata;
+    use crate::persistence::model::PersistedState;
     use crate::persistence::writer::Urgency;
     use crate::playback::checkpoint::PlaybackCheckpoint;
     use crate::playback::event::StartDisposition;

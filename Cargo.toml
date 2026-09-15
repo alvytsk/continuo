@@ -26,6 +26,7 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls", "h
 http = "1"
 getrandom = "0.4"
 quick-xml = { version = "0.42", default-features = false, features = ["encoding"] }
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm_0_29", "layout-cache"] }
 
 [target.'cfg(unix)'.dependencies]
 signal-hook = "0.4.4"
@@ -34,6 +35,7 @@ gag = "1.0.0"
 [dev-dependencies]
 tempfile = "3"
 socket2 = "0.6"
+portable-pty = "0.9.0"
 
 [lints.rust]
 unsafe_code = "forbid"

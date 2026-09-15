@@ -20,8 +20,9 @@ pub enum DomainError {
     InvalidMediaId { input: String, reason: &'static str },
 }
 
-/// Startup failures around a `play` invocation's shared lifecycle: the
-/// profile lock, signal installation, the session log, and terminal setup.
+/// Failures around a `play` or `tui` invocation's shared lifecycle: the
+/// profile lock, signal installation, the session log, terminal setup, and a
+/// background worker's uncontained panic.
 #[derive(Debug, thiserror::Error)]
 pub enum LifecycleError {
     #[error(transparent)]
@@ -34,6 +35,8 @@ pub enum LifecycleError {
     Redirect(#[source] std::io::Error),
     #[error("cannot set up the terminal")]
     Terminal(#[source] std::io::Error),
+    #[error("a background worker panicked")]
+    WorkerPanicked,
 }
 
 #[derive(Debug, thiserror::Error)]

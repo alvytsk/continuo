@@ -16,3 +16,4 @@ pub mod resume;
 pub mod session;
 pub mod subscription;
 pub mod telemetry;
+pub mod tui;

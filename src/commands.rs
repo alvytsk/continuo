@@ -97,6 +97,9 @@ pub fn run(command: CliCommand) -> Result<(), FeedError> {
         CliCommand::Play { .. } => Err(FeedError::Malformed {
             detail: "play is resolved by the application, not by the command table".to_string(),
         }),
+        CliCommand::Tui { .. } => Err(FeedError::Malformed {
+            detail: "tui is run by the application, not by the command table".to_string(),
+        }),
     };
     // A command whose output never reached the terminal has not reported
     // anything, whatever it committed, so the flush decides the status too.

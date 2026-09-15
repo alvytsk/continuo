@@ -36,6 +36,21 @@ impl StateSink for StateStore {
     }
 }
 
+/// Writing is off for this session — an unsupported file, or a quarantine
+/// or queue backup that could not be performed. The session runs normally
+/// with in-memory state; only the disk write is suppressed, and the reason
+/// has already been logged once (D3). Both `play` and `tui` always have a
+/// state directory by the time persistence opens: a missing one fails at the
+/// profile lock instead (`LockError::NoStateDirectory`), before any state is
+/// read.
+pub struct DisabledSink;
+
+impl StateSink for DisabledSink {
+    fn write(&self, _state: &PersistedState) -> Result<(), PersistenceError> {
+        Ok(())
+    }
+}
+
 struct Pending {
     state: PersistedState,
     deadline: Instant,
