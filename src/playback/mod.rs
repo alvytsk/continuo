@@ -11,6 +11,7 @@ pub mod output;
 pub mod prepare;
 pub mod provenance;
 pub mod resample;
+pub mod spectrum;
 pub mod state;
 pub mod timeline;
 pub mod volume;

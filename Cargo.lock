@@ -427,6 +427,7 @@ dependencies = [
  "reqwest",
  "rtrb",
  "rubato",
+ "rustfft",
  "serde",
  "serde_json",
  "signal-hook 0.4.4",
