@@ -966,6 +966,7 @@ impl PlayerRuntime {
                         title: tags.title,
                         artist: tags.artist,
                         album: tags.album,
+                        year: tags.year,
                         duration: tags.duration.map(|value| DisplayDuration {
                             value,
                             source: DurationSource::Decoded(tags.duration_provenance),
@@ -1050,6 +1051,7 @@ impl PlayerRuntime {
             title: entry_title(entry),
             artist: display.artist.as_deref().map(displayable),
             album: display.album.as_deref().map(displayable),
+            year: display.year.as_deref().map(displayable),
             loaded: false,
             state: PlaybackState::Idle,
             position: Duration::ZERO,

@@ -50,6 +50,7 @@ pub struct DisplayMetadata {
     pub title: Option<String>,
     pub artist: Option<String>,
     pub album: Option<String>,
+    pub year: Option<String>,
     pub duration: Option<DisplayDuration>,
 }
 

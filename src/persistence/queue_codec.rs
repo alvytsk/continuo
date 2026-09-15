@@ -64,6 +64,8 @@ struct DisplayDto {
     #[serde(default)]
     album: Option<String>,
     #[serde(default)]
+    year: Option<String>,
+    #[serde(default)]
     duration_ms: Option<u64>,
     #[serde(default)]
     duration_source: Option<String>,
@@ -120,6 +122,7 @@ pub(crate) fn encode(queue: &Queue) -> Vec<QueueEntryDto> {
                     title: display.title.clone(),
                     artist: display.artist.clone(),
                     album: display.album.clone(),
+                    year: display.year.clone(),
                     duration_ms,
                     duration_source,
                 },
@@ -253,6 +256,7 @@ fn entry_from_dto(dto: QueueEntryDto) -> Result<QueueEntry, QueueProblem> {
         title: dto.display.title,
         artist: dto.display.artist,
         album: dto.display.album,
+        year: dto.display.year,
         duration,
     };
     Ok(Queue::entry_from_parts(

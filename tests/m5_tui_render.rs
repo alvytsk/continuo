@@ -47,6 +47,13 @@ fn text(view: &PlayerView, ui: &UiState, w: u16, h: u16) -> String {
     screen(&render(view, ui, &Visuals::default(), w, h).0)
 }
 
+/// The bracketed progress row of a normal-tier screen.
+fn progress_row(screen: &str) -> Option<&str> {
+    screen
+        .lines()
+        .find(|line| line.trim_start().starts_with("│ ["))
+}
+
 fn within(rect: Rect, area: Rect) -> bool {
     rect.x >= area.x
         && rect.y >= area.y
@@ -109,10 +116,9 @@ fn regions_are_valid_for_zero_and_tiny_areas() {
 
 #[test]
 fn normal_layout_shows_cover_metadata_and_distinct_playing_and_selected_rows() {
-    let v = view(
-        PlaybackPhase::Playing,
-        Some(playing(ids()[0], true, Some(decoded(185)), false)),
-    );
+    let mut now = playing(ids()[0], true, Some(decoded(185)), false);
+    now.year = Some("1998".into());
+    let v = view(PlaybackPhase::Playing, Some(now));
     let mut ui = UiState::new(true);
     ui.selected = Some(v.rows[2].id);
     let screen = text(&v, &ui, 100, 30);
@@ -120,8 +126,8 @@ fn normal_layout_shows_cover_metadata_and_distinct_playing_and_selected_rows() {
         screen.contains("Harbor"),
         "normal shows secondary metadata\n{screen}"
     );
-    assert!(screen.contains("Harbor · Coast"), "{screen}");
-    assert!(screen.contains("01:02 / 03:05"), "{screen}");
+    assert!(screen.contains("Coast · 1998"), "album and year\n{screen}");
+    assert!(screen.contains("▶ 01:02 / 03:05"), "{screen}");
     assert!(
         screen.contains('░') && screen.contains('♪'),
         "cover placeholder\n{screen}"
@@ -173,8 +179,8 @@ fn the_selected_row_is_highlighted_apart_from_the_playing_marker() {
     };
     let (selected, active) = (row(2), row(0));
     let cell = |x: u16, y: u16| buffer.cell((x, y)).expect("cell").clone();
-    assert_eq!(cell(selected.x + 4, selected.y).bg, theme.green);
-    assert_ne!(cell(active.x + 4, active.y).bg, theme.green);
+    assert_eq!(cell(selected.x + 4, selected.y).bg, theme.amber);
+    assert_ne!(cell(active.x + 4, active.y).bg, theme.amber);
     assert!((active.x..active.right()).any(|x| cell(x, active.y).symbol() == "▶"));
     assert!(!(selected.x..selected.right()).any(|x| cell(x, selected.y).symbol() == "▶"));
 }
@@ -266,7 +272,7 @@ fn unknown_duration_and_estimated_position_are_honest() {
     let screen = text(&v, &UiState::new(true), 100, 30);
     assert!(screen.contains("~01:02 / --:--"), "{screen}");
     assert!(
-        !screen.contains('━'),
+        !progress_row(&screen).expect("progress row").contains('━'),
         "an unknown duration fills nothing\n{screen}"
     );
 }
@@ -283,13 +289,20 @@ fn a_declared_duration_is_parenthesized_and_never_fills_the_bar() {
     );
     let screen = text(&v, &UiState::new(true), 100, 30);
     assert!(screen.contains("01:02 / (02:00)"), "{screen}");
-    assert!(!screen.contains('━'), "{screen}");
+    assert!(
+        !progress_row(&screen).expect("progress row").contains('━'),
+        "{screen}"
+    );
 
     let decoded = view(
         PlaybackPhase::Playing,
         Some(playing(ids()[0], true, Some(decoded(120)), false)),
     );
-    assert!(text(&decoded, &UiState::new(true), 100, 30).contains('━'));
+    let screen = text(&decoded, &UiState::new(true), 100, 30);
+    assert!(
+        progress_row(&screen).expect("progress row").contains('━'),
+        "{screen}"
+    );
 }
 
 #[test]
@@ -338,14 +351,14 @@ fn buffering_and_unsaved_are_labelled() {
     v.persistence = PersistenceStatus::Unsaved;
     let screen = text(&v, &UiState::new(true), 100, 30);
     assert!(screen.contains("playing buffering"), "{screen}");
-    let status = screen.lines().next().expect("status row");
+    let status = screen.lines().nth(1).expect("status row");
     assert!(
-        status.contains("continuo")
-            && status.contains("vol 80%")
-            && status.contains("mouse on")
-            && status.contains("unsaved"),
+        status.contains("CONTINUO") && status.contains("mouse on") && status.contains("unsaved"),
         "{status}"
     );
+    assert!(screen.contains("VOL ━━━━━━━━──   80%"), "{screen}");
+    let compact = text(&v, &UiState::new(true), 70, 20);
+    assert!(compact.contains("vol 80%"), "{compact}");
 }
 
 #[test]
@@ -353,16 +366,13 @@ fn failing_persistence_is_labelled_apart_from_unsaved() {
     let mut v = view(PlaybackPhase::Unloaded, None);
     v.persistence = PersistenceStatus::Failing;
     let screen = text(&v, &UiState::new(true), 100, 30);
-    let status = screen.lines().next().expect("status row");
-    assert!(
-        status.contains("vol 80%") && status.contains("not saving"),
-        "{status}"
-    );
+    let status = screen.lines().nth(1).expect("status row");
+    assert!(status.contains("not saving"), "{status}");
     assert!(!status.contains("unsaved"), "{status}");
 
     v.persistence = PersistenceStatus::Saving;
     let screen = text(&v, &UiState::new(true), 100, 30);
-    let status = screen.lines().next().expect("status row");
+    let status = screen.lines().nth(1).expect("status row");
     assert!(
         !status.contains("saving") && !status.contains("unsaved"),
         "{status}"
@@ -379,7 +389,8 @@ fn empty_loading_and_failed_screens() {
         "{screen}"
     );
     assert!(
-        screen.contains("space play · enter play selected · b browse · a add · ? help · q quit")
+        screen.contains("Space Play/Pause") && screen.contains("q Quit"),
+        "{screen}"
     );
     let loading = view(PlaybackPhase::Loading, None);
     assert!(text(&loading, &UiState::new(true), 100, 30).contains("loading"));
@@ -411,7 +422,7 @@ fn a_prepared_cover_replaces_the_placeholder_in_the_cover_region() {
     let (buffer, _) = render(&v, &UiState::new(true), &visuals, 100, 30);
     let expected = regions(Rect::new(0, 0, 100, 30), Tier::Normal).cover;
     assert_eq!(probe.0.get(), expected);
-    assert_eq!(expected.map(|r| (r.width, r.height)), Some((14, 7)));
+    assert_eq!(expected.map(|r| (r.width, r.height)), Some((20, 10)));
     assert!(!screen(&buffer).contains('░'));
 }
 

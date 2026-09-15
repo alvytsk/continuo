@@ -69,6 +69,7 @@ pub struct LocalTags {
     pub title: Option<String>,
     pub artist: Option<String>,
     pub album: Option<String>,
+    pub year: Option<String>,
     pub duration: Option<Duration>,
     /// Computed exactly as playback computes it, so a row enriched here
     /// never claims more certainty than the loaded track later would.
@@ -104,6 +105,7 @@ pub fn probe_local_tags(path: &AbsolutePath) -> Result<LocalTags, PlaybackError>
         title: names.title,
         artist: names.artist,
         album: names.album,
+        year: names.year,
         duration,
         duration_provenance,
         front_cover,

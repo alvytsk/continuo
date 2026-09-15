@@ -161,6 +161,7 @@ impl DecodedSource {
                 title: names.title,
                 artist: names.artist,
                 album: names.album,
+                year: names.year,
                 duration,
                 duration_provenance,
                 front_cover,
@@ -491,6 +492,9 @@ pub(crate) struct StandardNames {
     pub title: Option<String>,
     pub artist: Option<String>,
     pub album: Option<String>,
+    /// The four-digit year of the first date tag (ID3 TDRC/TYER, Vorbis
+    /// DATE), when it starts with one.
+    pub year: Option<String>,
 }
 
 pub(crate) fn standard_names(revision: Option<&MetadataRevision>) -> StandardNames {
@@ -506,6 +510,16 @@ pub(crate) fn standard_names(revision: Option<&MetadataRevision>) -> StandardNam
             Some(StandardTag::TrackTitle(value)) => (&mut names.title, value),
             Some(StandardTag::Artist(value)) => (&mut names.artist, value),
             Some(StandardTag::Album(value)) => (&mut names.album, value),
+            Some(
+                StandardTag::RecordingDate(value)
+                | StandardTag::ReleaseDate(value)
+                | StandardTag::OriginalReleaseDate(value),
+            ) => {
+                if names.year.is_none() {
+                    names.year = year_of(value);
+                }
+                continue;
+            }
             _ => continue,
         };
         if slot.is_none() {
@@ -513,6 +527,14 @@ pub(crate) fn standard_names(revision: Option<&MetadataRevision>) -> StandardNam
         }
     }
     names
+}
+
+/// The leading four digits of a date string, when it starts with four.
+fn year_of(date: &str) -> Option<String> {
+    let year = date.get(..4)?;
+    year.bytes()
+        .all(|byte| byte.is_ascii_digit())
+        .then(|| year.to_owned())
 }
 
 fn copy_planar(decoded: &GenericAudioBufferRef<'_>, planes: &mut Vec<Vec<f32>>) {
@@ -524,4 +546,17 @@ fn duration_to_time(value: Duration) -> symphonia::core::units::Time {
     // returns `None`; the fallback exists only to avoid `unwrap`.
     symphonia::core::units::Time::try_new(value.as_secs() as i64, value.subsec_nanos())
         .unwrap_or(symphonia::core::units::Time::ZERO)
+}
+
+#[cfg(test)]
+mod year_tests {
+    use super::year_of;
+
+    #[test]
+    fn a_year_is_the_leading_four_digits_of_a_date() {
+        assert_eq!(year_of("1998-04-20"), Some("1998".to_owned()));
+        assert_eq!(year_of("1998"), Some("1998".to_owned()));
+        assert_eq!(year_of("199"), None);
+        assert_eq!(year_of("unknown"), None);
+    }
 }

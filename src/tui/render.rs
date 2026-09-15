@@ -20,7 +20,7 @@ use crate::playback::provenance::PositionProvenance;
 use crate::queue::{DisplayDuration, DurationSource, QueueEntryId};
 use crate::tui::browser::BrowserState;
 use crate::tui::layout::{
-    Regions, Tier, inset, regions, take_left, take_right, tier_for, visible_rows,
+    Regions, Tier, inset, queue_body, regions, take_left, take_right, tier_for, visible_rows,
 };
 use crate::tui::state::{Overlay, UiState};
 use crate::tui::theme::Theme;
@@ -67,7 +67,16 @@ pub enum TransportButton {
 }
 
 const EMPTY_QUEUE: &str = "Queue is empty — press b to browse or a to add";
-const KEY_HINTS: &str = "space play · enter play selected · b browse · a add · ? help · q quit";
+const BRAND: &str = "CONTINUO";
+/// Key, then what it does; drawn as bold key and muted label.
+const KEY_HINTS: [(&str, &str); 6] = [
+    ("Space", "Play/Pause"),
+    ("Enter", "Play selected"),
+    ("b", "Browse"),
+    ("a", "Add"),
+    ("?", "Help"),
+    ("q", "Quit"),
+];
 const TOO_SMALL: &str = "Terminal too small (need 30×8)";
 const RESIZE_HINTS: &str = "space play · q quit";
 /// Verbatim per the design (§4/§7): confirming discards the queue, not
@@ -96,13 +105,19 @@ const HELP_LINES: [&str; 18] = [
 ];
 const NOTHING_PLAYING: &str = "Nothing playing";
 const UNKNOWN_TIME: &str = "--:--";
-/// Outside the `▁`–`█` block elements, which only the spectrum draws.
+/// The played part of the bar in green, the rest in the line colour.
 const BAR_FILLED: &str = "━";
 const BAR_EMPTY: &str = "─";
 const LEVELS: [&str; 9] = [" ", "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
 /// Bars drawn while no analysis is available.
 const FLAT_BANDS: usize = 24;
+/// A band at or above this level gets an amber cap on its top cell.
+const PEAK_LEVEL: f32 = 0.8;
+const VOLUME_COLUMNS: usize = 10;
 const MARKER_COLUMNS: u16 = 2;
+const NUMBER_COLUMNS: u16 = 4;
+/// Rows below the last entry, like an editor past the end of a file.
+const FILLER: &str = "~";
 const DURATION_COLUMNS: u16 = 10;
 const SAVED_COLUMNS: u16 = 16;
 /// The row width below which the saved column is dropped.
@@ -128,10 +143,10 @@ pub fn draw(
         return HitMap::default();
     }
 
-    draw_status(buffer, regions.status, view, ui, &theme);
     if tier != Tier::Minimal {
         bordered(&theme).render(regions.player, buffer);
     }
+    draw_status(buffer, regions.status, view, ui, tier, &theme);
     if let Some(cover) = regions.cover {
         match visuals.cover {
             CoverView::Placeholder => draw_cover_placeholder(buffer, cover, &theme),
@@ -143,7 +158,7 @@ pub fn draw(
         draw_spectrum(buffer, spectrum, visuals.spectrum, &theme);
     }
     let buttons = draw_transport(buffer, regions.transport, view, tier, &theme);
-    let progress = draw_progress(buffer, regions.progress, view, tier, &theme);
+    let progress = draw_progress(buffer, &regions, view, tier, &theme);
     let rows = draw_queue(buffer, regions.queue, view, ui, tier, &theme);
     draw_footer(buffer, regions.footer, view, &theme);
     draw_overlay(buffer, area, ui, visuals.browser, &theme);
@@ -269,11 +284,20 @@ fn centred(line: Line<'_>, area: Rect) -> Line<'_> {
     }
 }
 
-fn draw_status(buffer: &mut Buffer, area: Rect, view: &PlayerView, ui: &UiState, theme: &Theme) {
+/// The brand on the left and the session flags on the right. The volume
+/// lives here except in the normal tier, whose transport row has a slider.
+fn draw_status(
+    buffer: &mut Buffer,
+    area: Rect,
+    view: &PlayerView,
+    ui: &UiState,
+    tier: Tier,
+    theme: &Theme,
+) {
     let mut rest = area;
     let brand = Line::styled(
-        "continuo",
-        Style::new().fg(theme.green).add_modifier(Modifier::BOLD),
+        format!(" {BRAND} "),
+        Style::new().fg(theme.cream).add_modifier(Modifier::BOLD),
     );
     let brand_columns = u16::try_from(brand.width()).unwrap_or(u16::MAX);
     brand.render(take_left(&mut rest, brand_columns), buffer);
@@ -282,18 +306,23 @@ fn draw_status(buffer: &mut Buffer, area: Rect, view: &PlayerView, ui: &UiState,
     take_left(&mut rest, 1);
     let muted = Style::new().fg(theme.muted);
     let mouse = if ui.mouse_capture { "on" } else { "off" };
-    let mut spans = vec![Span::styled(
-        format!("vol {}% · mouse {mouse}", view.volume.percent()),
-        muted,
-    )];
+    let flags = if tier == Tier::Normal {
+        format!(" mouse {mouse} ")
+    } else {
+        format!(" vol {}% · mouse {mouse} ", view.volume.percent())
+    };
+    let mut spans = vec![Span::styled(flags, muted)];
     let persistence = match view.persistence {
         PersistenceStatus::Saving => None,
         PersistenceStatus::Unsaved => Some("unsaved"),
         PersistenceStatus::Failing => Some("not saving"),
     };
     if let Some(label) = persistence {
-        spans.push(Span::styled(" · ", muted));
-        spans.push(Span::styled(label, Style::new().fg(theme.amber)));
+        spans.insert(1, Span::styled("· ", muted));
+        spans.insert(
+            2,
+            Span::styled(format!("{label} "), Style::new().fg(theme.amber)),
+        );
     }
     Line::from(spans)
         .alignment(Alignment::Right)
@@ -317,41 +346,58 @@ fn draw_cover_placeholder(buffer: &mut Buffer, area: Rect, theme: &Theme) {
     }
 }
 
+/// The title, and in the normal tier the artist beneath it and then the
+/// album with its year.
 fn draw_info(buffer: &mut Buffer, regions: &Regions, view: &PlayerView, tier: Tier, theme: &Theme) {
     let area = regions.info;
-    match &view.now_playing {
-        Some(now) => {
-            Line::styled(
-                now.title.as_str(),
-                Style::new().fg(theme.cream).add_modifier(Modifier::BOLD),
-            )
-            .render(area, buffer);
-            let secondary: Vec<&str> = [now.artist.as_deref(), now.album.as_deref()]
-                .into_iter()
-                .flatten()
-                .collect();
-            if tier == Tier::Normal && !secondary.is_empty() {
-                Line::styled(secondary.join(" · "), Style::new().fg(theme.muted))
-                    .render(row(area, area.y.saturating_add(1)), buffer);
-            }
-        }
-        None => Line::styled(NOTHING_PLAYING, Style::new().fg(theme.muted)).render(area, buffer),
+    let Some(now) = &view.now_playing else {
+        Line::styled(NOTHING_PLAYING, Style::new().fg(theme.muted)).render(area, buffer);
+        return;
+    };
+    Line::styled(
+        now.title.as_str(),
+        Style::new().fg(theme.cream).add_modifier(Modifier::BOLD),
+    )
+    .render(row(area, area.y), buffer);
+    if tier != Tier::Normal {
+        return;
+    }
+    if let Some(artist) = &now.artist {
+        Line::styled(artist.as_str(), Style::new().fg(theme.text))
+            .render(row(area, area.y.saturating_add(1)), buffer);
+    }
+    let release: Vec<&str> = [now.album.as_deref(), now.year.as_deref()]
+        .into_iter()
+        .flatten()
+        .collect();
+    if !release.is_empty() {
+        Line::styled(release.join(" · "), Style::new().fg(theme.muted))
+            .render(row(area, area.y.saturating_add(2)), buffer);
     }
 }
 
 /// Flat bars without analysis; otherwise each band's level in eighths of a
-/// row, never below the floor glyph, alternating green and cyan.
+/// row, never below the floor glyph, with an amber cap on a loud band. Bands
+/// get equal slots, the last column of a slot left as a gap; when a slot is
+/// wide enough for two digits and the area at least three rows tall, the
+/// bottom row numbers the bands instead.
 fn draw_spectrum(buffer: &mut Buffer, area: Rect, levels: Option<&[f32]>, theme: &Theme) {
     let levels = levels.filter(|levels| !levels.is_empty());
     let bands = levels.map_or(FLAT_BANDS, <[f32]>::len);
     let width = usize::from(area.width);
-    let height = usize::from(area.height);
+    let slot = if bands <= width { width / bands } else { 0 };
+    let labelled = slot >= 3 && area.height >= 3;
+    let bars = Rect {
+        height: area.height.saturating_sub(u16::from(labelled)),
+        ..area
+    };
+    let height = usize::from(bars.height);
     if width == 0 || height == 0 {
         return;
     }
+    let labels = Style::new().fg(theme.muted);
     for (column, x) in (area.left()..area.right()).enumerate() {
-        let band = if bands <= width {
-            let slot = width / bands;
+        let band = if slot > 0 {
             if slot > 1 && column % slot == slot - 1 {
                 continue;
             }
@@ -362,6 +408,17 @@ fn draw_spectrum(buffer: &mut Buffer, area: Rect, levels: Option<&[f32]>, theme:
         if band >= bands {
             continue;
         }
+        if labelled && column % slot == 0 {
+            let number = format!("{:02}", band + 1);
+            let cell = Rect {
+                x,
+                y: bars.bottom(),
+                width: 2,
+                height: 1,
+            }
+            .intersection(area);
+            Line::styled(number, labels).render(cell, buffer);
+        }
         let level = levels
             .and_then(|levels| levels.get(band))
             .copied()
@@ -370,13 +427,14 @@ fn draw_spectrum(buffer: &mut Buffer, area: Rect, levels: Option<&[f32]>, theme:
             .clamp(0.0, 1.0);
         // The float is clamped to [0, height × 8] before the cast.
         let eighths = ((level * (height * 8) as f32).round() as usize).max(1);
-        let color = if band % 2 == 0 {
-            theme.green
-        } else {
-            theme.cyan
-        };
-        for (from_bottom, y) in (area.top()..area.bottom()).rev().enumerate() {
+        let top = (eighths - 1) / 8;
+        for (from_bottom, y) in (bars.top()..bars.bottom()).rev().enumerate() {
             let fill = eighths.saturating_sub(from_bottom * 8).min(8);
+            let color = if from_bottom == top && level >= PEAK_LEVEL {
+                theme.amber
+            } else {
+                theme.green
+            };
             if let Some(cell) = buffer.cell_mut((x, y)) {
                 cell.set_symbol(LEVELS[fill]).set_fg(color);
             }
@@ -392,37 +450,57 @@ fn draw_transport(
     theme: &Theme,
 ) -> Vec<(Rect, TransportButton)> {
     let play_pause = if view.phase == PlaybackPhase::Playing {
-        " Ⅱ "
+        "[||]"
     } else {
-        " ▶ "
+        "[>]"
     };
     let labels = [
-        (" |◀ ", TransportButton::Previous),
+        ("[|<]", TransportButton::Previous),
         (play_pause, TransportButton::PlayPause),
-        (" ■ ", TransportButton::Stop),
-        (" ▶| ", TransportButton::Next),
+        ("[■]", TransportButton::Stop),
+        ("[>|]", TransportButton::Next),
     ];
+    let mut rest = area;
+    if tier == Tier::Normal {
+        draw_volume(buffer, &mut rest, view, theme);
+    }
     let mut buttons = Vec::with_capacity(labels.len());
-    let mut x = area.x;
     for (label, button) in labels {
         let line = Line::styled(label, Style::new().fg(button_color(button, theme)));
         let width = u16::try_from(line.width()).unwrap_or(u16::MAX);
-        let rect = Rect { x, width, ..area }.intersection(area);
+        let rect = take_left(&mut rest, width);
         line.render(rect, buffer);
         if !rect.is_empty() {
             buttons.push((rect, button));
         }
-        x = x.saturating_add(width).saturating_add(1);
+        take_left(&mut rest, 2);
     }
     if tier != Tier::Minimal {
-        let rest = Rect {
-            x: x.saturating_add(1),
-            ..area
-        }
-        .intersection(area);
+        take_left(&mut rest, 1);
         state_line(view, theme).render(rest, buffer);
     }
     buttons
+}
+
+/// `VOL ━━━━━━━───  70%` at the right end of the row, taken off `rest`.
+fn draw_volume(buffer: &mut Buffer, rest: &mut Rect, view: &PlayerView, theme: &Theme) {
+    let percent = view.volume.percent();
+    let filled = (usize::from(percent) * VOLUME_COLUMNS)
+        .div_ceil(100)
+        .min(VOLUME_COLUMNS);
+    let line = Line::from(vec![
+        Span::styled("VOL ", Style::new().fg(theme.muted)),
+        Span::styled(BAR_FILLED.repeat(filled), Style::new().fg(theme.text)),
+        Span::styled(
+            BAR_EMPTY.repeat(VOLUME_COLUMNS - filled),
+            Style::new().fg(theme.line),
+        ),
+        Span::styled(format!("  {percent:>3}%"), Style::new().fg(theme.text)),
+    ]);
+    let width = u16::try_from(line.width()).unwrap_or(u16::MAX);
+    let slider = take_right(rest, width);
+    take_right(rest, 2);
+    line.render(slider, buffer);
 }
 
 fn button_color(button: TransportButton, theme: &Theme) -> Color {
@@ -450,32 +528,46 @@ fn state_line(view: &PlayerView, theme: &Theme) -> Line<'static> {
     Line::from(spans)
 }
 
-/// Draws the time label and the bar after it; returns the bar's rectangle.
+/// Draws the time label and the bar; returns the bar's rectangle. With a
+/// time row of its own the label goes there, with the phase glyph before
+/// it, and the bar fills its row between brackets; otherwise the bar follows
+/// the label on the shared row.
 fn draw_progress(
     buffer: &mut Buffer,
-    area: Rect,
+    regions: &Regions,
     view: &PlayerView,
     tier: Tier,
     theme: &Theme,
 ) -> Rect {
-    let mut spans = Vec::new();
-    if tier == Tier::Minimal {
-        spans.extend(state_line(view, theme).spans);
-        spans.push(Span::raw("  "));
-    }
     let (label, ratio) = progress_label(view.now_playing.as_ref());
-    spans.push(Span::styled(label, Style::new().fg(theme.text)));
-    spans.push(Span::raw(" "));
-    let line = Line::from(spans);
-    let used = u16::try_from(line.width()).unwrap_or(u16::MAX);
-    line.render(area, buffer);
-
-    let bar = Rect {
-        x: area.x.saturating_add(used),
-        width: area.width.saturating_sub(used),
-        ..area
+    let mut bar = regions.progress;
+    if regions.time == regions.progress {
+        let mut spans = Vec::new();
+        if tier == Tier::Minimal {
+            spans.extend(state_line(view, theme).spans);
+            spans.push(Span::raw("  "));
+        }
+        spans.push(Span::styled(label, Style::new().fg(theme.text)));
+        spans.push(Span::raw(" "));
+        let line = Line::from(spans);
+        let used = u16::try_from(line.width()).unwrap_or(u16::MAX);
+        line.render(bar, buffer);
+        take_left(&mut bar, used);
+    } else {
+        let glyph = match view.phase {
+            PlaybackPhase::Playing => "▶ ",
+            PlaybackPhase::Paused => "Ⅱ ",
+            _ => "",
+        };
+        Line::from(vec![
+            Span::styled(glyph, Style::new().fg(theme.green)),
+            Span::styled(label, Style::new().fg(theme.green)),
+        ])
+        .render(regions.time, buffer);
+        let bracket = Style::new().fg(theme.muted);
+        Line::styled("[", bracket).render(take_left(&mut bar, 1), buffer);
+        Line::styled("]", bracket).render(take_right(&mut bar, 1), buffer);
     }
-    .intersection(area);
     let width = usize::from(bar.width);
     // `ratio` is within [0, 1], so the product is within [0, width].
     let filled = ratio.map_or(0, |ratio| (ratio * width as f64).round() as usize);
@@ -559,25 +651,28 @@ fn draw_queue(
     let body = if tier == Tier::Minimal {
         area
     } else {
+        let count = match view.rows.len() {
+            1 => " 1 track ".to_owned(),
+            n => format!(" {n} tracks "),
+        };
         bordered(theme)
             .title(Line::styled(
-                format!(" queue {:02} ", view.rows.len()),
-                Style::new().fg(theme.muted),
+                " PLAYLIST ",
+                Style::new().fg(theme.cream).add_modifier(Modifier::BOLD),
             ))
+            .title(Line::styled(count, Style::new().fg(theme.muted)).right_aligned())
             .render(area, buffer);
-        inset(area)
+        queue_body(area)
     };
     if view.rows.is_empty() {
         Line::styled(EMPTY_QUEUE, Style::new().fg(theme.muted)).render(body, buffer);
         return Vec::new();
     }
 
-    let two_line = tier == Tier::Normal;
-    let row_height: u16 = if two_line { 2 } else { 1 };
     let selected = ui
         .selected
         .and_then(|id| view.rows.iter().position(|row| row.id == id));
-    let capacity = usize::from(body.height / row_height);
+    let capacity = usize::from(body.height);
     let window = visible_rows(view.rows.len(), ui.queue_offset, selected, capacity);
     let mut hits = Vec::with_capacity(window.len());
     let mut y = body.y;
@@ -585,42 +680,42 @@ fn draw_queue(
         let Some(entry) = view.rows.get(index) else {
             break;
         };
-        let rect = Rect {
-            y,
-            height: row_height,
-            ..body
-        }
-        .intersection(body);
+        let rect = row(body, y);
         draw_queue_row(
             buffer,
             rect,
+            index,
             entry,
             view.active == Some(entry.id),
             selected == Some(index),
-            two_line,
             theme,
         );
         hits.push((rect, entry.id));
-        y = y.saturating_add(row_height);
+        y = y.saturating_add(1);
+    }
+    if tier != Tier::Minimal {
+        while y < body.bottom() {
+            Line::styled(FILLER, Style::new().fg(theme.line)).render(row(body, y), buffer);
+            y += 1;
+        }
     }
     hits
 }
 
-/// One row: playing marker, title (and in the normal tier its artist and
-/// album beneath), duration, saved history. Narrow rows drop the saved
-/// column, then the duration, before the title.
+/// One row: playing marker, number, title, duration, saved history. Narrow
+/// rows drop the saved column, then the duration, before the title.
 fn draw_queue_row(
     buffer: &mut Buffer,
     rect: Rect,
+    index: usize,
     entry: &QueueRow,
     playing: bool,
     selected: bool,
-    two_line: bool,
     theme: &Theme,
 ) {
     let (base, accent, muted) = if selected {
-        let on_green = Style::new().bg(theme.green).fg(theme.ink);
-        (on_green, on_green, on_green)
+        let on_amber = Style::new().bg(theme.amber).fg(theme.ink);
+        (on_amber.add_modifier(Modifier::BOLD), on_amber, on_amber)
     } else {
         (
             Style::new().fg(theme.text),
@@ -635,13 +730,12 @@ fn draw_queue_row(
     if playing {
         Line::styled("▶", accent).render(marker, buffer);
     }
+    let number = take_left(&mut rest, NUMBER_COLUMNS);
+    Line::styled(format!("{:02}", index + 1), muted).render(number, buffer);
     let saved = column(&mut rest, SAVED_COLUMNS, SAVED_MIN_ROW);
     let duration = column(&mut rest, DURATION_COLUMNS, DURATION_MIN_ROW);
 
     Line::styled(entry.title.as_str(), base).render(rest, buffer);
-    if two_line && let Some(subtitle) = &entry.subtitle {
-        Line::styled(subtitle.as_str(), muted).render(row(rest, rest.y.saturating_add(1)), buffer);
-    }
     if let Some(value) = entry.duration {
         Line::styled(duration_label(value), base)
             .alignment(Alignment::Right)
@@ -655,11 +749,20 @@ fn draw_queue_row(
 }
 
 fn draw_footer(buffer: &mut Buffer, area: Rect, view: &PlayerView, theme: &Theme) {
-    match &view.status {
+    let line = match &view.status {
         Some(status) => Line::styled(status.as_str(), Style::new().fg(theme.amber)),
-        None => Line::styled(KEY_HINTS, Style::new().fg(theme.muted)),
-    }
-    .render(area, buffer);
+        None => {
+            let key = Style::new().fg(theme.cream).add_modifier(Modifier::BOLD);
+            let label = Style::new().fg(theme.muted);
+            let mut spans = vec![Span::raw(" ")];
+            for (name, action) in KEY_HINTS {
+                spans.push(Span::styled(name, key));
+                spans.push(Span::styled(format!(" {action}   "), label));
+            }
+            Line::from(spans)
+        }
+    };
+    line.render(area, buffer);
 }
 
 /// A right-hand column of `columns` plus a one-cell gap before it, taken

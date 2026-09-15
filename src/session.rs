@@ -128,6 +128,7 @@ pub struct DisplayUpdate {
     pub title: Option<String>,
     pub artist: Option<String>,
     pub album: Option<String>,
+    pub year: Option<String>,
     pub duration: Option<DisplayDuration>,
 }
 
@@ -562,6 +563,12 @@ impl Session {
                 display.album = Some(album.clone());
                 changed = true;
             }
+            if let Some(year) = &update.year
+                && display.year.as_ref() != Some(year)
+            {
+                display.year = Some(year.clone());
+                changed = true;
+            }
             if let Some(duration) = update.duration
                 && display.duration != Some(duration)
             {
@@ -620,6 +627,9 @@ impl Session {
         }
         if let Some(album) = &metadata.album {
             display.album = Some(album.clone());
+        }
+        if let Some(year) = &metadata.year {
+            display.year = Some(year.clone());
         }
         if let Some(duration) = metadata.duration {
             display.duration = Some(DisplayDuration {

@@ -9,6 +9,7 @@ pub struct MediaMetadata {
     pub title: Option<String>,
     pub artist: Option<String>,
     pub album: Option<String>,
+    pub year: Option<String>,
     pub duration: Option<Duration>,
     /// Whether `duration` came from a real index/container header (or is
     /// simply absent) versus `estimate_num_mpeg_frames`'s ~16-frame

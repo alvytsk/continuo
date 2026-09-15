@@ -235,6 +235,7 @@ fn volume_and_display_updates_submit_through_the_session() {
         title: Some("Title".into()),
         artist: Some("Artist".into()),
         album: None,
+        year: None,
         duration: None,
     };
     assert!(matches!(
@@ -261,6 +262,7 @@ fn an_identical_display_update_submits_nothing_and_leaves_state_unchanged() {
         title: Some("Title".into()),
         artist: Some("Artist".into()),
         album: None,
+        year: None,
         duration: None,
     };
     assert!(matches!(
@@ -290,6 +292,7 @@ fn a_display_update_that_repeats_one_field_and_changes_another_submits_and_keeps
             title: Some("Title".into()),
             artist: Some("Artist".into()),
             album: None,
+            year: None,
             duration: None,
         },
     );
@@ -299,6 +302,7 @@ fn a_display_update_that_repeats_one_field_and_changes_another_submits_and_keeps
             title: Some("Title".into()),
             artist: Some("New Artist".into()),
             album: None,
+            year: None,
             duration: None,
         },
     );
@@ -328,6 +332,7 @@ fn a_none_field_in_a_display_update_never_blanks_an_existing_value() {
             title: None,
             artist: None,
             album: Some("Album".into()),
+            year: None,
             duration: None,
         },
     );
@@ -337,6 +342,7 @@ fn a_none_field_in_a_display_update_never_blanks_an_existing_value() {
             title: Some("Title".into()),
             artist: None,
             album: None,
+            year: None,
             duration: None,
         },
     );

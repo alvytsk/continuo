@@ -134,7 +134,7 @@ fn b_browses_the_working_directory_and_enter_enqueues_a_file() {
     child.send(b"\r");
     child.send(b"b");
     assert!(
-        child.wait_for("queue 01", Duration::from_secs(10)),
+        child.wait_for("1 track", Duration::from_secs(10)),
         "{}",
         child.output()
     );
@@ -155,7 +155,7 @@ const FIXTURE_5S: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/si
 const FIXTURE_SHORT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/sine.flac");
 const NULL_OUTPUT: (&str, &str) = ("CONTINUO_AUDIO_OUTPUT", "null");
 /// Shown on the key-hint row of every frame with a queue or without one.
-const DRAWN: &str = "q quit";
+const DRAWN: &str = "Quit";
 const HOOK_PREFIX: &str = "continuo test hook";
 const CONTAINED: &str = "contained panic in background job";
 const PATIENCE: Duration = Duration::from_secs(10);
@@ -287,7 +287,7 @@ fn hang_up_after_a_volume_change(hang_up: fn(&mut PtyChild)) {
         child.output()
     );
     child.send(b"-");
-    assert!(child.wait_for("vol 95%", PATIENCE), "{}", child.output());
+    assert!(child.wait_for(" 95%", PATIENCE), "{}", child.output());
     hang_up(&mut child);
     let code = child.wait_exit(PATIENCE);
     assert!(
@@ -456,7 +456,7 @@ fn contained_artwork_and_metadata_panics_keep_the_player_running() {
             child.send(b"\r");
             child.send(b"b");
             assert!(
-                child.wait_for("queue 03", PATIENCE),
+                child.wait_for("3 tracks", PATIENCE),
                 "{hook}: {}",
                 child.output()
             );

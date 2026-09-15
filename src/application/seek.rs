@@ -607,6 +607,7 @@ mod tests {
                 title: None,
                 artist: None,
                 album: None,
+                year: None,
                 duration: Some(Duration::from_secs(300)),
                 duration_provenance: PositionProvenance::Established,
                 front_cover: None,

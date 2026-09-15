@@ -74,6 +74,7 @@ pub struct NowPlaying {
     pub title: String,
     pub artist: Option<String>,
     pub album: Option<String>,
+    pub year: Option<String>,
     /// Whether the engine holds this entry's adopted playback. `false` for an
     /// active entry that has not been loaded in this session (or whose
     /// playback a later load displaced).

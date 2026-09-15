@@ -104,6 +104,7 @@ pub fn playing(
         title: "Morning Tide".into(),
         artist: Some("Harbor".into()),
         album: Some("Coast".into()),
+        year: None,
         loaded,
         state: if loaded {
             PlaybackState::Playing
