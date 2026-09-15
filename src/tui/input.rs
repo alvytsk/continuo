@@ -37,9 +37,10 @@ pub enum Effect {
 }
 
 /// Maps one key press to zero or more effects, following §7's table. Ctrl-C
-/// always quits, even mid-keystroke in the input overlay; every other rule
-/// is scoped to the open overlay, so a shortcut like `q` or space can never
-/// fire while the user is typing.
+/// always quits, even mid-keystroke in the input overlay, and Ctrl-L always
+/// redraws (§11 recovery), leaving whichever overlay is open as it was;
+/// every other rule is scoped to the open overlay, so a shortcut like `q` or
+/// space can never fire while the user is typing.
 pub fn handle_key(key: KeyEvent, ui: &mut UiState, view: &PlayerView) -> Vec<Effect> {
     if key.kind != KeyEventKind::Press {
         return Vec::new();
@@ -47,13 +48,17 @@ pub fn handle_key(key: KeyEvent, ui: &mut UiState, view: &PlayerView) -> Vec<Eff
     if is_ctrl_c(&key) {
         return vec![Effect::Quit];
     }
+    if is_ctrl_l(&key) {
+        return vec![Effect::FullRedraw];
+    }
     match ui.overlay {
         Overlay::Input => input_overlay(key, ui),
         Overlay::ConfirmClear => confirm_overlay(key, ui),
         Overlay::Help => help_overlay(key, ui),
         // Every other key belongs to the browser: `tui::run` forwards it to
         // `BrowserState::handle_key` (see `routes_to_browser`), whose own
-        // close becomes `Effect::CloseBrowser`.
+        // close becomes `Effect::CloseBrowser`. Ctrl-C and Ctrl-L never get
+        // here.
         Overlay::Browser => Vec::new(),
         Overlay::None => no_overlay(key, ui, view),
     }
@@ -61,9 +66,10 @@ pub fn handle_key(key: KeyEvent, ui: &mut UiState, view: &PlayerView) -> Vec<Eff
 
 /// Whether `key` goes to the open browser's own key handling instead of
 /// [`handle_key`]: every key while the browser overlay is open except
-/// Ctrl-C, which quits from anywhere.
+/// Ctrl-C, which quits from anywhere, and Ctrl-L, which redraws from
+/// anywhere.
 pub fn routes_to_browser(key: &KeyEvent, ui: &UiState) -> bool {
-    ui.overlay == Overlay::Browser && !is_ctrl_c(key)
+    ui.overlay == Overlay::Browser && !is_ctrl_c(key) && !is_ctrl_l(key)
 }
 
 /// Maps one mouse event to zero or more effects, mirroring `handle_key`:
@@ -237,13 +243,10 @@ fn help_overlay(key: KeyEvent, ui: &mut UiState) -> Vec<Effect> {
 }
 
 fn no_overlay(key: KeyEvent, ui: &mut UiState, view: &PlayerView) -> Vec<Effect> {
-    if is_ctrl_l(&key) {
-        return vec![Effect::FullRedraw];
-    }
     // Ctrl-C and Ctrl-L are the only chords with an effect here, and both
-    // are handled above `no_overlay` (Ctrl-C) or by the check just above
-    // (Ctrl-L); every other CONTROL or ALT chord — Ctrl-D, Alt-d, and so on
-    // — must not fall through to the plain-letter bindings below.
+    // are handled in `handle_key` before any overlay; every other CONTROL or
+    // ALT chord — Ctrl-D, Alt-d, and so on — must not fall through to the
+    // plain-letter bindings below.
     if blocks_ordinary_bindings(&key) {
         return Vec::new();
     }

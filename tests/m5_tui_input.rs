@@ -418,6 +418,31 @@ fn only_left_button_down_activates_or_selects() {
 }
 
 #[test]
+fn ctrl_l_redraws_from_every_overlay_without_closing_it() {
+    let view = sample_view();
+    for overlay in [
+        Overlay::None,
+        Overlay::Help,
+        Overlay::Input,
+        Overlay::ConfirmClear,
+        Overlay::Browser,
+    ] {
+        let mut ui = UiState::new(true);
+        ui.overlay = overlay;
+        ui.input = "typed".into();
+        assert!(
+            matches!(
+                &handle_key(ctrl('l'), &mut ui, &view)[..],
+                [Effect::FullRedraw]
+            ),
+            "{overlay:?}"
+        );
+        assert_eq!(ui.overlay, overlay, "{overlay:?} stays open");
+        assert_eq!(ui.input, "typed", "{overlay:?} keeps typed input");
+    }
+}
+
+#[test]
 fn a_ctrl_chord_on_y_does_not_confirm_the_clear() {
     let view = sample_view();
     let mut ui = UiState::new(true);
@@ -428,7 +453,7 @@ fn a_ctrl_chord_on_y_does_not_confirm_the_clear() {
 }
 
 #[test]
-fn the_open_browser_takes_every_key_but_ctrl_c() {
+fn the_open_browser_takes_every_key_but_ctrl_c_and_ctrl_l() {
     let view = sample_view();
     let mut ui = UiState::new(true);
     assert!(
@@ -446,12 +471,24 @@ fn the_open_browser_takes_every_key_but_ctrl_c() {
         key(KeyCode::Char('b')),
         key(KeyCode::Esc),
         key(KeyCode::Char(' ')),
-        ctrl('l'),
         alt('d'),
     ] {
         assert!(routes_to_browser(&event, &ui), "{event:?}");
         assert!(handle_key(event, &mut ui, &view).is_empty(), "{event:?}");
     }
+    assert!(
+        !routes_to_browser(&ctrl('l'), &ui),
+        "Ctrl-L is a recovery redraw"
+    );
+    assert!(matches!(
+        &handle_key(ctrl('l'), &mut ui, &view)[..],
+        [Effect::FullRedraw]
+    ));
+    assert_eq!(
+        ui.overlay,
+        Overlay::Browser,
+        "a redraw leaves the browser open"
+    );
     assert!(!routes_to_browser(&ctrl('c'), &ui));
     assert!(matches!(
         &handle_key(ctrl('c'), &mut ui, &view)[..],

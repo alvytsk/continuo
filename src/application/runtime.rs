@@ -30,7 +30,7 @@ use crate::http::service::HttpService;
 use crate::library::EpisodeCandidate;
 use crate::lifecycle::hooks::TestHook;
 use crate::media::capabilities::{MediaCapabilities, SeekSupport};
-use crate::media::id::MediaId;
+use crate::media::id::{AbsolutePath, MediaId};
 use crate::media::source::SourceLocation;
 use crate::persistence::PersistenceError;
 use crate::persistence::model::PersistedState;
@@ -347,6 +347,18 @@ impl PlayerRuntime {
         let entry = queue.get(queue.active()?)?;
         match entry.source() {
             QueueSource::LocalFile(path) => path.as_path().parent().map(Path::to_path_buf),
+            QueueSource::RemoteUrl(_) | QueueSource::Podcast { .. } => None,
+        }
+    }
+
+    /// The active queue entry's identity and file, when that entry is a
+    /// local file; `None` for a remote or podcast entry or no active entry.
+    /// Read from the queue alone, like [`Self::active_local_dir`].
+    pub fn active_local_file(&self) -> Option<(MediaId, AbsolutePath)> {
+        let queue = self.session.state().queue();
+        let entry = queue.get(queue.active()?)?;
+        match entry.source() {
+            QueueSource::LocalFile(path) => Some((entry.media().clone(), path.clone())),
             QueueSource::RemoteUrl(_) | QueueSource::Podcast { .. } => None,
         }
     }

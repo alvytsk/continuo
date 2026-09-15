@@ -100,7 +100,9 @@ pub fn run(cli: cli::Cli) -> Result<RunOutcome, crate::error::AppError> {
             // the enclosure, what is checkpointed is the episode.
             run_resolved(media, location)
         }
-        CliCommand::Tui { mouse } => crate::tui::run(crate::tui::TuiOptions { mouse }),
+        CliCommand::Tui { mouse, artwork } => {
+            crate::tui::run(crate::tui::TuiOptions { mouse, artwork })
+        }
         command => crate::commands::run(command)
             .map(|()| RunOutcome::Completed)
             .map_err(Into::into),

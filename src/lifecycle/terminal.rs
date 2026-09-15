@@ -18,7 +18,7 @@ use crossterm::terminal::{LeaveAlternateScreen, disable_raw_mode};
 /// the raw escape sequence; it is written only to the real terminal device,
 /// never treated as a display string, so it does not conflict with the
 /// project's ban on raw control characters in displayed text.
-const KITTY_DELETE_ALL: &[u8] = b"\x1b_Ga=d,d=A\x1b\\";
+pub(crate) const KITTY_DELETE_ALL: &[u8] = b"\x1b_Ga=d,d=A\x1b\\";
 
 /// What a running TUI has changed about the terminal, tracked so it can be
 /// undone. Each flag is set by the code that made the corresponding change

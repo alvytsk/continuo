@@ -33,6 +33,9 @@ pub enum ArtworkError {
     Io,
     #[error("artwork decoding panicked")]
     Panicked,
+    /// Resizing or encoding for the terminal's image protocol failed.
+    #[error("artwork could not be encoded for the terminal")]
+    Encoding,
     #[error("no artwork")]
     Missing,
 }

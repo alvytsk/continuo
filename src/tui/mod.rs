@@ -14,8 +14,14 @@
 //! The on-demand browser (§8) is owned here too: its state exists only while
 //! it is open, its keys go to [`browser::BrowserState::handle_key`], and its
 //! reads run on a [`BrowseWorker`] started the first time it opens.
+//!
+//! Cover art (§9) is detected once after entering the alternate screen,
+//! loaded for the active local entry on an [`ArtworkWorker`] started the
+//! first time one needs it, and prepared by [`images::CoverCache`] before
+//! each draw — never inside it.
 
 pub mod browser;
+pub mod images;
 pub mod input;
 pub mod layout;
 pub mod render;
@@ -23,7 +29,7 @@ pub mod state;
 pub mod theme;
 
 use std::any::Any;
-use std::io::{self, Stdout};
+use std::io::{self, Stdout, Write};
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::Arc;
 use std::time::Duration;
@@ -34,13 +40,16 @@ use crossterm::execute;
 use crossterm::terminal::{EnterAlternateScreen, enable_raw_mode};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
+use ratatui::layout::Rect;
+use ratatui_image::picker::{Picker, ProtocolType};
 
 use crate::application::browse::{BrowseRequest, BrowseWorker};
 use crate::application::enrich::default_probe;
 use crate::application::runtime::{
     AppCommand, FlushReport, LibraryStores, PlayerRuntime, RuntimeParts,
 };
-use crate::cli::MouseMode;
+use crate::artwork::worker::{ArtworkWorker, default_loader};
+use crate::cli::{ArtworkMode, MouseMode};
 use crate::clock::{Clock, SystemClock};
 use crate::error::{AppError, LifecycleError};
 use crate::http::limits::Limits;
@@ -49,13 +58,17 @@ use crate::lifecycle::hooks::TestHook;
 use crate::lifecycle::lock::{LockError, ProfileLock};
 use crate::lifecycle::panic::{FatalCleanup, install_panic_hook};
 use crate::lifecycle::signals::ShutdownSignals;
+use crate::lifecycle::terminal::KITTY_DELETE_ALL;
+use crate::media::id::MediaId;
 use crate::persistence::store::{LoadOutcome, QueueBackup, StateStore};
 use crate::persistence::writer::{DisabledSink, StateSink, WriterHandle};
 use crate::playback::engine::EngineHandle;
 use crate::session::Session;
 use crate::tui::browser::{BrowserEffect, BrowserState};
+use crate::tui::images::{CoverCache, picker_for, query_terminal};
 use crate::tui::input::{Effect, handle_key, handle_mouse, routes_to_browser};
-use crate::tui::render::{HitMap, Visuals};
+use crate::tui::layout::{regions, tier_for};
+use crate::tui::render::{CoverView, HitMap, Visuals};
 use crate::tui::state::{Overlay, UiState};
 
 /// How long one loop pass waits for terminal input before pumping the
@@ -65,6 +78,7 @@ const STATE_NOT_SAVED: &str = "This session is not saved";
 
 pub struct TuiOptions {
     pub mouse: MouseMode,
+    pub artwork: ArtworkMode,
 }
 
 type Tty = Terminal<CrosstermBackend<Stdout>>;
@@ -178,8 +192,20 @@ fn start_and_loop(
     }
     stage!(signals, cleanup);
 
+    // Once, in the alternate screen and before the loop reads any input:
+    // the query's answer arrives on stdin.
+    let picker = picker_for(options.artwork, query_terminal);
+    if picker
+        .as_ref()
+        .is_some_and(|picker| picker.protocol_type() == ProtocolType::Kitty)
+    {
+        cleanup.terminal().set_kitty_images(true);
+    }
+    let artwork = Artwork::new(options.artwork, picker, hook);
+    stage!(signals, cleanup);
+
     let ui = UiState::new(options.mouse == MouseMode::On);
-    run_loop(runtime, terminal, ui, cleanup, signals)
+    run_loop(runtime, terminal, ui, artwork, cleanup, signals)
 }
 
 /// Opens this run's log, hands a clone to the panic hook for contained-panic
@@ -312,6 +338,7 @@ fn run_loop(
     runtime: &mut PlayerRuntime,
     terminal: &mut Tty,
     mut ui: UiState,
+    mut artwork: Artwork,
     cleanup: &FatalCleanup,
     signals: &ShutdownSignals,
 ) -> Ending {
@@ -323,7 +350,7 @@ fn run_loop(
             runtime,
             ui: &mut ui,
             browsing: &mut browsing,
-            terminal,
+            artwork: &mut artwork,
             cleanup,
             signals,
         };
@@ -332,6 +359,8 @@ fn run_loop(
         }
         runtime.pump();
         browsing.poll();
+        // Every pass, so the worker's one-slot result channel never stalls it.
+        artwork.poll(runtime);
         if let Some(ending) = interrupted(signals, cleanup) {
             return ending;
         }
@@ -340,7 +369,14 @@ fn run_loop(
         }
         let view = runtime.view();
         ui.reconcile(&view, None);
+        if let Err(error) = artwork.prepare(terminal, &ui) {
+            return Ending::Failed(LifecycleError::Terminal(error).into());
+        }
         let visuals = Visuals {
+            cover: artwork
+                .covers
+                .widget()
+                .map_or(CoverView::Placeholder, CoverView::Image),
             browser: browsing.state.as_ref(),
             ..Visuals::default()
         };
@@ -350,6 +386,119 @@ fn run_loop(
             return Ending::Failed(LifecycleError::Terminal(error).into());
         }
     }
+}
+
+/// Cover art for the active entry: the detected picker (none under
+/// `--artwork off`), the worker that loads covers, and the prepared cover.
+struct Artwork {
+    mode: ArtworkMode,
+    picker: Option<Picker>,
+    hook: TestHook,
+    /// Started the first time a local entry becomes active, never under
+    /// `--artwork off`.
+    worker: Option<ArtworkWorker>,
+    /// The local entry whose cover was last requested; `None` while the
+    /// active entry is remote, a podcast, or absent.
+    requested: Option<MediaId>,
+    covers: CoverCache,
+}
+
+impl Artwork {
+    fn new(mode: ArtworkMode, picker: Option<Picker>, hook: TestHook) -> Self {
+        Self {
+            mode,
+            picker,
+            hook,
+            worker: None,
+            requested: None,
+            covers: CoverCache::new(hook),
+        }
+    }
+
+    /// Requests the cover when the active local entry's media changes, shows
+    /// the placeholder meanwhile and for every other entry, and installs a
+    /// finished cover if it is still for the active entry. A failed load
+    /// leaves the placeholder.
+    fn poll(&mut self, runtime: &PlayerRuntime) {
+        if self.mode == ArtworkMode::Off {
+            return;
+        }
+        let active = runtime.active_local_file();
+        let media = active.as_ref().map(|(media, _)| media);
+        if media != self.requested.as_ref() {
+            match active {
+                Some((media, path)) => {
+                    self.covers.set_image(media.clone(), None);
+                    let hook = self.hook;
+                    self.worker
+                        .get_or_insert_with(|| ArtworkWorker::spawn(default_loader(hook)))
+                        .request(media.clone(), path);
+                    self.requested = Some(media);
+                }
+                None => {
+                    if let Some(previous) = self.requested.take() {
+                        self.covers.set_image(previous, None);
+                    }
+                }
+            }
+        }
+        let Some(worker) = &self.worker else {
+            return;
+        };
+        while let Some(result) = worker.try_result() {
+            if self.requested.as_ref() != Some(&result.media) {
+                continue;
+            }
+            let image = result.image.map_err(|error| {
+                tracing::debug!(%error, "no cover art for the active entry");
+            });
+            self.covers.set_image(result.media, image.ok());
+        }
+    }
+
+    /// Prepares the cover for this frame's cover region, then clears the
+    /// terminal if a placement from an earlier frame may be stale.
+    ///
+    /// Sixel and iTerm2 images are drawn over the cells rather than in them,
+    /// so an overlay could not hide one: while an overlay is open those
+    /// protocols show the placeholder instead.
+    fn prepare(&mut self, terminal: &mut Tty, ui: &UiState) -> io::Result<()> {
+        let size = terminal.size()?;
+        let area = Rect::new(0, 0, size.width, size.height);
+        let covered = ui.overlay != Overlay::None
+            && self.picker.as_ref().is_some_and(|picker| {
+                matches!(
+                    picker.protocol_type(),
+                    ProtocolType::Sixel | ProtocolType::Iterm2
+                )
+            });
+        let cover = regions(area, tier_for(area.width, area.height))
+            .cover
+            .filter(|_| !covered);
+        self.covers.prepare(self.picker.as_ref(), self.mode, cover);
+        if self.covers.take_placement_cleanup() {
+            if self
+                .picker
+                .as_ref()
+                .is_some_and(|picker| picker.protocol_type() == ProtocolType::Kitty)
+            {
+                let mut stdout = io::stdout();
+                stdout.write_all(KITTY_DELETE_ALL)?;
+                stdout.flush()?;
+            }
+            clear_screen(terminal, area)?;
+        }
+        Ok(())
+    }
+}
+
+/// What `terminal.clear()` does for a full-screen terminal — erase the
+/// screen and forget the last frame, so the next draw repaints every cell —
+/// without its cursor-position query. That query blocks for up to two
+/// seconds and then fails when the terminal does not answer, which would
+/// turn a recovery redraw into a fatal terminal error.
+fn clear_screen(terminal: &mut Tty, area: Rect) -> io::Result<()> {
+    terminal.resize(area)
 }
 
 /// The browser while it is open, and the worker that reads for it.
@@ -405,7 +554,7 @@ struct Front<'a> {
     runtime: &'a mut PlayerRuntime,
     ui: &'a mut UiState,
     browsing: &'a mut Browsing,
-    terminal: &'a mut Tty,
+    artwork: &'a mut Artwork,
     cleanup: &'a FatalCleanup,
     signals: &'a ShutdownSignals,
 }
@@ -413,10 +562,12 @@ struct Front<'a> {
 /// Reads at most one input event and runs it through `tui::input::handle_key`
 /// or `tui::input::handle_mouse` — whichever the event is — executing
 /// whatever effects come back exactly the same way for either. While the
-/// browser is open every key but Ctrl-C goes to the browser instead, and its
-/// effects are executed here too. `hits` is where the last drawn frame put
-/// its clickable parts (Task 19); every other event kind (resize, focus,
-/// paste) is ignored here since the next loop pass redraws unconditionally.
+/// browser is open every key but Ctrl-C and Ctrl-L goes to the browser
+/// instead, and its effects are executed here too. `hits` is where the last
+/// drawn frame put its clickable parts (Task 19). A resize invalidates the
+/// prepared cover, whose placement no longer matches the screen; every other
+/// event kind (focus, paste) is ignored here since the next loop pass
+/// redraws unconditionally.
 fn handle_input(front: &mut Front<'_>, hits: &HitMap) -> io::Result<()> {
     if !event::poll(INPUT_POLL)? {
         return Ok(());
@@ -437,6 +588,10 @@ fn handle_input(front: &mut Front<'_>, hits: &HitMap) -> io::Result<()> {
         }
         Event::Key(key) => handle_key(key, front.ui, &view),
         Event::Mouse(mouse) => handle_mouse(mouse, hits, front.ui, &view),
+        Event::Resize(..) => {
+            front.artwork.covers.invalidate();
+            Vec::new()
+        }
         _ => Vec::new(),
     };
     for effect in effects {
@@ -481,10 +636,10 @@ fn apply_effect(effect: Effect, front: &mut Front<'_>) -> io::Result<()> {
             }
             front.cleanup.terminal().set_mouse(on);
         }
-        Effect::FullRedraw => {
-            front.terminal.clear()?;
-            // Invalidating prepared cover-art placements is Task 25's job.
-        }
+        // Invalidating requests placement cleanup, which the loop answers by
+        // clearing the screen before the next draw; the cover is then
+        // prepared again.
+        Effect::FullRedraw => front.artwork.covers.invalidate(),
         Effect::OpenBrowser => front.browsing.open(front.runtime, front.ui),
         Effect::CloseBrowser => front.browsing.close(front.ui),
     }

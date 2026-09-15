@@ -20,6 +20,18 @@ pub enum MouseMode {
     Off,
 }
 
+/// How `continuo tui` draws cover art: `auto` asks the terminal which image
+/// protocol it supports and falls back to colored half-blocks, `blocks`
+/// always uses half-blocks without asking, and `off` shows only the
+/// placeholder and never loads artwork.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, clap::ValueEnum)]
+pub enum ArtworkMode {
+    #[default]
+    Auto,
+    Blocks,
+    Off,
+}
+
 #[derive(Debug, Subcommand)]
 pub enum CliCommand {
     /// Play a local audio file, an HTTP(S) URL, or a subscribed feed's
@@ -56,6 +68,9 @@ pub enum CliCommand {
         /// Whether the player captures the mouse.
         #[arg(long, value_enum, default_value_t = MouseMode::On)]
         mouse: MouseMode,
+        /// How the player draws cover art.
+        #[arg(long, value_enum, default_value_t = ArtworkMode::Auto)]
+        artwork: ArtworkMode,
     },
     /// List every subscription.
     Feeds,
