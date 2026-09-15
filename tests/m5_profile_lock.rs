@@ -38,3 +38,30 @@ fn the_contention_message_is_exact() {
         "Another Continuo player is using this state profile"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn a_new_lock_file_is_private_and_an_existing_one_keeps_its_mode() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mode = |path: &std::path::Path| {
+        std::fs::metadata(path)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777
+    };
+    let dir = tempfile::tempdir().expect("tempdir");
+    let state = dir.path().join("fresh").join("state.json");
+    let lock = ProfileLock::acquire(&state).expect("lock");
+    assert_eq!(mode(lock.path()), 0o600);
+    drop(lock);
+
+    let existing = dir.path().join("existing");
+    std::fs::create_dir(&existing).expect("dir");
+    let path = existing.join("state.lock");
+    std::fs::write(&path, b"").expect("lock file");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+    let lock = ProfileLock::acquire(&existing.join("state.json")).expect("lock");
+    assert_eq!(mode(lock.path()), 0o644, "left as it was");
+}

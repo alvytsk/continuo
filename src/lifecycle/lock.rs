@@ -50,17 +50,11 @@ impl ProfileLock {
         prepare_directory(dir).map_err(LockError::Directory)?;
 
         let path = dir.join("state.lock");
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&path)
-            .map_err(|source| LockError::Io {
-                path: path.clone(),
-                op: "open",
-                source,
-            })?;
+        let file = lock_options().open(&path).map_err(|source| LockError::Io {
+            path: path.clone(),
+            op: "open",
+            source,
+        })?;
         file.try_lock().map_err(|error| match error {
             std::fs::TryLockError::WouldBlock => LockError::Contended,
             std::fs::TryLockError::Error(source) => LockError::Io {
@@ -76,4 +70,18 @@ impl ProfileLock {
     pub fn path(&self) -> &Path {
         &self.path
     }
+}
+
+/// Opens the lock file without truncating it, creating it private to the
+/// user like the profile's other files. The mode applies only on creation:
+/// an existing lock file keeps whatever permissions it already has.
+fn lock_options() -> OpenOptions {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options
 }
