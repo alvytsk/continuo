@@ -35,6 +35,7 @@ use crate::lifecycle::hooks::TestHook;
 use crate::media::capabilities::{MediaCapabilities, SeekSupport};
 use crate::media::id::MediaId;
 use crate::media::source::SourceLocation;
+use crate::media::tags::CoverBytes;
 use crate::persistence::PersistenceError;
 use crate::persistence::model::PersistedState;
 use crate::persistence::writer::{ShutdownOutcome, Urgency, WriterHandle};
@@ -181,6 +182,9 @@ pub(crate) fn shut_down_engine(
 struct Mirror {
     load: LoadRequestId,
     session_rev: u64,
+    media: MediaId,
+    /// The loaded container's own front cover, if it carried one.
+    front_cover: Option<Arc<CoverBytes>>,
     duration: Option<Duration>,
     duration_provenance: PositionProvenance,
     capabilities: MediaCapabilities,
@@ -196,6 +200,7 @@ impl Mirror {
         let PlaybackEvent::Loaded {
             session_rev,
             request,
+            media,
             metadata,
             capabilities,
             position,
@@ -207,6 +212,8 @@ impl Mirror {
         Some(Self {
             load: *request,
             session_rev: *session_rev,
+            media: media.clone(),
+            front_cover: metadata.front_cover.clone(),
             duration: metadata.duration,
             duration_provenance: metadata.duration_provenance,
             capabilities: *capabilities,
@@ -363,21 +370,36 @@ impl PlayerRuntime {
     }
 
     /// The active queue entry's identity and where its cover comes from: a
-    /// local file's own path, or a podcast episode's feed artwork URL, the
-    /// latter only once playback has opened the HTTP service — nothing is
-    /// fetched for a merely restored or enqueued episode (§8). `None` for a
-    /// plain remote URL, an episode without artwork, or no active entry.
+    /// local file's own path; a podcast episode's feed artwork URL, only
+    /// once playback has opened the HTTP service — nothing is fetched for a
+    /// merely restored or enqueued episode (§8); otherwise, for a podcast
+    /// without feed art or a plain remote URL, the front cover embedded in
+    /// the stream, which exists only once that stream is loaded. `None`
+    /// when none of those applies, or there is no active entry.
     pub fn active_cover(&self) -> Option<(MediaId, CoverSource)> {
         let queue = self.session.state().queue();
         let entry = queue.get(queue.active()?)?;
+        let embedded = || {
+            let mirror = self
+                .mirror
+                .as_ref()
+                .filter(|mirror| &mirror.media == entry.media())?;
+            Some(CoverSource::Embedded(Arc::clone(
+                mirror.front_cover.as_ref()?,
+            )))
+        };
         let source = match entry.source() {
             QueueSource::LocalFile(path) => CoverSource::Local(path.clone()),
-            QueueSource::RemoteUrl(_) => return None,
+            QueueSource::RemoteUrl(_) => embedded()?,
             QueueSource::Podcast { .. } => {
-                let http = Arc::clone(self.http.as_ref()?);
-                let library = self.library.as_ref()?;
-                let url = podcast_artwork(&library.subscriptions, &library.cache, entry.media())?;
-                CoverSource::Remote { url, http }
+                let feed_art = || {
+                    let http = Arc::clone(self.http.as_ref()?);
+                    let library = self.library.as_ref()?;
+                    let url =
+                        podcast_artwork(&library.subscriptions, &library.cache, entry.media())?;
+                    Some(CoverSource::Remote { url, http })
+                };
+                feed_art().or_else(embedded)?
             }
         };
         Some((entry.media().clone(), source))

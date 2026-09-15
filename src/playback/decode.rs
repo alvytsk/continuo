@@ -145,6 +145,9 @@ impl DecodedSource {
             .make_audio_decoder(params, &AudioDecoderOptions::default())
             .map_err(PlaybackError::Decode)?;
         let names = standard_names(reader.metadata().current());
+        let front_cover = crate::media::tags::front_cover_of(reader.metadata().current())
+            .0
+            .map(std::sync::Arc::new);
 
         Ok(Self {
             path: label,
@@ -160,6 +163,7 @@ impl DecodedSource {
                 album: names.album,
                 duration,
                 duration_provenance,
+                front_cover,
             },
             planes: vec![Vec::new(); usize::from(channels)],
             cursor: 0,

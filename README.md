@@ -74,8 +74,12 @@ first load, so the player is usable on a machine with no output device.
 A podcast episode's cover is the feed's `itunes:image` (the episode's own
 first, then the channel's), as recorded in the feed cache at the last
 `refresh`. It is downloaded only once playback has opened a network
-connection, never for a merely restored or enqueued episode. A plain URL
-entry always shows the placeholder.
+connection, never for a merely restored or enqueued episode. A podcast
+whose feed names no image, and a plain URL entry, show the front cover
+embedded in the stream's own tag (ID3 `APIC`, FLAC `PICTURE`) once the
+track is loaded; the decoder reads it while opening the stream, so it
+costs no extra request. Until then, and when there is none, the
+placeholder.
 
 - `--mouse off` starts with mouse capture disabled, leaving the terminal's
   (or multiplexer's) own text selection and scrolling alone. `m` toggles it

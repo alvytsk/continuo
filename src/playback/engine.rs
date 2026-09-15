@@ -3364,6 +3364,7 @@ mod tests {
             album: None,
             duration: Some(Duration::from_secs(100)),
             duration_provenance: PositionProvenance::Estimated,
+            front_cover: None,
         };
         assert_eq!(
             established_duration(&metadata),
@@ -3380,6 +3381,7 @@ mod tests {
             album: None,
             duration: Some(Duration::from_secs(100)),
             duration_provenance: PositionProvenance::Established,
+            front_cover: None,
         };
         assert_eq!(
             established_duration(&metadata),

@@ -37,7 +37,7 @@ Five bullets are only partly discharged; each is marked **Partial** with the rea
 
 | Check | Procedure and pass condition |
 |---|---|
-| Image protocol or fallback | With `--artwork auto`, play the embedded-art track and the `cover.jpg` track. Record which protocol drew the cover (Kitty, Sixel, iTerm2) or that it fell back to half-blocks, and that the fallback came within about a quarter second. The podcast episode shows its feed's `itunes:image` once it plays (the placeholder before that); the URL shows the placeholder. |
+| Image protocol or fallback | With `--artwork auto`, play the embedded-art track and the `cover.jpg` track. Record which protocol drew the cover (Kitty, Sixel, iTerm2) or that it fell back to half-blocks, and that the fallback came within about a quarter second. The podcast episode shows its feed's `itunes:image` once it plays (the placeholder before that); a URL shows its stream's embedded front cover once loaded, else the placeholder. |
 | `--artwork blocks` | Half-block cover drawn, no terminal query visible. |
 | `--artwork off` | Placeholder only, no image ever placed. |
 | Resize through all four tiers | Shrink the window or pane through normal (≥80×28), compact, minimal (<50 or <18, no cover or spectrum) and the resize message (<30 or <8), then back. Space and `q` keep working at every size, and no stale image fragment remains at any step. |

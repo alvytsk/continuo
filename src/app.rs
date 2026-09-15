@@ -1097,6 +1097,7 @@ mod tests {
                 album: None,
                 duration: Some(Duration::from_secs(300)),
                 duration_provenance: PositionProvenance::Established,
+                front_cover: None,
             },
             capabilities: MediaCapabilities {
                 continuity: Continuity::Finite,
@@ -1582,6 +1583,7 @@ mod tests {
                 album: None,
                 duration: Some(Duration::from_secs(300)),
                 duration_provenance: PositionProvenance::Established,
+                front_cover: None,
             },
             capabilities: MediaCapabilities {
                 continuity: Continuity::Finite,

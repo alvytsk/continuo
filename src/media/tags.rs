@@ -7,7 +7,7 @@
 use std::time::Duration;
 
 use symphonia::core::formats::TrackType;
-use symphonia::core::meta::StandardVisualKey;
+use symphonia::core::meta::{MetadataRevision, StandardVisualKey};
 
 use crate::media::id::AbsolutePath;
 use crate::playback::decode::{
@@ -20,11 +20,48 @@ use crate::playback::provenance::PositionProvenance;
 pub const MAX_EMBEDDED_COVER_BYTES: usize = 10 * 1024 * 1024;
 
 /// An embedded picture exactly as the file stores it, still encoded.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct CoverBytes {
     pub data: Vec<u8>,
     /// The MIME type the tag declares; a hint, not a verified format.
     pub media_type: Option<String>,
+}
+
+/// The length, not the bytes: this rides on `MediaMetadata`, whose `Debug`
+/// reaches logs and test failures.
+impl std::fmt::Debug for CoverBytes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CoverBytes")
+            .field("len", &self.data.len())
+            .field("media_type", &self.media_type)
+            .finish()
+    }
+}
+
+/// The revision's front cover (decision 13: only a visual whose usage is
+/// `FrontCover` counts), and whether one exists but exceeds
+/// [`MAX_EMBEDDED_COVER_BYTES`] — in which case it is dropped, not
+/// truncated. Shared by the local tag probe and the playback decoder, so a
+/// remote stream's ID3 or FLAC picture is read by the same rule.
+pub(crate) fn front_cover_of(revision: Option<&MetadataRevision>) -> (Option<CoverBytes>, bool) {
+    let cover = revision.and_then(|revision| {
+        revision
+            .media
+            .visuals
+            .iter()
+            .find(|visual| visual.usage == Some(StandardVisualKey::FrontCover))
+    });
+    match cover {
+        Some(visual) if visual.data.len() > MAX_EMBEDDED_COVER_BYTES => (None, true),
+        Some(visual) => (
+            Some(CoverBytes {
+                data: visual.data.to_vec(),
+                media_type: visual.media_type.clone(),
+            }),
+            false,
+        ),
+        None => (None, false),
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -61,24 +98,7 @@ pub fn probe_local_tags(path: &AbsolutePath) -> Result<LocalTags, PlaybackError>
     let metadata = reader.metadata();
     let revision = metadata.current();
     let names = standard_names(revision);
-    let cover = revision.and_then(|revision| {
-        revision
-            .media
-            .visuals
-            .iter()
-            .find(|visual| visual.usage == Some(StandardVisualKey::FrontCover))
-    });
-    let (front_cover, cover_oversized) = match cover {
-        Some(visual) if visual.data.len() > MAX_EMBEDDED_COVER_BYTES => (None, true),
-        Some(visual) => (
-            Some(CoverBytes {
-                data: visual.data.to_vec(),
-                media_type: visual.media_type.clone(),
-            }),
-            false,
-        ),
-        None => (None, false),
-    };
+    let (front_cover, cover_oversized) = front_cover_of(revision);
 
     Ok(LocalTags {
         title: names.title,

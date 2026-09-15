@@ -4,8 +4,9 @@
 //! ordinary [`ArtworkError::Panicked`] result instead of taking the process
 //! down. A local track's cover is read from its tags or a sibling file; a
 //! podcast episode's is downloaded from the feed's `itunes:image` URL
-//! through the HTTP service playback already opened. Plain remote URLs have
-//! no artwork source and never reach this worker.
+//! through the HTTP service playback already opened; failing that, and for
+//! a plain remote URL, the front cover the decoder found in the stream's
+//! own tag once it was loaded.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -20,14 +21,20 @@ use crate::http::service::HttpService;
 use crate::lifecycle::hooks::TestHook;
 use crate::lifecycle::panic::run_contained;
 use crate::media::id::{AbsolutePath, MediaId};
-use crate::media::tags::probe_local_tags;
+use crate::media::tags::{CoverBytes, probe_local_tags};
 use url::Url;
 
 /// Where a cover comes from.
 #[derive(Clone)]
 pub enum CoverSource {
     Local(AbsolutePath),
-    Remote { url: Url, http: Arc<HttpService> },
+    Remote {
+        url: Url,
+        http: Arc<HttpService>,
+    },
+    /// A front cover the playback decoder already read from the loaded
+    /// stream's own tag (ID3 `APIC`, FLAC `PICTURE`, MP4 `covr`).
+    Embedded(Arc<CoverBytes>),
 }
 
 /// Loads the decoded cover for a source. Shared with the worker thread, so
@@ -139,6 +146,7 @@ pub fn default_loader(hook: TestHook) -> CoverLoader {
         }
         let path = match source {
             CoverSource::Local(path) => path,
+            CoverSource::Embedded(cover) => return decode_limited(&cover.data),
             CoverSource::Remote { url, http } => {
                 let request = DocumentRequest {
                     origin: url.clone(),

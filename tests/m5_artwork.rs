@@ -3,6 +3,9 @@
 
 mod support;
 
+#[path = "support/runtime.rs"]
+mod runtime;
+
 #[path = "support/tagged_flac.rs"]
 mod tagged_flac;
 
@@ -218,4 +221,67 @@ fn a_remote_cover_is_fetched_and_decoded_and_a_failed_fetch_is_reported() {
     let source = CoverSource::Remote { url, http };
     assert_eq!(loader(&source).err(), Some(ArtworkError::Remote));
     missing.shutdown();
+}
+
+/// A remote stream whose tag carries a front cover (ID3 `APIC`, FLAC
+/// `PICTURE`): once the track is loaded, the decoder's copy of that cover
+/// becomes the active entry's cover source, with no second request.
+#[test]
+fn a_remote_streams_embedded_front_cover_becomes_the_active_cover_source() {
+    use continuo::application::runtime::AppCommand;
+    use continuo::media::id::NormalizedUrl;
+    use continuo::persistence::model::PersistedState;
+    use continuo::queue::{NewQueueEntry, QueueSource};
+    use continuo::session::Session;
+    use runtime::{rig_with, row_ids};
+    use support::server::{Script, TestServer};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let track = tagged_flac::tagged_flac(
+        dir.path(),
+        "Title",
+        "Artist",
+        "Album",
+        Some(&encoded(image::ImageFormat::Png, 4, 3)),
+    );
+    let server = TestServer::start(Script::serving(std::fs::read(track).expect("read track")));
+    let url = NormalizedUrl::parse(&server.url("/a.flac")).expect("url");
+    let entry = NewQueueEntry::new(
+        MediaId::RemoteUrl(url.clone()),
+        QueueSource::RemoteUrl(url),
+        Default::default(),
+    )
+    .expect("entry");
+    let mut session = Session::new(PersistedState::default());
+    session.enqueue(vec![entry]).expect("fits");
+    let mut rig = rig_with(session.state().clone());
+
+    rig.runtime.pump();
+    assert!(rig.runtime.active_cover().is_none(), "nothing before play");
+    let remote = row_ids(&rig.runtime)[0];
+    rig.runtime.handle(AppCommand::PlayEntry(remote));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let source = loop {
+        rig.runtime.pump();
+        if let Some((_, source)) = rig.runtime.active_cover() {
+            break source;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no cover source: {:?}",
+            rig.runtime.view()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert!(matches!(source, CoverSource::Embedded(_)));
+    let requests_before = server.requests().len();
+    let image = default_loader(TestHook::None)(&source).expect("embedded cover decodes");
+    assert_eq!((image.width(), image.height()), (4, 3));
+    assert_eq!(
+        server.requests().len(),
+        requests_before,
+        "the cover cost no extra request"
+    );
+    let _ = rig.runtime.shutdown();
+    server.shutdown();
 }
