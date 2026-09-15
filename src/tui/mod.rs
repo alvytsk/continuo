@@ -40,7 +40,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crossterm::cursor::Hide;
-use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event};
+use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event, MouseEventKind};
 use crossterm::execute;
 use crossterm::terminal::{EnterAlternateScreen, enable_raw_mode};
 use ratatui::Terminal;
@@ -376,7 +376,7 @@ fn run_loop(
             continue;
         }
         // Before the view, so an encoding failure's status shows this frame.
-        if let Err(error) = artwork.prepare(runtime, terminal, &ui) {
+        if let Err(error) = artwork.prepare(runtime, terminal, &ui, cleanup) {
             return Ending::Failed(LifecycleError::Terminal(error).into());
         }
         let view = runtime.view();
@@ -392,6 +392,12 @@ fn run_loop(
             browser: browsing.state.as_ref(),
             spectrum: spectrum.levels(),
         };
+        // Checked again at the last moment: a worker's fatal panic can
+        // restore the primary screen while this pass prepares its frame, and
+        // a draw after that would paint over the panic diagnostic.
+        if cleanup.rendering_disabled() {
+            continue;
+        }
         if let Err(error) = terminal.draw(|frame| {
             hits = render::draw(frame, &view, &ui, &visuals);
         }) {
@@ -518,6 +524,7 @@ impl Artwork {
         runtime: &mut PlayerRuntime,
         terminal: &mut Tty,
         ui: &UiState,
+        cleanup: &FatalCleanup,
     ) -> io::Result<()> {
         let size = terminal.size()?;
         let area = Rect::new(0, 0, size.width, size.height);
@@ -535,7 +542,9 @@ impl Artwork {
         if let Some(status) = self.covers.take_failure().as_ref().and_then(failure_status) {
             runtime.set_status(status);
         }
-        if self.covers.take_placement_cleanup() {
+        // Never once fatal cleanup has begun: the clear would land on the
+        // restored primary screen.
+        if !cleanup.rendering_disabled() && self.covers.take_placement_cleanup() {
             if self
                 .picker
                 .as_ref()
@@ -618,21 +627,93 @@ struct Front<'a> {
     signals: &'a ShutdownSignals,
 }
 
-/// Reads at most one input event and runs it through `tui::input::handle_key`
-/// or `tui::input::handle_mouse` — whichever the event is — executing
-/// whatever effects come back exactly the same way for either. While the
-/// browser is open every key but Ctrl-C and Ctrl-L goes to the browser
-/// instead, and its effects are executed here too. `hits` is where the last
-/// drawn frame put its clickable parts (Task 19). A resize invalidates the
-/// prepared cover, whose placement no longer matches the screen; every other
-/// event kind (focus, paste) is ignored here since the next loop pass
-/// redraws unconditionally.
+/// Handles pending input: mouse motion already queued is drained, up to
+/// [`MAX_EVENTS_PER_PASS`], so a flood of it cannot hold a key back by one
+/// frame per motion event; the pass ends after the first event that can act
+/// (see [`drain_after`]) or once a quit request or fatal panic is recorded.
 fn handle_input(front: &mut Front<'_>, hits: &HitMap) -> io::Result<()> {
-    if !event::poll(INPUT_POLL)? {
-        return Ok(());
+    drain_events(event::poll, event::read, |event| {
+        let next = drain_after(&event);
+        handle_event(front, hits, event)?;
+        Ok(if interrupted(front.signals, front.cleanup).is_some() {
+            Drain::Stop
+        } else {
+            next
+        })
+    })
+    .map(|_| ())
+}
+
+/// Whether draining may go on after `event`. Only mouse motion, which no
+/// handler acts on, lets it: every other event keeps a frame of its own, as
+/// before, so a click is always tested against the frame drawn after the
+/// previous action.
+///
+/// That also keeps a hung-up pane observable. crossterm 0.29 retries a tty
+/// read that returns end of file or an I/O error without end, so the loop
+/// learns of a hangup from a draw whose write fails. Handling the bytes a
+/// closing pane delivers one pass each gives it that draw before it reads
+/// the tty again; draining them together would not.
+fn drain_after(event: &Event) -> Drain {
+    match event {
+        Event::Mouse(mouse)
+            if matches!(
+                mouse.kind,
+                MouseEventKind::Moved | MouseEventKind::Drag(_) | MouseEventKind::Up(_)
+            ) =>
+        {
+            Drain::Continue
+        }
+        _ => Drain::Stop,
     }
+}
+
+/// At most this many input events are handled before the loop pumps and
+/// draws again, so an endless flood cannot starve drawing.
+const MAX_EVENTS_PER_PASS: usize = 256;
+
+/// Whether draining may go on to the next pending event this pass.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Drain {
+    Continue,
+    Stop,
+}
+
+/// Waits up to [`INPUT_POLL`] for the first event, then takes only what is
+/// already pending, handing each to `handle` until the queue is empty,
+/// `handle` says stop, or [`MAX_EVENTS_PER_PASS`] events were handled.
+/// Returns how many were handled. Generic over the event source so the
+/// bound and the stop rule can be tested without a terminal.
+fn drain_events(
+    mut poll: impl FnMut(Duration) -> io::Result<bool>,
+    mut read: impl FnMut() -> io::Result<Event>,
+    mut handle: impl FnMut(Event) -> io::Result<Drain>,
+) -> io::Result<usize> {
+    let mut wait = INPUT_POLL;
+    let mut handled = 0;
+    while handled < MAX_EVENTS_PER_PASS && poll(wait)? {
+        wait = Duration::ZERO;
+        let event = read()?;
+        handled += 1;
+        if handle(event)? == Drain::Stop {
+            break;
+        }
+    }
+    Ok(handled)
+}
+
+/// Runs one input event through `tui::input::handle_key` or
+/// `tui::input::handle_mouse` — whichever the event is — executing whatever
+/// effects come back exactly the same way for either. While the browser is
+/// open every key but Ctrl-C and Ctrl-L goes to the browser instead, and its
+/// effects are executed here too. `hits` is where the last drawn frame put
+/// its clickable parts (Task 19) — the frame the listener was looking at. A
+/// resize invalidates the prepared cover, whose placement no longer matches
+/// the screen; every other event kind (focus, paste) is ignored here since
+/// the next loop pass redraws unconditionally.
+fn handle_event(front: &mut Front<'_>, hits: &HitMap, event: Event) -> io::Result<()> {
     let view = front.runtime.view();
-    let effects = match event::read()? {
+    let effects = match event {
         Event::Key(key) if routes_to_browser(&key, front.ui) => {
             let Some(browser) = &mut front.browsing.state else {
                 // An overlay with no browser behind it has nothing to show.
@@ -686,6 +767,10 @@ fn apply_effect(effect: Effect, front: &mut Front<'_>) -> io::Result<()> {
         }
         Effect::Notice(message) => front.runtime.set_status(message),
         Effect::Quit => front.signals.request(),
+        // Not once fatal cleanup has begun, which has already released the
+        // terminal: re-enabling capture would leave the primary screen
+        // reporting mouse events to a shell.
+        Effect::SetMouseCapture(_) if front.cleanup.rendering_disabled() => {}
         Effect::SetMouseCapture(on) => {
             let mut stdout = io::stdout();
             if on {
@@ -729,10 +814,18 @@ fn teardown(
     signals.close();
     drop(lock);
 
+    // `writeln!`, not `eprintln!`: the pane's PTY may be gone by now, and
+    // `eprintln!` panics when the write fails.
+    let mut stderr = io::stderr();
     match flush {
-        Some(FlushReport::Failed(error)) => eprintln!("State was not saved: {error}"),
+        Some(FlushReport::Failed(error)) => {
+            let _ = writeln!(stderr, "State was not saved: {error}");
+        }
         Some(FlushReport::Unconfirmed) => {
-            eprintln!("State was not saved: the final write was not confirmed in time");
+            let _ = writeln!(
+                stderr,
+                "State was not saved: the final write was not confirmed in time"
+            );
         }
         Some(FlushReport::Written | FlushReport::Disabled) | None => {}
     }
@@ -747,5 +840,132 @@ fn teardown(
             RunOutcome::Completed => Err(error),
         },
         Ending::Requested => Ok(outcome),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::VecDeque;
+
+    use crossterm::event::{
+        KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    };
+
+    use super::*;
+
+    fn motion() -> Event {
+        Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: 3,
+            row: 4,
+            modifiers: KeyModifiers::NONE,
+        })
+    }
+
+    fn key() -> Event {
+        Event::Key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE))
+    }
+
+    /// Drains `pending` once, recording each poll's wait.
+    fn pass(
+        pending: &mut VecDeque<Event>,
+        waits: &mut Vec<Duration>,
+        mut handle: impl FnMut(Event) -> Drain,
+    ) -> usize {
+        let queue = std::cell::RefCell::new(pending);
+        drain_events(
+            |wait| {
+                waits.push(wait);
+                Ok(!queue.borrow().is_empty())
+            },
+            || {
+                queue
+                    .borrow_mut()
+                    .pop_front()
+                    .ok_or_else(|| io::Error::other("read without a pending event"))
+            },
+            |event| Ok(handle(event)),
+        )
+        .unwrap_or_else(|error| panic!("drain: {error}"))
+    }
+
+    #[test]
+    fn a_motion_flood_is_drained_in_bounded_passes_and_the_key_behind_it_is_reached() {
+        let mut pending: VecDeque<Event> = std::iter::repeat_with(motion).take(600).collect();
+        pending.push_back(key());
+        let mut keys = 0;
+        let mut waits = Vec::new();
+
+        let first = pass(&mut pending, &mut waits, |event| {
+            keys += usize::from(matches!(event, Event::Key(_)));
+            drain_after(&event)
+        });
+        assert_eq!(
+            first, MAX_EVENTS_PER_PASS,
+            "bounded, so drawing is not starved"
+        );
+        assert_eq!(waits[0], INPUT_POLL, "only the first poll waits");
+        assert!(waits[1..].iter().all(|wait| wait.is_zero()), "{waits:?}");
+
+        let mut passes = 1;
+        while keys == 0 {
+            pass(&mut pending, &mut Vec::new(), |event| {
+                keys += usize::from(matches!(event, Event::Key(_)));
+                drain_after(&event)
+            });
+            passes += 1;
+        }
+        assert_eq!(passes, 3, "601 events take three passes, not 601");
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn only_mouse_motion_lets_draining_continue() {
+        let mouse = |kind| {
+            Event::Mouse(MouseEvent {
+                kind,
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        for passing in [
+            motion(),
+            mouse(MouseEventKind::Drag(MouseButton::Left)),
+            mouse(MouseEventKind::Up(MouseButton::Left)),
+        ] {
+            assert_eq!(drain_after(&passing), Drain::Continue, "{passing:?}");
+        }
+        for acting in [
+            key(),
+            mouse(MouseEventKind::Down(MouseButton::Left)),
+            mouse(MouseEventKind::ScrollDown),
+            Event::Resize(80, 24),
+        ] {
+            assert_eq!(drain_after(&acting), Drain::Stop, "{acting:?}");
+        }
+    }
+
+    #[test]
+    fn a_key_behind_buffered_keys_keeps_its_own_pass() {
+        let mut pending: VecDeque<Event> = [key(), key()].into_iter().collect();
+        assert_eq!(
+            pass(&mut pending, &mut Vec::new(), |event| drain_after(&event)),
+            1
+        );
+        assert_eq!(pending.len(), 1);
+    }
+
+    #[test]
+    fn draining_stops_when_the_handler_says_so_and_waits_once_when_idle() {
+        let mut pending: VecDeque<Event> = [key(), key(), key()].into_iter().collect();
+        let handled = pass(&mut pending, &mut Vec::new(), |_| Drain::Stop);
+        assert_eq!(handled, 1);
+        assert_eq!(pending.len(), 2, "the rest wait for the next pass");
+
+        let mut idle = VecDeque::new();
+        let mut waits = Vec::new();
+        assert_eq!(pass(&mut idle, &mut waits, |_| Drain::Continue), 0);
+        assert_eq!(waits, vec![INPUT_POLL]);
     }
 }

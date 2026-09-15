@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::{error::Error, process::ExitCode};
 
 use clap::Parser;
@@ -38,7 +39,8 @@ fn main() -> ExitCode {
     match app::run(cli) {
         Ok(outcome) => ExitCode::from(outcome.exit_status()),
         Err(error) => {
-            eprintln!("continuo: {error}");
+            // A closed terminal must not turn the report into a panic.
+            let _ = writeln!(std::io::stderr(), "continuo: {error}");
             tracing::error!(error = ?error, "playback failed");
             ExitCode::FAILURE
         }
