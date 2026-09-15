@@ -2,7 +2,7 @@
 
 A keyboard-first terminal audio player for local audio, finite HTTP media, and podcasts.
 
-Milestones 0 through 4 are implemented: domain types and identities (M0), local playback over Symphonia and CPAL with position tracking (M1), durable checkpoint persistence (M2), finite HTTP media with capability probing and range-based seek (M3), and RSS/Atom subscriptions with episode listing and progress (M4). A full terminal UI (M5) is not implemented yet; today's interface is a status line plus a handful of keys (space to pause, the arrow keys to seek, `s`/`p` to stop/play, `q` to quit).
+Milestones 0 through 5 are implemented: domain types and identities (M0), local playback over Symphonia and CPAL with position tracking (M1), durable checkpoint persistence (M2), finite HTTP media with capability probing and range-based seek (M3), RSS/Atom subscriptions with episode listing and progress (M4), and a Ratatui terminal player with a persistent queue, a browser, cover art and a frequency spectrum (M5). `continuo tui` opens the [terminal player](#terminal-player). `continuo play` keeps its original interface: a status line plus a handful of keys (space to pause, the arrow keys to seek, `s`/`p` to stop/play, `q` to quit).
 
 ## Development
 
@@ -11,12 +11,13 @@ Install Rust through rustup. The repository pins Rust 1.98.1 and the rustfmt and
 Run from the repository root:
 
     cargo run --locked -- play <path-or-url>
+    cargo run --locked -- tui
     RUST_LOG=continuo=debug cargo run --locked -- play <path-or-url>
     cargo fmt --check
     cargo clippy --locked --all-targets --all-features -- -D warnings
     cargo test --locked
 
-Logging goes to stderr. Runtime code forbids unsafe code and denies unwrap/expect; tests may use unwrap/expect for assertions and fixtures.
+Logging goes to stderr, except under `tui`, which sends it to a per-run log file (see [Logs](#logs)). Runtime code forbids unsafe code and denies unwrap/expect; tests may use unwrap/expect for assertions and fixtures.
 
 M0 has no audio system dependency; every later milestone requires libasound2-dev on Linux for CPAL — the runtime libasound.so.2 alone is insufficient.
 
@@ -25,6 +26,7 @@ M0 has no audio system dependency; every later milestone requires libasound2-dev
     continuo play ~/Music/episode.mp3
     continuo play https://example.com/podcast/episode-42.mp3
     continuo play https://example.com/podcast/episode-42.mp3 --probe-only
+    continuo tui
 
 `--probe-only` opens the source, prints what was found, and exits without touching an audio device or the terminal.
 
@@ -57,6 +59,162 @@ estimate happens to be exact for them — but nothing in the file tells the
 player which kind it is before the seek runs, so every landing on an
 index-less MP3 is reported and should be read as an estimate, never as a
 confirmed position.
+
+## Terminal player
+
+    continuo tui [--mouse on|off] [--artwork auto|blocks|off]
+
+`tui` opens a full-screen player on the saved queue. It restores the queue,
+the active entry, the volume and every checkpoint, and **never starts playing
+on its own**: no track is loaded and nothing is fetched from the network until
+you press a playback key. (Local files' tags and the active local entry's
+cover art are read in the background.) The audio device is created on the
+first load, so the player is usable on a machine with no output device.
+
+- `--mouse off` starts with mouse capture disabled, leaving the terminal's
+  (or multiplexer's) own text selection and scrolling alone. `m` toggles it
+  at any time. The default is `on`.
+- `--artwork auto` (the default) asks the terminal which image protocol it
+  supports and falls back to colored half-blocks when it does not answer
+  within 250 ms. `blocks` always uses half-blocks without asking; `off` never
+  loads artwork and shows only the placeholder.
+
+The layout adapts to the terminal size. At 80×28 and above it shows the
+cover, track information, spectrum, transport and progress above the queue;
+below 80 columns **or** 28 rows it is compact, below 50 **or** 18 it is
+minimal (no cover, no spectrum), and below 30 **or** 8 it asks for a larger
+window while space and `q` keep working. Either dimension alone is enough to
+drop a tier, so 100×20 is compact.
+
+### Keys
+
+| Key | Action |
+|---|---|
+| Space | Pause or resume. Before anything is loaded, load the restored active entry (or, with none, the selected row); after the last entry ended, replay it |
+| Enter | Play the selected queue entry |
+| Up/Down or `j`/`k` | Move the selection; playback does not change |
+| `J`/`K` | Move the selected entry down/up |
+| Left/Right | Seek backward/forward 10 seconds (a burst of presses becomes one seek) |
+| Home | Restart the track from the beginning |
+| `-` or `_` / `+` or `=` | Volume down/up by 5% |
+| `s` / `p` | Stop / play |
+| `[` / `]` | Previous / next queue entry; never wraps |
+| `d` | Remove the selected entry |
+| `b` | Open the browser |
+| `a` | Type a path or an `http(s)://` URL to enqueue |
+| `c` | Clear the queue, after a `y` confirmation |
+| `?` | Show the key help |
+| `m` | Toggle mouse capture |
+| Ctrl-L | Redraw the whole screen and re-place the cover |
+| Esc | Close the open overlay or cancel typing |
+| `q` / Ctrl-C | Quit |
+
+Ctrl-C quits and Ctrl-L redraws from **anywhere**, including while typing, in
+the help and confirmation overlays, and in the browser; Ctrl-L leaves an open
+overlay open. Every other key belongs to what is open: while typing after `a`,
+printable keys (`q` and space included) are text, Enter enqueues and Esc
+cancels; the clear confirmation takes `y` and treats any other key as no; the
+help closes on `?` or Esc. A Ctrl or Alt chord never fires a plain shortcut —
+Ctrl-D does not remove an entry, Alt-q does not quit — while Shift still
+reaches `J`, `K`, `+`, `_`, `?`, `[` and `]` on terminals that report it.
+
+Seeking before anything is loaded answers `Play a track before seeking` and
+opens nothing; while a track is loading it answers `Still loading`; after the
+last entry ended, Left/Right answer `Track ended; press play to replay` and
+Home restarts it. With an empty queue and nothing playing, Space, `p`, Enter,
+Home and Left/Right answer `Queue is empty`.
+
+With mouse capture on, a click selects a queue row and a click on the
+already selected row plays it, the wheel over the queue moves the selection,
+the transport buttons act like their keys, and a click on the progress bar
+seeks — only for a loaded track whose duration the decoder confirmed. The
+mouse does nothing while an overlay is open, and nothing depends on it.
+
+### The browser
+
+`b` opens a browser over one directory at a time — the active local entry's
+directory, else the directory `tui` was started in — and over cached podcast
+subscriptions. Up/Down or `j`/`k` move, Tab switches between Files and
+Podcasts, Enter opens a directory or a feed and enqueues a file or an episode,
+Space marks several rows to enqueue together, Backspace or Left goes back up,
+and `b` or Esc closes it. Directories are read one level at a time; nothing
+indexes a library recursively.
+
+**Opening the browser never refreshes a feed.** The Podcasts tab lists what
+`continuo subscribe` and `continuo refresh` last cached, exactly like
+`continuo episodes`, and the only way to update it is still `continuo refresh`
+from a shell. Enqueueing or restoring a URL or an episode makes no network
+request either; only playing it does.
+
+### The queue
+
+Enqueueing appends and never changes what is playing. The queue is kept in
+`state.json` with the checkpoints, so it survives a restart, and the same
+file may hold the same track twice: duplicates share one listening history
+but keep their own places in the queue. When a track ends, the next entry
+starts from its own resume point (a finished one replays from the beginning);
+the last entry simply ends — there is no wrap, shuffle or repeat. A load that
+fails leaves the queue alone and waits for you rather than skipping ahead.
+
+This build supports **256 queue occurrences**, including duplicates. An
+enqueue that would go past that is refused whole with `Queue is full (256
+entries)` rather than truncated. The limit is not a property of the file: a
+larger queue written by some other build is reset on load (see below) and
+never costs a checkpoint. Checkpoints keep their own cap of 512 media, and a
+queued track's history can still be evicted by enough other listening; the
+entry stays queued and then starts from zero.
+
+A queue entry for a podcast episode remembers the episode, not a list
+position. Before loading it, the player looks the episode up in the local
+feed cache and uses its current enclosure; when the episode, the subscription
+or the cache file is gone, it plays the URL it last saw and says `Using saved
+episode source`.
+
+Before the active entry is loaded, the progress line shows its **saved
+history**, not a live position:
+
+- `12:34 saved` — the checkpoint's resume point;
+- `~12:34 saved` — an estimated resume point (see
+  [Seeking accuracy](#seeking-accuracy));
+- `played` — finished; playing it starts from the beginning;
+- `position unknown` — a checkpoint without a position.
+
+Queue rows show the same labels. They describe what was saved last time, not
+proof that the file or URL is still there.
+
+If the queue part of `state.json` is damaged — a malformed entry, duplicate
+entry IDs, an entry whose source does not match its identity, or more entries
+than this build supports — only the queue is reset: checkpoints, volume and
+the current media survive. The original bytes are first copied to
+`state.json.queue-recovery-<timestamp>`, and the player says what was reset
+and where the copy is. A bad active-entry reference alone keeps the entries
+and clears only that reference. If the copy cannot be made, the session runs
+unsaved (`unsaved` in the header) and the original file is left untouched.
+
+### Quitting, signals and exit status
+
+`q` and Ctrl-C exit 0. SIGINT, SIGHUP and SIGTERM — including a pane or
+terminal window closing — take the same path: the final position is captured
+and flushed, the terminal is restored, and the process exits with
+`128 + signal number` (130, 129 and 143). `continuo play` follows the same
+contract, with or without a terminal. A flush that fails is reported as
+`State was not saved: …` after the terminal is restored; the player never
+claims a save it could not confirm. SIGKILL, a crash or power loss keep only
+the last completed write.
+
+### Logs
+
+While `tui` runs, everything written to the process's standard error —
+tracing, panics inside background jobs, and messages printed directly by ALSA
+or other C libraries — goes to a new log file instead of the screen:
+
+    $XDG_STATE_HOME/continuo/logs/continuo-tui-<UTC timestamp>-<pid>.log
+
+Each run creates its own file and keeps the five most recent earlier ones.
+The file has no size cap. `RUST_LOG=continuo=debug continuo tui` works as
+usual; the output lands in that file. A crash is the exception: the panic
+message is printed on the restored terminal, after the player has left the
+alternate screen.
 
 ## Podcasts
 
@@ -273,12 +431,27 @@ trusting a feed URL to mean the same feed forever, and feed URLs move.
 - Bytes decide the encoding, not the declaration. A document that will not
   decode is refused rather than repaired with replacement characters.
 
-### One process at a time
+### One player per profile
 
-There is no locking between processes. Two `continuo` commands writing
+`continuo tui` and `continuo play` take an exclusive lock on
+`state.lock`, next to `state.json`, before they read any playback state, and
+hold it until their final write is flushed. A second player on the same
+profile — `tui` or `play`, in any combination — refuses to start, before it
+opens an audio device or touches the terminal:
+
+    continuo: Another Continuo player is using this state profile
+
+`play` still reports a missing file or an invalid source first, since it
+resolves its source before asking for the lock. The lock file is never
+deleted; the lock is released when the process exits, however it exits.
+
+Feed commands (`subscribe`, `unsubscribe`, `refresh`, `feeds`, `episodes`)
+and `play --probe-only` take no lock and can run beside a player. They are
+still not serialized against **each other**: two commands writing
 subscriptions at the same time can lose one of the two writes — each file
 write is atomic on its own, so neither file can be left half-written, but
-nothing serializes one whole command against another. Run one at a time.
+nothing serializes one whole command against another. Run those one at a
+time.
 
 ### Where the files live
 
@@ -286,34 +459,38 @@ nothing serializes one whole command against another. Run one at a time.
 |---|---|
 | `$XDG_DATA_HOME/continuo/subscriptions.json` | Subscriptions — durable user data |
 | `$XDG_CACHE_HOME/continuo/feeds/<feed-id>.json` | Cached episodes — refetchable |
-| `$XDG_STATE_HOME/continuo/state.json` | Checkpoints and volume |
+| `$XDG_STATE_HOME/continuo/state.json` | Checkpoints, volume, the queue and its active entry |
+| `$XDG_STATE_HOME/continuo/state.lock` | The player lock (empty, never deleted) |
+| `$XDG_STATE_HOME/continuo/logs/` | One log per `tui` run; the five most recent earlier ones are kept |
 
 On macOS and Windows these resolve to the platform's own data, cache and
 local-data directories.
 
-The cache is the only one of the three that is disposable, and `continuo
+The cache and the logs are disposable, and `continuo
 refresh <slug>` is the way to rebuild it — the same command the messages
 above name. Subscriptions and checkpoints are not disposable: `continuo
 unsubscribe <slug>` is how a subscription goes away.
 
 ## Design and roadmap
 
-Read the [architecture](docs/architecture.md), the [M3 acceptance coverage map](docs/m3-acceptance.md), and the [approved foundation spec](docs/superpowers/specs/2026-09-07-continuo-foundation-design.md).
+Read the [architecture](docs/architecture.md), the [M3 acceptance coverage map](docs/m3-acceptance.md), the [M5 acceptance record](docs/m5-acceptance.md), and the [approved foundation spec](docs/superpowers/specs/2026-09-07-continuo-foundation-design.md).
 
-M1 added local playback, M2 durable resume, M3 finite HTTP playback, and M4 feeds and subscriptions. M5 adds the TUI, over the same `continuo::library` functions the commands above already call.
+M1 added local playback, M2 durable resume, M3 finite HTTP playback, M4 feeds and subscriptions, and M5 the terminal player, over the same `continuo::library` functions the commands above already call.
 
 Non-UTF-8 local paths are unsupported. Position will be an estimate when device latency is unavailable, and seek support may remain unknown until probed. HTTP transport never implies live radio.
 
 ## Playback state
 
-Position, completion and volume are written to a small JSON file so that
-quitting and relaunching the same file resumes where you left off.
+Position, completion, volume and the `tui` queue are written to a small JSON
+file so that quitting and relaunching the same file resumes where you left
+off.
 
 - **Linux:** `$XDG_STATE_HOME/continuo/state.json`, falling back to
   `~/.local/state/continuo/state.json`
 - **macOS and Windows:** the platform's local data directory
 
-The file holds one checkpoint per media identity, capped at 512 entries, and is
+The file holds one checkpoint per media identity, capped at 512 entries, plus
+the queue (schema 3; files from earlier builds load with an empty queue), and is
 replaced atomically — a crash mid-write cannot leave a truncated file. A file
 this build cannot read is preserved rather than overwritten: garbage is moved
 aside as `state.json.rejected-<timestamp>`, and a file from a newer build is
