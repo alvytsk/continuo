@@ -10,6 +10,7 @@ use crossterm::style::Print;
 use crossterm::terminal::{Clear, ClearType};
 use crossterm::{cursor, execute};
 
+use crate::application::runtime::{FlushReport, classify_flush, shut_down_engine};
 use crate::application::source::resolve_source;
 use crate::cli::{self, CliCommand};
 use crate::clock::{Clock, SystemClock};
@@ -25,7 +26,7 @@ use crate::media::source::SourceLocation;
 use crate::persistence::PersistenceError;
 use crate::persistence::model::PersistedState;
 use crate::persistence::store::{LoadReason, QueueBackup, StateStore};
-use crate::persistence::writer::{ShutdownOutcome, StateSink, Urgency, WriterHandle};
+use crate::persistence::writer::{ShutdownOutcome, StateSink, WriterHandle};
 use crate::playback::command::{LoadRequestId, PlaybackCommand, ResumeIntent};
 use crate::playback::engine::EngineHandle;
 use crate::playback::error::PlaybackError;
@@ -355,23 +356,10 @@ fn finish(
     persisting: bool,
     outcome: Result<(), PlaybackError>,
 ) -> Result<(), PlaybackError> {
-    // Out of band first, and in band only as a courtesy. The worker stops
-    // reading commands while an event backlog exists, and both loops have
-    // just stopped draining events, so an in-band `Shutdown` can sit unread
-    // in the channel forever while `join` blocks - hanging the process with
-    // the terminal still in raw mode. The interrupt is the only signal that
-    // is guaranteed to be seen.
-    engine.interrupt_shutdown();
-    engine.commands().send(PlaybackCommand::Shutdown).ok();
-    let report = engine.join();
-
-    // The events neither loop drained are replayed through the policy before
-    // the snapshot is taken, so the snapshot comes from a session that has
-    // seen everything the run produced (D19).
-    writer.submit(
-        session.reconcile_shutdown(&report, clock.sample()),
-        Urgency::Forced,
-    );
+    // Both loops have just stopped draining events, which is exactly the
+    // backlog `shut_down_engine`'s out-of-band interrupt exists for; the
+    // events neither loop drained are replayed before the forced snapshot.
+    shut_down_engine(engine, &mut session, &writer, clock.as_ref());
 
     // Restore the terminal before waiting on the disk, and before returning
     // to a caller that will print a diagnostic on `outcome` — so the writer's
@@ -656,32 +644,6 @@ fn open_persistence(store: StateStore, media: &MediaId, clock: &Arc<dyn Clock>) 
 fn submit(writer: &WriterHandle, action: Action) {
     if let Action::Submit { state, urgency } = action {
         writer.submit(state, urgency);
-    }
-}
-
-/// What the flush is reported as, decided apart from the logging so that the
-/// one branch that exists to prevent a dishonest line can be asserted rather
-/// than read.
-enum FlushReport {
-    Written,
-    Failed(PersistenceError),
-    Unconfirmed,
-    /// Nothing was ever going to reach the disk this session.
-    Disabled,
-}
-
-/// A disabled sink reports every write as a success, deliberately — the writer
-/// must not count a deliberate disable as a failure (D11) — so a session that
-/// was not persisting reaches `Written` having written nothing. The outcome
-/// alone must therefore never be reported as a checkpoint that landed.
-fn classify_flush(outcome: ShutdownOutcome, persisting: bool) -> FlushReport {
-    if !persisting {
-        return FlushReport::Disabled;
-    }
-    match outcome {
-        ShutdownOutcome::Written => FlushReport::Written,
-        ShutdownOutcome::Failed(error) => FlushReport::Failed(error),
-        ShutdownOutcome::Unconfirmed => FlushReport::Unconfirmed,
     }
 }
 
@@ -1008,6 +970,7 @@ mod tests {
     use crate::media::capabilities::{Continuity, MediaCapabilities, SeekSupport};
     use crate::media::id::{AbsolutePath, EpisodeKey, FeedId, NormalizedUrl};
     use crate::media::metadata::MediaMetadata;
+    use crate::persistence::writer::Urgency;
     use crate::playback::checkpoint::PlaybackCheckpoint;
     use crate::playback::event::StartDisposition;
     use crate::resume::ResumeCandidate;

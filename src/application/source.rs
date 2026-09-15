@@ -3,7 +3,7 @@
 //! resolved on the calling thread, before anything with a network or a
 //! worker exists.
 
-use std::path::PathBuf;
+use std::path::Path;
 
 use url::Url;
 
@@ -19,7 +19,13 @@ pub fn resolve_source(input: &str) -> Result<(MediaId, SourceLocation), Playback
     if is_url_spelling(input) {
         return resolve_url(input);
     }
-    let path = PathBuf::from(input);
+    resolve_path(Path::new(input))
+}
+
+/// The local-file half of [`resolve_source`], for a caller that already
+/// holds a path and must not have it reinterpreted as a URL spelling.
+pub fn resolve_path(path: &Path) -> Result<(MediaId, SourceLocation), PlaybackError> {
+    let path = path.to_path_buf();
     let canonical = path.canonicalize().map_err(|source| PlaybackError::Open {
         path: path.clone(),
         source,
