@@ -3,6 +3,7 @@
 
 pub mod atomic;
 pub mod model;
+pub mod queue_codec;
 pub mod store;
 pub mod writer;
 

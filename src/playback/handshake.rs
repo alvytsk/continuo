@@ -45,6 +45,16 @@ impl Handshake {
         self.generation
     }
 
+    /// The epoch the next publication will carry, without consuming it.
+    ///
+    /// Decision 18: the spectrum mapping for a `Run` must be published
+    /// *before* `start_running` or `release` makes the callback label tap
+    /// blocks with this epoch, so the analysis worker never sees a block it
+    /// cannot map yet.
+    pub fn upcoming_epoch(&self) -> u32 {
+        self.epoch.wrapping_add(1)
+    }
+
     /// Publish `Run` for an already-installed generation (used by tests and by
     /// resuming from `Park` without a flush).
     ///
@@ -447,6 +457,17 @@ mod tests {
             rig.timeline.played_frames(out.borrow().now()) >= played,
             "releasing must not void what the generation already played"
         );
+    }
+
+    #[test]
+    fn the_upcoming_epoch_is_the_one_the_next_run_publishes() {
+        let mut rig = rig(64);
+        let upcoming = rig.handshake.upcoming_epoch();
+        rig.handshake.start_running(1, &mut rig.timeline);
+        assert_eq!(rig.link.load_control().epoch, upcoming);
+        let upcoming = rig.handshake.upcoming_epoch();
+        rig.handshake.release();
+        assert_eq!(rig.link.load_control().epoch, upcoming);
     }
 
     #[test]

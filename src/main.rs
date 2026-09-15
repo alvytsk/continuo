@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::{error::Error, process::ExitCode};
 
 use clap::Parser;
@@ -28,15 +29,18 @@ fn main() -> ExitCode {
     let cli = match cli::Cli::try_parse() {
         Ok(cli) => cli,
         Err(error) => {
-            eprint!("{error}");
-            return ExitCode::FAILURE;
+            // clap sends help and version to stdout with status 0 and usage errors
+            // to stderr with status 2 (§4); printing it ourselves lost both.
+            let _ = error.print();
+            return ExitCode::from(u8::try_from(error.exit_code()).unwrap_or(2));
         }
     };
 
     match app::run(cli) {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(outcome) => ExitCode::from(outcome.exit_status()),
         Err(error) => {
-            eprintln!("continuo: {error}");
+            // A closed terminal must not turn the report into a panic.
+            let _ = writeln!(std::io::stderr(), "continuo: {error}");
             tracing::error!(error = ?error, "playback failed");
             ExitCode::FAILURE
         }

@@ -36,6 +36,21 @@ impl StateSink for StateStore {
     }
 }
 
+/// Writing is off for this session — an unsupported file, or a quarantine
+/// or queue backup that could not be performed. The session runs normally
+/// with in-memory state; only the disk write is suppressed, and the reason
+/// has already been logged once (D3). Both `play` and `tui` always have a
+/// state directory by the time persistence opens: a missing one fails at the
+/// profile lock instead (`LockError::NoStateDirectory`), before any state is
+/// read.
+pub struct DisabledSink;
+
+impl StateSink for DisabledSink {
+    fn write(&self, _state: &PersistedState) -> Result<(), PersistenceError> {
+        Ok(())
+    }
+}
+
 struct Pending {
     state: PersistedState,
     deadline: Instant,
@@ -135,6 +150,11 @@ struct Shared {
     slot: Mutex<Slot>,
     wake: Condvar,
     closing: AtomicBool,
+    /// Whether the latest write attempt failed, or no writer thread exists to
+    /// make one. Set by the writer after every attempt, so a later success
+    /// clears it; read without the slot lock, so a front end can poll it
+    /// every frame.
+    failing: AtomicBool,
 }
 
 pub struct WriterHandle {
@@ -158,6 +178,7 @@ impl WriterHandle {
             slot: Mutex::new(Slot::default()),
             wake: Condvar::new(),
             closing: AtomicBool::new(false),
+            failing: AtomicBool::new(false),
         });
         let (ack_tx, ack_rx) = bounded(1);
         let thread = {
@@ -179,6 +200,9 @@ impl WriterHandle {
                 }
             }
         };
+        if thread.is_none() {
+            shared.failing.store(true, Ordering::Release);
+        }
         Self {
             shared,
             ack: ack_rx,
@@ -198,6 +222,14 @@ impl WriterHandle {
         let now = self.clock.sample().monotonic;
         lock(&self.shared.slot).submit(state, urgency, now, submit_seq);
         self.shared.wake.notify_all();
+    }
+
+    /// Whether the latest write attempt failed (or the writer never
+    /// started), so a front end must not claim state is being saved. A
+    /// deliberately disabled sink reports success and is never failing: the
+    /// caller already knows that session is not persisting.
+    pub fn is_failing(&self) -> bool {
+        self.shared.failing.load(Ordering::Acquire)
     }
 
     /// Bounded by design (D10): an unconditional join after the timeout would
@@ -293,6 +325,7 @@ fn run(
         match sink.write(&pending.state) {
             Ok(()) => {
                 consecutive_failures = 0;
+                shared.failing.store(false, Ordering::Release);
                 lock(&shared.slot).mark_written(pending.submit_seq);
                 if closing {
                     let _ = ack.send(Ok(()));
@@ -301,6 +334,7 @@ fn run(
             }
             Err(error) => {
                 consecutive_failures = consecutive_failures.saturating_add(1);
+                shared.failing.store(true, Ordering::Release);
                 if should_warn(consecutive_failures) {
                     tracing::warn!(
                         %error,
@@ -408,6 +442,64 @@ mod tests {
         slot.reinsert_failed(failed, at(base, 10));
 
         assert_eq!(slot.next_deadline(), Some(at(base, 10) + COALESCE_WINDOW));
+    }
+
+    /// Fails while its switch is on, and counts every attempt.
+    struct SwitchSink {
+        fail: Arc<AtomicBool>,
+        attempts: Arc<AtomicU64>,
+    }
+
+    impl StateSink for SwitchSink {
+        fn write(&self, _: &PersistedState) -> Result<(), PersistenceError> {
+            self.attempts.fetch_add(1, Ordering::SeqCst);
+            if self.fail.load(Ordering::SeqCst) {
+                Err(PersistenceError::NoStateDirectory)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    fn wait_for(what: &str, done: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !done() {
+            assert!(Instant::now() < deadline, "never: {what}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn the_health_signal_follows_the_latest_write_attempt() {
+        let fail = Arc::new(AtomicBool::new(true));
+        let attempts = Arc::new(AtomicU64::new(0));
+        let sink = SwitchSink {
+            fail: Arc::clone(&fail),
+            attempts: Arc::clone(&attempts),
+        };
+        let mut writer = WriterHandle::spawn(Box::new(sink), Arc::new(crate::clock::SystemClock));
+        assert!(!writer.is_failing(), "nothing has been attempted yet");
+
+        writer.submit(PersistedState::default(), Urgency::Forced);
+        wait_for("a failed write reported", || writer.is_failing());
+
+        fail.store(false, Ordering::SeqCst);
+        let before = attempts.load(Ordering::SeqCst);
+        writer.submit(PersistedState::default(), Urgency::Forced);
+        wait_for("a later success clears it", || {
+            attempts.load(Ordering::SeqCst) > before && !writer.is_failing()
+        });
+        assert!(matches!(writer.shutdown(), ShutdownOutcome::Written));
+    }
+
+    #[test]
+    fn a_disabled_sink_is_never_reported_as_failing() {
+        let mut writer =
+            WriterHandle::spawn(Box::new(DisabledSink), Arc::new(crate::clock::SystemClock));
+        writer.submit(PersistedState::default(), Urgency::Forced);
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!writer.is_failing());
+        assert!(matches!(writer.shutdown(), ShutdownOutcome::Written));
     }
 
     #[test]

@@ -14,14 +14,25 @@ use continuo::playback::state::PlaybackState;
 use continuo::playback::timeline::PositionQuality;
 use continuo::playback::volume::Volume;
 use continuo::resume::resume_candidate;
-use continuo::session::{Action, CAPTURE_INTERVAL, ResumeDecision, Session, decide_resume};
+use continuo::session::{
+    Action, CAPTURE_INTERVAL, LoadTarget, ResumeDecision, Session, decide_resume,
+};
 
 mod support;
 use support::media;
 
-fn loaded(session_rev: u64, name: &str, position: Duration) -> PlaybackEvent {
+fn loaded(
+    session: &mut Session,
+    session_rev: u64,
+    name: &str,
+    position: Duration,
+) -> PlaybackEvent {
+    let request = session
+        .register_load(LoadTarget::Legacy, &media(name))
+        .unwrap_or_else(|error| panic!("room for a load: {error:?}"));
     PlaybackEvent::Loaded {
         session_rev,
+        request,
         media: media(name),
         metadata: MediaMetadata::default(),
         capabilities: MediaCapabilities {
@@ -37,15 +48,23 @@ fn loaded(session_rev: u64, name: &str, position: Duration) -> PlaybackEvent {
 }
 
 fn state_changed(session_rev: u64, state: PlaybackState) -> PlaybackEvent {
-    PlaybackEvent::StateChanged { session_rev, state }
+    PlaybackEvent::StateChanged {
+        session_rev,
+        state,
+        request: None,
+    }
 }
 
 /// A `Loaded` for `media`, fixed at the revision every protection test in this
 /// file drives (1): the source could not honour the stored checkpoint, so
 /// playback falls back to zero and `retained` is what protection must recover.
-fn loaded_unavailable(media: &MediaId, retained: Duration) -> PlaybackEvent {
+fn loaded_unavailable(session: &mut Session, media: &MediaId, retained: Duration) -> PlaybackEvent {
+    let request = session
+        .register_load(LoadTarget::Legacy, media)
+        .unwrap_or_else(|error| panic!("room for a load: {error:?}"));
     PlaybackEvent::Loaded {
         session_rev: 1,
+        request,
         media: media.clone(),
         metadata: MediaMetadata::default(),
         capabilities: MediaCapabilities {
@@ -59,9 +78,13 @@ fn loaded_unavailable(media: &MediaId, retained: Duration) -> PlaybackEvent {
 
 /// A `Loaded` for `media` with nothing to protect — the counterpart to
 /// `loaded_unavailable`, at the same fixed revision.
-fn loaded_fresh(media: &MediaId) -> PlaybackEvent {
+fn loaded_fresh(session: &mut Session, media: &MediaId) -> PlaybackEvent {
+    let request = session
+        .register_load(LoadTarget::Legacy, media)
+        .unwrap_or_else(|error| panic!("room for a load: {error:?}"));
     PlaybackEvent::Loaded {
         session_rev: 1,
+        request,
         media: media.clone(),
         metadata: MediaMetadata::default(),
         capabilities: MediaCapabilities {
@@ -73,7 +96,8 @@ fn loaded_fresh(media: &MediaId) -> PlaybackEvent {
     }
 }
 
-fn progress(session_rev: u64, name: &str, secs: u64) -> Progress {
+/// Progress for whatever `session` currently has adopted.
+fn progress(session: &Session, session_rev: u64, name: &str, secs: u64) -> Progress {
     Progress {
         session_rev,
         media: Some(media(name)),
@@ -81,6 +105,7 @@ fn progress(session_rev: u64, name: &str, secs: u64) -> Progress {
         quality: PositionQuality::Exact,
         provenance: PositionProvenance::Established,
         buffering: false,
+        load: session.adopted().map(|adopted| adopted.request),
     }
 }
 
@@ -158,7 +183,8 @@ fn completed_in(session: &Session, media: &MediaId) -> bool {
 fn playing(name: &str) -> (Session, FakeClock) {
     let clock = FakeClock::new();
     let mut session = Session::new(PersistedState::default());
-    let _ = session.observe(&loaded(1, name, Duration::ZERO), clock.sample());
+    let event = loaded(&mut session, 1, name, Duration::ZERO);
+    let _ = session.observe(&event, clock.sample());
     let _ = session.observe(&state_changed(1, PlaybackState::Paused), clock.sample());
     let _ = session.observe(&state_changed(1, PlaybackState::Playing), clock.sample());
     (session, clock)
@@ -170,12 +196,12 @@ fn five_seconds_of_playback_becomes_an_ordinary_submission() {
 
     clock.advance(Duration::from_millis(4_900));
     assert!(
-        is_none(&session.tick(&progress(1, "a", 4), clock.sample())),
+        is_none(&session.tick(&progress(&session, 1, "a", 4), clock.sample())),
         "4.9 s is not yet due"
     );
 
     clock.advance(Duration::from_millis(100));
-    let (state, urgency) = submitted(session.tick(&progress(1, "a", 5), clock.sample()));
+    let (state, urgency) = submitted(session.tick(&progress(&session, 1, "a", 5), clock.sample()));
     assert_eq!(urgency, Urgency::Ordinary);
     assert_eq!(
         state.entry_for(&media("a")).unwrap().position.unwrap(),
@@ -188,12 +214,14 @@ fn five_seconds_of_playback_becomes_an_ordinary_submission() {
 fn the_interval_restarts_after_each_capture() {
     let (mut session, clock) = playing("a");
     clock.advance(Duration::from_secs(5));
-    let _ = submitted(session.tick(&progress(1, "a", 5), clock.sample()));
+    let _ = submitted(session.tick(&progress(&session, 1, "a", 5), clock.sample()));
 
     clock.advance(Duration::from_secs(4));
-    assert!(is_none(&session.tick(&progress(1, "a", 9), clock.sample())));
+    assert!(is_none(
+        &session.tick(&progress(&session, 1, "a", 9), clock.sample())
+    ));
     clock.advance(Duration::from_secs(1));
-    let _ = submitted(session.tick(&progress(1, "a", 10), clock.sample()));
+    let _ = submitted(session.tick(&progress(&session, 1, "a", 10), clock.sample()));
 }
 
 #[test]
@@ -203,7 +231,7 @@ fn a_wall_clock_that_jumps_backwards_does_not_disturb_the_interval() {
     // An hour backwards on the wall, mid-interval.
     clock.set_wall(time::OffsetDateTime::UNIX_EPOCH - Duration::from_secs(3600));
 
-    let (state, _) = submitted(session.tick(&progress(1, "a", 5), clock.sample()));
+    let (state, _) = submitted(session.tick(&progress(&session, 1, "a", 5), clock.sample()));
     assert_eq!(
         state.entry_for(&media("a")).unwrap().position.unwrap(),
         Duration::from_secs(5),
@@ -218,10 +246,12 @@ fn no_ordinary_capture_happens_while_paused() {
     // Whatever the pause itself is worth, it is worth it once: this first tick
     // resolves the pause's forced checkpoint, and the claim here is only that
     // nothing keeps firing behind it.
-    let _ = session.tick(&progress(1, "a", 5), clock.sample());
+    let _ = session.tick(&progress(&session, 1, "a", 5), clock.sample());
 
     clock.advance(Duration::from_secs(30));
-    assert!(is_none(&session.tick(&progress(1, "a", 5), clock.sample())));
+    assert!(is_none(
+        &session.tick(&progress(&session, 1, "a", 5), clock.sample())
+    ));
 }
 
 #[test]
@@ -229,7 +259,7 @@ fn a_sample_from_a_session_the_policy_is_not_tracking_is_ignored() {
     let (mut session, clock) = playing("a");
     clock.advance(Duration::from_secs(10));
     assert!(
-        is_none(&session.tick(&progress(7, "a", 10), clock.sample())),
+        is_none(&session.tick(&progress(&session, 7, "a", 10), clock.sample())),
         "a stale revision must not move a checkpoint"
     );
 }
@@ -247,7 +277,7 @@ fn a_revision_is_adopted_from_an_event_the_policy_otherwise_ignores() {
         clock.sample(),
     );
     clock.advance(Duration::from_secs(5));
-    let (state, _) = submitted(session.tick(&progress(9, "a", 5), clock.sample()));
+    let (state, _) = submitted(session.tick(&progress(&session, 9, "a", 5), clock.sample()));
     assert_eq!(
         state.entry_for(&media("a")).unwrap().position.unwrap(),
         Duration::from_secs(5)
@@ -258,7 +288,7 @@ fn a_revision_is_adopted_from_an_event_the_policy_otherwise_ignores() {
 fn a_volume_change_submits_at_ordinary_urgency_and_touches_no_checkpoint() {
     let (mut session, clock) = playing("a");
     clock.advance(Duration::from_secs(2));
-    let _ = session.tick(&progress(1, "a", 2), clock.sample());
+    let _ = session.tick(&progress(&session, 1, "a", 2), clock.sample());
 
     let (state, urgency) = submitted(session.observe(
         &PlaybackEvent::VolumeChanged {
@@ -299,10 +329,10 @@ fn end_of_track_records_the_events_own_position_and_marks_completion() {
 fn a_media_switch_produces_one_snapshot_carrying_both_halves() {
     let (mut session, clock) = playing("a");
     clock.advance(Duration::from_secs(5));
-    let _ = submitted(session.tick(&progress(1, "a", 93), clock.sample()));
+    let _ = submitted(session.tick(&progress(&session, 1, "a", 93), clock.sample()));
 
-    let (state, urgency) =
-        submitted(session.observe(&loaded(2, "b", Duration::ZERO), clock.sample()));
+    let event = loaded(&mut session, 2, "b", Duration::ZERO);
+    let (state, urgency) = submitted(session.observe(&event, clock.sample()));
     assert_eq!(urgency, Urgency::Forced);
     assert_eq!(
         state.entry_for(&media("a")).unwrap().position.unwrap(),
@@ -319,10 +349,8 @@ fn a_media_switch_produces_one_snapshot_carrying_both_halves() {
 #[test]
 fn reloading_the_same_media_submits_nothing() {
     let (mut session, clock) = playing("a");
-    assert!(is_none(&session.observe(
-        &loaded(2, "a", Duration::from_secs(30)),
-        clock.sample()
-    )));
+    let event = loaded(&mut session, 2, "a", Duration::from_secs(30));
+    assert!(is_none(&session.observe(&event, clock.sample())));
 }
 
 #[test]
@@ -339,12 +367,13 @@ fn playing_clears_a_completed_flag_carried_in_from_the_file() {
 
     let clock = FakeClock::new();
     let mut session = Session::new(opening);
-    let _ = session.observe(&loaded(1, "a", Duration::ZERO), clock.sample());
+    let event = loaded(&mut session, 1, "a", Duration::ZERO);
+    let _ = session.observe(&event, clock.sample());
     let _ = session.observe(&state_changed(1, PlaybackState::Paused), clock.sample());
     let _ = session.observe(&state_changed(1, PlaybackState::Playing), clock.sample());
 
     clock.advance(Duration::from_secs(5));
-    let (state, _) = submitted(session.tick(&progress(1, "a", 5), clock.sample()));
+    let (state, _) = submitted(session.tick(&progress(&session, 1, "a", 5), clock.sample()));
     assert!(
         !state.completed_for(&media("a")),
         "§12: a successful establishment after a completed state clears it"
@@ -364,7 +393,7 @@ fn a_pause_from_playing_is_resolved_by_the_same_iterations_tick() {
         clock.sample()
     )));
     // ...then samples once, and that sample is newer than the transition.
-    let (state, urgency) = submitted(session.tick(&progress(1, "a", 2), clock.sample()));
+    let (state, urgency) = submitted(session.tick(&progress(&session, 1, "a", 2), clock.sample()));
 
     assert_eq!(urgency, Urgency::Forced);
     assert_eq!(
@@ -380,13 +409,16 @@ fn a_pause_that_interrupts_no_playback_raises_nothing() {
     // landing on every launch — and zero it for a completed entry.
     let clock = FakeClock::new();
     let mut session = Session::new(PersistedState::default());
-    let _ = session.observe(&loaded(1, "a", Duration::ZERO), clock.sample());
+    let event = loaded(&mut session, 1, "a", Duration::ZERO);
+    let _ = session.observe(&event, clock.sample());
 
     assert!(is_none(&session.observe(
         &state_changed(1, PlaybackState::Paused),
         clock.sample()
     )));
-    assert!(is_none(&session.tick(&progress(1, "a", 0), clock.sample())));
+    assert!(is_none(
+        &session.tick(&progress(&session, 1, "a", 0), clock.sample())
+    ));
 }
 
 #[test]
@@ -396,14 +428,14 @@ fn a_pause_after_a_stop_raises_nothing_either() {
     // engine settles into afterwards must not force a second checkpoint.
     let (mut session, clock) = playing("a");
     let _ = session.observe(&state_changed(2, PlaybackState::Stopped), clock.sample());
-    let _ = submitted(session.tick(&progress(2, "a", 93), clock.sample()));
+    let _ = submitted(session.tick(&progress(&session, 2, "a", 93), clock.sample()));
 
     assert!(is_none(&session.observe(
         &state_changed(2, PlaybackState::Paused),
         clock.sample()
     )));
     assert!(is_none(
-        &session.tick(&progress(2, "a", 93), clock.sample())
+        &session.tick(&progress(&session, 2, "a", 93), clock.sample())
     ));
 }
 
@@ -416,7 +448,7 @@ fn a_stop_raises_a_force_that_the_tick_resolves() {
         clock.sample()
     )));
 
-    let (state, urgency) = submitted(session.tick(&progress(2, "a", 93), clock.sample()));
+    let (state, urgency) = submitted(session.tick(&progress(&session, 2, "a", 93), clock.sample()));
     assert_eq!(urgency, Urgency::Forced);
     assert_eq!(
         state.entry_for(&media("a")).unwrap().position.unwrap(),
@@ -437,7 +469,7 @@ fn a_seek_persists_the_canonical_position_never_the_events_actual() {
     };
     assert!(is_none(&session.observe(&seek, clock.sample())));
 
-    let (state, urgency) = submitted(session.tick(&progress(1, "a", 60), clock.sample()));
+    let (state, urgency) = submitted(session.tick(&progress(&session, 1, "a", 60), clock.sample()));
     assert_eq!(urgency, Urgency::Forced);
     assert_eq!(
         state.entry_for(&media("a")).unwrap().position.unwrap(),
@@ -456,7 +488,7 @@ fn a_force_is_rekeyed_across_a_device_recovery_and_still_resolves() {
         clock.sample(),
     );
 
-    let (state, urgency) = submitted(session.tick(&progress(2, "a", 40), clock.sample()));
+    let (state, urgency) = submitted(session.tick(&progress(&session, 2, "a", 40), clock.sample()));
     assert_eq!(
         urgency,
         Urgency::Forced,
@@ -472,18 +504,19 @@ fn a_force_is_rekeyed_across_a_device_recovery_and_still_resolves() {
 fn a_load_retires_a_force_raised_against_the_previous_media() {
     let (mut session, clock) = playing("a");
     clock.advance(Duration::from_secs(5));
-    let _ = submitted(session.tick(&progress(1, "a", 93), clock.sample()));
+    let _ = submitted(session.tick(&progress(&session, 1, "a", 93), clock.sample()));
     let _ = session.observe(&state_changed(1, PlaybackState::Paused), clock.sample());
 
     // The load replaces the media; its own handling already recorded `a`.
-    let (state, _) = submitted(session.observe(&loaded(2, "b", Duration::ZERO), clock.sample()));
+    let event = loaded(&mut session, 2, "b", Duration::ZERO);
+    let (state, _) = submitted(session.observe(&event, clock.sample()));
     assert_eq!(
         state.entry_for(&media("a")).unwrap().position.unwrap(),
         Duration::from_secs(93)
     );
 
     assert!(
-        is_none(&session.tick(&progress(2, "b", 1), clock.sample())),
+        is_none(&session.tick(&progress(&session, 2, "b", 1), clock.sample())),
         "the retired force must not fire against the new media"
     );
 }
@@ -495,9 +528,9 @@ fn a_load_retires_a_force_raised_against_the_previous_media() {
 fn a_stopped_seek_target_survives_the_shutdown_force() {
     let (mut session, clock) = playing("a");
     clock.advance(Duration::from_secs(5));
-    let _ = submitted(session.tick(&progress(1, "a", 93), clock.sample()));
+    let _ = submitted(session.tick(&progress(&session, 1, "a", 93), clock.sample()));
     let _ = session.observe(&state_changed(2, PlaybackState::Stopped), clock.sample());
-    let _ = session.tick(&progress(2, "a", 93), clock.sample());
+    let _ = session.tick(&progress(&session, 2, "a", 93), clock.sample());
 
     let (state, urgency) = submitted(session.observe(
         &PlaybackEvent::SeekTargetStored {
@@ -514,7 +547,7 @@ fn a_stopped_seek_target_survives_the_shutdown_force() {
 
     // The engine's canonical position still reads the pre-seek value, because a
     // stopped seek deliberately does not move it.
-    let final_state = session.shutdown_snapshot(&progress(2, "a", 93), clock.sample());
+    let final_state = session.shutdown_snapshot(&progress(&session, 2, "a", 93), clock.sample());
     assert_eq!(
         final_state
             .entry_for(&media("a"))
@@ -532,7 +565,7 @@ fn a_stopped_seek_target_survives_the_shutdown_force() {
 fn a_force_that_resolves_under_an_outstanding_target_records_the_target() {
     let (mut session, clock) = playing("a");
     clock.advance(Duration::from_secs(5));
-    let _ = submitted(session.tick(&progress(1, "a", 93), clock.sample()));
+    let _ = submitted(session.tick(&progress(&session, 1, "a", 93), clock.sample()));
     let _ = session.observe(&state_changed(2, PlaybackState::Stopped), clock.sample());
     let _ = session.observe(
         &PlaybackEvent::SeekTargetStored {
@@ -544,7 +577,7 @@ fn a_force_that_resolves_under_an_outstanding_target_records_the_target() {
 
     // The stop raised its force before the seek stored anything, and the seek
     // re-keyed rather than retired it.
-    let (state, urgency) = submitted(session.tick(&progress(2, "a", 93), clock.sample()));
+    let (state, urgency) = submitted(session.tick(&progress(&session, 2, "a", 93), clock.sample()));
     assert_eq!(urgency, Urgency::Forced);
     assert_eq!(
         state.entry_for(&media("a")).unwrap().position.unwrap(),
@@ -559,9 +592,9 @@ fn a_force_that_resolves_under_an_outstanding_target_records_the_target() {
 fn a_restart_clears_the_target_it_discarded() {
     let (mut session, clock) = playing("a");
     clock.advance(Duration::from_secs(5));
-    let _ = submitted(session.tick(&progress(1, "a", 93), clock.sample()));
+    let _ = submitted(session.tick(&progress(&session, 1, "a", 93), clock.sample()));
     let _ = session.observe(&state_changed(2, PlaybackState::Stopped), clock.sample());
-    let _ = session.tick(&progress(2, "a", 93), clock.sample());
+    let _ = session.tick(&progress(&session, 2, "a", 93), clock.sample());
     let _ = session.observe(
         &PlaybackEvent::SeekTargetStored {
             session_rev: 2,
@@ -574,14 +607,14 @@ fn a_restart_clears_the_target_it_discarded() {
     // Playing. No SeekCompleted is emitted for it, ever.
     let _ = session.observe(&state_changed(2, PlaybackState::Playing), clock.sample());
     clock.advance(Duration::from_secs(5));
-    let (state, _) = submitted(session.tick(&progress(2, "a", 5), clock.sample()));
+    let (state, _) = submitted(session.tick(&progress(&session, 2, "a", 5), clock.sample()));
     assert_eq!(
         state.entry_for(&media("a")).unwrap().position.unwrap(),
         Duration::from_secs(5),
         "an ordinary checkpoint after a restart uses the sample, not the discarded target"
     );
 
-    let final_state = session.shutdown_snapshot(&progress(2, "a", 7), clock.sample());
+    let final_state = session.shutdown_snapshot(&progress(&session, 2, "a", 7), clock.sample());
     assert_eq!(
         final_state
             .entry_for(&media("a"))
@@ -615,7 +648,7 @@ fn a_resumed_stopped_seek_clears_the_target_through_its_seek_completed() {
         },
         clock.sample(),
     );
-    let (state, _) = submitted(session.tick(&progress(2, "a", 31), clock.sample()));
+    let (state, _) = submitted(session.tick(&progress(&session, 2, "a", 31), clock.sample()));
     assert_eq!(
         state.entry_for(&media("a")).unwrap().position.unwrap(),
         Duration::from_secs(31)
@@ -639,7 +672,8 @@ fn a_stopped_seek_clears_the_completion_its_target_supersedes() {
 
     let clock = FakeClock::new();
     let mut session = Session::new(opening);
-    let _ = session.observe(&loaded(1, "a", Duration::ZERO), clock.sample());
+    let event = loaded(&mut session, 1, "a", Duration::ZERO);
+    let _ = session.observe(&event, clock.sample());
     let (state, urgency) = submitted(session.observe(
         &PlaybackEvent::SeekTargetStored {
             session_rev: 1,
@@ -656,7 +690,7 @@ fn a_stopped_seek_clears_the_completion_its_target_supersedes() {
         "the listener asked for 30 s; a retained completion would throw the target away"
     );
 
-    let final_state = session.shutdown_snapshot(&progress(1, "a", 0), clock.sample());
+    let final_state = session.shutdown_snapshot(&progress(&session, 1, "a", 0), clock.sample());
     let entry = final_state.entry_for(&media("a")).unwrap();
     assert_eq!(entry.position.unwrap(), Duration::from_secs(30));
     assert!(!entry.completed);
@@ -691,18 +725,20 @@ fn a_launch_that_never_establishes_writes_no_checkpoint() {
 
     let clock = FakeClock::new();
     let mut session = Session::new(opening);
-    let _ = session.observe(&loaded(1, "a", Duration::ZERO), clock.sample());
+    let event = loaded(&mut session, 1, "a", Duration::ZERO);
+    let _ = session.observe(&event, clock.sample());
     let _ = session.observe(
         &PlaybackEvent::Failed {
             session_rev: 1,
             message: "cannot open the audio device".into(),
             cause: None,
+            request: None,
         },
         clock.sample(),
     );
-    let _ = session.tick(&progress(1, "a", 0), clock.sample());
+    let _ = session.tick(&progress(&session, 1, "a", 0), clock.sample());
 
-    let final_state = session.shutdown_snapshot(&progress(1, "a", 0), clock.sample());
+    let final_state = session.shutdown_snapshot(&progress(&session, 1, "a", 0), clock.sample());
     assert_eq!(
         final_state
             .entry_for(&media("a"))
@@ -734,18 +770,21 @@ fn a_switch_away_from_a_media_that_never_established_records_nothing_for_it() {
 
     let clock = FakeClock::new();
     let mut session = Session::new(opening);
-    let _ = session.observe(&loaded(1, "a", Duration::ZERO), clock.sample());
+    let event = loaded(&mut session, 1, "a", Duration::ZERO);
+    let _ = session.observe(&event, clock.sample());
     let _ = session.observe(
         &PlaybackEvent::Failed {
             session_rev: 1,
             message: "cannot open the audio device".into(),
             cause: None,
+            request: None,
         },
         clock.sample(),
     );
 
     // The listener gives up on `a` and picks another track.
-    let (state, _) = submitted(session.observe(&loaded(2, "b", Duration::ZERO), clock.sample()));
+    let event = loaded(&mut session, 2, "b", Duration::ZERO);
+    let (state, _) = submitted(session.observe(&event, clock.sample()));
     let entry = state.entry_for(&media("a")).unwrap();
     assert_eq!(
         entry.position.unwrap(),
@@ -775,19 +814,21 @@ fn a_switch_onto_a_completed_entry_does_not_capture_its_unvalidated_zero() {
 
     let clock = FakeClock::new();
     let mut session = Session::new(opening);
-    let _ = session.observe(&loaded(1, "a", Duration::ZERO), clock.sample());
+    let event = loaded(&mut session, 1, "a", Duration::ZERO);
+    let _ = session.observe(&event, clock.sample());
     let _ = session.observe(&state_changed(1, PlaybackState::Playing), clock.sample());
     clock.advance(Duration::from_secs(5));
-    let _ = submitted(session.tick(&progress(1, "a", 93), clock.sample()));
+    let _ = submitted(session.tick(&progress(&session, 1, "a", 93), clock.sample()));
 
     // The switch, with no StateChanged in front of it.
-    let _ = submitted(session.observe(&loaded(2, "b", Duration::ZERO), clock.sample()));
+    let event = loaded(&mut session, 2, "b", Duration::ZERO);
+    let _ = submitted(session.observe(&event, clock.sample()));
     assert!(
-        is_none(&session.tick(&progress(2, "b", 0), clock.sample())),
+        is_none(&session.tick(&progress(&session, 2, "b", 0), clock.sample())),
         "nothing has established `b`, so the sample the engine reports for it is not a checkpoint"
     );
 
-    let final_state = session.shutdown_snapshot(&progress(2, "b", 0), clock.sample());
+    let final_state = session.shutdown_snapshot(&progress(&session, 2, "b", 0), clock.sample());
     let entry = final_state.entry_for(&media("b")).unwrap();
     assert_eq!(
         entry.position.unwrap(),
@@ -815,18 +856,19 @@ fn a_stop_before_anything_establishes_writes_no_checkpoint() {
 
     let clock = FakeClock::new();
     let mut session = Session::new(opening);
-    let _ = session.observe(&loaded(1, "a", Duration::ZERO), clock.sample());
+    let event = loaded(&mut session, 1, "a", Duration::ZERO);
+    let _ = session.observe(&event, clock.sample());
     // The launch pause nobody asked for, then a stop before the queued Play is
     // dispatched.
     let _ = session.observe(&state_changed(1, PlaybackState::Paused), clock.sample());
     let _ = session.observe(&state_changed(1, PlaybackState::Stopped), clock.sample());
 
     assert!(
-        is_none(&session.tick(&progress(1, "a", 0), clock.sample())),
+        is_none(&session.tick(&progress(&session, 1, "a", 0), clock.sample())),
         "the force is answered by recording nothing, not by writing a position nothing validated"
     );
 
-    let final_state = session.shutdown_snapshot(&progress(1, "a", 0), clock.sample());
+    let final_state = session.shutdown_snapshot(&progress(&session, 1, "a", 0), clock.sample());
     let entry = final_state.entry_for(&media("a")).unwrap();
     assert_eq!(entry.position.unwrap(), Duration::from_secs(240));
     assert!(entry.completed);
@@ -836,7 +878,8 @@ fn a_stop_before_anything_establishes_writes_no_checkpoint() {
 fn a_launch_that_never_establishes_still_writes_volume_and_current_media() {
     let clock = FakeClock::new();
     let mut session = Session::new(PersistedState::default());
-    let _ = session.observe(&loaded(1, "a", Duration::ZERO), clock.sample());
+    let event = loaded(&mut session, 1, "a", Duration::ZERO);
+    let _ = session.observe(&event, clock.sample());
     let _ = session.observe(
         &PlaybackEvent::VolumeChanged {
             session_rev: 1,
@@ -845,7 +888,7 @@ fn a_launch_that_never_establishes_still_writes_volume_and_current_media() {
         clock.sample(),
     );
 
-    let final_state = session.shutdown_snapshot(&progress(1, "a", 0), clock.sample());
+    let final_state = session.shutdown_snapshot(&progress(&session, 1, "a", 0), clock.sample());
     assert_eq!(final_state.volume(), Volume::new(0.25));
     assert_eq!(final_state.current_media(), Some(&media("a")));
     assert!(
@@ -858,11 +901,12 @@ fn a_launch_that_never_establishes_still_writes_volume_and_current_media() {
 fn a_second_load_cannot_inherit_the_first_ones_establishment() {
     let (mut session, clock) = playing("a");
     clock.advance(Duration::from_secs(5));
-    let _ = submitted(session.tick(&progress(1, "a", 93), clock.sample()));
+    let _ = submitted(session.tick(&progress(&session, 1, "a", 93), clock.sample()));
 
     // A new media that fails to open after Loaded.
-    let _ = session.observe(&loaded(2, "b", Duration::ZERO), clock.sample());
-    let final_state = session.shutdown_snapshot(&progress(2, "b", 0), clock.sample());
+    let event = loaded(&mut session, 2, "b", Duration::ZERO);
+    let _ = session.observe(&event, clock.sample());
+    let final_state = session.shutdown_snapshot(&progress(&session, 2, "b", 0), clock.sample());
     assert!(final_state.entry_for(&media("b")).is_none());
     assert_eq!(
         final_state
@@ -886,7 +930,7 @@ fn a_device_recovery_does_not_re_gate_an_established_session() {
         clock.sample(),
     );
 
-    let final_state = session.shutdown_snapshot(&progress(2, "a", 40), clock.sample());
+    let final_state = session.shutdown_snapshot(&progress(&session, 2, "a", 40), clock.sample());
     assert_eq!(
         final_state
             .entry_for(&media("a"))
@@ -902,9 +946,9 @@ fn a_device_recovery_does_not_re_gate_an_established_session() {
 fn a_media_switch_carries_the_outgoing_stopped_seek_target_out_with_it() {
     let (mut session, clock) = playing("a");
     clock.advance(Duration::from_secs(5));
-    let _ = submitted(session.tick(&progress(1, "a", 93), clock.sample()));
+    let _ = submitted(session.tick(&progress(&session, 1, "a", 93), clock.sample()));
     let _ = session.observe(&state_changed(2, PlaybackState::Stopped), clock.sample());
-    let _ = session.tick(&progress(2, "a", 93), clock.sample());
+    let _ = session.tick(&progress(&session, 2, "a", 93), clock.sample());
     let _ = session.observe(
         &PlaybackEvent::SeekTargetStored {
             session_rev: 2,
@@ -913,7 +957,8 @@ fn a_media_switch_carries_the_outgoing_stopped_seek_target_out_with_it() {
         clock.sample(),
     );
 
-    let (state, _) = submitted(session.observe(&loaded(3, "b", Duration::ZERO), clock.sample()));
+    let event = loaded(&mut session, 3, "b", Duration::ZERO);
+    let (state, _) = submitted(session.observe(&event, clock.sample()));
     assert_eq!(
         state.entry_for(&media("a")).unwrap().position.unwrap(),
         Duration::from_secs(30),
@@ -934,9 +979,10 @@ fn a_media_switch_does_not_walk_a_completed_entry_backwards() {
     ));
     // A tick after the end can only report a position at or behind the one
     // EndOfTrack already recorded.
-    let _ = session.tick(&progress(1, "a", 239), clock.sample());
+    let _ = session.tick(&progress(&session, 1, "a", 239), clock.sample());
 
-    let (state, _) = submitted(session.observe(&loaded(2, "b", Duration::ZERO), clock.sample()));
+    let event = loaded(&mut session, 2, "b", Duration::ZERO);
+    let (state, _) = submitted(session.observe(&event, clock.sample()));
     let entry = state.entry_for(&media("a")).unwrap();
     assert_eq!(
         entry.position.unwrap(),
@@ -950,10 +996,10 @@ fn a_media_switch_does_not_walk_a_completed_entry_backwards() {
 fn the_shutdown_snapshot_refuses_a_position_from_a_session_it_was_not_tracking() {
     let (mut session, clock) = playing("a");
     clock.advance(Duration::from_secs(5));
-    let _ = submitted(session.tick(&progress(1, "a", 93), clock.sample()));
+    let _ = submitted(session.tick(&progress(&session, 1, "a", 93), clock.sample()));
 
     // A final Progress carrying a revision the policy never learned.
-    let final_state = session.shutdown_snapshot(&progress(99, "a", 5), clock.sample());
+    let final_state = session.shutdown_snapshot(&progress(&session, 99, "a", 5), clock.sample());
     assert_eq!(
         final_state
             .entry_for(&media("a"))
@@ -983,28 +1029,30 @@ fn a_protected_entry_survives_every_capture_path() {
     let retained = Duration::from_secs(2400);
     let mut session = Session::new(state_with(&media("ep1"), retained, false));
 
-    let _ = session.observe(&loaded_unavailable(&media("ep1"), retained), clock.sample());
+    let event = loaded_unavailable(&mut session, &media("ep1"), retained);
+    let _ = session.observe(&event, clock.sample());
     let _ = session.observe(&state_changed(1, PlaybackState::Playing), clock.sample());
 
     // Periodic.
     clock.advance_monotonic(CAPTURE_INTERVAL + Duration::from_secs(1));
-    let _ = session.tick(&progress(1, "ep1", 120), clock.sample());
+    let _ = session.tick(&progress(&session, 1, "ep1", 120), clock.sample());
     assert_eq!(stored_position(&session, &media("ep1")), retained);
 
     // Pause, then stop.
     let _ = session.observe(&state_changed(1, PlaybackState::Paused), clock.sample());
-    let _ = session.tick(&progress(1, "ep1", 130), clock.sample());
+    let _ = session.tick(&progress(&session, 1, "ep1", 130), clock.sample());
     let _ = session.observe(&state_changed(1, PlaybackState::Stopped), clock.sample());
-    let _ = session.tick(&progress(1, "ep1", 130), clock.sample());
+    let _ = session.tick(&progress(&session, 1, "ep1", 130), clock.sample());
     assert_eq!(stored_position(&session, &media("ep1")), retained);
 
     // The shutdown snapshot, taken while `ep1` is still current, still
     // protected and still established.
-    let state = session.shutdown_snapshot(&progress(1, "ep1", 130), clock.sample());
+    let state = session.shutdown_snapshot(&progress(&session, 1, "ep1", 130), clock.sample());
     assert_eq!(position_in(&state, &media("ep1")), retained);
 
     // A media switch carries the outgoing entry out — but not over this one.
-    let _ = session.observe(&loaded_fresh(&media("ep2")), clock.sample());
+    let event = loaded_fresh(&mut session, &media("ep2"));
+    let _ = session.observe(&event, clock.sample());
     assert_eq!(stored_position(&session, &media("ep1")), retained);
 }
 
@@ -1015,7 +1063,8 @@ fn an_established_restart_lifts_the_protection() {
     let clock = FakeClock::new();
     let retained = Duration::from_secs(2400);
     let mut session = Session::new(state_with(&media("ep1"), retained, false));
-    let _ = session.observe(&loaded_unavailable(&media("ep1"), retained), clock.sample());
+    let event = loaded_unavailable(&mut session, &media("ep1"), retained);
+    let _ = session.observe(&event, clock.sample());
 
     let _ = session.observe(
         &PlaybackEvent::RestartEstablished {
@@ -1027,7 +1076,7 @@ fn an_established_restart_lifts_the_protection() {
     );
     let _ = session.observe(&state_changed(1, PlaybackState::Playing), clock.sample());
     clock.advance_monotonic(CAPTURE_INTERVAL + Duration::from_secs(1));
-    let _ = session.tick(&progress(1, "ep1", 30), clock.sample());
+    let _ = session.tick(&progress(&session, 1, "ep1", 30), clock.sample());
 
     assert_eq!(
         stored_position(&session, &media("ep1")),
@@ -1040,7 +1089,8 @@ fn an_established_seek_lifts_the_protection() {
     let clock = FakeClock::new();
     let retained = Duration::from_secs(2400);
     let mut session = Session::new(state_with(&media("ep1"), retained, false));
-    let _ = session.observe(&loaded_unavailable(&media("ep1"), retained), clock.sample());
+    let event = loaded_unavailable(&mut session, &media("ep1"), retained);
+    let _ = session.observe(&event, clock.sample());
 
     let _ = session.observe(
         &PlaybackEvent::SeekCompleted {
@@ -1052,7 +1102,7 @@ fn an_established_seek_lifts_the_protection() {
         },
         clock.sample(),
     );
-    let _ = session.tick(&progress(1, "ep1", 60), clock.sample());
+    let _ = session.tick(&progress(&session, 1, "ep1", 60), clock.sample());
     assert_eq!(
         stored_position(&session, &media("ep1")),
         Duration::from_secs(60)
@@ -1064,7 +1114,8 @@ fn verified_completion_lifts_the_protection_and_records_the_completion() {
     let clock = FakeClock::new();
     let retained = Duration::from_secs(2400);
     let mut session = Session::new(state_with(&media("ep1"), retained, false));
-    let _ = session.observe(&loaded_unavailable(&media("ep1"), retained), clock.sample());
+    let event = loaded_unavailable(&mut session, &media("ep1"), retained);
+    let _ = session.observe(&event, clock.sample());
 
     let _ = session.observe(
         &PlaybackEvent::EndOfTrack {
@@ -1089,7 +1140,8 @@ fn a_capability_change_alone_never_lifts_the_protection() {
     let clock = FakeClock::new();
     let retained = Duration::from_secs(2400);
     let mut session = Session::new(state_with(&media("ep1"), retained, false));
-    let _ = session.observe(&loaded_unavailable(&media("ep1"), retained), clock.sample());
+    let event = loaded_unavailable(&mut session, &media("ep1"), retained);
+    let _ = session.observe(&event, clock.sample());
 
     let _ = session.observe(
         &PlaybackEvent::CapabilitiesChanged {
@@ -1103,7 +1155,7 @@ fn a_capability_change_alone_never_lifts_the_protection() {
     );
     let _ = session.observe(&state_changed(1, PlaybackState::Playing), clock.sample());
     clock.advance_monotonic(CAPTURE_INTERVAL + Duration::from_secs(1));
-    let _ = session.tick(&progress(1, "ep1", 30), clock.sample());
+    let _ = session.tick(&progress(&session, 1, "ep1", 30), clock.sample());
 
     assert_eq!(stored_position(&session, &media("ep1")), retained);
 }
@@ -1115,10 +1167,11 @@ fn a_fresh_sequential_session_with_nothing_to_protect_records_normally() {
     // resumed.
     let clock = FakeClock::new();
     let mut session = Session::new(PersistedState::default());
-    let _ = session.observe(&loaded_fresh(&media("ep1")), clock.sample());
+    let event = loaded_fresh(&mut session, &media("ep1"));
+    let _ = session.observe(&event, clock.sample());
     let _ = session.observe(&state_changed(1, PlaybackState::Playing), clock.sample());
     clock.advance_monotonic(CAPTURE_INTERVAL + Duration::from_secs(1));
-    let _ = session.tick(&progress(1, "ep1", 45), clock.sample());
+    let _ = session.tick(&progress(&session, 1, "ep1", 45), clock.sample());
     assert_eq!(
         stored_position(&session, &media("ep1")),
         Duration::from_secs(45)
@@ -1135,7 +1188,8 @@ fn a_cancelled_seek_commits_no_target_and_leaves_an_outstanding_one_alone() {
     // `outstanding_target`.
     let clock = FakeClock::new();
     let mut session = Session::new(PersistedState::default());
-    let _ = session.observe(&loaded_fresh(&media("ep1")), clock.sample());
+    let event = loaded_fresh(&mut session, &media("ep1"));
+    let _ = session.observe(&event, clock.sample());
     let _ = session.observe(
         &PlaybackEvent::SeekTargetStored {
             session_rev: 1,
@@ -1155,7 +1209,7 @@ fn a_cancelled_seek_commits_no_target_and_leaves_an_outstanding_one_alone() {
     // `SeekCancelled` left the target alone as it must, 5 (the sampled
     // position below) if it wrongly resolved it. 5 is the failure this test
     // is looking for.
-    let _ = session.tick(&progress(1, "ep1", 5), clock.sample());
+    let _ = session.tick(&progress(&session, 1, "ep1", 5), clock.sample());
     assert_eq!(
         stored_position(&session, &media("ep1")),
         Duration::from_secs(90)
@@ -1175,12 +1229,13 @@ fn a_protected_tick_answers_none_rather_than_resubmitting_unchanged_state() {
     let clock = FakeClock::new();
     let retained = Duration::from_secs(2400);
     let mut session = Session::new(state_with(&media("ep1"), retained, false));
-    let _ = session.observe(&loaded_unavailable(&media("ep1"), retained), clock.sample());
+    let event = loaded_unavailable(&mut session, &media("ep1"), retained);
+    let _ = session.observe(&event, clock.sample());
     let _ = session.observe(&state_changed(1, PlaybackState::Playing), clock.sample());
 
     clock.advance_monotonic(CAPTURE_INTERVAL + Duration::from_secs(1));
     assert!(is_none(
-        &session.tick(&progress(1, "ep1", 120), clock.sample())
+        &session.tick(&progress(&session, 1, "ep1", 120), clock.sample())
     ));
 }
 
@@ -1198,7 +1253,8 @@ fn a_protected_entry_survives_a_stopped_seek_while_still_protected() {
     let clock = FakeClock::new();
     let retained = Duration::from_secs(2400);
     let mut session = Session::new(state_with(&media("ep1"), retained, false));
-    let _ = session.observe(&loaded_unavailable(&media("ep1"), retained), clock.sample());
+    let event = loaded_unavailable(&mut session, &media("ep1"), retained);
+    let _ = session.observe(&event, clock.sample());
 
     let _ = session.observe(
         &PlaybackEvent::SeekTargetStored {
@@ -1227,7 +1283,8 @@ fn an_estimated_seek_does_not_lift_the_protection() {
     let clock = FakeClock::new();
     let retained = Duration::from_secs(2400);
     let mut session = Session::new(state_with(&media("ep1"), retained, false));
-    let _ = session.observe(&loaded_unavailable(&media("ep1"), retained), clock.sample());
+    let event = loaded_unavailable(&mut session, &media("ep1"), retained);
+    let _ = session.observe(&event, clock.sample());
 
     let _ = session.observe(
         &PlaybackEvent::SeekCompleted {
@@ -1239,7 +1296,7 @@ fn an_estimated_seek_does_not_lift_the_protection() {
         },
         clock.sample(),
     );
-    let mut estimated_progress = progress(1, "ep1", 60);
+    let mut estimated_progress = progress(&session, 1, "ep1", 60);
     estimated_progress.provenance = PositionProvenance::Estimated;
     let _ = session.tick(&estimated_progress, clock.sample());
 
@@ -1265,7 +1322,8 @@ fn an_estimated_restart_does_not_lift_the_protection() {
     let clock = FakeClock::new();
     let retained = Duration::from_secs(2400);
     let mut session = Session::new(state_with(&media("ep1"), retained, false));
-    let _ = session.observe(&loaded_unavailable(&media("ep1"), retained), clock.sample());
+    let event = loaded_unavailable(&mut session, &media("ep1"), retained);
+    let _ = session.observe(&event, clock.sample());
 
     let _ = session.observe(
         &PlaybackEvent::RestartEstablished {
@@ -1275,7 +1333,7 @@ fn an_estimated_restart_does_not_lift_the_protection() {
         },
         clock.sample(),
     );
-    let mut estimated_progress = progress(1, "ep1", 0);
+    let mut estimated_progress = progress(&session, 1, "ep1", 0);
     estimated_progress.provenance = PositionProvenance::Estimated;
     let _ = session.tick(&estimated_progress, clock.sample());
 
@@ -1296,7 +1354,8 @@ fn an_estimated_completion_does_not_lift_the_protection() {
     let clock = FakeClock::new();
     let retained = Duration::from_secs(2400);
     let mut session = Session::new(state_with(&media("ep1"), retained, false));
-    let _ = session.observe(&loaded_unavailable(&media("ep1"), retained), clock.sample());
+    let event = loaded_unavailable(&mut session, &media("ep1"), retained);
+    let _ = session.observe(&event, clock.sample());
 
     let _ = session.observe(
         &PlaybackEvent::EndOfTrack {
@@ -1334,9 +1393,13 @@ fn an_estimated_completion_does_not_lift_the_protection() {
 fn a_resumed_estimated_load_sets_up_no_fallback_protection() {
     let clock = FakeClock::new();
     let mut session = Session::new(PersistedState::default());
+    let request = session
+        .register_load(LoadTarget::Legacy, &media("ep1"))
+        .expect("registered");
     let _ = session.observe(
         &PlaybackEvent::Loaded {
             session_rev: 1,
+            request,
             media: media("ep1"),
             metadata: MediaMetadata::default(),
             capabilities: MediaCapabilities {
@@ -1352,7 +1415,7 @@ fn a_resumed_estimated_load_sets_up_no_fallback_protection() {
     );
     let _ = session.observe(&state_changed(1, PlaybackState::Playing), clock.sample());
     clock.advance_monotonic(CAPTURE_INTERVAL + Duration::from_secs(1));
-    let _ = session.tick(&progress(1, "ep1", 100), clock.sample());
+    let _ = session.tick(&progress(&session, 1, "ep1", 100), clock.sample());
 
     assert_eq!(
         stored_position(&session, &media("ep1")),

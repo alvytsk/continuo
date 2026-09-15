@@ -25,6 +25,7 @@ use crossbeam_channel::{Sender, TrySendError};
 use crate::http::channel::{SourceInterrupt, WaitHook};
 use crate::media::id::MediaId;
 
+use super::command::LoadRequestId;
 use super::engine::{DEADLINE, EVENT_CAPACITY, PUMP_NAP, RESERVED_EVENT_SLOTS, TransportCore};
 use super::event::{PlaybackEvent, Progress};
 use super::output::Nanos;
@@ -77,6 +78,10 @@ pub struct SessionFacts {
     /// The worker reads it to know the transport is parked without having
     /// dispatched the `Pause` itself.
     pub frozen_by_hook: bool,
+    /// Mirrored from `Worker::adopted_load` on every `publish_progress` pass
+    /// (M5 §6, Decision 2); copied straight into `Progress::load` below,
+    /// never derived from anything else here.
+    pub load: Option<LoadRequestId>,
 }
 
 /// What a blocked source read services on the worker's behalf.
@@ -156,6 +161,9 @@ impl WaitService {
 
     /// Release a parked callback. A no-op with no transport open — there is
     /// nothing to release, and nothing downstream treats that as a failure.
+    ///
+    /// Goes through `TransportCore::release`, which publishes the spectrum
+    /// tap's mapping for the thaw's `Run` before releasing (decision 18).
     fn release(&self) {
         let mut guard = lock(&self.transport);
         if let Some(core) = guard.as_mut() {
@@ -254,6 +262,7 @@ impl WaitService {
                 // a source read is blocked - never derived from `quality`,
                 // which reports an unrelated fact (a timing base that jumped).
                 buffering: servicing == Servicing::BlockedRead,
+                load: facts.load,
             }
         };
         // Keep-latest: nothing but the assignment happens under the lock.
@@ -292,6 +301,7 @@ impl WaitService {
                 self.announce(PlaybackEvent::StateChanged {
                     session_rev: facts.session_rev,
                     state: PlaybackState::Paused,
+                    request: None,
                 });
             }
         } else if !frozen && facts.frozen_by_hook {
@@ -300,6 +310,7 @@ impl WaitService {
             self.announce(PlaybackEvent::StateChanged {
                 session_rev: facts.session_rev,
                 state: PlaybackState::Playing,
+                request: None,
             });
         }
         // Ruling 2: dropped before `publish_progress`, which takes this same
@@ -335,6 +346,7 @@ mod tests {
                 quality: PositionQuality::Exact,
                 provenance: PositionProvenance::Established,
                 buffering: false,
+                load: None,
             })),
             Arc::new(Mutex::new(SessionFacts {
                 session_rev: 1,
@@ -344,6 +356,7 @@ mod tests {
                 playing: false,
                 provenance: PositionProvenance::Established,
                 frozen_by_hook: false,
+                load: None,
             })),
             SourceInterrupt::new(1024),
             tx,

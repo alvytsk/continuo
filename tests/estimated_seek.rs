@@ -807,7 +807,9 @@ fn a_launch_resume_past_an_estimated_ceiling_preserves_the_checkpoint() {
         Err(error) => panic!("test URL {url:?} must normalize: {error}"),
     };
     let target = Duration::from_secs(400);
+    let request = engine.next_request();
     engine.send(PlaybackCommand::Load {
+        request,
         media,
         source: SourceLocation::Http(parsed),
         resume: ResumeIntent::StartAt(target),

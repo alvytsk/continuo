@@ -24,7 +24,7 @@
 pub mod server;
 
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -37,7 +37,7 @@ use continuo::http::service::HttpService;
 use continuo::media::id::{AbsolutePath, MediaId, NormalizedUrl};
 use continuo::media::source::SourceLocation;
 use continuo::playback::callback::CallbackCore;
-use continuo::playback::command::{PlaybackCommand, ResumeIntent};
+use continuo::playback::command::{LoadRequestId, PlaybackCommand, ResumeIntent};
 use continuo::playback::engine::EngineHandle;
 use continuo::playback::error::PlaybackError;
 use continuo::playback::event::{PlaybackEvent, Progress, ShutdownReport, StartDisposition};
@@ -126,10 +126,25 @@ struct Device {
 
 struct HarnessOutput {
     device: Arc<Mutex<Device>>,
+    /// Counts calls to `negotiate` - the first step of every open attempt -
+    /// so a test can prove a later command did not reopen a device that
+    /// already failed (M5 §6). `Arc`-shared rather than plain, so a test can
+    /// keep reading it after this harness has moved into the engine thread.
+    negotiations: Arc<AtomicUsize>,
+}
+
+impl HarnessOutput {
+    fn new(device: Arc<Mutex<Device>>) -> Self {
+        Self {
+            device,
+            negotiations: Arc::new(AtomicUsize::new(0)),
+        }
+    }
 }
 
 impl AudioOutput for HarnessOutput {
     fn negotiate(&mut self, request: &OutputRequest) -> Result<NegotiatedOutput, PlaybackError> {
+        self.negotiations.fetch_add(1, Ordering::Relaxed);
         lock(&self.device).output.negotiate(request)
     }
 
@@ -246,6 +261,11 @@ pub struct TestEngine {
     /// other draining helpers are free to consume events out of a test's
     /// direct sight.
     saw_end_of_track: AtomicBool,
+    /// The token the next `Load` a helper sends (rather than an explicit
+    /// `*_as` caller) draws from. Sequential from 1, so a test asserting
+    /// `r.get() == 1` against the very first load a bare helper method sends
+    /// keeps working unchanged.
+    next_request: AtomicU64,
 }
 
 /// A live borrow of the engine's `EngineHandle`, returned by `handle()`.
@@ -298,12 +318,8 @@ impl TestEngine {
             link: None,
         }));
         let (fault_tx, fault_rx) = crossbeam_channel::bounded(16);
-        let handle = EngineHandle::spawn_with(
-            Box::new(HarnessOutput {
-                device: Arc::clone(&device),
-            }),
-            fault_rx,
-        );
+        let handle =
+            EngineHandle::spawn_with(Box::new(HarnessOutput::new(Arc::clone(&device))), fault_rx);
         let driver = Arc::new(Driver {
             device: Arc::clone(&device),
             mode: AtomicU8::new(FROZEN),
@@ -336,7 +352,15 @@ impl TestEngine {
             draining: AtomicBool::new(true),
             http: Mutex::new(None),
             saw_end_of_track: AtomicBool::new(false),
+            next_request: AtomicU64::new(1),
         }
+    }
+
+    /// The token the next bare (non-`*_as`) `Load`-sending helper will use.
+    /// Sequential from 1, allocated here so every such helper draws from one
+    /// counter rather than each hardcoding its own.
+    pub fn next_request(&self) -> LoadRequestId {
+        LoadRequestId::from_raw(self.next_request.fetch_add(1, Ordering::Relaxed))
     }
 
     /// Load an HTTP source. Builds an `HttpService` on first use (`Limits`
@@ -345,7 +369,14 @@ impl TestEngine {
     /// engine's lifetime; every later `load_remote` on this `TestEngine`
     /// reuses it.
     pub fn load_remote(&mut self, url: &str) {
-        self.load_remote_inner(url, ResumeIntent::StartAt(Duration::ZERO), None, true);
+        let request = self.next_request();
+        self.load_remote_inner(
+            request,
+            url,
+            ResumeIntent::StartAt(Duration::ZERO),
+            None,
+            true,
+        );
     }
 
     /// `load_remote` under a caller-decided `ResumeIntent`, for a resume test
@@ -354,7 +385,8 @@ impl TestEngine {
     /// fallback). Shares the cached brisk `HttpService`, same as
     /// `load_remote`.
     pub fn load_remote_with_resume(&mut self, url: &str, resume: ResumeIntent) {
-        self.load_remote_inner(url, resume, None, true);
+        let request = self.next_request();
+        self.load_remote_inner(request, url, resume, None, true);
     }
 
     /// `load_remote` against a dedicated `HttpService` built from `limits`
@@ -363,7 +395,9 @@ impl TestEngine {
     /// the frozen position afterwards cannot itself race the brisk 500 ms
     /// one into a spurious `Failed`.
     pub fn load_remote_with_limits(&mut self, url: &str, limits: Limits) {
+        let request = self.next_request();
         self.load_remote_inner(
+            request,
             url,
             ResumeIntent::StartAt(Duration::ZERO),
             Some(limits),
@@ -378,7 +412,21 @@ impl TestEngine {
     /// fails immediately as "no HTTP service", which would prove nothing
     /// about the file itself.
     pub fn load_remote_expecting_failure(&mut self, url: &str) {
-        self.load_remote_inner(url, ResumeIntent::StartAt(Duration::ZERO), None, false);
+        let request = self.next_request();
+        self.load_remote_inner(
+            request,
+            url,
+            ResumeIntent::StartAt(Duration::ZERO),
+            None,
+            false,
+        );
+    }
+
+    /// `load_remote_with_resume` under a caller-chosen token, for a test that
+    /// must correlate this load's events against a request it names itself
+    /// rather than the counter's next value.
+    pub fn load_remote_as(&mut self, request: LoadRequestId, url: &str, resume: ResumeIntent) {
+        self.load_remote_inner(request, url, resume, None, true);
     }
 
     /// Shared body for the `load_remote*` entry points above. `limits`:
@@ -390,6 +438,7 @@ impl TestEngine {
     /// does not wait for a state the attempt is never going to reach.
     fn load_remote_inner(
         &mut self,
+        request: LoadRequestId,
         url: &str,
         resume: ResumeIntent,
         limits: Option<Limits>,
@@ -429,6 +478,7 @@ impl TestEngine {
             Err(error) => panic!("test URL {url:?} must normalize: {error}"),
         };
         self.send(PlaybackCommand::Load {
+            request,
             media,
             source: SourceLocation::Http(parsed),
             resume,
@@ -465,7 +515,21 @@ impl TestEngine {
     /// resolve - calls this directly, loading a second time under an intent
     /// `start`/`start_at` cannot express.
     pub fn load_with_resume(&mut self, path: AbsolutePath, resume: ResumeIntent) {
+        let request = self.next_request();
+        self.load_with_resume_as(request, path, resume);
+    }
+
+    /// `load_with_resume` under a caller-chosen token, for a test that must
+    /// correlate this load's events against a request it names itself rather
+    /// than the counter's next value.
+    pub fn load_with_resume_as(
+        &mut self,
+        request: LoadRequestId,
+        path: AbsolutePath,
+        resume: ResumeIntent,
+    ) {
         self.send(PlaybackCommand::Load {
+            request,
             media: MediaId::LocalFile(path.clone()),
             source: SourceLocation::LocalPath(path.as_path().to_path_buf()),
             resume,
@@ -1089,14 +1153,11 @@ pub fn load_failure_on_device(name: &str, channels: u16) -> String {
     }));
     // Held for the call's duration, so the worker's fault receiver stays live.
     let (_faults, fault_rx) = crossbeam_channel::bounded(16);
-    let handle = EngineHandle::spawn_with(
-        Box::new(HarnessOutput {
-            device: Arc::clone(&device),
-        }),
-        fault_rx,
-    );
+    let handle =
+        EngineHandle::spawn_with(Box::new(HarnessOutput::new(Arc::clone(&device))), fault_rx);
     let path = fixture(name);
     let sent = handle.commands().send(PlaybackCommand::Load {
+        request: LoadRequestId::from_raw(1),
         media: MediaId::LocalFile(path.clone()),
         source: SourceLocation::LocalPath(path.as_path().to_path_buf()),
         resume: ResumeIntent::StartAt(Duration::ZERO),
@@ -1134,18 +1195,15 @@ pub fn failed_load_position(
         link: None,
     }));
     let (_faults, fault_rx) = crossbeam_channel::bounded(16);
-    let handle = EngineHandle::spawn_with(
-        Box::new(HarnessOutput {
-            device: Arc::clone(&device),
-        }),
-        fault_rx,
-    );
+    let handle =
+        EngineHandle::spawn_with(Box::new(HarnessOutput::new(Arc::clone(&device))), fault_rx);
     let id = MediaId::LocalFile(
         continuo::media::id::AbsolutePath::new(missing.to_path_buf()).expect("absolute path"),
     );
     handle
         .commands()
         .send(PlaybackCommand::Load {
+            request: LoadRequestId::from_raw(1),
             media: id,
             source: SourceLocation::LocalPath(missing.to_path_buf()),
             resume: ResumeIntent::StartAt(start_at),
@@ -1184,14 +1242,11 @@ pub fn failed_device_session(name: &str, channels: u16, start_at: Duration) -> S
     }));
     // Held for the call's duration, so the worker's fault receiver stays live.
     let (_faults, fault_rx) = crossbeam_channel::bounded(16);
-    let handle = EngineHandle::spawn_with(
-        Box::new(HarnessOutput {
-            device: Arc::clone(&device),
-        }),
-        fault_rx,
-    );
+    let handle =
+        EngineHandle::spawn_with(Box::new(HarnessOutput::new(Arc::clone(&device))), fault_rx);
     let path = fixture(name);
     let sent = handle.commands().send(PlaybackCommand::Load {
+        request: LoadRequestId::from_raw(1),
         media: MediaId::LocalFile(path.clone()),
         source: SourceLocation::LocalPath(path.as_path().to_path_buf()),
         resume: ResumeIntent::StartAt(start_at),
@@ -1223,4 +1278,80 @@ pub fn failed_device_session(name: &str, channels: u16, start_at: Duration) -> S
     events.extend(std::mem::take(&mut report.events));
     report.events = events;
     report
+}
+
+/// Like `failed_device_session`, but also sends `PlayLoaded` for the same
+/// token, followed by a `SetVolume` barrier, to prove that a later
+/// `PlayLoaded` does not reopen a device that already failed (M5 §6): the
+/// `adopted_load == Some(request) && state == Paused` gate in `dispatch`
+/// never sees `Paused` here, since the load's own synchronous open already
+/// failed. Hands back every event up to the volume barrier, plus however
+/// many times the device was asked to negotiate - exactly once is the direct
+/// evidence "no second open attempt" needs, since a silent reopen that fails
+/// the same way would be invisible in the event stream alone.
+pub fn failed_device_session_with_play_loaded(
+    name: &str,
+    channels: u16,
+) -> (Vec<PlaybackEvent>, usize) {
+    let device = Arc::new(Mutex::new(Device {
+        output: TestOutput::new(channels, RATE, BUFFER_FRAMES, LATENCY),
+        link: None,
+    }));
+    let harness = HarnessOutput::new(Arc::clone(&device));
+    let negotiations = Arc::clone(&harness.negotiations);
+    // Held for the call's duration, so the worker's fault receiver stays live.
+    let (_faults, fault_rx) = crossbeam_channel::bounded(16);
+    let handle = EngineHandle::spawn_with(Box::new(harness), fault_rx);
+    let path = fixture(name);
+    let request = LoadRequestId::from_raw(1);
+    if handle
+        .commands()
+        .send(PlaybackCommand::Load {
+            request,
+            media: MediaId::LocalFile(path.clone()),
+            source: SourceLocation::LocalPath(path.as_path().to_path_buf()),
+            resume: ResumeIntent::StartAt(Duration::ZERO),
+        })
+        .is_err()
+    {
+        panic!("the engine stopped accepting commands");
+    }
+    if handle
+        .commands()
+        .send(PlaybackCommand::PlayLoaded { request })
+        .is_err()
+    {
+        panic!("the engine stopped accepting commands");
+    }
+    if handle
+        .commands()
+        .send(PlaybackCommand::SetVolume(Volume::new(0.25)))
+        .is_err()
+    {
+        panic!("the engine stopped accepting commands");
+    }
+
+    let mut events = Vec::new();
+    let deadline = Instant::now() + PATIENCE;
+    loop {
+        while let Ok(event) = handle.events().try_recv() {
+            events.push(event);
+        }
+        if events
+            .iter()
+            .any(|event| matches!(event, PlaybackEvent::VolumeChanged { .. }))
+        {
+            break;
+        }
+        if Instant::now() >= deadline {
+            panic!("the volume barrier never arrived; saw {events:?}");
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    handle.interrupt_shutdown();
+    let mut report = handle.join();
+    events.extend(std::mem::take(&mut report.events));
+
+    (events, negotiations.load(Ordering::Relaxed))
 }

@@ -17,7 +17,7 @@ use continuo::persistence::model::{PersistedCheckpoint, PersistedState, SCHEMA_V
 use continuo::persistence::store::StateStore;
 use continuo::persistence::writer::Urgency;
 use continuo::playback::checkpoint::PlaybackCheckpoint;
-use continuo::playback::command::PlaybackCommand;
+use continuo::playback::command::{PlaybackCommand, ResumeIntent};
 use continuo::playback::decode::DecodedSource;
 use continuo::playback::event::{PlaybackEvent, Progress, StartDisposition};
 use continuo::playback::provenance::PositionProvenance;
@@ -25,7 +25,7 @@ use continuo::playback::state::PlaybackState;
 use continuo::playback::timeline::PositionQuality;
 use continuo::playback::volume::Volume;
 use continuo::resume::{RestartPreference, decide_resume, restart_preference, resume_candidate};
-use continuo::session::{Action, CAPTURE_INTERVAL, Session};
+use continuo::session::{Action, CAPTURE_INTERVAL, LoadTarget, Session};
 
 mod support;
 
@@ -99,9 +99,20 @@ impl Rig {
         );
 
         let (store, clock) = store_in(dir);
+        let mut session = Session::new(state);
+        // Registered before the engine ever sends the `Load`, so the
+        // `Loaded` it produces carries a token `session` recognizes (M5 §6)
+        // — `TestEngine::start_at`'s own auto-generated token would not.
+        let request = session
+            .register_load(LoadTarget::Legacy, &track_id())
+            .unwrap_or_else(|error| panic!("registered: {error:?}"));
+        let mut engine = TestEngine::start_idle();
+        engine.load_with_resume_as(request, fixture_path(), ResumeIntent::StartAt(start_at));
+        engine.send(PlaybackCommand::Play);
+        engine.await_state(PlaybackState::Playing);
         let mut rig = Self {
-            engine: TestEngine::start_at(TRACK, start_at),
-            session: Session::new(state),
+            engine,
+            session,
             store,
             clock,
         };
@@ -456,6 +467,14 @@ fn a_position_past_the_end_survives_a_launch_whose_device_refuses_to_open() {
 fn relaunch_onto_a_refusing_device(dir: &std::path::Path) -> PersistedCheckpoint {
     let (store, clock) = store_in(dir);
     let mut session = Session::new(reload(dir));
+    // `failed_device_session` is not `Session`-aware and always sends its
+    // `Load` under token 1 (`tests/support/mod.rs`); registering here first
+    // and doing nothing else with this fresh session hands out that same
+    // token, so the `Loaded` it replays below is genuinely adopted, exactly
+    // as it would be in production.
+    let _ = session
+        .register_load(LoadTarget::Legacy, &track_id())
+        .unwrap_or_else(|error| panic!("registered: {error:?}"));
 
     let report = support::failed_device_session(TRACK, 6, Duration::ZERO);
     let final_state = session.reconcile_shutdown(&report, clock.sample());
@@ -597,9 +616,18 @@ fn a_stored_estimate_with_no_established_position_reports_none_for_it_after_a_re
 
 // -------------------------------------------------------------- upgrade (R3)
 
-fn loaded_fresh_for(session_rev: u64, media: &MediaId, position: Duration) -> PlaybackEvent {
+fn loaded_fresh_for(
+    session: &mut Session,
+    session_rev: u64,
+    media: &MediaId,
+    position: Duration,
+) -> PlaybackEvent {
+    let request = session
+        .register_load(LoadTarget::Legacy, media)
+        .unwrap_or_else(|error| panic!("registered: {error:?}"));
     PlaybackEvent::Loaded {
         session_rev,
+        request,
         media: media.clone(),
         metadata: MediaMetadata::default(),
         capabilities: MediaCapabilities {
@@ -612,10 +640,19 @@ fn loaded_fresh_for(session_rev: u64, media: &MediaId, position: Duration) -> Pl
 }
 
 fn state_changed_to(session_rev: u64, state: PlaybackState) -> PlaybackEvent {
-    PlaybackEvent::StateChanged { session_rev, state }
+    PlaybackEvent::StateChanged {
+        session_rev,
+        state,
+        request: None,
+    }
 }
 
-fn established_progress(session_rev: u64, media: &MediaId, secs: u64) -> Progress {
+fn established_progress(
+    session: &Session,
+    session_rev: u64,
+    media: &MediaId,
+    secs: u64,
+) -> Progress {
     Progress {
         session_rev,
         media: Some(media.clone()),
@@ -623,6 +660,7 @@ fn established_progress(session_rev: u64, media: &MediaId, secs: u64) -> Progres
         quality: PositionQuality::Exact,
         provenance: PositionProvenance::Established,
         buffering: false,
+        load: session.adopted().map(|adopted| adopted.request),
     }
 }
 
@@ -673,10 +711,11 @@ fn a_session_opened_on_a_v1_file_keeps_persisting_as_v2_with_every_entry_intact(
     // Drive a second, unrelated media through the real `Session` — the
     // production pairing `open_persistence` builds, not a direct
     // `store.write` the way `persistence_store.rs` proves the migration.
-    let _ = session.observe(&loaded_fresh_for(1, &b, Duration::ZERO), clock.sample());
+    let event = loaded_fresh_for(&mut session, 1, &b, Duration::ZERO);
+    let _ = session.observe(&event, clock.sample());
     let _ = session.observe(&state_changed_to(1, PlaybackState::Playing), clock.sample());
     clock.advance_monotonic(CAPTURE_INTERVAL + Duration::from_secs(1));
-    match session.tick(&established_progress(1, &b, 15), clock.sample()) {
+    match session.tick(&established_progress(&session, 1, &b, 15), clock.sample()) {
         Action::Submit { state, .. } => store.write(&state).unwrap(),
         Action::None => panic!("the interval capture must have produced a write"),
     }
@@ -684,8 +723,8 @@ fn a_session_opened_on_a_v1_file_keeps_persisting_as_v2_with_every_entry_intact(
     let bytes = std::fs::read(dir.path().join("state.json")).unwrap();
     let raw: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(
-        raw["schema_version"], 2,
-        "the file on disk must claim v2 once a v2-aware Session has written through it: {raw}"
+        raw["schema_version"], 3,
+        "the file on disk must claim the current schema once a Session has written through it: {raw}"
     );
 
     let reloaded = reload(dir.path());

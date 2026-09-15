@@ -544,6 +544,14 @@ impl<'a> Walker<'a> {
                 let effective = base.as_ref().unwrap_or_else(|| self.base()).clone();
                 self.read_atom_link(element, &effective, parent == Context::AtomEntry)?;
             }
+            (
+                Context::RssChannel | Context::AtomFeed | Context::RssItem | Context::AtomEntry,
+                Some(ITUNES_NS),
+                "image",
+            ) => {
+                let effective = base.as_ref().unwrap_or_else(|| self.base()).clone();
+                self.read_itunes_image(element, &effective, parent)?;
+            }
             _ => {}
         }
 
@@ -621,6 +629,37 @@ impl<'a> Walker<'a> {
             }
         }
         Ok(None)
+    }
+
+    /// `itunes:image href`, kept only when it resolves to an http(s) URL
+    /// with a host — the same bar an enclosure is held to. The first one at
+    /// each level wins; an item's own image is stored on the item and the
+    /// feed's on the feed, so the caller can prefer the former.
+    fn read_itunes_image(
+        &mut self,
+        element: &BytesStart<'_>,
+        base: &Url,
+        parent: Context,
+    ) -> Result<(), FeedError> {
+        let mut href = None;
+        for attribute in element.attributes() {
+            let attribute = attribute.map_err(|_| malformed("invalid attribute"))?;
+            if attribute.key.as_ref() == "href" {
+                href = normalized(&attribute, self.version);
+            }
+        }
+        let image = href
+            .and_then(|value| resolved_url(Some(base), &value))
+            .filter(|url| matches!(url.scheme(), "http" | "https") && url.host_str().is_some());
+        match parent {
+            Context::RssItem | Context::AtomEntry => {
+                if let Some(builder) = self.item.as_mut() {
+                    set_once(&mut builder.item.image, image);
+                }
+            }
+            _ => set_once(&mut self.feed.image, image),
+        }
+        Ok(())
     }
 
     fn read_enclosure(&mut self, element: &BytesStart<'_>, base: &Url) -> Result<(), FeedError> {

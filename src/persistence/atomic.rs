@@ -35,7 +35,7 @@ pub fn replace_bytes(path: &Path, bytes: &[u8]) -> Result<(), PersistenceError> 
     // 0600 an assertion the code makes rather than a side effect the create
     // call happened to have (D12).
     let write_temp = || -> Result<(), io::Error> {
-        let mut file = private_file(&temp)?;
+        let mut file = create_private_new(&temp)?;
         set_private(&temp)?;
         file.write_all(bytes)?;
         file.sync_all()
@@ -58,18 +58,23 @@ pub fn replace_bytes(path: &Path, bytes: &[u8]) -> Result<(), PersistenceError> 
         });
     }
 
-    // Not fatal: the replacement already happened, and a parent that cannot
-    // be fsynced is a durability gap, not a lost checkpoint.
+    sync_parent_best_effort(dir);
+    Ok(())
+}
+
+/// Best-effort, non-fatal fsync of a parent directory after a rename into it.
+/// Not fatal: the replacement already happened, and a parent that cannot be
+/// fsynced is a durability gap, not a lost checkpoint.
+pub(crate) fn sync_parent_best_effort(dir: &Path) {
     if let Ok(handle) = File::open(dir)
         && let Err(error) = handle.sync_all()
     {
         tracing::debug!(path = ?dir, %error, "cannot fsync the parent directory");
     }
-    Ok(())
 }
 
 #[cfg(unix)]
-fn prepare_directory(dir: &Path) -> Result<(), PersistenceError> {
+pub(crate) fn prepare_directory(dir: &Path) -> Result<(), PersistenceError> {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 
     if !dir.exists() {
@@ -117,7 +122,7 @@ fn prepare_directory(dir: &Path) -> Result<(), PersistenceError> {
 }
 
 #[cfg(not(unix))]
-fn prepare_directory(dir: &Path) -> Result<(), PersistenceError> {
+pub(crate) fn prepare_directory(dir: &Path) -> Result<(), PersistenceError> {
     // Platform defaults: a documented gap (§17, D12).
     fs::create_dir_all(dir).map_err(|source| PersistenceError::Io {
         path: dir.to_path_buf(),
@@ -127,7 +132,7 @@ fn prepare_directory(dir: &Path) -> Result<(), PersistenceError> {
 }
 
 #[cfg(unix)]
-fn private_file(path: &Path) -> Result<File, io::Error> {
+pub(crate) fn create_private_new(path: &Path) -> Result<File, io::Error> {
     use std::os::unix::fs::OpenOptionsExt;
 
     OpenOptions::new()
@@ -138,7 +143,7 @@ fn private_file(path: &Path) -> Result<File, io::Error> {
 }
 
 #[cfg(not(unix))]
-fn private_file(path: &Path) -> Result<File, io::Error> {
+pub(crate) fn create_private_new(path: &Path) -> Result<File, io::Error> {
     OpenOptions::new().write(true).create_new(true).open(path)
 }
 
@@ -147,13 +152,13 @@ fn private_file(path: &Path) -> Result<File, io::Error> {
 /// re-asserts the 0600 the create already applied, so there is no window
 /// where the file is briefly more open than this.
 #[cfg(unix)]
-fn set_private(path: &Path) -> Result<(), io::Error> {
+pub(crate) fn set_private(path: &Path) -> Result<(), io::Error> {
     use std::os::unix::fs::PermissionsExt;
 
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))
 }
 
 #[cfg(not(unix))]
-fn set_private(_path: &Path) -> Result<(), io::Error> {
+pub(crate) fn set_private(_path: &Path) -> Result<(), io::Error> {
     Ok(())
 }

@@ -1,7 +1,9 @@
 pub mod capabilities;
+pub mod display;
 pub mod id;
 pub mod metadata;
 pub mod source;
+pub mod tags;
 pub mod vbr_header;
 
 use std::time::Duration;

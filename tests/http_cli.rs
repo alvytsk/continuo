@@ -1,15 +1,16 @@
-mod support;
+#![cfg(target_os = "linux")]
 
-use std::process::Command;
+#[path = "support/process.rs"]
+mod process;
+mod support;
 
 use support::server::{Script, TestServer};
 
-#[allow(clippy::unwrap_used)] // Spawning a fixed test binary.
+#[allow(clippy::unwrap_used)] // Fallible spawn of a fixed test binary.
 fn run(args: &[&str]) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_continuo"))
-        .args(args)
-        .output()
-        .unwrap()
+    let profile = process::Profile::new().unwrap();
+    // `output()` waits for the child, so `profile` outlives it.
+    profile.command().args(args).output().unwrap()
 }
 
 #[test]

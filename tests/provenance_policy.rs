@@ -22,14 +22,23 @@ use continuo::playback::event::{PlaybackEvent, Progress, StartDisposition};
 use continuo::playback::provenance::PositionProvenance;
 use continuo::playback::state::PlaybackState;
 use continuo::playback::timeline::PositionQuality;
-use continuo::session::{Action, CAPTURE_INTERVAL, Session};
+use continuo::session::{Action, CAPTURE_INTERVAL, LoadTarget, Session};
 
 mod support;
 use support::media;
 
-fn loaded(session_rev: u64, name: &str, position: Duration) -> PlaybackEvent {
+fn loaded(
+    session: &mut Session,
+    session_rev: u64,
+    name: &str,
+    position: Duration,
+) -> PlaybackEvent {
+    let request = session
+        .register_load(LoadTarget::Legacy, &media(name))
+        .unwrap_or_else(|error| panic!("room for a load: {error:?}"));
     PlaybackEvent::Loaded {
         session_rev,
+        request,
         media: media(name),
         metadata: MediaMetadata::default(),
         capabilities: MediaCapabilities {
@@ -42,10 +51,20 @@ fn loaded(session_rev: u64, name: &str, position: Duration) -> PlaybackEvent {
 }
 
 fn state_changed(session_rev: u64, state: PlaybackState) -> PlaybackEvent {
-    PlaybackEvent::StateChanged { session_rev, state }
+    PlaybackEvent::StateChanged {
+        session_rev,
+        state,
+        request: None,
+    }
 }
 
-fn progress(session_rev: u64, name: &str, secs: u64, provenance: PositionProvenance) -> Progress {
+fn progress(
+    session: &Session,
+    session_rev: u64,
+    name: &str,
+    secs: u64,
+    provenance: PositionProvenance,
+) -> Progress {
     Progress {
         session_rev,
         media: Some(media(name)),
@@ -53,6 +72,7 @@ fn progress(session_rev: u64, name: &str, secs: u64, provenance: PositionProvena
         quality: PositionQuality::Exact,
         provenance,
         buffering: false,
+        load: session.adopted().map(|adopted| adopted.request),
     }
 }
 
@@ -112,7 +132,8 @@ fn entry_completed(session: &Session, media: &MediaId) -> bool {
 fn playing_on(state: PersistedState, name: &str, start: Duration) -> (Session, FakeClock) {
     let clock = FakeClock::new();
     let mut session = Session::new(state);
-    let _ = session.observe(&loaded(1, name, start), clock.sample());
+    let event = loaded(&mut session, 1, name, start);
+    let _ = session.observe(&event, clock.sample());
     let _ = session.observe(&state_changed(1, PlaybackState::Paused), clock.sample());
     let _ = session.observe(&state_changed(1, PlaybackState::Playing), clock.sample());
     (session, clock)
@@ -137,7 +158,7 @@ fn an_estimated_capture_never_overwrites_an_established_position() {
 
     clock.advance_monotonic(CAPTURE_INTERVAL + Duration::from_secs(1));
     let state = submitted(session.tick(
-        &progress(1, "a", 45, PositionProvenance::Estimated),
+        &progress(&session, 1, "a", 45, PositionProvenance::Estimated),
         clock.sample(),
     ));
 
@@ -167,7 +188,7 @@ fn an_estimated_capture_with_nothing_established_never_bootstraps_a_position() {
 
     clock.advance_monotonic(CAPTURE_INTERVAL + Duration::from_secs(1));
     let _ = session.tick(
-        &progress(1, "a", 45, PositionProvenance::Estimated),
+        &progress(&session, 1, "a", 45, PositionProvenance::Estimated),
         clock.sample(),
     );
 
@@ -257,7 +278,7 @@ fn a_stored_target_struck_from_an_estimated_position_inherits_its_provenance() {
         clock.sample(),
     );
     let _ = session.tick(
-        &progress(1, "a", 90, PositionProvenance::Estimated),
+        &progress(&session, 1, "a", 90, PositionProvenance::Estimated),
         clock.sample(),
     );
     assert_eq!(
@@ -308,7 +329,7 @@ fn an_established_capture_writes_the_position_and_clears_a_stale_estimate() {
 
     clock.advance_monotonic(CAPTURE_INTERVAL + Duration::from_secs(1));
     let _ = session.tick(
-        &progress(1, "a", 50, PositionProvenance::Established),
+        &progress(&session, 1, "a", 50, PositionProvenance::Established),
         clock.sample(),
     );
 
@@ -356,7 +377,7 @@ fn a_media_switch_writes_only_the_estimate_for_an_estimated_outgoing_entry() {
         clock.sample(),
     );
     let _ = session.tick(
-        &progress(1, "a", 90, PositionProvenance::Estimated),
+        &progress(&session, 1, "a", 90, PositionProvenance::Estimated),
         clock.sample(),
     );
 
@@ -366,14 +387,15 @@ fn a_media_switch_writes_only_the_estimate_for_an_estimated_outgoing_entry() {
     // distinguished from the one above.
     assert!(matches!(
         session.tick(
-            &progress(1, "a", 105, PositionProvenance::Estimated),
+            &progress(&session, 1, "a", 105, PositionProvenance::Estimated),
             clock.sample()
         ),
         Action::None
     ));
 
     // Switch media: `record_outgoing` fires for "a".
-    let _ = session.observe(&loaded(2, "b", Duration::ZERO), clock.sample());
+    let event = loaded(&mut session, 2, "b", Duration::ZERO);
+    let _ = session.observe(&event, clock.sample());
 
     assert_eq!(
         entry_position(&session, &media("a")),

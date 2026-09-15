@@ -5,6 +5,7 @@ use crate::media::capabilities::MediaCapabilities;
 use crate::media::id::MediaId;
 use crate::media::metadata::MediaMetadata;
 
+use super::command::LoadRequestId;
 use super::provenance::PositionProvenance;
 use super::state::PlaybackState;
 use super::timeline::PositionQuality;
@@ -41,6 +42,9 @@ pub enum StartDisposition {
 pub enum PlaybackEvent {
     Loaded {
         session_rev: u64,
+        /// The token the `Load` that produced this outcome carried. Echoed,
+        /// never interpreted (M5 §6).
+        request: LoadRequestId,
         media: MediaId,
         metadata: MediaMetadata,
         capabilities: MediaCapabilities,
@@ -55,6 +59,9 @@ pub enum PlaybackEvent {
     StateChanged {
         session_rev: u64,
         state: PlaybackState,
+        /// `Some` only when `state == Loading`, carrying that load's token
+        /// (Decision 2, M5 §6). Every other state carries `None`.
+        request: Option<LoadRequestId>,
     },
     SeekCompleted {
         session_rev: u64,
@@ -132,6 +139,14 @@ pub enum PlaybackEvent {
         session_rev: u64,
         message: String,
     },
+    /// A `Load` accepted but abandoned before it produced `Loaded` or
+    /// `Failed` — a stop or shutdown landed during the open (M5 §6). The
+    /// load's one guaranteed outcome in that case; nothing else is emitted
+    /// for it.
+    LoadCancelled {
+        session_rev: u64,
+        request: LoadRequestId,
+    },
     Failed {
         session_rev: u64,
         message: String,
@@ -141,6 +156,11 @@ pub enum PlaybackEvent {
         /// test asserts on (Ruling 1) — the remaining stringiness there is
         /// known debt for a later task, not something to fix here.
         cause: Option<RemoteFailure>,
+        /// `Some` only when this failure is the outcome of the load still in
+        /// flight when it happened - set from `loading`, taken by the same
+        /// `fail_with` that emits this event, so a failure after `Loaded`
+        /// carries `None` and is not mistaken for a load outcome (M5 §6).
+        request: Option<LoadRequestId>,
     },
 }
 
@@ -163,6 +183,7 @@ impl PlaybackEvent {
             | Self::CapabilitiesChanged { session_rev, .. }
             | Self::RestartEstablished { session_rev, .. }
             | Self::Warning { session_rev, .. }
+            | Self::LoadCancelled { session_rev, .. }
             | Self::Failed { session_rev, .. } => *session_rev,
         }
     }
@@ -184,6 +205,22 @@ impl PlaybackEvent {
             _ => false,
         }
     }
+
+    /// The load this event concludes, if it is a load outcome (M5 §6). Each
+    /// accepted `Load` produces exactly one.
+    pub fn load_outcome(&self) -> Option<LoadRequestId> {
+        match self {
+            Self::Loaded { request, .. } | Self::LoadCancelled { request, .. } => Some(*request),
+            Self::Failed { request, .. } => *request,
+            _ => None,
+        }
+    }
+
+    /// Protected outcomes are never dropped or displaced, and may use the
+    /// reserved tail: correlation cannot be inferred from anything later.
+    pub fn is_protected(&self) -> bool {
+        self.load_outcome().is_some()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -203,6 +240,11 @@ pub struct Progress {
     /// timing base that jumped - an unrelated fact this field must never be
     /// derived from.
     pub buffering: bool,
+    /// The load token the worker currently owns (Decision 2, M5 §6): set
+    /// when the worker emits `Loaded`, kept across stop, pause and recovery,
+    /// and cleared when the next `load` starts. Mirrored from
+    /// `Worker::adopted_load` via `SessionFacts::load`.
+    pub load: Option<LoadRequestId>,
 }
 
 /// What a shutdown hands back: the position the worker captured on its way out,

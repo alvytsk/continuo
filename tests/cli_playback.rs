@@ -1,14 +1,16 @@
+#![cfg(target_os = "linux")]
+
+#[path = "support/process.rs"]
+mod process;
 mod support;
 
-use std::process::Command;
 use std::time::Duration;
 
 #[allow(clippy::unwrap_used)] // Fallible spawn of a fixed test binary.
 fn run(args: &[&str]) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_continuo"))
-        .args(args)
-        .output()
-        .unwrap()
+    let profile = process::Profile::new().unwrap();
+    // `output()` waits for the child, so `profile` outlives it.
+    profile.command().args(args).output().unwrap()
 }
 
 #[test]
@@ -52,7 +54,9 @@ fn a_directory_is_rejected_as_not_a_regular_file() {
 fn a_relative_path_is_accepted_and_canonicalized() {
     // Canonicalization happens at the worker's source-opening boundary, so a
     // relative path must not be rejected by argument parsing.
-    let output = Command::new(env!("CARGO_BIN_EXE_continuo"))
+    let profile = process::Profile::new().unwrap();
+    let output = profile
+        .command()
         .args(["play", "tests/fixtures/sine.flac", "--probe-only"])
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .output()

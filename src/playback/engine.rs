@@ -29,17 +29,22 @@ use crate::media::source::SourceLocation;
 use crate::resume::{KnownDuration, ResumeDecision, decide_resume};
 
 use super::callback::CallbackCore;
-use super::command::{Admission, PlaybackCommand, ResumeIntent};
+use super::command::{Admission, LoadRequestId, PlaybackCommand, ResumeIntent};
 use super::decode::{DecodedSource, SeekOutcome};
 use super::error::PlaybackError;
 use super::event::{PlaybackEvent, Progress, ShutdownReport, StartDisposition};
 use super::handshake::Handshake;
 use super::link::OutputLink;
 use super::output::cpal_output::{CpalOutput, OutputFault};
+use super::output::null_output::NullOutput;
 use super::output::{AudioOutput, Nanos, NegotiatedOutput, OutputRequest, SpanRecord};
 use super::prepare::{PrepareContext, prepare};
 use super::provenance::PositionProvenance;
 use super::resample::Converter;
+use super::spectrum::registry::{TapMapping, TapRegistry};
+use super::spectrum::worker::{
+    self as spectrum_worker, SpectrumHandle, SpectrumPort, SpectrumThread,
+};
 use super::state::PlaybackState;
 use super::timeline::{PositionQuality, Timeline};
 use super::volume::Volume;
@@ -69,8 +74,9 @@ pub(crate) const RESERVED_EVENT_SLOTS: usize = 9;
 pub(crate) const EVENT_CAPACITY: usize = 64;
 const PENDING_CAP: usize = 128;
 
-// Reserve budget. Terminal outcomes may occupy the reserved tail; ordinary
-// events may not. The worst case is one loop iteration emitting, at most:
+// Reserve budget. Terminal or protected outcomes may occupy the reserved
+// tail; ordinary events may not. The worst case is one loop iteration
+// emitting, at most:
 //
 //   stop interrupt        1  StateChanged{Stopped}
 //   a serviced fault      2  Failed + StateChanged, or DeviceRecovered + StateChanged
@@ -86,19 +92,32 @@ const PENDING_CAP: usize = 128;
 //                        10 (naive union)
 //
 // 10 looks like it breaks `RESERVED_EVENT_SLOTS == 9`, but the reserve only
-// has to be as large as the TERMINAL share of that union: an ordinary event
-// that cannot flush is merely held in `pending_events` (bounded separately,
-// by `PENDING_CAP`) until the reserve clears - never lost, and so never in
-// need of reservation. Only a terminal outcome, which the reserved tail
-// exists to guarantee delivery for even under a full ordinary backlog, must
-// actually fit. Row by row, the terminal-maximizing variant is: stop's
-// StateChanged{Stopped} (1), a fatal fault's Failed + StateChanged{Failed}
-// (2), Load's failure tail above (2, not the success tail's 0), and end of
-// track's pair (2) - 7 terminal events at most, comfortably under 9 with two
-// to spare. Those four are still not mutually exclusive in a single pass, so
-// the union is the bound rather than the maximum of them; command admission
-// closes while a backlog exists, and `service_faults` defers a fault whose
-// events would not fit, so neither source can outrun the drain.
+// has to be as large as the TERMINAL-OR-PROTECTED share of that union: an
+// ordinary event that cannot flush is merely held in `pending_events`
+// (bounded separately, by `PENDING_CAP`) until the reserve clears - never
+// lost, and so never in need of reservation. Only a terminal or protected
+// outcome, which the reserved tail exists to guarantee delivery for even
+// under a full ordinary backlog, must actually fit (Decision 4, Decision 5).
+// Row by row:
+//
+//   stop interrupt        1  StateChanged{Stopped} (terminal)
+//   a fatal fault          2  Failed + StateChanged{Failed} (both terminal)
+//   a dispatched load      3  Loaded (protected, M5 §6) + Failed +
+//                             StateChanged{Failed} (both terminal) - `Loaded`
+//                             itself is not terminal but must still fit, so
+//                             this row's share is now one wider than a
+//                             fault's.
+//   end of track           2  EndOfTrack + StateChanged{Ended} (both terminal)
+//                        --
+//                         8 <= RESERVED_EVENT_SLOTS (9)
+//
+// A cancelled load - a stop or shutdown landing during the open - emits only
+// `LoadCancelled` (1, protected), well under the dispatched-load row's own
+// share, so it never raises the bound. These four rows are still not
+// mutually exclusive in a single pass, so the union is the bound rather than
+// the maximum of them; command admission closes while a backlog exists, and
+// `service_faults` defers a fault whose events would not fit, so neither
+// source can outrun the drain.
 //
 // `RestartEstablished` and `SeekCancelled` both belong to commands narrower
 // than `Load` (their own event plus a `StateChanged`, at most 2, and neither
@@ -170,6 +189,12 @@ pub struct EngineHandle {
     /// `Worker::load` can build a `PrepareContext` from whatever is
     /// installed at the moment it runs.
     http: Arc<Mutex<Option<Arc<HttpService>>>>,
+    /// The analysis worker's application side (§10), handed out by
+    /// [`Self::spectrum`].
+    spectrum: SpectrumHandle,
+    /// The `continuo-spectrum` thread: stopped and joined by [`Self::join`]
+    /// and by `Drop`, so it never outlives the engine.
+    spectrum_thread: SpectrumThread,
 }
 
 impl EngineHandle {
@@ -185,6 +210,18 @@ impl EngineHandle {
         let (wake_tx, wake_rx) = crossbeam_channel::bounded(64);
         output.set_wake(wake_tx.clone());
         Self::assemble(Box::new(output), faults, wake_tx, wake_rx)
+    }
+
+    /// Spawn over whichever output the environment calls for: the paced,
+    /// deviceless [`NullOutput`] when `CONTINUO_AUDIO_OUTPUT=null` (what a
+    /// subprocess test sets on a CI machine with no sound device), otherwise
+    /// the real default device.
+    pub fn spawn_for_environment() -> Self {
+        if std::env::var("CONTINUO_AUDIO_OUTPUT").as_deref() == Ok("null") {
+            Self::spawn(Box::new(NullOutput::new()))
+        } else {
+            Self::spawn_cpal()
+        }
     }
 
     /// Spawn a worker over any output, plus the fault stream it publishes to.
@@ -209,6 +246,7 @@ impl EngineHandle {
             quality: PositionQuality::Exact,
             provenance: PositionProvenance::Established,
             buffering: false,
+            load: None,
         }));
         let interrupt = Arc::new(AtomicU8::new(0));
         // One real capacity for the worker's whole life (Carried Finding 2):
@@ -218,6 +256,11 @@ impl EngineHandle {
         // to sit here only so `WaitService` had something to poll.
         let source_interrupt = SourceInterrupt::new(Limits::default().buffer_bytes);
         let http = Arc::new(Mutex::new(None));
+        // Shared by the callback (writer), the decode worker, `WaitService`
+        // and the spectrum worker, which schedules frames against it.
+        let device_clock = Arc::new(AtomicU64::new(0));
+        let (spectrum, spectrum_port, spectrum_thread) =
+            spectrum_worker::spawn(Arc::clone(&device_clock));
         let worker = Worker::new(
             output,
             faults,
@@ -229,6 +272,8 @@ impl EngineHandle {
             Arc::clone(&interrupt),
             Arc::clone(&source_interrupt),
             Arc::clone(&http),
+            device_clock,
+            spectrum_port,
         );
         let join = std::thread::Builder::new()
             .name("continuo-decode".into())
@@ -246,7 +291,15 @@ impl EngineHandle {
             worker: join,
             source_interrupt,
             http,
+            spectrum,
+            spectrum_thread,
         }
+    }
+
+    /// The spectrum analysis worker: enable it, read its latest frame.
+    /// Analysis starts disabled.
+    pub fn spectrum(&self) -> SpectrumHandle {
+        self.spectrum.clone()
     }
 
     pub fn commands(&self) -> &Sender<PlaybackCommand> {
@@ -410,6 +463,8 @@ impl EngineHandle {
             },
             None => Vec::new(),
         };
+        // After the decode worker, whose teardown retires the last mapping.
+        self.spectrum_thread.stop();
         let mut events = Vec::new();
         while let Ok(event) = self.stream.events.try_recv() {
             events.push(event);
@@ -425,6 +480,9 @@ impl EngineHandle {
 impl Drop for EngineHandle {
     fn drop(&mut self) {
         self.interrupt_shutdown();
+        // Idempotent after `join`. The spectrum thread wakes on this at once
+        // and never waits on the decode worker, so this cannot hang.
+        self.spectrum_thread.stop();
     }
 }
 
@@ -463,6 +521,18 @@ pub struct TransportCore {
     /// Media position the current generation's frame counting starts from.
     anchor: Duration,
     sample_rate: u32,
+    /// This transport's spectrum tap, when it has one: what every `Run`
+    /// publication must map first (decision 18).
+    tap: Option<TransportTap>,
+}
+
+/// What a transport needs to publish its tap mappings: the registry, its
+/// never-reused instance ID, and the revision and channel count it plays.
+pub(crate) struct TransportTap {
+    registry: TapRegistry,
+    instance: u64,
+    session_rev: u64,
+    channels: u16,
 }
 
 impl TransportCore {
@@ -482,7 +552,49 @@ impl TransportCore {
             timeline,
             anchor,
             sample_rate,
+            tap: None,
         }
+    }
+
+    /// Attaches the spectrum tap's mapping state. Builder-style, so `new`
+    /// keeps its public signature.
+    pub(crate) fn with_tap(mut self, tap: TransportTap) -> Self {
+        self.tap = Some(tap);
+        self
+    }
+
+    /// Publishes the mapping for the `Run` about to be published for
+    /// `generation`, under the epoch that publication will use. Must run
+    /// immediately before `start_running` or `release` (decision 18).
+    fn publish_tap_mapping(&self, generation: u16) {
+        if let Some(tap) = &self.tap {
+            tap.registry.publish(TapMapping {
+                instance: tap.instance,
+                generation,
+                epoch: self.handshake.upcoming_epoch(),
+                session_rev: tap.session_rev,
+                sample_rate: self.sample_rate,
+                channels: tap.channels,
+            });
+        }
+    }
+
+    /// Retires every mapping of this transport's tap, for teardown.
+    fn retire_tap(&self) {
+        if let Some(tap) = &self.tap {
+            tap.registry.retire_instance(tap.instance);
+        }
+    }
+
+    /// Publishes `Run` for `generation`, mapping it first.
+    fn start_running(&mut self, generation: u16) {
+        self.publish_tap_mapping(generation);
+        let Self {
+            handshake,
+            timeline,
+            ..
+        } = self;
+        handshake.start_running(generation, timeline);
     }
 
     /// Drain spans and return the position implied by what has actually
@@ -506,8 +618,10 @@ impl TransportCore {
             .is_ok()
     }
 
-    /// Release a parked callback, for the hook's thaw arm.
+    /// Release a parked callback: the hook's thaw arm and `Worker::play`'s
+    /// resume. The mapping goes out first (decision 18).
     pub(crate) fn release(&mut self) {
+        self.publish_tap_mapping(self.handshake.generation());
         self.handshake.release();
     }
 }
@@ -551,6 +665,15 @@ struct Worker {
     position_provenance: PositionProvenance,
     requested_target: Option<Duration>,
     media: Option<MediaId>,
+    /// The load currently in flight, set by `load` before `StateChanged`
+    /// announces `Loading` and taken (cleared) the moment that load reaches
+    /// an outcome: `Loaded` takes it into `adopted_load`, and both
+    /// cancellation returns plus `fail_with` clear it directly (M5 §6).
+    loading: Option<LoadRequestId>,
+    /// The load whose media the worker currently holds, set when `Loaded` is
+    /// emitted. Stop, pause, seek and device recovery never touch it; only
+    /// the next `load` clears it, before announcing its own `Loading`.
+    adopted_load: Option<LoadRequestId>,
     volume: Volume,
     generation: u16,
     pushed_total: u64,
@@ -610,6 +733,9 @@ struct Worker {
     /// can tell whether jumping the worker's own backlog would misreport
     /// event order. Maintained after every mutation of `pending_events`.
     backlog_empty: Arc<AtomicBool>,
+    /// Builds each transport's spectrum tap and holds the registry its
+    /// mappings are published to.
+    spectrum: SpectrumPort,
 }
 
 impl Worker {
@@ -625,6 +751,8 @@ impl Worker {
         interrupt: Arc<AtomicU8>,
         source_interrupt: Arc<SourceInterrupt>,
         http: Arc<Mutex<Option<Arc<HttpService>>>>,
+        device_clock: Arc<AtomicU64>,
+        spectrum: SpectrumPort,
     ) -> Self {
         let transport = Arc::new(Mutex::new(None));
         let facts = Arc::new(Mutex::new(SessionFacts {
@@ -635,10 +763,10 @@ impl Worker {
             playing: false,
             provenance: PositionProvenance::Established,
             frozen_by_hook: false,
+            load: None,
         }));
         let backlog_empty = Arc::new(AtomicBool::new(true));
         let outbox = Arc::new(Mutex::new(VecDeque::new()));
-        let device_clock = Arc::new(AtomicU64::new(0));
         let clock: Arc<dyn Fn() -> Nanos + Send + Sync> = {
             let device_clock = Arc::clone(&device_clock);
             Arc::new(move || Nanos(device_clock.load(Ordering::Relaxed)))
@@ -678,6 +806,8 @@ impl Worker {
             position_provenance: PositionProvenance::Established,
             requested_target: None,
             media: None,
+            loading: None,
+            adopted_load: None,
             volume: Volume::FULL,
             generation: 0,
             pushed_total: 0,
@@ -708,6 +838,7 @@ impl Worker {
             http,
             device_clock,
             backlog_empty,
+            spectrum,
         }
     }
 
@@ -817,14 +948,17 @@ impl Worker {
     // ----------------------------------------------------------------- events
 
     fn emit(&mut self, event: PlaybackEvent) {
-        if self.pending_events.len() >= PENDING_CAP {
+        // Protected events — load outcomes — bypass `PENDING_CAP` entirely
+        // (Decision 4): correlation cannot be inferred from anything later,
+        // so one is always pushed, never dropped or counted as such.
+        if self.pending_events.len() >= PENDING_CAP && !event.is_protected() {
             if !event.is_terminal() {
                 self.dropped_events += 1;
                 return;
             }
             // A terminal outcome displaces the oldest ordinary event rather
             // than being dropped: nothing that follows implies it.
-            match self.pending_events.iter().position(|e| !e.is_terminal()) {
+            match displacement_victim(&self.pending_events) {
                 Some(index) => {
                     self.pending_events.remove(index);
                     self.dropped_events += 1;
@@ -837,6 +971,20 @@ impl Worker {
         }
         self.pending_events.push_back(event);
         self.note_backlog();
+    }
+
+    /// Emits `LoadCancelled` for the load still in flight, if any — the one
+    /// outcome a `Load` abandoned mid-open owes its caller (M5 §6). Called
+    /// from both cancellation returns in `load`, and from `shutdown`'s drain
+    /// of undelivered `Load` commands.
+    fn cancel_load(&mut self) {
+        if let Some(request) = self.loading.take() {
+            let session_rev = self.session_rev;
+            self.emit(PlaybackEvent::LoadCancelled {
+                session_rev,
+                request,
+            });
+        }
     }
 
     /// Drain `WaitService`'s outbox onto the back of `pending_events`. Called
@@ -875,7 +1023,8 @@ impl Worker {
     fn flush_events(&mut self) {
         while let Some(front) = self.pending_events.front() {
             let free = self.free_event_slots();
-            if free == 0 || (!front.is_terminal() && free <= RESERVED_EVENT_SLOTS) {
+            let may_use_reserve = front.is_terminal() || front.is_protected();
+            if free == 0 || (!may_use_reserve && free <= RESERVED_EVENT_SLOTS) {
                 break;
             }
             let Some(event) = self.pending_events.pop_front() else {
@@ -966,7 +1115,21 @@ impl Worker {
         }
         self.state = state;
         let session_rev = self.session_rev;
-        self.emit(PlaybackEvent::StateChanged { session_rev, state });
+        // Only a `Loading` announcement carries a token: it is the one state
+        // change a load itself causes, so `play()`'s remote-reopen `Loading`
+        // - reached with `self.loading` already `None` because `Loaded`
+        // already took it - correctly carries `None` too, with no special
+        // casing here (M5 §6, Decision 2).
+        let request = if state == PlaybackState::Loading {
+            self.loading
+        } else {
+            None
+        };
+        self.emit(PlaybackEvent::StateChanged {
+            session_rev,
+            state,
+            request,
+        });
     }
 
     fn fail(&mut self, message: String) {
@@ -998,10 +1161,16 @@ impl Worker {
         self.source_interrupt.retire();
         self.retire_remote_source();
         let session_rev = self.session_rev;
+        // `take`, not a read: only a failure while a load was still in
+        // flight is that load's outcome (M5 §6). Taking it here means a
+        // later fault on the same session - after `Loaded` already took
+        // `loading` for itself - correctly reports no request at all.
+        let request = self.loading.take();
         self.emit(PlaybackEvent::Failed {
             session_rev,
             message,
             cause,
+            request,
         });
         self.set_state(PlaybackState::Failed);
     }
@@ -1088,6 +1257,7 @@ impl Worker {
             // `frozen_by_hook` is deliberately left untouched here: it is the
             // hook's own bookkeeping (Ruling 1's `SessionFacts` lives in
             // `wait.rs`), and this pass has nothing new to tell it.
+            facts.load = self.adopted_load;
         }
         self.service.service_as(Servicing::WorkerLoop);
         // Read back whatever the shared recompute settled on, so
@@ -1290,6 +1460,10 @@ impl Worker {
             // during that block (see `CallbackCore::fill`'s doc comment).
             Arc::clone(&self.device_clock),
         );
+        // A fresh instance per transport, its reader already with the
+        // analysis worker before the callback can write a block.
+        let (tap_instance, tap_writer) = self.spectrum.open_tap(channels, config.sample_rate);
+        let core = core.with_tap(tap_writer);
         // Plain `store`, deliberately, not `fetch_max`: everywhere else in
         // this file `fetch_max` is correct precisely because writer and
         // reader stay inside one clock domain, but opening a stream *changes*
@@ -1331,7 +1505,14 @@ impl Worker {
         self.pcm = Some(pcm_tx);
         let sample_rate = config.sample_rate;
         self.config = Some(config);
-        *lock(&self.transport) = Some(TransportCore::new(handshake, timeline, anchor, sample_rate));
+        let tap = TransportTap {
+            registry: self.spectrum.registry().clone(),
+            instance: tap_instance,
+            session_rev: self.session_rev,
+            channels,
+        };
+        *lock(&self.transport) =
+            Some(TransportCore::new(handshake, timeline, anchor, sample_rate).with_tap(tap));
         self.prime_and_run(playing);
         Ok(())
     }
@@ -1427,12 +1608,7 @@ impl Worker {
         let mut guard = lock(&self.transport);
         if let Some(core) = guard.as_mut() {
             let generation = core.handshake.generation();
-            let TransportCore {
-                handshake,
-                timeline,
-                ..
-            } = core;
-            handshake.start_running(generation, timeline);
+            core.start_running(generation);
         }
     }
 
@@ -1513,7 +1689,11 @@ impl Worker {
         self.output.close();
         retire_faults(&mut self.deferred_fault, &self.faults);
         let link = self.link.take();
-        *lock(&self.transport) = None;
+        // A load, stop, recovery or shutdown invalidates every mapping of the
+        // old transport, so its spectrum disappears without new audio.
+        if let Some(core) = lock(&self.transport).take() {
+            core.retire_tap();
+        }
         self.pcm = None;
         self.config = None;
         self.converter = None;
@@ -1533,6 +1713,18 @@ impl Worker {
         // (neither calls `self.emit` directly), so nothing between here and
         // `publish_progress` can reorder ahead of what was just drained.
         self.drain_outbox();
+        // Accepted but never dispatched: each still owes its caller an
+        // outcome. Every other undelivered command is simply discarded -
+        // nothing else in `PlaybackCommand` promises one.
+        while let Ok(command) = self.commands.try_recv() {
+            if let PlaybackCommand::Load { request, .. } = command {
+                let session_rev = self.session_rev;
+                self.emit(PlaybackEvent::LoadCancelled {
+                    session_rev,
+                    request,
+                });
+            }
+        }
         let captured_exactly = self.capture_position();
         self.teardown();
         self.source = None;
@@ -1802,11 +1994,17 @@ impl Worker {
     fn dispatch(&mut self, command: PlaybackCommand) {
         match command {
             PlaybackCommand::Load {
+                request,
                 media,
                 source,
                 resume,
-            } => self.load(media, source, resume),
+            } => self.load(request, media, source, resume),
             PlaybackCommand::Play => self.play(),
+            PlaybackCommand::PlayLoaded { request } => {
+                if self.adopted_load == Some(request) && self.state == PlaybackState::Paused {
+                    self.play();
+                }
+            }
             PlaybackCommand::Pause => self.pause(),
             PlaybackCommand::TogglePause => match self.state {
                 PlaybackState::Playing => self.pause(),
@@ -1840,12 +2038,23 @@ impl Worker {
         }
     }
 
-    fn load(&mut self, media: MediaId, source: SourceLocation, resume: ResumeIntent) {
+    fn load(
+        &mut self,
+        request: LoadRequestId,
+        media: MediaId,
+        source: SourceLocation,
+        resume: ResumeIntent,
+    ) {
         self.capture_and_teardown();
         self.source = None;
         self.session_rev += 1;
         self.media = Some(media.clone());
         self.requested_target = None;
+        // This load's media is not yet held until `Loaded` says so, and its
+        // token is now the one in flight - both before `set_state(Loading)`
+        // reads `self.loading` for the announcement below (M5 §6).
+        self.adopted_load = None;
+        self.loading = Some(request);
         // A caller-decided start is already the position that will be asked
         // for, so it is pinned BEFORE opening: if the load fails, Failed must
         // carry it so a retry can resume there. Zeroing here loses it for
@@ -1880,7 +2089,10 @@ impl Worker {
             // still `Loading` here (set above), so leaving it alone is what
             // lets the very next pass's `do_stop` actually run instead of
             // early-returning on a `Failed` it did not ask for.
-            Err(error) if is_cancelled(&error) => return,
+            Err(error) if is_cancelled(&error) => {
+                self.cancel_load();
+                return;
+            }
             Err(error) => {
                 self.fail_from(error);
                 return;
@@ -1999,7 +2211,10 @@ impl Worker {
                 }
                 // Abandon the load, leaving no decoder open. The interrupt
                 // still stands and the loop's next pass acts on it.
-                Err(error) if is_cancelled(&error) => return,
+                Err(error) if is_cancelled(&error) => {
+                    self.cancel_load();
+                    return;
+                }
                 Err(error) => {
                     self.fail_from(error);
                     return;
@@ -2009,8 +2224,13 @@ impl Worker {
         let session_rev = self.session_rev;
         let position = self.position;
         let capabilities = self.capabilities;
+        // Takes `loading`: this outcome closes it. `adopted_load` now holds
+        // the same token until the next `load` clears it (M5 §6, Decision 2).
+        self.loading = None;
+        self.adopted_load = Some(request);
         self.emit(PlaybackEvent::Loaded {
             session_rev,
+            request,
             media,
             metadata: decoded.metadata().clone(),
             capabilities,
@@ -2075,7 +2295,7 @@ impl Worker {
                 {
                     let mut guard = lock(&self.transport);
                     if let Some(core) = guard.as_mut() {
-                        core.handshake.release();
+                        core.release();
                     }
                 }
                 self.set_state(PlaybackState::Playing);
@@ -2977,6 +3197,16 @@ fn adopt_preserved(promised: Duration, actual: Duration) -> Duration {
     }
 }
 
+/// The oldest event `Worker::emit` may displace to make room for a terminal
+/// arrival at `PENDING_CAP`: neither terminal (already guaranteed delivery
+/// some other way) nor protected (never displaced — Decision 4). A free
+/// function so the unit test below can exercise it directly.
+fn displacement_victim(pending: &VecDeque<PlaybackEvent>) -> Option<usize> {
+    pending
+        .iter()
+        .position(|event| !event.is_terminal() && !event.is_protected())
+}
+
 /// An estimated duration is not a ceiling (§5.5): `clamp_target` must treat
 /// it exactly like an absent one, the same shape `decide_resume` uses for
 /// `KnownDuration`. Clamping to an estimate would silently relocate a seek
@@ -2999,6 +3229,31 @@ fn established_duration(metadata: &MediaMetadata) -> Option<Duration> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A terminal, non-protected event may be displaced to make room for
+    /// another terminal event at `PENDING_CAP`; a protected one — a load
+    /// outcome — never may, since correlation cannot be inferred from
+    /// anything later (Decision 4).
+    #[test]
+    fn a_terminal_event_never_displaces_a_protected_one() {
+        let mut pending = VecDeque::new();
+        pending.push_back(PlaybackEvent::LoadCancelled {
+            session_rev: 1,
+            request: LoadRequestId::from_raw(1),
+        });
+        pending.push_back(PlaybackEvent::EndOfTrack {
+            session_rev: 1,
+            position: Duration::ZERO,
+            provenance: PositionProvenance::Established,
+        });
+        pending.push_back(PlaybackEvent::Warning {
+            session_rev: 1,
+            message: String::new(),
+        });
+        assert_eq!(displacement_victim(&pending), Some(2));
+        pending.pop_back();
+        assert_eq!(displacement_victim(&pending), None);
+    }
 
     /// Fix round 2: proves the exact `store`/`fetch_max` composition
     /// `open_transport`, `CallbackCore::fill` and `Worker::publish_progress`
@@ -3105,8 +3360,12 @@ mod tests {
     fn an_estimated_duration_is_not_treated_as_a_ceiling() {
         let metadata = MediaMetadata {
             title: None,
+            artist: None,
+            album: None,
+            year: None,
             duration: Some(Duration::from_secs(100)),
             duration_provenance: PositionProvenance::Estimated,
+            front_cover: None,
         };
         assert_eq!(
             established_duration(&metadata),
@@ -3119,8 +3378,12 @@ mod tests {
     fn an_established_duration_is_still_a_ceiling() {
         let metadata = MediaMetadata {
             title: None,
+            artist: None,
+            album: None,
+            year: None,
             duration: Some(Duration::from_secs(100)),
             duration_provenance: PositionProvenance::Established,
+            front_cover: None,
         };
         assert_eq!(
             established_duration(&metadata),

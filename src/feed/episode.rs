@@ -31,6 +31,7 @@ use super::parse::{ParseReport, ParseWarning, WarningKind};
 pub struct BoundFeed {
     pub title: Option<String>,
     pub site_link: Option<Url>,
+    pub image: Option<Url>,
     pub items: Vec<BoundItem>,
     pub skipped: usize,
     pub warnings: Vec<ParseWarning>,
@@ -43,6 +44,8 @@ pub struct BoundFeed {
 #[derive(Clone, Debug, PartialEq)]
 pub struct BoundItem {
     pub episode: Episode,
+    /// The item's own artwork URL, when the feed named one for it.
+    pub image: Option<Url>,
     pub enclosure_length: Option<u64>,
     pub enclosure_mime: Option<String>,
 }
@@ -132,6 +135,7 @@ pub fn bind_feed(feed_id: &FeedId, parsed: ParseReport) -> BoundFeed {
         };
 
         items.push(BoundItem {
+            image: item.image,
             episode: Episode {
                 id,
                 source,
@@ -147,6 +151,7 @@ pub fn bind_feed(feed_id: &FeedId, parsed: ParseReport) -> BoundFeed {
     BoundFeed {
         title: feed.title,
         site_link: feed.site_link,
+        image: feed.image,
         items,
         skipped,
         warnings,

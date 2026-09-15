@@ -7,11 +7,13 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
+use super::queue_codec::{self, QueueReset};
 use crate::media::id::MediaId;
 use crate::playback::checkpoint::PlaybackCheckpoint;
 use crate::playback::volume::Volume;
+use crate::queue::{Queue, QueueEntryId};
 
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// Counting the current entry, which is never evictable (D2).
 pub const MAX_ENTRIES: usize = 512;
@@ -51,19 +53,21 @@ pub struct PersistedCheckpoint {
 /// [`RawState`] so that deriving it is the only way to build one from a file:
 /// a `#[serde(skip)]` field would arrive as `0` and hand every caller a
 /// sequence that regresses.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(from = "RawState")]
+#[derive(Clone, Debug)]
 pub struct PersistedState {
     schema_version: u32,
     current_media: Option<MediaId>,
     volume: f32,
     checkpoints: BTreeMap<MediaId, PersistedCheckpoint>,
-    #[serde(skip)]
+    queue: Queue,
     next_seq: u64,
 }
 
+/// The state file's shape before the queue is validated: `queue` and
+/// `active_entry` are held as raw JSON so a damaged queue can be recovered
+/// field-by-field without ever touching `checkpoints` (M5 §6, task brief).
 #[derive(Deserialize)]
-struct RawState {
+pub(super) struct RawState {
     schema_version: u32,
     #[serde(default)]
     current_media: Option<MediaId>,
@@ -71,27 +75,76 @@ struct RawState {
     volume: f32,
     #[serde(default)]
     checkpoints: BTreeMap<MediaId, PersistedCheckpoint>,
+    #[serde(default)]
+    queue: Option<serde_json::Value>,
+    #[serde(default)]
+    active_entry: Option<serde_json::Value>,
 }
 
 fn full_gain() -> f32 {
     Volume::FULL.as_gain()
 }
 
-impl From<RawState> for PersistedState {
-    fn from(raw: RawState) -> Self {
-        let next_seq = raw
+impl RawState {
+    /// `accept_queue` is false for schema 1/2 files and for read-only
+    /// snapshots, which never examine queue data (task brief recovery rules
+    /// 1-2).
+    pub(super) fn into_state(self, accept_queue: bool) -> (PersistedState, Option<QueueReset>) {
+        let next_seq = self
             .checkpoints
             .values()
             .map(|entry| entry.touch_seq)
             .max()
             .map_or(1, |highest| highest.saturating_add(1));
-        Self {
-            schema_version: raw.schema_version,
-            current_media: raw.current_media,
-            volume: raw.volume,
-            checkpoints: raw.checkpoints,
-            next_seq,
+        let (queue, reset) = if accept_queue && self.schema_version >= SCHEMA_VERSION {
+            queue_codec::recover_queue(
+                self.queue.as_ref(),
+                self.active_entry.as_ref(),
+                self.current_media.as_ref(),
+            )
+        } else {
+            (Queue::default(), None)
+        };
+        (
+            PersistedState {
+                schema_version: self.schema_version,
+                current_media: self.current_media,
+                volume: self.volume,
+                checkpoints: self.checkpoints,
+                queue,
+                next_seq,
+            },
+            reset,
+        )
+    }
+}
+
+impl<'de> Deserialize<'de> for PersistedState {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(RawState::deserialize(deserializer)?.into_state(true).0)
+    }
+}
+
+impl Serialize for PersistedState {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        struct Out<'a> {
+            schema_version: u32,
+            current_media: &'a Option<MediaId>,
+            volume: f32,
+            checkpoints: &'a BTreeMap<MediaId, PersistedCheckpoint>,
+            queue: Vec<queue_codec::QueueEntryDto>,
+            active_entry: Option<u64>,
         }
+        Out {
+            schema_version: self.schema_version,
+            current_media: &self.current_media,
+            volume: self.volume,
+            checkpoints: &self.checkpoints,
+            queue: queue_codec::encode(&self.queue),
+            active_entry: self.queue.active().map(QueueEntryId::get),
+        }
+        .serialize(serializer)
     }
 }
 
@@ -102,6 +155,7 @@ impl Default for PersistedState {
             current_media: None,
             volume: Volume::FULL.as_gain(),
             checkpoints: BTreeMap::new(),
+            queue: Queue::default(),
             next_seq: 1,
         }
     }
@@ -139,6 +193,18 @@ impl PersistedState {
     /// v1 build would read and quietly discard.
     pub(super) fn migrate_to_current_schema(&mut self) {
         self.schema_version = SCHEMA_VERSION;
+    }
+
+    /// The playback queue (M5 §5), decoded independently of `checkpoints` so
+    /// a damaged queue never costs a saved checkpoint.
+    pub fn queue(&self) -> &Queue {
+        &self.queue
+    }
+
+    /// Mutable access for `Session`, which is the only thing allowed to
+    /// change what is queued (§3).
+    pub(crate) fn queue_mut(&mut self) -> &mut Queue {
+        &mut self.queue
     }
 
     pub fn current_media(&self) -> Option<&MediaId> {

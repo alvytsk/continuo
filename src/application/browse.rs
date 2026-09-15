@@ -1,0 +1,198 @@
+//! What the on-demand browser reads (design doc M5 §8): one level of a local
+//! directory, the subscribed feeds and a feed's cached episodes, each read on
+//! a worker thread so the render loop never waits on the filesystem.
+//!
+//! Nothing here touches the network. The worker owns its own
+//! [`LibraryStores`] and never builds an `HttpService`; the feed listings
+//! are the same read-only snapshot reads `continuo feeds` uses, so opening
+//! the browser or listing episodes never refreshes a feed. A listing is a
+//! directory read and a `stat` per entry — no recursion and no media
+//! metadata probing.
+
+use std::path::{Path, PathBuf};
+use std::thread;
+
+use crossbeam_channel::{Receiver, Sender};
+
+use crate::application::runtime::LibraryStores;
+use crate::library::{EpisodeCandidate, FeedSummary, episode_candidates, list_feeds};
+
+/// The extensions a listing classifies as audio, compared ASCII
+/// case-insensitively.
+const AUDIO_EXTENSIONS: [&str; 4] = ["mp3", "flac", "wav", "m4a"];
+const NO_LIBRARY: &str = "No subscription library is available";
+const NOT_RUNNING: &str = "The browser's reader is not running";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EntryKind {
+    Directory,
+    Audio,
+    Other,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DirEntry {
+    /// The file name as the filesystem spells it, lossily decoded; a front
+    /// end still has to make it displayable before drawing it.
+    pub name: String,
+    pub path: PathBuf,
+    pub kind: EntryKind,
+}
+
+/// One level of `path`: directories first, then the rest, each group by
+/// case-insensitive name. A symlink is classified by what it points at; a
+/// dangling one is `Other`. An unreadable directory is an `Err`, never a
+/// panic.
+pub fn list_directory(path: &Path) -> std::io::Result<Vec<DirEntry>> {
+    let mut entries = Vec::new();
+    for entry in std::fs::read_dir(path)? {
+        let entry = entry?;
+        let entry_path = entry.path();
+        let is_dir = std::fs::metadata(&entry_path).is_ok_and(|metadata| metadata.is_dir());
+        let kind = if is_dir {
+            EntryKind::Directory
+        } else if is_audio(&entry_path) {
+            EntryKind::Audio
+        } else {
+            EntryKind::Other
+        };
+        entries.push(DirEntry {
+            name: entry.file_name().to_string_lossy().into_owned(),
+            path: entry_path,
+            kind,
+        });
+    }
+    entries.sort_by_cached_key(|entry| {
+        (
+            entry.kind != EntryKind::Directory,
+            entry.name.to_lowercase(),
+            entry.name.clone(),
+        )
+    });
+    Ok(entries)
+}
+
+fn is_audio(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            AUDIO_EXTENSIONS
+                .iter()
+                .any(|audio| extension.eq_ignore_ascii_case(audio))
+        })
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BrowseRequest {
+    Directory(PathBuf),
+    Feeds,
+    Episodes { slug: String },
+}
+
+/// A request's answer, naming what it was for so a caller can tell a late
+/// answer for a place it already left from the one it is waiting on.
+#[derive(Clone, Debug)]
+pub enum BrowseResult {
+    Directory {
+        path: PathBuf,
+        entries: Result<Vec<DirEntry>, String>,
+    },
+    Feeds(Result<Vec<FeedSummary>, String>),
+    Episodes {
+        slug: String,
+        episodes: Result<Vec<EpisodeCandidate>, String>,
+    },
+}
+
+/// One background thread answering [`BrowseRequest`]s in order. It exits
+/// once this handle is dropped and it has finished the request in hand.
+pub struct BrowseWorker {
+    requests: Sender<BrowseRequest>,
+    results: Receiver<BrowseResult>,
+    /// For answering a request the thread will never see.
+    failures: Sender<BrowseResult>,
+}
+
+impl BrowseWorker {
+    pub fn spawn(library: Option<LibraryStores>) -> Self {
+        let (requests, request_rx) = crossbeam_channel::unbounded();
+        let (result_tx, results) = crossbeam_channel::unbounded();
+        // Detached: a directory read stuck on a slow mount must not hold up
+        // whoever drops the handle.
+        let _detached = thread::Builder::new()
+            .name("continuo-browse".into())
+            .spawn({
+                let result_tx = result_tx.clone();
+                move || serve(library.as_ref(), &request_rx, &result_tx)
+            });
+        Self {
+            requests,
+            results,
+            failures: result_tx,
+        }
+    }
+
+    /// Queues `request`; never blocks. When the thread could not start, the
+    /// request is answered at once with an error instead.
+    pub fn request(&self, request: BrowseRequest) {
+        if let Err(refused) = self.requests.send(request) {
+            let _ = self
+                .failures
+                .send(answer_with(refused.into_inner(), NOT_RUNNING));
+        }
+    }
+
+    pub fn try_result(&self) -> Option<BrowseResult> {
+        self.results.try_recv().ok()
+    }
+}
+
+fn serve(
+    library: Option<&LibraryStores>,
+    requests: &Receiver<BrowseRequest>,
+    results: &Sender<BrowseResult>,
+) {
+    for request in requests {
+        if results.send(answer(library, request)).is_err() {
+            return;
+        }
+    }
+}
+
+/// `request`'s answer when all it can say is `message`.
+fn answer_with(request: BrowseRequest, message: &str) -> BrowseResult {
+    match request {
+        BrowseRequest::Directory(path) => BrowseResult::Directory {
+            path,
+            entries: Err(message.to_owned()),
+        },
+        BrowseRequest::Feeds => BrowseResult::Feeds(Err(message.to_owned())),
+        BrowseRequest::Episodes { slug } => BrowseResult::Episodes {
+            slug,
+            episodes: Err(message.to_owned()),
+        },
+    }
+}
+
+fn answer(library: Option<&LibraryStores>, request: BrowseRequest) -> BrowseResult {
+    match request {
+        BrowseRequest::Directory(path) => {
+            let entries = list_directory(&path).map_err(|error| error.to_string());
+            BrowseResult::Directory { path, entries }
+        }
+        BrowseRequest::Feeds => match library {
+            Some(stores) => BrowseResult::Feeds(
+                list_feeds(&stores.subscriptions, &stores.cache).map_err(|error| error.to_string()),
+            ),
+            None => answer_with(request, NO_LIBRARY),
+        },
+        BrowseRequest::Episodes { slug } => match library {
+            Some(stores) => {
+                let episodes = episode_candidates(&stores.subscriptions, &stores.cache, &slug)
+                    .map_err(|error| error.to_string());
+                BrowseResult::Episodes { slug, episodes }
+            }
+            None => answer_with(BrowseRequest::Episodes { slug }, NO_LIBRARY),
+        },
+    }
+}

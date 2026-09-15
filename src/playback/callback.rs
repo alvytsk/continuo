@@ -5,6 +5,7 @@ use rtrb::{Consumer, Producer};
 
 use super::link::{Adopted, Control, OutputLink, Phase};
 use super::output::{Nanos, SpanRecord};
+use super::spectrum::tap::TapWriter;
 
 /// The production output callback, shared by `CpalOutput` and `TestOutput`.
 ///
@@ -27,6 +28,9 @@ pub struct CallbackCore {
     /// the freeze and park acknowledgments.
     pending: Option<SpanRecord>,
     current_gain: f32,
+    /// Optional post-gain PCM tap (spec §10, Task 27). Absent by default, so
+    /// a callback with no tap attached behaves exactly as before this task.
+    tap: Option<TapWriter>,
     /// Mirrors the callback-domain instant on every invocation of `fill` -
     /// including while parked or frozen - so a wait hook blocked deep inside a
     /// decoder read, which cannot reach `Worker.output`, still has a live
@@ -56,8 +60,16 @@ impl CallbackCore {
             media_total: 0,
             pending: None,
             current_gain: gain,
+            tap: None,
             clock,
         }
+    }
+
+    /// Attaches a post-gain PCM tap (spec §10, Task 27). Builder-style so
+    /// callers that never build one incur no change to `new`'s signature.
+    pub fn with_tap(mut self, tap: TapWriter) -> Self {
+        self.tap = Some(tap);
+        self
     }
 
     /// `callback` is the actual current instant - the same domain `now()`
@@ -123,6 +135,16 @@ impl CallbackCore {
         let frames = (written / channels) as u32;
         self.apply_gain(out);
         if frames > 0 {
+            if let Some(tap) = self.tap.as_mut() {
+                tap.offer(
+                    &out[..frames as usize * channels],
+                    self.channels,
+                    self.sample_rate,
+                    control.generation,
+                    control.epoch,
+                    playback,
+                );
+            }
             self.media_total += u64::from(frames);
             let record = SpanRecord {
                 generation: control.generation,
@@ -202,6 +224,8 @@ fn silence(out: &mut [f32]) {
 mod tests {
     use super::*;
     use crate::playback::output::test_output::TestOutput;
+    use crate::playback::spectrum::tap::tap_pair;
+    use std::sync::atomic::AtomicBool;
     use std::time::Duration;
 
     const RATE: u32 = 48_000;
@@ -382,6 +406,42 @@ mod tests {
         let record = spans.pop().unwrap();
         assert_eq!(record.generation, 2);
         assert_eq!(record.media_total_after, 480);
+    }
+
+    #[test]
+    fn the_tap_sees_post_gain_samples() {
+        let link = Arc::new(OutputLink::new());
+        link.set_gain(0.5); // before construction, so `current_gain` starts at 0.5: no ramp.
+        let (mut pcm_tx, pcm_rx) = rtrb::RingBuffer::<f32>::new(4_800 * 2);
+        let (span_tx, _spans) = rtrb::RingBuffer::<SpanRecord>::new(64);
+        let core = CallbackCore::new(
+            Arc::clone(&link),
+            pcm_rx,
+            span_tx,
+            2,
+            RATE,
+            Arc::new(AtomicU64::new(0)),
+        );
+        let (tap_writer, mut tap_reader) = tap_pair(1, 2, RATE, Arc::new(AtomicBool::new(true)));
+        let core = core.with_tap(tap_writer);
+        push_frames(&mut pcm_tx, 480, 1.0);
+        let mut out = TestOutput::new(2, RATE, 480, Duration::from_millis(20));
+        out.attach(core);
+        link.publish_control(Control {
+            generation: 1,
+            epoch: 1,
+            phase: Phase::Run,
+        });
+        out.advance(Duration::from_millis(10));
+
+        let mut tapped = Vec::new();
+        let descriptor = tap_reader.next_block(&mut tapped).expect("tapped block");
+        assert_eq!(descriptor.samples as usize, tapped.len());
+        assert!(!tapped.is_empty());
+        assert!(
+            tapped.iter().all(|sample| *sample == 0.5),
+            "every tapped sample is post-gain: {tapped:?}"
+        );
     }
 
     #[test]

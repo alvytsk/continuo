@@ -13,7 +13,8 @@ use crate::media::id::MediaId;
 
 use super::PersistenceError;
 use super::atomic::replace_bytes;
-use super::model::{PersistedCheckpoint, PersistedState, SCHEMA_VERSION};
+use super::model::{PersistedCheckpoint, PersistedState, RawState, SCHEMA_VERSION};
+use super::queue_codec::QueueReset;
 
 /// How many `-2`, `-3`, … candidates a quarantine will try before giving up.
 pub const MAX_QUARANTINE_CANDIDATES: u32 = 100;
@@ -43,7 +44,21 @@ struct VersionEnvelope {
 /// Does not touch the filesystem at all: no read, no quarantine, no write.
 /// What each caller does with a rejection — quarantine and keep writing,
 /// disable writing, or simply return `Err` — is entirely theirs.
-fn decode_state(path: &Path, bytes: &[u8]) -> Result<PersistedState, PersistenceError> {
+///
+/// `accept_queue` gates whether schema 3's `queue`/`active_entry` fields are
+/// decoded at all: [`StateStore::load`] passes `true`, and
+/// [`StateStore::read_snapshot`] passes `false`, since a listing never
+/// examines queue data (task brief recovery rules 1-2). The queue's own
+/// recovery outcome — `Some(QueueReset)` when the queue or active entry had
+/// to be reset — is returned alongside the state; [`StateStore::load`] uses
+/// it to back up the original file before writing resumes (§6), and
+/// [`StateStore::read_snapshot`] discards it, since a read never backs up or
+/// writes anything.
+fn decode_state(
+    path: &Path,
+    bytes: &[u8],
+    accept_queue: bool,
+) -> Result<(PersistedState, Option<QueueReset>), PersistenceError> {
     let envelope = serde_json::from_slice::<VersionEnvelope>(bytes)
         .map_err(|source| malformed(path, &source))?;
 
@@ -63,8 +78,9 @@ fn decode_state(path: &Path, bytes: &[u8]) -> Result<PersistedState, Persistence
         });
     }
 
-    let mut state = serde_json::from_slice::<PersistedState>(bytes)
-        .map_err(|source| malformed(path, &source))?;
+    let raw =
+        serde_json::from_slice::<RawState>(bytes).map_err(|source| malformed(path, &source))?;
+    let (mut state, queue_reset) = raw.into_state(accept_queue);
 
     // A v1 file's shape already deserialises cleanly into the current
     // `PersistedState` (§4.5): `position` lands in `Some`, and the absent
@@ -81,7 +97,7 @@ fn decode_state(path: &Path, bytes: &[u8]) -> Result<PersistedState, Persistence
         );
         state.migrate_to_current_schema();
     }
-    Ok(state)
+    Ok((state, queue_reset))
 }
 
 /// Sanitizes a `serde_json::Error` into a category plus line/column,
@@ -131,10 +147,27 @@ pub enum LoadReason {
     Unreadable,
 }
 
+/// Whether the exact original bytes were copied aside before a repaired
+/// queue's state could reach a writer (§6).
+#[derive(Debug)]
+pub enum QueueBackup {
+    Saved(PathBuf),
+    Failed,
+}
+
+/// Reported on [`LoadOutcome`] whenever `decode_state` had to reset queue
+/// data: what was reset, and whether the pre-repair bytes were preserved.
+#[derive(Debug)]
+pub struct QueueRepair {
+    pub reset: QueueReset,
+    pub backup: QueueBackup,
+}
+
 pub struct LoadOutcome {
     pub state: PersistedState,
     pub writable: bool,
     pub reason: LoadReason,
+    pub queue_repair: Option<QueueRepair>,
 }
 
 /// A read-only wrapper over a decoded [`PersistedState`], returned by
@@ -196,12 +229,28 @@ impl StateStore {
             }
         };
 
-        match decode_state(&self.path, &bytes) {
-            Ok(state) => LoadOutcome {
+        match decode_state(&self.path, &bytes, true) {
+            Ok((state, None)) => LoadOutcome {
                 state,
                 writable: true,
                 reason: LoadReason::Loaded,
+                queue_repair: None,
             },
+            Ok((state, Some(reset))) => {
+                let backup = self.back_up_original(&bytes);
+                let writable = matches!(backup, QueueBackup::Saved(_));
+                tracing::warn!(
+                    fields = reset.fields_reset(),
+                    writable,
+                    "queue data in the state file was reset"
+                );
+                LoadOutcome {
+                    state,
+                    writable,
+                    reason: LoadReason::Loaded,
+                    queue_repair: Some(QueueRepair { reset, backup }),
+                }
+            }
             Err(PersistenceError::UnsupportedVersion { found, .. }) => {
                 tracing::warn!(
                     path = ?self.path,
@@ -238,7 +287,7 @@ impl StateStore {
             }
         };
 
-        decode_state(&self.path, &bytes).map(StateSnapshot)
+        decode_state(&self.path, &bytes, false).map(|(state, _)| StateSnapshot(state))
     }
 
     pub fn write(&self, state: &PersistedState) -> Result<(), PersistenceError> {
@@ -273,6 +322,7 @@ impl StateStore {
             state: PersistedState::default(),
             writable,
             reason,
+            queue_repair: None,
         }
     }
 
@@ -315,10 +365,50 @@ impl StateStore {
         }
         None
     }
+
+    /// §6: copy the exact bytes aside with create-new semantics before any
+    /// writer can replace them. Never renames or rewrites the original.
+    fn back_up_original(&self, bytes: &[u8]) -> QueueBackup {
+        use std::io::Write;
+        let stamp = stamp(self.clock.sample().wall);
+        let dir = self.parent();
+        for suffix in 1..=MAX_QUARANTINE_CANDIDATES {
+            let name = if suffix == 1 {
+                format!("state.json.queue-recovery-{stamp}")
+            } else {
+                format!("state.json.queue-recovery-{stamp}-{suffix}")
+            };
+            let candidate = dir.join(name);
+            let mut file = match super::atomic::create_private_new(&candidate) {
+                Ok(file) => file,
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(_) => return QueueBackup::Failed,
+            };
+            // D12 (atomic.rs): the backup holds the user's full listening
+            // history, so its mode is asserted explicitly rather than left
+            // to the create-time mode, which the umask can alter.
+            if super::atomic::set_private(&candidate).is_err() {
+                return QueueBackup::Failed;
+            }
+            if file
+                .write_all(bytes)
+                .and_then(|()| file.sync_all())
+                .is_err()
+            {
+                return QueueBackup::Failed;
+            }
+            super::atomic::sync_parent_best_effort(dir);
+            return QueueBackup::Saved(candidate);
+        }
+        QueueBackup::Failed
+    }
 }
 
 /// `20260908T143211Z` — filesystem-safe, no colons (§13).
-fn stamp(at: OffsetDateTime) -> String {
+///
+/// `pub(crate)` so `lifecycle::stderr` can reuse the exact same format for
+/// per-session TUI log filenames rather than duplicating it.
+pub(crate) fn stamp(at: OffsetDateTime) -> String {
     format!(
         "{:04}{:02}{:02}T{:02}{:02}{:02}Z",
         at.year(),
