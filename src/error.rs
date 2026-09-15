@@ -21,8 +21,7 @@ pub enum DomainError {
 }
 
 /// Startup failures around a `play` invocation's shared lifecycle: the
-/// profile lock (Task 11) and, in later tasks, signal installation, the
-/// session log, and terminal setup.
+/// profile lock, signal installation, the session log, and terminal setup.
 #[derive(Debug, thiserror::Error)]
 pub enum LifecycleError {
     #[error(transparent)]

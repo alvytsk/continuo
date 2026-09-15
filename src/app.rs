@@ -96,10 +96,11 @@ pub fn run(cli: cli::Cli) -> Result<(), crate::error::AppError> {
     }
 }
 
-/// Task 11's addition to the legacy order: resolve the source (the caller
-/// already has), acquire the exclusive profile lock, *then* load
-/// `state.json` — never the other way around, or a second player could read
-/// or write state a first player still holds. The lock is bound here, not in
+/// The source is resolved first (the caller already has it), the exclusive
+/// profile lock is taken next, and only then is `state.json` loaded: a
+/// rejected source is reported before a second player would ever be told the
+/// profile is contended, and no process reads or writes state that another
+/// player still holds. The lock is bound here, not in
 /// [`run_resolved_locked`], so it stays held for that whole call and is only
 /// released once this function returns — after `finish`'s `report_flush`.
 fn run_resolved(media: MediaId, location: SourceLocation) -> Result<(), crate::error::AppError> {
@@ -116,10 +117,10 @@ fn run_resolved(media: MediaId, location: SourceLocation) -> Result<(), crate::e
 }
 
 /// The shared playback body: persistence open, engine assembly, resume,
-/// session, both key loops and the shutdown. Unchanged from before Task 11
-/// except that it now receives the already-locked `StateStore` instead of
-/// resolving one of its own (§13: `platform_path` still has exactly one
-/// caller, just moved up into [`run_resolved`]).
+/// session, both key loops and the shutdown. It receives an already-locked
+/// `StateStore` from [`run_resolved`] rather than resolving one of its own,
+/// which is what keeps `platform_path` down to exactly one caller in the
+/// program (§13).
 fn run_resolved_locked(
     media: MediaId,
     location: SourceLocation,
