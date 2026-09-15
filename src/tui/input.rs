@@ -1,0 +1,200 @@
+//! The keyboard map (design doc M5 §7): a key, the current [`UiState`] and
+//! the last drawn [`PlayerView`] in, a list of [`Effect`]s out. Nothing here
+//! touches the terminal or the runtime — `tui::run` is the only thing that
+//! executes an effect.
+
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+
+use crate::application::runtime::{AppCommand, EnqueueItem};
+use crate::application::transport::QUEUE_EMPTY;
+use crate::application::view::PlayerView;
+use crate::queue::Direction;
+use crate::tui::state::{Overlay, UiState};
+
+const VOLUME_STEP: f32 = 0.05;
+const SEEK_STEP: i64 = 10;
+
+/// What a key press asks the caller to do. `tui::run` (Task 21 adds mouse
+/// input alongside it) is the only executor.
+#[derive(Clone, Debug)]
+pub enum Effect {
+    App(AppCommand),
+    Quit,
+    SetMouseCapture(bool),
+    FullRedraw,
+    OpenBrowser,
+    CloseBrowser,
+    /// A status message with no runtime effect, for a rule §4 defines as a
+    /// no-op (an empty queue's Enter, for instance).
+    Notice(&'static str),
+}
+
+/// Maps one key press to zero or more effects, following §7's table. Ctrl-C
+/// always quits, even mid-keystroke in the input overlay; every other rule
+/// is scoped to the open overlay, so a shortcut like `q` or space can never
+/// fire while the user is typing.
+pub fn handle_key(key: KeyEvent, ui: &mut UiState, view: &PlayerView) -> Vec<Effect> {
+    if key.kind != KeyEventKind::Press {
+        return Vec::new();
+    }
+    if is_ctrl_c(&key) {
+        return vec![Effect::Quit];
+    }
+    match ui.overlay {
+        Overlay::Input => input_overlay(key, ui),
+        Overlay::ConfirmClear => confirm_overlay(key, ui),
+        Overlay::Help => help_overlay(key, ui),
+        // Task 22 forwards these keys to `BrowserState::handle_key`, whose
+        // own close maps to `Effect::CloseBrowser`.
+        Overlay::Browser => Vec::new(),
+        Overlay::None => no_overlay(key, ui, view),
+    }
+}
+
+fn is_ctrl_c(key: &KeyEvent) -> bool {
+    key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL)
+}
+
+/// Printable characters append to `ui.input` (so `q`, space and `+` never
+/// act as shortcuts here); a control character is dropped rather than
+/// stored, since typed input is user text that later reaches the screen and
+/// must never carry a raw control character.
+fn input_overlay(key: KeyEvent, ui: &mut UiState) -> Vec<Effect> {
+    match key.code {
+        KeyCode::Backspace => {
+            ui.input.pop();
+            Vec::new()
+        }
+        KeyCode::Enter => {
+            let trimmed = ui.input.trim().to_owned();
+            ui.overlay = Overlay::None;
+            ui.input.clear();
+            if trimmed.is_empty() {
+                Vec::new()
+            } else {
+                vec![Effect::App(AppCommand::Enqueue(vec![
+                    EnqueueItem::from_input(&trimmed),
+                ]))]
+            }
+        }
+        KeyCode::Esc => {
+            ui.overlay = Overlay::None;
+            ui.input.clear();
+            Vec::new()
+        }
+        KeyCode::Char(c) if !c.is_control() => {
+            ui.input.push(c);
+            Vec::new()
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// `y` clears the queue; any other key closes the confirmation without
+/// effect.
+fn confirm_overlay(key: KeyEvent, ui: &mut UiState) -> Vec<Effect> {
+    ui.overlay = Overlay::None;
+    if key.code == KeyCode::Char('y') {
+        vec![Effect::App(AppCommand::ClearQueue)]
+    } else {
+        Vec::new()
+    }
+}
+
+/// `?` or Esc closes the help overlay; every other key is ignored.
+fn help_overlay(key: KeyEvent, ui: &mut UiState) -> Vec<Effect> {
+    if matches!(key.code, KeyCode::Char('?') | KeyCode::Esc) {
+        ui.overlay = Overlay::None;
+    }
+    Vec::new()
+}
+
+fn no_overlay(key: KeyEvent, ui: &mut UiState, view: &PlayerView) -> Vec<Effect> {
+    match key.code {
+        KeyCode::Char(' ') => vec![Effect::App(AppCommand::PlayPause {
+            selected: ui.selected,
+        })],
+        KeyCode::Enter => match ui.selected {
+            Some(id) => vec![Effect::App(AppCommand::PlayEntry(id))],
+            None => vec![Effect::Notice(QUEUE_EMPTY)],
+        },
+        KeyCode::Up | KeyCode::Char('k') => {
+            move_selection(ui, view, Direction::Up);
+            Vec::new()
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            move_selection(ui, view, Direction::Down);
+            Vec::new()
+        }
+        KeyCode::Char('K') => move_entry(ui, Direction::Up),
+        KeyCode::Char('J') => move_entry(ui, Direction::Down),
+        KeyCode::Left => vec![Effect::App(AppCommand::SeekBy(-SEEK_STEP))],
+        KeyCode::Right => vec![Effect::App(AppCommand::SeekBy(SEEK_STEP))],
+        KeyCode::Home => vec![Effect::App(AppCommand::Restart)],
+        KeyCode::Char('-' | '_') => vec![Effect::App(AppCommand::AdjustVolume(-VOLUME_STEP))],
+        KeyCode::Char('+' | '=') => vec![Effect::App(AppCommand::AdjustVolume(VOLUME_STEP))],
+        KeyCode::Char('s') => vec![Effect::App(AppCommand::Stop)],
+        KeyCode::Char('p') => vec![Effect::App(AppCommand::Play {
+            selected: ui.selected,
+        })],
+        KeyCode::Char('[') => vec![Effect::App(AppCommand::Previous {
+            selected: ui.selected,
+        })],
+        KeyCode::Char(']') => vec![Effect::App(AppCommand::Next {
+            selected: ui.selected,
+        })],
+        KeyCode::Char('d') => ui
+            .selected
+            .map_or_else(Vec::new, |id| vec![Effect::App(AppCommand::Remove(id))]),
+        KeyCode::Char('b') => vec![Effect::OpenBrowser],
+        KeyCode::Char('a') => {
+            ui.overlay = Overlay::Input;
+            ui.input.clear();
+            Vec::new()
+        }
+        KeyCode::Char('c') => {
+            ui.overlay = Overlay::ConfirmClear;
+            Vec::new()
+        }
+        KeyCode::Char('?') => {
+            ui.overlay = Overlay::Help;
+            Vec::new()
+        }
+        KeyCode::Char('m') => {
+            ui.mouse_capture = !ui.mouse_capture;
+            vec![Effect::SetMouseCapture(ui.mouse_capture)]
+        }
+        KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            vec![Effect::FullRedraw]
+        }
+        KeyCode::Esc => Vec::new(),
+        KeyCode::Char('q') => vec![Effect::Quit],
+        _ => Vec::new(),
+    }
+}
+
+/// Moves the selection by one row, never wrapping; an empty queue selects
+/// nothing.
+fn move_selection(ui: &mut UiState, view: &PlayerView, direction: Direction) {
+    if view.rows.is_empty() {
+        ui.selected = None;
+        return;
+    }
+    let index = ui
+        .selected
+        .and_then(|id| view.rows.iter().position(|row| row.id == id));
+    let next = match (index, direction) {
+        (Some(index), Direction::Up) => index.saturating_sub(1),
+        (Some(index), Direction::Down) => (index + 1).min(view.rows.len() - 1),
+        (None, _) => 0,
+    };
+    ui.selected = view.rows.get(next).map(|row| row.id);
+}
+
+/// `Move` needs a concrete entry, so there is nothing to send with no
+/// selection.
+fn move_entry(ui: &UiState, direction: Direction) -> Vec<Effect> {
+    ui.selected.map_or_else(Vec::new, |id| {
+        vec![Effect::App(AppCommand::Move(id, direction))]
+    })
+}

@@ -11,6 +11,7 @@
 //! Each frame is drawn by [`render::draw`] in the size tier the terminal
 //! allows (§7).
 
+pub mod input;
 pub mod layout;
 pub mod render;
 pub mod state;
@@ -23,15 +24,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crossterm::cursor::Hide;
-use crossterm::event::{self, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event};
 use crossterm::execute;
 use crossterm::terminal::{EnterAlternateScreen, enable_raw_mode};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
-use crate::application::runtime::{
-    AppCommand, FlushReport, LibraryStores, PlayerRuntime, RuntimeParts,
-};
+use crate::application::runtime::{FlushReport, LibraryStores, PlayerRuntime, RuntimeParts};
 use crate::cli::MouseMode;
 use crate::clock::{Clock, SystemClock};
 use crate::error::{AppError, LifecycleError};
@@ -45,13 +44,13 @@ use crate::persistence::store::{LoadOutcome, QueueBackup, StateStore};
 use crate::persistence::writer::{DisabledSink, StateSink, WriterHandle};
 use crate::playback::engine::EngineHandle;
 use crate::session::Session;
+use crate::tui::input::{Effect, handle_key};
 use crate::tui::render::{HitMap, Visuals};
 use crate::tui::state::UiState;
 
 /// How long one loop pass waits for terminal input before pumping the
 /// runtime again; also the bound on how late a signal or fatal panic is seen.
 const INPUT_POLL: Duration = Duration::from_millis(50);
-const VOLUME_STEP: f32 = 0.05;
 const STATE_NOT_SAVED: &str = "This session is not saved";
 
 pub struct TuiOptions {
@@ -292,10 +291,10 @@ fn run_loop(
     cleanup: &FatalCleanup,
     signals: &ShutdownSignals,
 ) -> Ending {
-    // Where the last frame put its clickable parts, for mouse input.
+    // Where the last frame put its clickable parts, for mouse input (Task 21).
     let mut hits = HitMap::default();
     loop {
-        if let Err(error) = handle_input(runtime, signals, &hits) {
+        if let Err(error) = handle_input(runtime, &mut ui, terminal, cleanup, signals, &hits) {
             return Ending::Failed(LifecycleError::Terminal(error).into());
         }
         runtime.pump();
@@ -315,8 +314,14 @@ fn run_loop(
     }
 }
 
+/// Reads at most one key event and runs `tui::input::handle_key` against it,
+/// executing whatever effects come back. `_hits` is unused until Task 21
+/// adds mouse handling alongside this.
 fn handle_input(
     runtime: &mut PlayerRuntime,
+    ui: &mut UiState,
+    terminal: &mut Tty,
+    cleanup: &FatalCleanup,
     signals: &ShutdownSignals,
     _hits: &HitMap,
 ) -> io::Result<()> {
@@ -326,14 +331,46 @@ fn handle_input(
     let Event::Key(key) = event::read()? else {
         return Ok(());
     };
-    if key.kind != KeyEventKind::Press {
-        return Ok(());
+    let view = runtime.view();
+    for effect in handle_key(key, ui, &view) {
+        apply_effect(effect, runtime, ui, terminal, cleanup, signals)?;
     }
-    match key.code {
-        KeyCode::Char('q') => signals.request(),
-        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => signals.request(),
-        KeyCode::Char('-') => runtime.handle(AppCommand::AdjustVolume(-VOLUME_STEP)),
-        _ => {}
+    Ok(())
+}
+
+/// Executes one effect `tui::input::handle_key` returned. `OpenBrowser` and
+/// `CloseBrowser` are no-ops for now: Task 22 gives the browser its own
+/// state, owned here in `tui::run`, and forwards its keys to it.
+fn apply_effect(
+    effect: Effect,
+    runtime: &mut PlayerRuntime,
+    ui: &mut UiState,
+    terminal: &mut Tty,
+    cleanup: &FatalCleanup,
+    signals: &ShutdownSignals,
+) -> io::Result<()> {
+    match effect {
+        Effect::App(command) => {
+            runtime.handle(command);
+            let hint = runtime.take_selection_hint();
+            ui.reconcile(&runtime.view(), hint);
+        }
+        Effect::Notice(message) => runtime.set_status(message),
+        Effect::Quit => signals.request(),
+        Effect::SetMouseCapture(on) => {
+            let mut stdout = io::stdout();
+            if on {
+                execute!(stdout, EnableMouseCapture)?;
+            } else {
+                execute!(stdout, DisableMouseCapture)?;
+            }
+            cleanup.terminal().set_mouse(on);
+        }
+        Effect::FullRedraw => {
+            terminal.clear()?;
+            // Invalidating prepared cover-art placements is Task 25's job.
+        }
+        Effect::OpenBrowser | Effect::CloseBrowser => {}
     }
     Ok(())
 }

@@ -8,7 +8,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Widget};
+use ratatui::widgets::{Block, Clear, Paragraph, Widget, Wrap};
 
 use crate::application::transport::PlaybackPhase;
 use crate::application::view::{NowPlaying, PersistenceStatus, PlayerView, QueueRow, format_saved};
@@ -17,7 +17,7 @@ use crate::queue::{DisplayDuration, DurationSource, QueueEntryId};
 use crate::tui::layout::{
     Regions, Tier, inset, regions, take_left, take_right, tier_for, visible_rows,
 };
-use crate::tui::state::UiState;
+use crate::tui::state::{Overlay, UiState};
 use crate::tui::theme::Theme;
 
 /// What the frame shows beyond the view: prepared artwork and spectrum levels.
@@ -62,6 +62,30 @@ const EMPTY_QUEUE: &str = "Queue is empty — press b to browse or a to add";
 const KEY_HINTS: &str = "space play · enter play selected · b browse · a add · ? help · q quit";
 const TOO_SMALL: &str = "Terminal too small (need 30×8)";
 const RESIZE_HINTS: &str = "space play · q quit";
+/// Verbatim per the design (§4/§7): confirming discards the queue, not
+/// listening history.
+const CONFIRM_CLEAR_TEXT: &str = "Clear the queue? Listening history is kept. y to confirm";
+/// The §7 key table, one line per row.
+const HELP_LINES: [&str; 18] = [
+    "Space           Pause/resume; unloaded/ended behavior follows §4",
+    "Enter           Play selected queue entry",
+    "Up/Down or j/k  Move selection",
+    "J/K             Move selected entry down/up",
+    "Left/Right      Seek backward/forward 10 seconds",
+    "Home            Explicit restart from beginning",
+    "- _ / + =       Decrease / increase volume",
+    "s / p           Stop / play",
+    "[ / ]           Previous / next queue entry",
+    "d               Remove selected entry",
+    "b               Open/close browser",
+    "a               Open path/URL input",
+    "c               Request queue clear with confirmation",
+    "?               Show help",
+    "m               Toggle mouse capture",
+    "Ctrl-L          Redraw the whole view",
+    "Esc             Close the active overlay or cancel input",
+    "q / Ctrl-C      Graceful quit",
+];
 const NOTHING_PLAYING: &str = "Nothing playing";
 const UNKNOWN_TIME: &str = "--:--";
 /// Outside the `▁`–`█` block elements, which only the spectrum draws.
@@ -114,12 +138,91 @@ pub fn draw(
     let progress = draw_progress(buffer, regions.progress, view, tier, &theme);
     let rows = draw_queue(buffer, regions.queue, view, ui, tier, &theme);
     draw_footer(buffer, regions.footer, view, &theme);
+    draw_overlay(buffer, area, ui, &theme);
     HitMap {
         rows,
         queue: regions.queue,
         progress,
         buttons,
     }
+}
+
+/// The help, confirm and input overlays float over everything else the
+/// frame drew; the browser overlay is Task 22's to draw.
+fn draw_overlay(buffer: &mut Buffer, area: Rect, ui: &UiState, theme: &Theme) {
+    match ui.overlay {
+        Overlay::Help => draw_help_overlay(buffer, area, theme),
+        Overlay::ConfirmClear => draw_confirm_overlay(buffer, area, theme),
+        Overlay::Input => draw_input_overlay(buffer, area, &ui.input, theme),
+        Overlay::Browser | Overlay::None => {}
+    }
+}
+
+/// A box centred in `area`, clamped to fit it even when `area` is smaller
+/// than the requested size.
+fn centered_box(area: Rect, width: u16, height: u16) -> Rect {
+    let width = width.min(area.width);
+    let height = height.min(area.height);
+    Rect {
+        x: area.x.saturating_add((area.width - width) / 2),
+        y: area.y.saturating_add((area.height - height) / 2),
+        width,
+        height,
+    }
+}
+
+fn draw_confirm_overlay(buffer: &mut Buffer, area: Rect, theme: &Theme) {
+    let width = u16::try_from(CONFIRM_CLEAR_TEXT.len() + 4)
+        .unwrap_or(u16::MAX)
+        .min(area.width);
+    let box_area = centered_box(area, width, 3);
+    Clear.render(box_area, buffer);
+    Block::bordered()
+        .title(" confirm ")
+        .border_style(Style::new().fg(theme.amber))
+        .style(Style::new().bg(theme.background))
+        .render(box_area, buffer);
+    Paragraph::new(CONFIRM_CLEAR_TEXT)
+        .style(Style::new().fg(theme.cream))
+        .wrap(Wrap { trim: true })
+        .render(inset(box_area), buffer);
+}
+
+fn draw_help_overlay(buffer: &mut Buffer, area: Rect, theme: &Theme) {
+    let content_width = HELP_LINES.iter().map(|line| line.len()).max().unwrap_or(0);
+    let width = u16::try_from(content_width + 4)
+        .unwrap_or(u16::MAX)
+        .min(area.width);
+    let height = u16::try_from(HELP_LINES.len() + 2)
+        .unwrap_or(u16::MAX)
+        .min(area.height);
+    let box_area = centered_box(area, width, height);
+    Clear.render(box_area, buffer);
+    Block::bordered()
+        .title(" help — ? or Esc to close ")
+        .border_style(Style::new().fg(theme.line))
+        .style(Style::new().bg(theme.background))
+        .render(box_area, buffer);
+    Paragraph::new(HELP_LINES.join("\n"))
+        .style(Style::new().fg(theme.text))
+        .render(inset(box_area), buffer);
+}
+
+/// Typed text reaches this overlay only through `tui::input`, which already
+/// drops raw control characters before they land in `ui.input`, so the
+/// string drawn here is always inert.
+fn draw_input_overlay(buffer: &mut Buffer, area: Rect, input: &str, theme: &Theme) {
+    let width = area.width.min(60);
+    let box_area = centered_box(area, width, 3);
+    Clear.render(box_area, buffer);
+    Block::bordered()
+        .title(" add path or URL — Enter to add, Esc to cancel ")
+        .border_style(Style::new().fg(theme.green))
+        .style(Style::new().bg(theme.background))
+        .render(box_area, buffer);
+    Paragraph::new(format!("{input}▏"))
+        .style(Style::new().fg(theme.cream))
+        .render(inset(box_area), buffer);
 }
 
 fn bordered(theme: &Theme) -> Block<'static> {
