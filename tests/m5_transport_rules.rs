@@ -346,10 +346,11 @@ fn previous_and_next_anchor_on_the_active_entry_and_never_wrap() {
     );
 }
 
-// --- Ruling: an empty queue while Playing or Paused keeps engine semantics
-// (Space toggles pause, `p` is idempotent play) instead of a blanket notice;
-// Stopped keeps the notice because clearing the playing entry drops its
-// adoption too. ---
+// An empty queue does not freeze a track that is already playing or paused:
+// Space, p, Home and seeks still act on the loaded track, and only Enter -
+// which would otherwise pick a row that no longer exists - reports the queue
+// as empty. Once playback has stopped, the loaded track's adoption is gone
+// too, so every transport key reports the empty queue instead.
 
 #[test]
 fn an_empty_queue_keeps_engine_semantics_while_playing() {
@@ -496,8 +497,9 @@ fn an_empty_queue_while_stopped_still_notices() {
     );
 }
 
-// --- Gap resolution (a): a stale selected id (no longer queued) falls back
-// to the first row, never a `Load` that later registration would reject. ---
+// A selected row that has since been removed is ignored; the default
+// selection falls back to the first row, so a stale id never produces a
+// load that a later queue registration would reject.
 
 #[test]
 fn a_stale_selection_falls_back_to_the_first_row() {
@@ -515,8 +517,8 @@ fn a_stale_selection_falls_back_to_the_first_row() {
     );
 }
 
-// --- Gap resolution (b): with no active entry, Ended follows the Unloaded
-// rule for Space/Play (loads the selection). ---
+// An ended track with no active queue entry replays from the selection, the
+// same as before anything loaded.
 
 #[test]
 fn ended_with_no_active_entry_loads_the_selection_on_space() {
@@ -533,8 +535,8 @@ fn ended_with_no_active_entry_loads_the_selection_on_space() {
     );
 }
 
-// --- Gap resolution (c): Loading anchors Previous/Next on `last_requested`
-// only while it is still queued, else the active entry, else the selection. ---
+// While loading, Previous/Next anchor on the last requested entry only if it
+// is still queued; otherwise on the active entry, then the selection.
 
 #[test]
 fn loading_anchors_on_active_when_last_requested_is_gone() {
@@ -556,8 +558,8 @@ fn loading_anchors_on_active_when_last_requested_is_gone() {
     );
 }
 
-// --- Gap resolution (d): with no active entry, Previous/Next in Playing,
-// Paused or Stopped are a no-op rather than anchoring on the selection. ---
+// With no active entry, Previous/Next during playback, pause or stop do
+// nothing.
 
 #[test]
 fn playing_with_no_active_entry_does_not_navigate() {
