@@ -2,7 +2,7 @@
 
 A keyboard-first terminal audio player for local audio, finite HTTP media, and podcasts.
 
-Milestones 0 through 5 are implemented: domain types and identities (M0), local playback over Symphonia and CPAL with position tracking (M1), durable checkpoint persistence (M2), finite HTTP media with capability probing and range-based seek (M3), RSS/Atom subscriptions with episode listing and progress (M4), and a Ratatui terminal player with a persistent queue, a browser, cover art and a frequency spectrum (M5). `continuo tui` opens the [terminal player](#terminal-player). `continuo play` keeps its original interface: a status line plus a handful of keys (space to pause, the arrow keys to seek, `s`/`p` to stop/play, `q` to quit).
+Milestones 0 through 5 are implemented: domain types and identities (M0), local playback over Symphonia and CPAL with position tracking (M1), durable checkpoint persistence (M2), finite HTTP media with capability probing and range-based seek (M3), RSS/Atom subscriptions with episode listing and progress (M4), and a Ratatui terminal player with a persistent queue, a browser, cover art and a frequency spectrum (M5). M5's automated suites pass, but its manual checks in real terminals (Ghostty, Zellij, Herdr) have not been run yet; [docs/m5-acceptance.md](docs/m5-acceptance.md) records both. `continuo tui` opens the [terminal player](#terminal-player). `continuo play` keeps its original interface: a status line plus a handful of keys (space to pause, the arrow keys to seek, `s`/`p` to stop/play, `q` to quit).
 
 ## Development
 
@@ -78,6 +78,11 @@ first load, so the player is usable on a machine with no output device.
   supports and falls back to colored half-blocks when it does not answer
   within 250 ms. `blocks` always uses half-blocks without asking; `off` never
   loads artwork and shows only the placeholder.
+- Under tmux (a `TERM` starting with `tmux`, or `TERM_PROGRAM=tmux`),
+  `--artwork auto` and `--artwork blocks` run
+  `tmux set -p allow-passthrough on`, which changes that pane's option for as
+  long as the pane lives. The image library does this while choosing a
+  protocol; `--artwork off` avoids it.
 
 The layout adapts to the terminal size. At 80×28 and above it shows the
 cover, track information, spectrum, transport and progress above the queue;
@@ -190,6 +195,10 @@ the current media survive. The original bytes are first copied to
 and where the copy is. A bad active-entry reference alone keeps the entries
 and clears only that reference. If the copy cannot be made, the session runs
 unsaved (`unsaved` in the header) and the original file is left untouched.
+
+A write that fails while the player runs — a full disk, a directory that is
+no longer writable — shows `not saving` in the header until a later write
+succeeds. Continuo keeps retrying with the newest state in the meantime.
 
 ### Quitting, signals and exit status
 
