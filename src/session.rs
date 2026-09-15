@@ -520,10 +520,12 @@ impl Session {
 
     /// Applies `update` to every queue entry whose media is `media`,
     /// replacing only the fields `update` actually carries — a field left
-    /// `None` leaves the entry's existing value alone. `Ordinary` submit only
-    /// when at least one entry matched and `update` carried at least one
-    /// field; otherwise `Action::None`, so a caller cannot be told a
-    /// submission happened when nothing was there to change.
+    /// `None` leaves the entry's existing value alone. A carried field is
+    /// written only when it actually differs from the entry's current value:
+    /// `Ordinary` submit only when at least one field on at least one entry
+    /// truly changed; otherwise `Action::None`, so a caller re-sending
+    /// metadata it already wrote (the plan's metadata-enrichment workers do
+    /// this repeatedly) does not push an empty write on every call.
     pub fn update_display(&mut self, media: &MediaId, update: DisplayUpdate) -> Action {
         if update == DisplayUpdate::default() {
             return Action::None;
@@ -536,28 +538,42 @@ impl Session {
             .filter(|entry| entry.media() == media)
             .map(|entry| entry.id())
             .collect();
-        if ids.is_empty() {
-            return Action::None;
-        }
+        let mut changed = false;
         for id in ids {
             let Some(entry) = self.state.queue_mut().get_mut(id) else {
                 continue;
             };
             let display = entry.display_mut();
-            if let Some(title) = &update.title {
+            if let Some(title) = &update.title
+                && display.title.as_ref() != Some(title)
+            {
                 display.title = Some(title.clone());
+                changed = true;
             }
-            if let Some(artist) = &update.artist {
+            if let Some(artist) = &update.artist
+                && display.artist.as_ref() != Some(artist)
+            {
                 display.artist = Some(artist.clone());
+                changed = true;
             }
-            if let Some(album) = &update.album {
+            if let Some(album) = &update.album
+                && display.album.as_ref() != Some(album)
+            {
                 display.album = Some(album.clone());
+                changed = true;
             }
-            if let Some(duration) = update.duration {
+            if let Some(duration) = update.duration
+                && display.duration != Some(duration)
+            {
                 display.duration = Some(duration);
+                changed = true;
             }
         }
-        self.submit(Urgency::Ordinary)
+        if changed {
+            self.submit(Urgency::Ordinary)
+        } else {
+            Action::None
+        }
     }
 
     /// Replaces one entry's podcast fallback URL. Unknown `id` is an error;

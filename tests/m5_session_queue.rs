@@ -253,6 +253,108 @@ fn volume_and_display_updates_submit_through_the_session() {
     }
 }
 
+#[test]
+fn an_identical_display_update_submits_nothing_and_leaves_state_unchanged() {
+    let mut session = Session::new(PersistedState::default());
+    session.enqueue(vec![entry("a")]).expect("fits");
+    let update = DisplayUpdate {
+        title: Some("Title".into()),
+        artist: Some("Artist".into()),
+        album: None,
+        duration: None,
+    };
+    assert!(matches!(
+        session.update_display(&media("a"), update.clone()),
+        Action::Submit { .. }
+    ));
+    let before = session.state().clone();
+    assert!(matches!(
+        session.update_display(&media("a"), update),
+        Action::None
+    ));
+    assert_eq!(
+        session.state().queue().entries(),
+        before.queue().entries(),
+        "a repeated, unchanged update must not touch state"
+    );
+}
+
+#[test]
+fn a_display_update_that_repeats_one_field_and_changes_another_submits_and_keeps_the_repeated_field()
+ {
+    let mut session = Session::new(PersistedState::default());
+    session.enqueue(vec![entry("a")]).expect("fits");
+    session.update_display(
+        &media("a"),
+        DisplayUpdate {
+            title: Some("Title".into()),
+            artist: Some("Artist".into()),
+            album: None,
+            duration: None,
+        },
+    );
+    let action = session.update_display(
+        &media("a"),
+        DisplayUpdate {
+            title: Some("Title".into()),
+            artist: Some("New Artist".into()),
+            album: None,
+            duration: None,
+        },
+    );
+    assert!(matches!(action, Action::Submit { .. }));
+    let entry = session
+        .state()
+        .queue()
+        .entries()
+        .first()
+        .expect("one entry");
+    assert_eq!(entry.display().title.as_deref(), Some("Title"));
+    assert_eq!(entry.display().artist.as_deref(), Some("New Artist"));
+}
+
+/// `volume_and_display_updates_submit_through_the_session` already leaves
+/// `album` and `duration` as `None` throughout, which shows a `None` field
+/// staying absent — but not that a `None` field leaves an *existing* value
+/// alone. This test covers that case directly: `album`, once set, survives a
+/// second update that carries `None` for it.
+#[test]
+fn a_none_field_in_a_display_update_never_blanks_an_existing_value() {
+    let mut session = Session::new(PersistedState::default());
+    session.enqueue(vec![entry("a")]).expect("fits");
+    session.update_display(
+        &media("a"),
+        DisplayUpdate {
+            title: None,
+            artist: None,
+            album: Some("Album".into()),
+            duration: None,
+        },
+    );
+    let action = session.update_display(
+        &media("a"),
+        DisplayUpdate {
+            title: Some("Title".into()),
+            artist: None,
+            album: None,
+            duration: None,
+        },
+    );
+    assert!(matches!(action, Action::Submit { .. }));
+    let entry = session
+        .state()
+        .queue()
+        .entries()
+        .first()
+        .expect("one entry");
+    assert_eq!(entry.display().title.as_deref(), Some("Title"));
+    assert_eq!(
+        entry.display().album.as_deref(),
+        Some("Album"),
+        "a None field must not blank an existing value"
+    );
+}
+
 /// A sink slow enough that snapshots queue up behind it.
 struct SlowSink {
     inner: StateStore,
