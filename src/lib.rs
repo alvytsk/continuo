@@ -1,5 +1,6 @@
 pub mod app;
 pub mod application;
+pub mod artwork;
 pub mod cli;
 pub mod clock;
 pub mod commands;
