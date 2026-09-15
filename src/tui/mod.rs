@@ -8,8 +8,13 @@
 //! — quit key, signal, worker fatal, startup failure, or a panic on this
 //! thread — takes the same teardown over whatever was initialized so far.
 //!
-//! The drawing here is deliberately minimal and temporary: a title row, the
-//! queue titles, and the empty-queue notice.
+//! Each frame is drawn by [`render::draw`] in the size tier the terminal
+//! allows (§7).
+
+pub mod layout;
+pub mod render;
+pub mod state;
+pub mod theme;
 
 use std::any::Any;
 use std::io::{self, Stdout};
@@ -21,16 +26,12 @@ use crossterm::cursor::Hide;
 use crossterm::event::{self, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{EnterAlternateScreen, enable_raw_mode};
+use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use ratatui::text::Line;
-use ratatui::widgets::Paragraph;
-use ratatui::{Frame, Terminal};
 
 use crate::application::runtime::{
     AppCommand, FlushReport, LibraryStores, PlayerRuntime, RuntimeParts,
 };
-use crate::application::transport::QUEUE_EMPTY;
-use crate::application::view::PlayerView;
 use crate::cli::MouseMode;
 use crate::clock::{Clock, SystemClock};
 use crate::error::{AppError, LifecycleError};
@@ -44,12 +45,13 @@ use crate::persistence::store::{LoadOutcome, QueueBackup, StateStore};
 use crate::persistence::writer::{DisabledSink, StateSink, WriterHandle};
 use crate::playback::engine::EngineHandle;
 use crate::session::Session;
+use crate::tui::render::{HitMap, Visuals};
+use crate::tui::state::UiState;
 
 /// How long one loop pass waits for terminal input before pumping the
 /// runtime again; also the bound on how late a signal or fatal panic is seen.
 const INPUT_POLL: Duration = Duration::from_millis(50);
 const VOLUME_STEP: f32 = 0.05;
-const TITLE: &str = "continuo";
 const STATE_NOT_SAVED: &str = "This session is not saved";
 
 pub struct TuiOptions {
@@ -165,7 +167,8 @@ fn start_and_loop(
     }
     stage!(signals, cleanup);
 
-    run_loop(runtime, terminal, cleanup, signals)
+    let ui = UiState::new(options.mouse == MouseMode::On);
+    run_loop(runtime, terminal, ui, cleanup, signals)
 }
 
 /// Opens this run's log, hands a clone to the panic hook for contained-panic
@@ -285,26 +288,38 @@ fn probe_stderr() {
 fn run_loop(
     runtime: &mut PlayerRuntime,
     terminal: &mut Tty,
+    mut ui: UiState,
     cleanup: &FatalCleanup,
     signals: &ShutdownSignals,
 ) -> Ending {
+    // Where the last frame put its clickable parts, for mouse input.
+    let mut hits = HitMap::default();
     loop {
-        if let Err(error) = handle_input(runtime, signals) {
+        if let Err(error) = handle_input(runtime, signals, &hits) {
             return Ending::Failed(LifecycleError::Terminal(error).into());
         }
         runtime.pump();
         if let Some(ending) = interrupted(signals, cleanup) {
             return ending;
         }
-        if !cleanup.rendering_disabled()
-            && let Err(error) = terminal.draw(|frame| draw(frame, &runtime.view()))
-        {
+        if cleanup.rendering_disabled() {
+            continue;
+        }
+        let view = runtime.view();
+        ui.reconcile(&view, None);
+        if let Err(error) = terminal.draw(|frame| {
+            hits = render::draw(frame, &view, &ui, &Visuals::default());
+        }) {
             return Ending::Failed(LifecycleError::Terminal(error).into());
         }
     }
 }
 
-fn handle_input(runtime: &mut PlayerRuntime, signals: &ShutdownSignals) -> io::Result<()> {
+fn handle_input(
+    runtime: &mut PlayerRuntime,
+    signals: &ShutdownSignals,
+    _hits: &HitMap,
+) -> io::Result<()> {
     if !event::poll(INPUT_POLL)? {
         return Ok(());
     }
@@ -321,20 +336,6 @@ fn handle_input(runtime: &mut PlayerRuntime, signals: &ShutdownSignals) -> io::R
         _ => {}
     }
     Ok(())
-}
-
-fn draw(frame: &mut Frame<'_>, view: &PlayerView) {
-    let title = match &view.status {
-        Some(status) => format!("{TITLE} · {status}"),
-        None => TITLE.to_owned(),
-    };
-    let mut lines = vec![Line::from(title)];
-    if view.rows.is_empty() {
-        lines.push(Line::from(QUEUE_EMPTY));
-    } else {
-        lines.extend(view.rows.iter().map(|row| Line::from(row.title.clone())));
-    }
-    frame.render_widget(Paragraph::new(lines), frame.area());
 }
 
 /// Releases what startup initialized, in §11's order: the engine and writer
