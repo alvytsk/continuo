@@ -23,9 +23,9 @@ use crate::playback::error::PlaybackError;
 /// Queued jobs beyond the ones in hand; one per queue entry the queue can
 /// hold.
 const REQUEST_CAPACITY: usize = 256;
-/// Finished results waiting for the runtime. A result may carry an embedded
-/// cover of up to 10 MiB, so a runtime that stops draining holds a handful of
-/// them rather than a queue's worth: the workers wait instead.
+/// Finished results waiting for the runtime; a runtime that stops draining
+/// holds a handful rather than a queue's worth, and the workers wait
+/// instead. Results carry no cover bytes (see [`Worker::serve`]).
 const RESULT_CAPACITY: usize = 16;
 
 /// Reads a local file's tags. Shared by every worker, so it must be callable
@@ -169,7 +169,14 @@ impl Worker {
                 Ok(probed) => {
                     tracing::debug!("metadata job completed");
                     match probed {
-                        Ok(tags) => EnrichOutcome::Tags(tags),
+                        // Enrichment only fills text and duration; artwork
+                        // has its own loader. Dropped here, inside the
+                        // worker, so a queued result never holds up to
+                        // 10 MiB of cover it will not use.
+                        Ok(tags) => EnrichOutcome::Tags(LocalTags {
+                            front_cover: None,
+                            ..tags
+                        }),
                         Err(error) => EnrichOutcome::Failed(error.to_string()),
                     }
                 }

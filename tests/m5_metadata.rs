@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use continuo::application::enrich::{EnrichOutcome, MetadataWorkers, TagProbe};
 use continuo::media::id::{AbsolutePath, MediaId};
-use continuo::media::tags::{LocalTags, probe_local_tags};
+use continuo::media::tags::{CoverBytes, LocalTags, probe_local_tags};
 
 fn png_2x2() -> Vec<u8> {
     let mut bytes = Vec::new();
@@ -102,6 +102,30 @@ fn a_panicking_probe_is_contained_and_the_worker_serves_the_next_job() {
     assert!(
         matches!(next_result(&workers).outcome, EnrichOutcome::Tags(t) if t.title.as_deref() == Some("ok"))
     );
+}
+
+#[test]
+fn enrichment_results_do_not_carry_the_cover_bytes() {
+    let probe: TagProbe = Arc::new(|_path| {
+        Ok(LocalTags {
+            title: Some("with art".into()),
+            front_cover: Some(CoverBytes {
+                data: vec![0; 4096],
+                media_type: Some("image/png".into()),
+            }),
+            ..LocalTags::default()
+        })
+    });
+    let workers = MetadataWorkers::spawn(1, probe, continuo::lifecycle::hooks::TestHook::None);
+    let path = AbsolutePath::new("/music/a.flac".into()).expect("abs");
+    workers.request(MediaId::LocalFile(path.clone()), path);
+    match next_result(&workers).outcome {
+        EnrichOutcome::Tags(tags) => {
+            assert_eq!(tags.title.as_deref(), Some("with art"));
+            assert!(tags.front_cover.is_none(), "artwork has its own loader");
+        }
+        other => panic!("tags expected: {other:?}"),
+    }
 }
 
 #[test]
