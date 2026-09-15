@@ -44,7 +44,7 @@ use crate::persistence::store::{LoadOutcome, QueueBackup, StateStore};
 use crate::persistence::writer::{DisabledSink, StateSink, WriterHandle};
 use crate::playback::engine::EngineHandle;
 use crate::session::Session;
-use crate::tui::input::{Effect, handle_key};
+use crate::tui::input::{Effect, handle_key, handle_mouse};
 use crate::tui::render::{HitMap, Visuals};
 use crate::tui::state::UiState;
 
@@ -314,25 +314,30 @@ fn run_loop(
     }
 }
 
-/// Reads at most one key event and runs `tui::input::handle_key` against it,
-/// executing whatever effects come back. `_hits` is unused until Task 21
-/// adds mouse handling alongside this.
+/// Reads at most one input event and runs it through `tui::input::handle_key`
+/// or `tui::input::handle_mouse` — whichever the event is — executing
+/// whatever effects come back exactly the same way for either. `hits` is
+/// where the last drawn frame put its clickable parts (Task 19); every other
+/// event kind (resize, focus, paste) is ignored here since the next loop
+/// pass redraws unconditionally.
 fn handle_input(
     runtime: &mut PlayerRuntime,
     ui: &mut UiState,
     terminal: &mut Tty,
     cleanup: &FatalCleanup,
     signals: &ShutdownSignals,
-    _hits: &HitMap,
+    hits: &HitMap,
 ) -> io::Result<()> {
     if !event::poll(INPUT_POLL)? {
         return Ok(());
     }
-    let Event::Key(key) = event::read()? else {
-        return Ok(());
-    };
     let view = runtime.view();
-    for effect in handle_key(key, ui, &view) {
+    let effects = match event::read()? {
+        Event::Key(key) => handle_key(key, ui, &view),
+        Event::Mouse(mouse) => handle_mouse(mouse, hits, ui, &view),
+        _ => Vec::new(),
+    };
+    for effect in effects {
         apply_effect(effect, runtime, ui, terminal, cleanup, signals)?;
     }
     Ok(())

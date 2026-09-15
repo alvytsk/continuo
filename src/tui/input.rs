@@ -1,21 +1,28 @@
-//! The keyboard map (design doc M5 §7): a key, the current [`UiState`] and
-//! the last drawn [`PlayerView`] in, a list of [`Effect`]s out. Nothing here
-//! touches the terminal or the runtime — `tui::run` is the only thing that
-//! executes an effect.
+//! The keyboard and mouse maps (design doc M5 §7): a key or mouse event, the
+//! current [`UiState`] and the last drawn [`PlayerView`] (and, for the
+//! mouse, where that frame's clickable parts landed) in, a list of
+//! [`Effect`]s out. Nothing here touches the terminal or the runtime —
+//! `tui::run` is the only thing that executes an effect.
 
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use std::time::Duration;
+
+use crossterm::event::{
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
+use ratatui::layout::Rect;
 
 use crate::application::runtime::{AppCommand, EnqueueItem};
 use crate::application::transport::QUEUE_EMPTY;
 use crate::application::view::PlayerView;
-use crate::queue::Direction;
+use crate::queue::{Direction, DisplayDuration, DurationSource, QueueEntryId};
+use crate::tui::render::{HitMap, TransportButton};
 use crate::tui::state::{Overlay, UiState};
 
 const VOLUME_STEP: f32 = 0.05;
 const SEEK_STEP: i64 = 10;
 
-/// What a key press asks the caller to do. `tui::run` (Task 21 adds mouse
-/// input alongside it) is the only executor.
+/// What a key press or mouse event asks the caller to do; `tui::run` is the
+/// only executor.
 #[derive(Clone, Debug)]
 pub enum Effect {
     App(AppCommand),
@@ -49,6 +56,100 @@ pub fn handle_key(key: KeyEvent, ui: &mut UiState, view: &PlayerView) -> Vec<Eff
         Overlay::Browser => Vec::new(),
         Overlay::None => no_overlay(key, ui, view),
     }
+}
+
+/// Maps one mouse event to zero or more effects, mirroring `handle_key`:
+/// pure, and the only executor is `tui::run`. Ignored entirely while mouse
+/// capture is off or an overlay is open — a click must never act behind a
+/// help/confirm/input/browser overlay. Only `Down(Left)` activates or
+/// selects; `ScrollUp`/`ScrollDown` move the selection while the cursor is
+/// over `hits.queue`; every other kind — drag, release, move, right or
+/// middle click — is ignored.
+pub fn handle_mouse(
+    event: MouseEvent,
+    hits: &HitMap,
+    ui: &mut UiState,
+    view: &PlayerView,
+) -> Vec<Effect> {
+    if !ui.mouse_capture || ui.overlay != Overlay::None {
+        return Vec::new();
+    }
+    match event.kind {
+        MouseEventKind::Down(MouseButton::Left) => left_click(event, hits, ui, view),
+        MouseEventKind::ScrollUp if hits.queue.contains((event.column, event.row).into()) => {
+            move_selection(ui, view, Direction::Up);
+            Vec::new()
+        }
+        MouseEventKind::ScrollDown if hits.queue.contains((event.column, event.row).into()) => {
+            move_selection(ui, view, Direction::Down);
+            Vec::new()
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// A transport button first, then a queue row — selecting it, or on the
+/// already-selected row, playing it — then the progress bar.
+fn left_click(
+    event: MouseEvent,
+    hits: &HitMap,
+    ui: &mut UiState,
+    view: &PlayerView,
+) -> Vec<Effect> {
+    let point = (event.column, event.row).into();
+    if let Some((_, button)) = hits.buttons.iter().find(|(rect, _)| rect.contains(point)) {
+        return vec![transport_effect(*button, ui.selected)];
+    }
+    if let Some((_, id)) = hits.rows.iter().find(|(rect, _)| rect.contains(point)) {
+        return if ui.selected == Some(*id) {
+            vec![Effect::App(AppCommand::PlayEntry(*id))]
+        } else {
+            ui.selected = Some(*id);
+            Vec::new()
+        };
+    }
+    seek_effect(point, hits.progress, view)
+        .into_iter()
+        .collect()
+}
+
+fn transport_effect(button: TransportButton, selected: Option<QueueEntryId>) -> Effect {
+    Effect::App(match button {
+        TransportButton::Previous => AppCommand::Previous { selected },
+        TransportButton::PlayPause => AppCommand::PlayPause { selected },
+        TransportButton::Stop => AppCommand::Stop,
+        TransportButton::Next => AppCommand::Next { selected },
+    })
+}
+
+/// `SeekTo` the fraction of `progress` the point falls at, only when
+/// `now_playing` is loaded with a decoder-confirmed duration; otherwise
+/// `None` — including when the click landed outside `progress` at all
+/// (`Rect::contains` is false for every point when `progress` is
+/// zero-width, so that case needs no separate check). The runtime's own
+/// `SeekTo` handling still applies its capability checks on top of this.
+fn seek_effect(
+    point: ratatui::layout::Position,
+    progress: Rect,
+    view: &PlayerView,
+) -> Option<Effect> {
+    if !progress.contains(point) {
+        return None;
+    }
+    let now = view.now_playing.as_ref()?;
+    if !now.loaded {
+        return None;
+    }
+    let Some(DisplayDuration {
+        value,
+        source: DurationSource::Decoded(_),
+    }) = now.duration
+    else {
+        return None;
+    };
+    let fraction = (f64::from(point.x - progress.x) / f64::from(progress.width)).clamp(0.0, 1.0);
+    let target = Duration::from_secs_f64(value.as_secs_f64() * fraction);
+    Some(Effect::App(AppCommand::SeekTo(target)))
 }
 
 fn is_ctrl_c(key: &KeyEvent) -> bool {
