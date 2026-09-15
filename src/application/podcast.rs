@@ -19,6 +19,29 @@ use crate::subscription::store::SubscriptionStore;
 /// than the cache's current one.
 pub const SAVED_SOURCE_NOTICE: &str = "Using saved episode source";
 
+/// The artwork URL for a queued podcast episode, from the cache alone: the
+/// episode's own `itunes:image`, else the feed's. `None` for a non-podcast,
+/// an unsubscribed feed, a missing or unreadable cache, or an episode the
+/// cache no longer lists — every one of those is simply "no cover".
+pub fn podcast_artwork(
+    subs: &SubscriptionStore,
+    cache: &CacheStore,
+    media: &MediaId,
+) -> Option<Url> {
+    let feed = media.feed()?;
+    let snapshot = subs.read_snapshot().ok()?;
+    let subscription = snapshot
+        .subscriptions
+        .iter()
+        .find(|subscription| &subscription.feed_id == feed)?;
+    let cached = cache.read(subscription).ok()?;
+    let episode = cached
+        .episodes
+        .iter()
+        .find(|episode| &episode.media_id == media)?;
+    episode.image.clone().or(cached.image)
+}
+
 /// The outcome of [`resolve_podcast`].
 #[derive(Clone, Debug, PartialEq)]
 pub enum PodcastResolution {

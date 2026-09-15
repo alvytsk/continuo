@@ -57,6 +57,10 @@ pub struct CachedEpisode {
     #[serde(with = "time::serde::rfc3339::option")]
     pub published: Option<OffsetDateTime>,
     pub declared_duration_secs: Option<u64>,
+    /// The episode's own `itunes:image`. Defaulted so a cache written before
+    /// this field existed still decodes; it fills in on the next refresh.
+    #[serde(default)]
+    pub image: Option<Url>,
 }
 
 /// The on-disk shape of one feed's cache entry (§5.2's JSON shape,
@@ -74,6 +78,9 @@ pub struct CachedFeed {
     pub validators: CacheValidators,
     pub title: Option<String>,
     pub site_link: Option<Url>,
+    /// The feed-level `itunes:image`; defaulted like [`CachedEpisode::image`].
+    #[serde(default)]
+    pub image: Option<Url>,
     pub skipped_items: usize,
     pub episodes: Vec<CachedEpisode>,
 }
@@ -128,6 +135,7 @@ impl CachedFeed {
                         .episode
                         .declared_duration
                         .map(|duration| duration.as_secs()),
+                    image: item.image,
                 }
             })
             .collect();
@@ -142,6 +150,7 @@ impl CachedFeed {
             validators,
             title: feed.title,
             site_link: feed.site_link,
+            image: feed.image,
             skipped_items: feed.skipped,
             episodes,
         }

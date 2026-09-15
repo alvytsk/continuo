@@ -19,6 +19,8 @@ use url::Url;
 pub struct ParsedFeed {
     pub title: Option<String>,
     pub site_link: Option<Url>,
+    /// The feed-level `itunes:image href`, http(s) only.
+    pub image: Option<Url>,
     pub items: Vec<ParsedItem>,
 }
 
@@ -32,6 +34,9 @@ pub struct ParsedItem {
     pub title: Option<String>,
     pub published: Option<OffsetDateTime>,
     pub declared_duration: Option<Duration>,
+    /// The item's own `itunes:image href`, http(s) only; `None` means the
+    /// feed-level image applies.
+    pub image: Option<Url>,
     /// The **1-based, pre-skip** document position of this `<item>` or
     /// `<entry>` element — the same counter [`crate::feed::parse::ParseWarning::item`]
     /// uses, and the only non-redacted locator a warning carries (§7.2).

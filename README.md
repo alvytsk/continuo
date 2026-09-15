@@ -71,6 +71,12 @@ you press a playback key. (Local files' tags and the active local entry's
 cover art are read in the background.) The audio device is created on the
 first load, so the player is usable on a machine with no output device.
 
+A podcast episode's cover is the feed's `itunes:image` (the episode's own
+first, then the channel's), as recorded in the feed cache at the last
+`refresh`. It is downloaded only once playback has opened a network
+connection, never for a merely restored or enqueued episode. A plain URL
+entry always shows the placeholder.
+
 - `--mouse off` starts with mouse capture disabled, leaving the terminal's
   (or multiplexer's) own text selection and scrolling alone. `m` toggles it
   at any time. The default is `on`.

@@ -324,3 +324,40 @@ fn path_for_never_echoes_a_traversal_shaped_id() -> Result<(), Box<dyn std::erro
     }
     Ok(())
 }
+
+/// Artwork URLs round-trip through the cache at both levels, and a cache
+/// written before the field existed still decodes, with no artwork.
+#[test]
+fn artwork_urls_roundtrip_and_default_to_none() -> Result<(), Box<dyn std::error::Error>> {
+    let rig = feeds::Rig::new()?;
+    let sub = rig.seed(
+        br#"<rss xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd"><channel>
+            <itunes:image href="https://example.org/feed.png"/>
+            <item><guid>id</guid><itunes:image href="https://example.org/id.png"/></item>
+        </channel></rss>"#,
+        "https://example.org/feed",
+    )?;
+
+    let cached = rig.cache.read(&sub)?;
+    assert_eq!(
+        cached.image.as_ref().map(|url| url.as_str()),
+        Some("https://example.org/feed.png")
+    );
+    assert_eq!(
+        cached.episodes[0].image.as_ref().map(|url| url.as_str()),
+        Some("https://example.org/id.png")
+    );
+
+    let path = rig.cache.path_for(&sub.feed_id)?;
+    let mut value: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+    value.as_object_mut().map(|feed| feed.remove("image"));
+    value["episodes"][0]
+        .as_object_mut()
+        .map(|episode| episode.remove("image"));
+    std::fs::write(&path, serde_json::to_vec(&value)?)?;
+
+    let cached = rig.cache.read(&sub)?;
+    assert_eq!(cached.image, None);
+    assert_eq!(cached.episodes[0].image, None);
+    Ok(())
+}

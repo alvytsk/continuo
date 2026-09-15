@@ -231,3 +231,38 @@ fn episode_candidates_carry_the_enclosure_and_declared_duration()
     );
     Ok(())
 }
+
+/// `podcast_artwork` answers from the cache alone: the episode's own image,
+/// else the feed's, and `None` for an unknown episode or a non-podcast.
+#[test]
+fn podcast_artwork_prefers_the_episode_image_then_the_feed_image()
+-> Result<(), Box<dyn std::error::Error>> {
+    use continuo::application::podcast::podcast_artwork;
+
+    let rig = feeds::Rig::new()?;
+    rig.seed(
+        &rss_with_itunes(&format!(
+            r#"<itunes:image href="https://cdn.example/feed.png"/>
+            <item><guid>e1</guid><itunes:image href="https://cdn.example/e1.png"/></item>
+            {}"#,
+            item("e2", None)
+        )),
+        FEED_URL,
+    )?;
+
+    let e1 = podcast_artwork(&rig.subs, &rig.cache, &episode_media("e1")?);
+    assert_eq!(
+        e1.as_ref().map(Url::as_str),
+        Some("https://cdn.example/e1.png")
+    );
+    let e2 = podcast_artwork(&rig.subs, &rig.cache, &episode_media("e2")?);
+    assert_eq!(
+        e2.as_ref().map(Url::as_str),
+        Some("https://cdn.example/feed.png")
+    );
+    assert_eq!(
+        podcast_artwork(&rig.subs, &rig.cache, &episode_media("e3")?),
+        None
+    );
+    Ok(())
+}

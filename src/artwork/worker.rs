@@ -2,8 +2,10 @@
 //! doc M5 §9, §11, decision 24): one thread, one latest-wins request slot,
 //! and every job run inside [`run_contained`] so a decoder panic becomes an
 //! ordinary [`ArtworkError::Panicked`] result instead of taking the process
-//! down. Remote and podcast entries never reach this worker — the TUI shows
-//! a placeholder for them instead — so it only ever sees local paths.
+//! down. A local track's cover is read from its tags or a sibling file; a
+//! podcast episode's is downloaded from the feed's `itunes:image` URL
+//! through the HTTP service playback already opened. Plain remote URLs have
+//! no artwork source and never reach this worker.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -13,15 +15,25 @@ use crossbeam_channel::{Receiver, Sender, TrySendError};
 
 use crate::artwork::decode::{ArtworkError, decode_limited, read_limited};
 use crate::artwork::resolve::{ArtworkSource, find_artwork};
+use crate::http::document::{DocumentOutcome, DocumentRequest};
+use crate::http::service::HttpService;
 use crate::lifecycle::hooks::TestHook;
 use crate::lifecycle::panic::run_contained;
 use crate::media::id::{AbsolutePath, MediaId};
 use crate::media::tags::probe_local_tags;
+use url::Url;
 
-/// Loads the decoded cover for a local track. Shared with the worker
-/// thread, so it must be callable from another thread.
+/// Where a cover comes from.
+#[derive(Clone)]
+pub enum CoverSource {
+    Local(AbsolutePath),
+    Remote { url: Url, http: Arc<HttpService> },
+}
+
+/// Loads the decoded cover for a source. Shared with the worker thread, so
+/// it must be callable from another thread.
 pub type CoverLoader =
-    Arc<dyn Fn(&AbsolutePath) -> Result<image::DynamicImage, ArtworkError> + Send + Sync>;
+    Arc<dyn Fn(&CoverSource) -> Result<image::DynamicImage, ArtworkError> + Send + Sync>;
 
 pub struct ArtworkResult {
     pub media: MediaId,
@@ -30,7 +42,7 @@ pub struct ArtworkResult {
 
 struct Job {
     media: MediaId,
-    path: AbsolutePath,
+    source: CoverSource,
 }
 
 /// A single artwork worker thread with a latest-wins request slot: a new
@@ -58,7 +70,7 @@ impl ArtworkWorker {
             .name("continuo-artwork".to_string())
             .spawn(move || {
                 for job in &worker_requests {
-                    let outcome = match run_contained("artwork", || (loader)(&job.path)) {
+                    let outcome = match run_contained("artwork", || (loader)(&job.source)) {
                         Ok(loaded) => {
                             tracing::debug!("artwork job completed");
                             loaded.map(Arc::new)
@@ -84,13 +96,13 @@ impl ArtworkWorker {
         }
     }
 
-    /// Requests a cover for `media`/`path`, replacing a request the worker
+    /// Requests a cover for `media` from `source`, replacing a request the worker
     /// has not yet picked up. Never blocks: every step is a non-blocking
     /// channel operation, and the loop below only ever repeats to retry a
     /// send that raced the worker taking the previous job, which converges
     /// in at most a couple of iterations.
-    pub fn request(&self, media: MediaId, path: AbsolutePath) {
-        let mut job = Job { media, path };
+    pub fn request(&self, media: MediaId, source: CoverSource) {
+        let mut job = Job { media, source };
         loop {
             match self.requests.try_send(job) {
                 Ok(()) => return,
@@ -109,9 +121,11 @@ impl ArtworkWorker {
     }
 }
 
-/// The production loader: probes the track's tags, resolves its artwork
-/// (embedded cover first, then siblings), and decodes it within the fixed
-/// limits. An embedded cover the tag probe already judged oversized
+/// The production loader. A local track: probes its tags, resolves its
+/// artwork (embedded cover first, then siblings), and decodes it within the
+/// fixed limits. A remote cover: one whole-document GET through the given
+/// service (its own timeouts and 8 MiB body cap apply, every failure is
+/// [`ArtworkError::Remote`]), then the same bounded decode. An embedded cover the tag probe already judged oversized
 /// (decision: `LocalTags::cover_oversized`) is reported as
 /// [`ArtworkError::TooLarge`] directly — it outranks any sibling, so a
 /// fallback would show the wrong cover rather than a placeholder for the
@@ -119,10 +133,27 @@ impl ArtworkWorker {
 /// panics first, inside the job, so the panic is contained.
 pub fn default_loader(hook: TestHook) -> CoverLoader {
     let armed = AtomicBool::new(hook == TestHook::ArtworkJobPanic);
-    Arc::new(move |path| {
+    Arc::new(move |source| {
         if armed.swap(false, Ordering::SeqCst) {
             hook.panic_at(TestHook::ArtworkJobPanic);
         }
+        let path = match source {
+            CoverSource::Local(path) => path,
+            CoverSource::Remote { url, http } => {
+                let request = DocumentRequest {
+                    origin: url.clone(),
+                    validators: None,
+                };
+                let outcome = http
+                    .handle()
+                    .block_on(http.fetch_document(request))
+                    .map_err(|_| ArtworkError::Remote)?;
+                return match outcome {
+                    DocumentOutcome::Fetched { bytes, .. } => decode_limited(&bytes),
+                    DocumentOutcome::Unchanged { .. } => Err(ArtworkError::Remote),
+                };
+            }
+        };
         let tags = probe_local_tags(path).map_err(|_| ArtworkError::Missing)?;
         if tags.cover_oversized {
             return Err(ArtworkError::TooLarge);

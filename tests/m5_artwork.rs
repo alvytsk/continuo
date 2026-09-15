@@ -1,6 +1,8 @@
 //! Design doc M5 §9: local artwork lookup, bounded decode and a contained
 //! worker.
 
+mod support;
+
 #[path = "support/tagged_flac.rs"]
 mod tagged_flac;
 
@@ -11,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use continuo::artwork::decode::{ArtworkError, MAX_ENCODED_BYTES, decode_limited, read_limited};
 use continuo::artwork::resolve::{ArtworkSource, find_artwork};
-use continuo::artwork::worker::{ArtworkWorker, CoverLoader, default_loader};
+use continuo::artwork::worker::{ArtworkWorker, CoverLoader, CoverSource, default_loader};
 use continuo::lifecycle::hooks::TestHook;
 use continuo::media::id::{AbsolutePath, MediaId};
 use continuo::media::tags::{CoverBytes, MAX_EMBEDDED_COVER_BYTES};
@@ -159,9 +161,9 @@ fn a_panicking_decode_is_a_placeholder_and_the_next_job_succeeds() {
             std::thread::sleep(Duration::from_millis(5));
         }
     };
-    worker.request(media.clone(), path.clone());
+    worker.request(media.clone(), CoverSource::Local(path.clone()));
     assert_eq!(wait(&worker).image.err(), Some(ArtworkError::Panicked));
-    worker.request(media, path);
+    worker.request(media, CoverSource::Local(path));
     assert!(wait(&worker).image.is_ok());
 }
 
@@ -182,5 +184,38 @@ fn an_oversized_embedded_cover_is_a_placeholder_and_never_falls_back_to_a_siblin
 
     let path = AbsolutePath::new(track).expect("abs");
     let loader = default_loader(TestHook::None);
-    assert_eq!(loader(&path).err(), Some(ArtworkError::TooLarge));
+    assert_eq!(
+        loader(&CoverSource::Local(path)).err(),
+        Some(ArtworkError::TooLarge)
+    );
+}
+
+/// A remote cover is fetched through the HTTP service the player already
+/// opened for playback, then decoded under the same limits as a local one;
+/// a failed fetch is `Remote`, not a panic and not a stray placeholder-less
+/// error.
+#[test]
+fn a_remote_cover_is_fetched_and_decoded_and_a_failed_fetch_is_reported() {
+    use continuo::http::limits::Limits;
+    use continuo::http::service::HttpService;
+    use support::server::{Script, TestServer};
+
+    let http = HttpService::spawn(Limits::brisk()).expect("http service");
+    let loader = default_loader(TestHook::None);
+
+    let served = TestServer::start(Script::serving(encoded(image::ImageFormat::Png, 3, 2)));
+    let url = served.url("/cover.png").parse().expect("url");
+    let source = CoverSource::Remote {
+        url,
+        http: Arc::clone(&http),
+    };
+    let image = loader(&source).expect("remote cover decodes");
+    assert_eq!((image.width(), image.height()), (3, 2));
+    served.shutdown();
+
+    let missing = TestServer::start(Script::serving(Vec::new()).status(404));
+    let url = missing.url("/cover.png").parse().expect("url");
+    let source = CoverSource::Remote { url, http };
+    assert_eq!(loader(&source).err(), Some(ArtworkError::Remote));
+    missing.shutdown();
 }

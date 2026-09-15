@@ -450,8 +450,8 @@ struct Artwork {
     /// Started the first time a local entry becomes active, never under
     /// `--artwork off`.
     worker: Option<ArtworkWorker>,
-    /// The local entry whose cover was last requested; `None` while the
-    /// active entry is remote, a podcast, or absent.
+    /// The entry whose cover was last requested; `None` while the active
+    /// entry has no cover source (see `PlayerRuntime::active_cover`).
     requested: Option<MediaId>,
     covers: CoverCache,
 }
@@ -468,7 +468,7 @@ impl Artwork {
         }
     }
 
-    /// Requests the cover when the active local entry's media changes, shows
+    /// Requests the cover when the active entry's cover source changes, shows
     /// the placeholder meanwhile and for every other entry, and installs a
     /// finished cover if it is still for the active entry. A failed load
     /// leaves the placeholder and, unless there simply is no artwork, a
@@ -478,16 +478,16 @@ impl Artwork {
         if self.mode == ArtworkMode::Off {
             return;
         }
-        let active = runtime.active_local_file();
+        let active = runtime.active_cover();
         let media = active.as_ref().map(|(media, _)| media);
         if media != self.requested.as_ref() {
             match active {
-                Some((media, path)) => {
+                Some((media, source)) => {
                     self.covers.set_image(media.clone(), None);
                     let hook = self.hook;
                     self.worker
                         .get_or_insert_with(|| ArtworkWorker::spawn(default_loader(hook)))
-                        .request(media.clone(), path);
+                        .request(media.clone(), source);
                     self.requested = Some(media);
                 }
                 None => {

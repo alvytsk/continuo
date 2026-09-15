@@ -31,6 +31,8 @@ pub enum ArtworkError {
     Corrupt,
     #[error("artwork could not be read")]
     Io,
+    #[error("artwork could not be downloaded")]
+    Remote,
     #[error("artwork decoding panicked")]
     Panicked,
     /// Resizing or encoding for the terminal's image protocol failed.

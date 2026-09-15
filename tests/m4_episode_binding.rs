@@ -133,6 +133,7 @@ fn invalid_enclosure_scheme_built_directly_falls_back_to_link()
     let link: Url = "https://example.org/item/42".parse()?;
     let bad_enclosure: Url = "ftp://example.org/audio.mp3".parse()?;
     let item = ParsedItem {
+        image: None,
         guid: None,
         link: Some(link.clone()),
         enclosure: Some(Enclosure {
@@ -149,6 +150,7 @@ fn invalid_enclosure_scheme_built_directly_falls_back_to_link()
         feed: ParsedFeed {
             title: None,
             site_link: None,
+            image: None,
             items: vec![item],
         },
         skipped: 0,

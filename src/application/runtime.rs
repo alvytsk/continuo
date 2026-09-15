@@ -12,7 +12,9 @@ use std::time::{Duration, Instant};
 use url::Url;
 
 use crate::application::enrich::{EnrichOutcome, MetadataWorkers, TagProbe};
-use crate::application::podcast::{PodcastResolution, SAVED_SOURCE_NOTICE, resolve_podcast};
+use crate::application::podcast::{
+    PodcastResolution, SAVED_SOURCE_NOTICE, podcast_artwork, resolve_podcast,
+};
 use crate::application::seek::KeyRouter;
 use crate::application::source::{is_url_spelling, resolve_path, resolve_source};
 use crate::application::transport::{
@@ -21,6 +23,7 @@ use crate::application::transport::{
 use crate::application::view::{
     NowPlaying, PersistenceStatus, PlayerView, entry_title, queue_rows, saved_history,
 };
+use crate::artwork::worker::CoverSource;
 use crate::clock::Clock;
 use crate::commands::displayable;
 use crate::feed::cache::CacheStore;
@@ -30,7 +33,7 @@ use crate::http::service::HttpService;
 use crate::library::EpisodeCandidate;
 use crate::lifecycle::hooks::TestHook;
 use crate::media::capabilities::{MediaCapabilities, SeekSupport};
-use crate::media::id::{AbsolutePath, MediaId};
+use crate::media::id::MediaId;
 use crate::media::source::SourceLocation;
 use crate::persistence::PersistenceError;
 use crate::persistence::model::PersistedState;
@@ -359,16 +362,25 @@ impl PlayerRuntime {
         }
     }
 
-    /// The active queue entry's identity and file, when that entry is a
-    /// local file; `None` for a remote or podcast entry or no active entry.
-    /// Read from the queue alone, like [`Self::active_local_dir`].
-    pub fn active_local_file(&self) -> Option<(MediaId, AbsolutePath)> {
+    /// The active queue entry's identity and where its cover comes from: a
+    /// local file's own path, or a podcast episode's feed artwork URL, the
+    /// latter only once playback has opened the HTTP service — nothing is
+    /// fetched for a merely restored or enqueued episode (§8). `None` for a
+    /// plain remote URL, an episode without artwork, or no active entry.
+    pub fn active_cover(&self) -> Option<(MediaId, CoverSource)> {
         let queue = self.session.state().queue();
         let entry = queue.get(queue.active()?)?;
-        match entry.source() {
-            QueueSource::LocalFile(path) => Some((entry.media().clone(), path.clone())),
-            QueueSource::RemoteUrl(_) | QueueSource::Podcast { .. } => None,
-        }
+        let source = match entry.source() {
+            QueueSource::LocalFile(path) => CoverSource::Local(path.clone()),
+            QueueSource::RemoteUrl(_) => return None,
+            QueueSource::Podcast { .. } => {
+                let http = Arc::clone(self.http.as_ref()?);
+                let library = self.library.as_ref()?;
+                let url = podcast_artwork(&library.subscriptions, &library.cache, entry.media())?;
+                CoverSource::Remote { url, http }
+            }
+        };
+        Some((entry.media().clone(), source))
     }
 
     /// The entry a removal suggests selecting next, once.

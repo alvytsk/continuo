@@ -1616,3 +1616,54 @@ fn a_declaration_longer_than_the_decoder_window_is_refused_not_panicked()
     }
     Ok(())
 }
+
+/// `itunes:image href` names the cover at feed level and, overriding it, at
+/// item level. A relative href resolves against the base in scope; an href
+/// that is not http(s) is dropped rather than kept as an unusable URL.
+#[test]
+fn itunes_image_is_read_at_feed_and_item_level() -> Result<(), Box<dyn std::error::Error>> {
+    let report = parse_feed(
+        rss(r#"<i:image href="covers/cover.png"/>
+            <item><guid>a</guid><i:image href="https://cdn.example.org/a.jpg"/></item>
+            <item><guid>b</guid></item>
+            <item><guid>c</guid><i:image href="ftp://cdn.example.org/c.jpg"/></item>"#)
+        .as_bytes(),
+        &feed_url(),
+    )?;
+    assert_eq!(
+        report.feed.image,
+        Some(Url::parse("https://example.org/covers/cover.png")?)
+    );
+    let images: Vec<_> = report
+        .feed
+        .items
+        .iter()
+        .map(|item| item.image.clone())
+        .collect();
+    assert_eq!(
+        images,
+        vec![
+            Some(Url::parse("https://cdn.example.org/a.jpg")?),
+            None,
+            None
+        ]
+    );
+
+    let report = parse_feed(
+        atom(
+            r#"<i:image href="https://example.org/feed.png"/>
+            <a:entry><a:id>a</a:id><i:image href="https://example.org/a.png"/></a:entry>"#,
+        )
+        .as_bytes(),
+        &feed_url(),
+    )?;
+    assert_eq!(
+        report.feed.image,
+        Some(Url::parse("https://example.org/feed.png")?)
+    );
+    assert_eq!(
+        report.feed.items[0].image,
+        Some(Url::parse("https://example.org/a.png")?)
+    );
+    Ok(())
+}
