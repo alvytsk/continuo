@@ -405,7 +405,10 @@ impl StateStore {
 }
 
 /// `20260908T143211Z` — filesystem-safe, no colons (§13).
-fn stamp(at: OffsetDateTime) -> String {
+///
+/// `pub(crate)` so `lifecycle::stderr` can reuse the exact same format for
+/// per-session TUI log filenames rather than duplicating it.
+pub(crate) fn stamp(at: OffsetDateTime) -> String {
     format!(
         "{:04}{:02}{:02}T{:02}{:02}{:02}Z",
         at.year(),

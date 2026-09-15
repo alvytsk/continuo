@@ -1,12 +1,13 @@
 //! Cross-cutting concerns shared by every `continuo` invocation that touches
 //! a state profile: the exclusive profile lock, shutdown-signal handling,
-//! deterministic test hooks, background-job panic containment, and
-//! idempotent terminal cleanup.
+//! deterministic test hooks, background-job panic containment, idempotent
+//! terminal cleanup, and the per-session TUI log.
 
 pub mod hooks;
 pub mod lock;
 pub mod panic;
 pub mod signals;
+pub mod stderr;
 pub mod terminal;
 
 /// How a `play` session ended (design doc M5 §6.5): cleanly, or because a
