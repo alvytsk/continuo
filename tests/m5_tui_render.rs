@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use continuo::application::transport::PlaybackPhase;
 use continuo::application::view::{PersistenceStatus, PlayerView, SavedHistory};
+use continuo::playback::provenance::PositionProvenance;
 use continuo::queue::{DisplayDuration, DurationSource};
 use continuo::tui::layout::{Regions, Tier, regions, tier_for};
 use continuo::tui::render::{CoverView, CoverWidget, HitMap, TransportButton, Visuals, draw};
@@ -273,6 +274,31 @@ fn a_declared_duration_is_parenthesized_and_never_fills_the_bar() {
         Some(playing(ids()[0], true, Some(decoded(120)), false)),
     );
     assert!(text(&decoded, &UiState::new(true), 100, 30).contains('━'));
+}
+
+#[test]
+fn an_estimated_duration_is_marked_like_an_estimated_position() {
+    let estimated = DisplayDuration {
+        value: Duration::from_secs(120),
+        source: DurationSource::Decoded(PositionProvenance::Estimated),
+    };
+    let mut v = view(
+        PlaybackPhase::Playing,
+        Some(playing(ids()[0], true, Some(estimated), false)),
+    );
+    v.rows[2].duration = Some(estimated);
+    let screen = text(&v, &UiState::new(true), 100, 30);
+    assert!(screen.contains("01:02 / ~02:00"), "{screen}");
+    let done = screen
+        .lines()
+        .find(|line| line.contains("Done"))
+        .expect("the third row");
+    assert!(done.contains("~02:00"), "{done}");
+    let established = screen
+        .lines()
+        .find(|line| line.contains("Morning Tide") && line.contains("03:05"))
+        .expect("the first row");
+    assert!(!established.contains("~03:05"), "{established}");
 }
 
 #[test]

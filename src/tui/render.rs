@@ -16,6 +16,7 @@ use ratatui::widgets::{Block, Clear, Paragraph, Widget, Wrap};
 use crate::application::transport::PlaybackPhase;
 use crate::application::view::{NowPlaying, PersistenceStatus, PlayerView, QueueRow, format_saved};
 use crate::media::display::format_hms;
+use crate::playback::provenance::PositionProvenance;
 use crate::queue::{DisplayDuration, DurationSource, QueueEntryId};
 use crate::tui::browser::BrowserState;
 use crate::tui::layout::{
@@ -538,10 +539,14 @@ fn clock(duration: std::time::Duration) -> String {
 }
 
 /// A declared duration is the feed's claim, not the decoder's, so it is
-/// shown in parentheses.
+/// shown in parentheses; a decoded one derived from a byte-offset estimate
+/// carries the same `~` an estimated position does.
 fn duration_label(duration: DisplayDuration) -> String {
     match duration.source {
-        DurationSource::Decoded(_) => clock(duration.value),
+        DurationSource::Decoded(PositionProvenance::Established) => clock(duration.value),
+        DurationSource::Decoded(PositionProvenance::Estimated) => {
+            format!("~{}", clock(duration.value))
+        }
         DurationSource::Declared => format!("({})", clock(duration.value)),
     }
 }
