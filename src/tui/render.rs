@@ -376,38 +376,37 @@ fn draw_info(buffer: &mut Buffer, regions: &Regions, view: &PlayerView, tier: Ti
     }
 }
 
-/// Flat bars without analysis; otherwise each band's level in eighths of a
-/// row, never below the floor glyph, with an amber cap on a loud band. Bands
-/// get equal slots, the last column of a slot left as a gap; when a slot is
-/// wide enough for two digits and the area at least three rows tall, the
-/// bottom row numbers the bands instead.
+/// Flat bars without analysis; otherwise each bar's level in eighths of a
+/// row, never below the floor glyph, with an amber cap on a loud bar. Bars
+/// are equally wide with a one-column gap between them: one per band when
+/// the width allows, otherwise as many as fit, each sampling the nearest
+/// band. When every bar is at least two columns wide and the area at least
+/// three rows tall, the bottom row numbers the bands instead.
 fn draw_spectrum(buffer: &mut Buffer, area: Rect, levels: Option<&[f32]>, theme: &Theme) {
     let levels = levels.filter(|levels| !levels.is_empty());
     let bands = levels.map_or(FLAT_BANDS, <[f32]>::len);
     let width = usize::from(area.width);
-    let slot = if bands <= width { width / bands } else { 0 };
-    let labelled = slot >= 3 && area.height >= 3;
+    let bars_count = bands.min(width.div_ceil(2));
+    if width == 0 || bars_count == 0 {
+        return;
+    }
+    let slot = (width + 1) / bars_count;
+    let labelled = slot >= 3 && bars_count == bands && area.height >= 3;
     let bars = Rect {
         height: area.height.saturating_sub(u16::from(labelled)),
         ..area
     };
     let height = usize::from(bars.height);
-    if width == 0 || height == 0 {
+    if height == 0 {
         return;
     }
     let labels = Style::new().fg(theme.muted);
     for (column, x) in (area.left()..area.right()).enumerate() {
-        let band = if slot > 0 {
-            if slot > 1 && column % slot == slot - 1 {
-                continue;
-            }
-            column / slot
-        } else {
-            column * bands / width
-        };
-        if band >= bands {
+        let bar = column / slot;
+        if bar >= bars_count || column % slot == slot - 1 {
             continue;
         }
+        let band = bar * bands / bars_count;
         if labelled && column % slot == 0 {
             let number = format!("{:02}", band + 1);
             let cell = Rect {
@@ -784,4 +783,28 @@ fn row(area: Rect, y: u16) -> Rect {
         ..area
     }
     .intersection(area)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_spectrum_fills_the_width_with_evenly_spaced_bars() {
+        let area = Rect::new(0, 0, 38, 4);
+        let mut buffer = Buffer::empty(area);
+        draw_spectrum(&mut buffer, area, Some(&[1.0; 24]), &Theme::default());
+        let drawn: Vec<bool> = (0..38).map(|x| buffer[(x, 3)].symbol() != " ").collect();
+        // 19 one-column bars, one gap each, the last column left over.
+        let expected: Vec<bool> = (0..38).map(|x| x % 2 == 0 && x < 37).collect();
+        assert_eq!(drawn, expected);
+
+        let area = Rect::new(0, 0, 100, 4);
+        let mut buffer = Buffer::empty(area);
+        draw_spectrum(&mut buffer, area, Some(&[1.0; 24]), &Theme::default());
+        let drawn: Vec<bool> = (0..100).map(|x| buffer[(x, 2)].symbol() != " ").collect();
+        // 24 three-column bars in four-column slots: 95 columns used.
+        let expected: Vec<bool> = (0..100).map(|x| x % 4 != 3 && x < 95).collect();
+        assert_eq!(drawn, expected);
+    }
 }
