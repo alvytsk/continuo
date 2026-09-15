@@ -10,22 +10,26 @@ mod feeds;
 #[path = "support/runtime.rs"]
 mod runtime;
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use continuo::application::browse::{BrowseRequest, BrowseResult, BrowseWorker};
+use continuo::application::enrich::TagProbe;
 use continuo::application::runtime::{AppCommand, EnqueueItem, LibraryStores};
 use continuo::clock::{Clock, SystemClock};
 use continuo::feed::cache::CacheStore;
+use continuo::library::EpisodeCandidate;
 use continuo::media::id::{EpisodeKey, FeedId, MediaId, NormalizedUrl};
+use continuo::media::tags::probe_local_tags;
 use continuo::persistence::model::PersistedState;
 use continuo::queue::{NewQueueEntry, QueueSource};
 use continuo::session::Session;
 use continuo::subscription::store::SubscriptionStore;
-use runtime::{pump_for, rig_with, row_ids};
+use runtime::{pump_for, rig_with, rig_with_probe, row_ids};
 use support::server::{Script, TestServer};
 
 const FEED_URL: &str = "https://feeds.example/radio-t.xml";
+const LOCAL: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/sine.flac");
 
 fn remote_entry(url: &str) -> NewQueueEntry {
     let normalized = NormalizedUrl::parse(url).unwrap_or_else(|error| panic!("url: {error}"));
@@ -88,17 +92,59 @@ fn wait_for_result(worker: &BrowseWorker) -> BrowseResult {
 fn restoring_enqueueing_and_browsing_remote_entries_make_no_requests() {
     let server = TestServer::start(Script::from_fixture("sine-5s.flac"));
 
-    let mut rig = rig_with(seeded(vec![
-        remote_entry(&server.url("/a.mp3")),
-        podcast_entry(&server.url("/ep.mp3")),
+    // Enrichment is on, with a probe that records every path it is handed:
+    // only the one local file below may ever reach it.
+    let probed = Arc::new(Mutex::new(Vec::new()));
+    let probe: TagProbe = Arc::new({
+        let probed = Arc::clone(&probed);
+        move |path| {
+            probed
+                .lock()
+                .unwrap_or_else(|error| panic!("probe log: {error}"))
+                .push(path.clone());
+            probe_local_tags(path)
+        }
+    });
+    let mut rig = rig_with_probe(
+        seeded(vec![
+            remote_entry(&server.url("/a.mp3")),
+            podcast_entry(&server.url("/ep.mp3")),
+        ]),
+        probe,
+    );
+    let episode = EpisodeCandidate {
+        media: MediaId::PodcastEpisode {
+            feed: FeedId::new(feeds::FEED_ID.into())
+                .unwrap_or_else(|error| panic!("feed: {error}")),
+            episode: EpisodeKey::resolve(Some("e2"), None, None)
+                .unwrap_or_else(|error| panic!("episode key: {error}")),
+        },
+        enclosure: Some(
+            server
+                .url("/ep2.mp3")
+                .parse()
+                .unwrap_or_else(|error| panic!("url: {error}")),
+        ),
+        title: None,
+        declared_duration: None,
+    };
+    let local = std::fs::canonicalize(LOCAL).unwrap_or_else(|error| panic!("fixture: {error}"));
+    rig.runtime.handle(AppCommand::Enqueue(vec![
+        EnqueueItem::Url(server.url("/b.mp3")),
+        EnqueueItem::Episode(episode),
+        // The positive control: enrichment is running in this rig.
+        EnqueueItem::Path(local.clone()),
     ]));
-    rig.runtime
-        .handle(AppCommand::Enqueue(vec![EnqueueItem::Url(
-            server.url("/b.mp3"),
-        )]));
     let view = rig.runtime.view();
-    assert_eq!(view.rows.len(), 3, "{view:?}");
+    assert_eq!(view.rows.len(), 5, "{view:?}");
     pump_for(&mut rig.runtime, Duration::from_millis(300));
+    let probed: Vec<_> = probed
+        .lock()
+        .unwrap_or_else(|error| panic!("probe log: {error}"))
+        .iter()
+        .map(|path| path.as_path().to_path_buf())
+        .collect();
+    assert_eq!(probed, vec![local], "enrichment probes local files only");
 
     let library = feeds::Rig::new().unwrap_or_else(|error| panic!("feeds rig: {error}"));
     library

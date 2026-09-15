@@ -7,6 +7,7 @@
 //! result.
 
 pub mod browse;
+pub mod enrich;
 pub mod podcast;
 pub mod runtime;
 pub mod seek;

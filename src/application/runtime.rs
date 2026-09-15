@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 use url::Url;
 
+use crate::application::enrich::{EnrichOutcome, MetadataWorkers, TagProbe};
 use crate::application::podcast::{PodcastResolution, SAVED_SOURCE_NOTICE, resolve_podcast};
 use crate::application::seek::KeyRouter;
 use crate::application::source::{is_url_spelling, resolve_path, resolve_source};
@@ -27,6 +28,7 @@ use crate::http::error::{RemoteFailure, redact_url};
 use crate::http::limits::Limits;
 use crate::http::service::HttpService;
 use crate::library::EpisodeCandidate;
+use crate::lifecycle::hooks::TestHook;
 use crate::media::capabilities::{MediaCapabilities, SeekSupport};
 use crate::media::id::MediaId;
 use crate::media::source::SourceLocation;
@@ -45,13 +47,17 @@ use crate::queue::{
     Direction, DisplayDuration, DisplayMetadata, DurationSource, MAX_QUEUE_ENTRIES, NewQueueEntry,
     QueueEntry, QueueEntryId, QueueError, QueueSource,
 };
-use crate::session::{Action, Advance, LoadTarget, RegisterLoadError, Removal, Session};
+use crate::session::{
+    Action, Advance, DisplayUpdate, LoadTarget, RegisterLoadError, Removal, Session,
+};
 use crate::subscription::store::SubscriptionStore;
 
 /// Shown when the engine refuses a command for want of queue room.
 pub const PLAYER_BUSY: &str = "Player is busy";
 /// Shown when `Session` already tracks its maximum of in-flight loads.
 pub const TOO_MANY_PENDING_LOADS: &str = "Too many pending loads";
+/// At most this many tag probes run at once (§8).
+const METADATA_WORKERS: usize = 2;
 
 /// Builds the engine on the first load. Boxed so a test can hand in a
 /// deviceless output while production uses the environment's choice.
@@ -75,6 +81,9 @@ pub struct RuntimeParts {
     /// entry then plays its saved source.
     pub library: Option<LibraryStores>,
     pub http_limits: Limits,
+    /// Reads local tags in the background; `None` disables enrichment.
+    pub metadata_probe: Option<TagProbe>,
+    pub hook: TestHook,
 }
 
 #[derive(Clone, Debug)]
@@ -280,11 +289,23 @@ pub struct PlayerRuntime {
     last_attempt: Option<LoadRequestId>,
     /// Whether the latest attempt failed.
     load_failed: bool,
+    /// `None` when enrichment is disabled.
+    metadata: Option<MetadataWorkers>,
+    /// The restored entries, until the first pump offers them to `metadata`.
+    restored: Vec<QueueEntryId>,
 }
 
 impl PlayerRuntime {
     pub fn new(parts: RuntimeParts) -> Self {
         let volume = parts.session.state().volume();
+        let restored = parts
+            .session
+            .state()
+            .queue()
+            .entries()
+            .iter()
+            .map(QueueEntry::id)
+            .collect();
         Self {
             session: parts.session,
             writer: parts.writer,
@@ -303,6 +324,10 @@ impl PlayerRuntime {
             last_requested: None,
             last_attempt: None,
             load_failed: false,
+            metadata: parts
+                .metadata_probe
+                .map(|probe| MetadataWorkers::spawn(METADATA_WORKERS, probe, parts.hook)),
+            restored,
         }
     }
 
@@ -360,9 +385,20 @@ impl PlayerRuntime {
         }
     }
 
-    /// One iteration: drain engine events, act on what they asked for, then
-    /// sample progress.
+    /// One iteration: apply finished metadata enrichment, drain engine
+    /// events, act on what they asked for, then sample progress.
     pub fn pump(&mut self) {
+        // The restored queue is offered on the first pass rather than in
+        // `new`: a front end builds the runtime before it is ready to run
+        // (the terminal player, before entering the terminal), and no worker
+        // should start a job before then. Entries enqueued in between made
+        // their own requests.
+        if !self.restored.is_empty() {
+            let restored = std::mem::take(&mut self.restored);
+            self.request_enrichment(&restored);
+        }
+        self.apply_enrichment();
+
         while let Some(event) = self
             .engine
             .as_ref()
@@ -439,6 +475,10 @@ impl PlayerRuntime {
     /// Stops the engine, reconciles what it never delivered, and flushes.
     pub fn shutdown(mut self) -> FlushReport {
         self.router.cancel();
+        // Cancelled, not joined: see `MetadataWorkers::spawn`.
+        if let Some(workers) = self.metadata.take() {
+            workers.cancel_all();
+        }
         if let Some(engine) = self.engine.take() {
             shut_down_engine(engine, &mut self.session, &self.writer, self.clock.as_ref());
         }
@@ -771,7 +811,10 @@ impl PlayerRuntime {
             }
         }
         match self.session.enqueue(batch) {
-            Ok((_, action)) => self.submit(action),
+            Ok((ids, action)) => {
+                self.submit(action);
+                self.request_enrichment(&ids);
+            }
             Err(QueueError::Capacity { .. }) => {
                 self.status = Some(format!("Queue is full ({MAX_QUEUE_ENTRIES} entries)"));
             }
@@ -795,9 +838,68 @@ impl PlayerRuntime {
 
     fn clear_queue(&mut self) {
         self.router.cancel();
+        if let Some(workers) = &self.metadata {
+            workers.cancel_all();
+        }
         let progress = self.latest_progress();
         let removal = self.session.clear_queue(&progress, self.clock.sample());
         self.apply_removal(removal);
+    }
+
+    /// Asks the metadata workers about each of `ids` that is a local file
+    /// the queue knows only by name, once per media. Remote and podcast
+    /// entries are never probed: enrichment reads local files only (§8).
+    fn request_enrichment(&self, ids: &[QueueEntryId]) {
+        let Some(workers) = &self.metadata else {
+            return;
+        };
+        let queue = self.session.state().queue();
+        let mut requested: Vec<&MediaId> = Vec::new();
+        for entry in ids.iter().filter_map(|id| queue.get(*id)) {
+            let QueueSource::LocalFile(path) = entry.source() else {
+                continue;
+            };
+            let media = entry.media();
+            if !matches!(media, MediaId::LocalFile(_))
+                || entry.display().title.is_some()
+                || requested.contains(&media)
+            {
+                continue;
+            }
+            requested.push(media);
+            workers.request(media.clone(), path.clone());
+        }
+    }
+
+    /// Applies finished enrichment through `Session`, which updates every
+    /// occurrence of the media still queued — none, if it was removed.
+    fn apply_enrichment(&mut self) {
+        let Some(workers) = &self.metadata else {
+            return;
+        };
+        while let Some(result) = workers.try_result() {
+            match result.outcome {
+                EnrichOutcome::Tags(tags) => {
+                    let update = DisplayUpdate {
+                        title: tags.title,
+                        artist: tags.artist,
+                        album: tags.album,
+                        duration: tags.duration.map(|value| DisplayDuration {
+                            value,
+                            source: DurationSource::Decoded(tags.duration_provenance),
+                        }),
+                    };
+                    let action = self.session.update_display(&result.media, update);
+                    self.submit(action);
+                }
+                EnrichOutcome::Failed(message) => {
+                    tracing::debug!(%message, "no tags for a queued file");
+                }
+                EnrichOutcome::Panicked => {
+                    tracing::debug!("the tag probe panicked; the entry keeps its name");
+                }
+            }
+        }
     }
 
     fn apply_removal(&mut self, removal: Removal) {
@@ -966,6 +1068,8 @@ mod tests {
             engine_factory: Box::new(|| EngineHandle::spawn(Box::new(NullOutput::new()))),
             library: None,
             http_limits: Limits::default(),
+            metadata_probe: None,
+            hook: TestHook::None,
         })
     }
 

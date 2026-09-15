@@ -7,10 +7,12 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use continuo::application::enrich::TagProbe;
 use continuo::application::runtime::{EngineFactory, LibraryStores, PlayerRuntime, RuntimeParts};
 use continuo::application::view::PlayerView;
 use continuo::clock::{Clock, SystemClock};
 use continuo::http::limits::Limits;
+use continuo::lifecycle::hooks::TestHook;
 use continuo::persistence::model::PersistedState;
 use continuo::persistence::store::StateStore;
 use continuo::persistence::writer::WriterHandle;
@@ -38,6 +40,21 @@ pub fn rig_with_parts(
     library: Option<LibraryStores>,
     engine_factory: EngineFactory,
 ) -> Rig {
+    build(state, library, engine_factory, None)
+}
+
+/// A rig whose metadata workers run `probe`; every other rig has
+/// enrichment disabled.
+pub fn rig_with_probe(state: PersistedState, probe: TagProbe) -> Rig {
+    build(state, None, null_engine(), Some(probe))
+}
+
+fn build(
+    state: PersistedState,
+    library: Option<LibraryStores>,
+    engine_factory: EngineFactory,
+    metadata_probe: Option<TagProbe>,
+) -> Rig {
     let dir = tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir: {error}"));
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let state_path = dir.path().join("state.json");
@@ -45,7 +62,10 @@ pub fn rig_with_parts(
         Box::new(StateStore::new(state_path.clone(), clock.clone())),
         clock.clone(),
     );
-    let runtime = PlayerRuntime::new(parts(state, writer, clock, library, engine_factory));
+    let runtime = PlayerRuntime::new(RuntimeParts {
+        metadata_probe,
+        ..parts(state, writer, clock, library, engine_factory)
+    });
     Rig {
         _dir: dir,
         runtime,
@@ -69,6 +89,8 @@ pub fn parts(
         engine_factory,
         library,
         http_limits: Limits::default(),
+        metadata_probe: None,
+        hook: TestHook::None,
     }
 }
 

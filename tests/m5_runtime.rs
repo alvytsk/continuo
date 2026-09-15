@@ -6,10 +6,14 @@ mod feeds;
 #[path = "support/runtime.rs"]
 mod runtime;
 
+#[path = "support/tagged_flac.rs"]
+mod tagged_flac;
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use continuo::application::enrich::default_probe;
 use continuo::application::runtime::{
     AppCommand, EnqueueItem, FlushReport, LibraryStores, PlayerRuntime,
 };
@@ -17,13 +21,16 @@ use continuo::application::transport::PlaybackPhase;
 use continuo::application::view::{NowPlaying, PlayerView};
 use continuo::clock::SystemClock;
 use continuo::feed::cache::CacheStore;
+use continuo::lifecycle::hooks::TestHook;
 use continuo::media::id::{AbsolutePath, EpisodeKey, FeedId, MediaId};
 use continuo::persistence::model::PersistedState;
 use continuo::persistence::writer::WriterHandle;
 use continuo::queue::{NewQueueEntry, QueueEntryId, QueueSource};
 use continuo::session::Session;
 use continuo::subscription::store::SubscriptionStore;
-use runtime::{null_engine, parts, pump_for, pump_until, rig_with, rig_with_parts, row_ids};
+use runtime::{
+    null_engine, parts, pump_for, pump_until, rig_with, rig_with_parts, rig_with_probe, row_ids,
+};
 use support::server::{DocumentReply, Script, TestServer};
 
 const SHORT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/sine.flac");
@@ -199,6 +206,63 @@ fn volume_without_an_engine_is_persisted_at_shutdown() {
     let written: serde_json::Value =
         serde_json::from_slice(&std::fs::read(state_path).expect("written")).expect("json");
     assert_eq!(written["volume"], 0.75);
+}
+
+fn shows_tags(view: &PlayerView) -> bool {
+    view.rows.iter().any(|row| {
+        row.title == "Morning Tide"
+            && row
+                .subtitle
+                .as_deref()
+                .is_some_and(|subtitle| subtitle.contains("Harbor"))
+    })
+}
+
+#[test]
+fn enqueueing_a_tagged_local_file_fills_title_and_artist_in_the_background() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = tagged_flac::tagged_flac(dir.path(), "Morning Tide", "Harbor", "Coast", None);
+    let mut rig = rig_with_probe(PersistedState::default(), default_probe(TestHook::None));
+    rig.runtime
+        .handle(AppCommand::Enqueue(vec![EnqueueItem::Path(path)]));
+    assert_eq!(
+        rig.runtime.view().rows[0].title,
+        "tagged.flac",
+        "not yet enriched"
+    );
+    pump_until(&mut rig.runtime, "tags shown on the row", shows_tags);
+    let row = rig.runtime.view().rows[0].clone();
+    assert_eq!(row.subtitle.as_deref(), Some("Harbor · Coast"));
+    assert!(row.duration.is_some(), "{row:?}");
+}
+
+#[test]
+fn restored_untitled_local_entries_are_enriched_on_the_first_pump() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = tagged_flac::tagged_flac(dir.path(), "Morning Tide", "Harbor", "Coast", None);
+    let mut rig = rig_with_probe(
+        seeded(vec![local_entry(&path)]),
+        default_probe(TestHook::None),
+    );
+    pump_until(&mut rig.runtime, "restored row enriched", shows_tags);
+}
+
+#[test]
+fn loading_a_tagged_file_fills_artist_and_album_from_the_decoder() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = tagged_flac::tagged_flac(dir.path(), "Morning Tide", "Harbor", "Coast", None);
+    // Enrichment disabled: only the load itself can supply the tags.
+    let mut rig = rig_with(PersistedState::default());
+    rig.runtime
+        .handle(AppCommand::Enqueue(vec![EnqueueItem::Path(path)]));
+    let id = row_ids(&rig.runtime)[0];
+    rig.runtime.handle(AppCommand::PlayEntry(id));
+    pump_until(&mut rig.runtime, "tags adopted with the load", shows_tags);
+    let now = now_playing(&rig.runtime.view());
+    assert_eq!(
+        (now.artist.as_deref(), now.album.as_deref()),
+        (Some("Harbor"), Some("Coast"))
+    );
 }
 
 #[test]

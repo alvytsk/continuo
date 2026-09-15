@@ -605,6 +605,8 @@ mod tests {
             media: local("/music/sonata.flac"),
             metadata: MediaMetadata {
                 title: None,
+                artist: None,
+                album: None,
                 duration: Some(Duration::from_secs(300)),
                 duration_provenance: PositionProvenance::Established,
             },

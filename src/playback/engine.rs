@@ -3259,6 +3259,8 @@ mod tests {
     fn an_estimated_duration_is_not_treated_as_a_ceiling() {
         let metadata = MediaMetadata {
             title: None,
+            artist: None,
+            album: None,
             duration: Some(Duration::from_secs(100)),
             duration_provenance: PositionProvenance::Estimated,
         };
@@ -3273,6 +3275,8 @@ mod tests {
     fn an_established_duration_is_still_a_ceiling() {
         let metadata = MediaMetadata {
             title: None,
+            artist: None,
+            album: None,
             duration: Some(Duration::from_secs(100)),
             duration_provenance: PositionProvenance::Established,
         };

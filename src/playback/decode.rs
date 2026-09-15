@@ -6,9 +6,9 @@ use symphonia::core::audio::GenericAudioBufferRef;
 use symphonia::core::codecs::audio::{AudioDecoder, AudioDecoderOptions};
 use symphonia::core::formats::probe::Hint;
 use symphonia::core::formats::well_known::FORMAT_ID_MP3;
-use symphonia::core::formats::{FormatOptions, FormatReader, SeekMode, SeekTo, TrackType};
+use symphonia::core::formats::{FormatOptions, FormatReader, SeekMode, SeekTo, Track, TrackType};
 use symphonia::core::io::{MediaSource, MediaSourceStream, MediaSourceStreamOptions};
-use symphonia::core::meta::{MetadataOptions, StandardTag};
+use symphonia::core::meta::{MetadataOptions, MetadataRevision, StandardTag};
 use symphonia::core::units::{TimeBase, Timestamp};
 
 use crate::media::capabilities::{
@@ -72,29 +72,9 @@ impl std::fmt::Debug for DecodedSource {
 
 impl DecodedSource {
     pub fn open(path: &AbsolutePath) -> Result<Self, PlaybackError> {
-        let owned = path.as_path().to_path_buf();
-        let metadata_fs = std::fs::metadata(&owned).map_err(|source| PlaybackError::Open {
-            path: owned.clone(),
-            source,
-        })?;
-        // Reject pipes and device files so this local-file slice cannot acquire
-        // an unbounded read.
-        if !metadata_fs.is_file() {
-            return Err(PlaybackError::UnsupportedInput {
-                path: owned,
-                reason: "not a regular file".into(),
-            });
-        }
-        let file = File::open(&owned).map_err(|source| PlaybackError::Open {
-            path: owned.clone(),
-            source,
-        })?;
-        let mut hint = Hint::new();
-        if let Some(extension) = owned.extension().and_then(|e| e.to_str()) {
-            hint.with_extension(extension);
-        }
+        let local = open_local_file(path)?;
         let evidence = SourceEvidence {
-            byte_len: Some(metadata_fs.len()),
+            byte_len: Some(local.byte_len),
             byte_seekable: true,
             live: false,
             // Not an assumption: M1 already ships this guarantee for the four
@@ -102,7 +82,12 @@ impl DecodedSource {
             // on every run.
             demuxer: DemuxerSeek::Proven,
         };
-        Self::from_media_source(Box::new(file), hint, owned, evidence)
+        Self::from_media_source(
+            Box::new(local.file),
+            local.hint,
+            path.as_path().to_path_buf(),
+            evidence,
+        )
     }
 
     /// Open over any `MediaSource`, with the supplied evidence folded into the
@@ -112,32 +97,15 @@ impl DecodedSource {
     /// for diagnostics — `UnsupportedInput`'s `path` field and this source's
     /// own `path()` accessor.
     pub fn from_media_source(
-        mut source: Box<dyn MediaSource>,
+        source: Box<dyn MediaSource>,
         hint: Hint,
         label: PathBuf,
         evidence: SourceEvidence,
     ) -> Result<Self, PlaybackError> {
-        // Read the container's own evidence for the MP3 frame-count header
-        // (Xing/Info/VBRI) before `MediaSourceStream` takes the source. This
-        // must run first: symphonia's `Track` never says whether its
-        // `num_frames` came from this header or from
-        // `estimate_num_mpeg_frames`'s ~16-frame extrapolation, and by the
-        // time the reader is built that distinction is unrecoverable.
-        let vbr_header = probe_vbr_header(source.as_mut())?;
-        let mss = MediaSourceStream::new(
-            source,
-            MediaSourceStreamOptions {
-                buffer_len: 64 * 1024,
-            },
-        );
-        let mut reader = symphonia::default::get_probe()
-            .probe(
-                &hint,
-                mss,
-                FormatOptions::default(),
-                MetadataOptions::default(),
-            )
-            .map_err(PlaybackError::Decode)?;
+        let ProbedContainer {
+            mut reader,
+            vbr_header,
+        } = probe_container(source, &hint)?;
 
         let track = reader.default_track(TrackType::Audio).ok_or_else(|| {
             PlaybackError::UnsupportedInput {
@@ -147,13 +115,7 @@ impl DecodedSource {
         })?;
         let track_id = track.id;
         let time_base = track.time_base;
-        let duration = track
-            .num_frames
-            .zip(track.time_base)
-            .and_then(|(frames, base)| {
-                base.calc_time(Timestamp::new(frames as i64))
-                    .map(|time| Duration::from_secs_f64(time.as_secs_f64()))
-            });
+        let (duration, duration_provenance) = track_duration(Some(track), vbr_header);
         let params = track
             .codec_params
             .as_ref()
@@ -182,14 +144,7 @@ impl DecodedSource {
         let decoder = symphonia::default::get_codecs()
             .make_audio_decoder(params, &AudioDecoderOptions::default())
             .map_err(PlaybackError::Decode)?;
-        // `Tag::std`, when present, is a `StandardTag` that carries its value inline
-        // (e.g. `StandardTag::TrackTitle(Arc<String>)`) rather than a separate key enum.
-        let title = reader.metadata().current().and_then(|revision| {
-            revision.media.tags.iter().find_map(|tag| match &tag.std {
-                Some(StandardTag::TrackTitle(title)) => Some(title.to_string()),
-                _ => None,
-            })
-        });
+        let names = standard_names(reader.metadata().current());
 
         Ok(Self {
             path: label,
@@ -199,22 +154,12 @@ impl DecodedSource {
             time_base,
             sample_rate,
             channels,
-            // `Some(XingInfo | Vbri)` is a real index: `Established`.
-            // `Some(Absent)` is symphonia's `estimate_num_mpeg_frames`
-            // fallback: `Estimated` (§5.5). `None` means this probe gathered
-            // no evidence at all (a non-MP3 container, a short read, or an
-            // unseekable source) and must not silently downgrade a duration
-            // that may be perfectly good — every non-MP3 format's real
-            // index/container header keeps the meaning it always had.
             metadata: MediaMetadata {
-                title,
+                title: names.title,
+                artist: names.artist,
+                album: names.album,
                 duration,
-                duration_provenance: match vbr_header {
-                    Some(VbrHeader::XingInfo | VbrHeader::Vbri) | None => {
-                        PositionProvenance::Established
-                    }
-                    Some(VbrHeader::Absent) => PositionProvenance::Estimated,
-                },
+                duration_provenance,
             },
             planes: vec![Vec::new(); usize::from(channels)],
             cursor: 0,
@@ -431,6 +376,139 @@ impl DecodedSource {
     pub fn time_base(&self) -> Option<TimeBase> {
         self.time_base
     }
+}
+
+/// A regular local file opened for reading, with the extension hint the
+/// container probe starts from.
+pub(crate) struct LocalFile {
+    pub file: File,
+    pub hint: Hint,
+    pub byte_len: u64,
+}
+
+/// Opens `path` for probing, refusing anything but a regular file.
+pub(crate) fn open_local_file(path: &AbsolutePath) -> Result<LocalFile, PlaybackError> {
+    let owned = path.as_path();
+    let metadata_fs = std::fs::metadata(owned).map_err(|source| PlaybackError::Open {
+        path: owned.to_path_buf(),
+        source,
+    })?;
+    // Reject pipes and device files so this local-file slice cannot acquire
+    // an unbounded read.
+    if !metadata_fs.is_file() {
+        return Err(PlaybackError::UnsupportedInput {
+            path: owned.to_path_buf(),
+            reason: "not a regular file".into(),
+        });
+    }
+    let file = File::open(owned).map_err(|source| PlaybackError::Open {
+        path: owned.to_path_buf(),
+        source,
+    })?;
+    let mut hint = Hint::new();
+    if let Some(extension) = owned.extension().and_then(|e| e.to_str()) {
+        hint.with_extension(extension);
+    }
+    Ok(LocalFile {
+        file,
+        hint,
+        byte_len: metadata_fs.len(),
+    })
+}
+
+/// A container symphonia's probe recognised, before any decoder exists.
+pub(crate) struct ProbedContainer {
+    pub reader: Box<dyn FormatReader + 'static>,
+    pub vbr_header: Option<VbrHeader>,
+}
+
+/// Runs the container probe — no decoder is built and no packet is read —
+/// shared by playback and the local tag probe so both see the same reader,
+/// tags and duration evidence.
+pub(crate) fn probe_container(
+    mut source: Box<dyn MediaSource>,
+    hint: &Hint,
+) -> Result<ProbedContainer, PlaybackError> {
+    // Read the container's own evidence for the MP3 frame-count header
+    // (Xing/Info/VBRI) before `MediaSourceStream` takes the source. This
+    // must run first: symphonia's `Track` never says whether its
+    // `num_frames` came from this header or from
+    // `estimate_num_mpeg_frames`'s ~16-frame extrapolation, and by the
+    // time the reader is built that distinction is unrecoverable.
+    let vbr_header = probe_vbr_header(source.as_mut())?;
+    let mss = MediaSourceStream::new(
+        source,
+        MediaSourceStreamOptions {
+            buffer_len: 64 * 1024,
+        },
+    );
+    let reader = symphonia::default::get_probe()
+        .probe(
+            hint,
+            mss,
+            FormatOptions::default(),
+            MetadataOptions::default(),
+        )
+        .map_err(PlaybackError::Decode)?;
+    Ok(ProbedContainer { reader, vbr_header })
+}
+
+/// A track's duration and how far it can be trusted.
+///
+/// `Some(XingInfo | Vbri)` is a real index: `Established`. `Some(Absent)` is
+/// symphonia's `estimate_num_mpeg_frames` fallback: `Estimated` (§5.5).
+/// `None` means the probe gathered no evidence at all (a non-MP3 container,
+/// a short read, or an unseekable source) and must not silently downgrade a
+/// duration that may be perfectly good — every non-MP3 format's real
+/// index/container header keeps the meaning it always had.
+pub(crate) fn track_duration(
+    track: Option<&Track>,
+    vbr_header: Option<VbrHeader>,
+) -> (Option<Duration>, PositionProvenance) {
+    let duration = track.and_then(|track| {
+        track
+            .num_frames
+            .zip(track.time_base)
+            .and_then(|(frames, base)| {
+                base.calc_time(Timestamp::new(frames as i64))
+                    .map(|time| Duration::from_secs_f64(time.as_secs_f64()))
+            })
+    });
+    let provenance = match vbr_header {
+        Some(VbrHeader::XingInfo | VbrHeader::Vbri) | None => PositionProvenance::Established,
+        Some(VbrHeader::Absent) => PositionProvenance::Estimated,
+    };
+    (duration, provenance)
+}
+
+/// The first title, artist and album a metadata revision carries.
+#[derive(Default)]
+pub(crate) struct StandardNames {
+    pub title: Option<String>,
+    pub artist: Option<String>,
+    pub album: Option<String>,
+}
+
+pub(crate) fn standard_names(revision: Option<&MetadataRevision>) -> StandardNames {
+    let mut names = StandardNames::default();
+    let Some(revision) = revision else {
+        return names;
+    };
+    // `Tag::std`, when present, is a `StandardTag` that carries its value
+    // inline (e.g. `StandardTag::TrackTitle(Arc<String>)`) rather than a
+    // separate key enum. The first of each wins.
+    for tag in &revision.media.tags {
+        let (slot, value) = match &tag.std {
+            Some(StandardTag::TrackTitle(value)) => (&mut names.title, value),
+            Some(StandardTag::Artist(value)) => (&mut names.artist, value),
+            Some(StandardTag::Album(value)) => (&mut names.album, value),
+            _ => continue,
+        };
+        if slot.is_none() {
+            *slot = Some(value.to_string());
+        }
+    }
+    names
 }
 
 fn copy_planar(decoded: &GenericAudioBufferRef<'_>, planes: &mut Vec<Vec<f32>>) {

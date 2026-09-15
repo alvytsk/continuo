@@ -36,6 +36,7 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
 use crate::application::browse::{BrowseRequest, BrowseWorker};
+use crate::application::enrich::default_probe;
 use crate::application::runtime::{
     AppCommand, FlushReport, LibraryStores, PlayerRuntime, RuntimeParts,
 };
@@ -163,7 +164,9 @@ fn start_and_loop(
     hook.panic_at(TestHook::PanicAfterRedirect);
     stage!(signals, cleanup);
 
-    let runtime = stages.runtime.insert(start_runtime(store, loaded, clock));
+    let runtime = stages
+        .runtime
+        .insert(start_runtime(store, loaded, clock, hook));
     stage!(signals, cleanup);
 
     let terminal = stages.terminal.insert(attempt!(
@@ -215,7 +218,12 @@ fn redirect_to_session_log(
     )))
 }
 
-fn start_runtime(store: StateStore, loaded: LoadOutcome, clock: Arc<dyn Clock>) -> PlayerRuntime {
+fn start_runtime(
+    store: StateStore,
+    loaded: LoadOutcome,
+    clock: Arc<dyn Clock>,
+    hook: TestHook,
+) -> PlayerRuntime {
     let LoadOutcome {
         state,
         writable,
@@ -235,6 +243,8 @@ fn start_runtime(store: StateStore, loaded: LoadOutcome, clock: Arc<dyn Clock>) 
         engine_factory: Box::new(EngineHandle::spawn_for_environment),
         library: library_stores(),
         http_limits: Limits::default(),
+        metadata_probe: Some(default_probe(hook)),
+        hook,
     });
     let status = match queue_repair {
         Some(repair) => Some(match repair.backup {

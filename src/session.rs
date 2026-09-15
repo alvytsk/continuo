@@ -603,11 +603,10 @@ impl Session {
         Ok(self.submit(Urgency::Ordinary))
     }
 
-    /// Copies a decoder-reported title and duration into the queue entry a
-    /// `Loaded` just adopted. Only these two fields move today — artist and
-    /// album arrive in a later task — and only when the decoder actually
-    /// reported them: `MediaMetadata`'s absent fields must never blank out
-    /// what the entry already displayed.
+    /// Copies a decoder-reported title, artist, album and duration into the
+    /// queue entry a `Loaded` just adopted, each only when the decoder
+    /// actually reported it: `MediaMetadata`'s absent fields must never blank
+    /// out what the entry already displayed.
     fn absorb_load_metadata(&mut self, id: QueueEntryId, metadata: &MediaMetadata) {
         let Some(entry) = self.state.queue_mut().get_mut(id) else {
             return;
@@ -615,6 +614,12 @@ impl Session {
         let display = entry.display_mut();
         if let Some(title) = &metadata.title {
             display.title = Some(title.clone());
+        }
+        if let Some(artist) = &metadata.artist {
+            display.artist = Some(artist.clone());
+        }
+        if let Some(album) = &metadata.album {
+            display.album = Some(album.clone());
         }
         if let Some(duration) = metadata.duration {
             display.duration = Some(DisplayDuration {
