@@ -1,7 +1,10 @@
 //! Draws a [`PlayerView`] into the regions of its size tier and reports where
 //! the clickable parts landed (design doc M5 §7). Every string it prints was
 //! already made safe by the view; the renderer only adds fixed labels and
-//! formatted times.
+//! formatted times, except the browser overlay, which makes its own
+//! filesystem and feed names safe (see [`browser`]).
+
+mod browser;
 
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
@@ -14,18 +17,22 @@ use crate::application::transport::PlaybackPhase;
 use crate::application::view::{NowPlaying, PersistenceStatus, PlayerView, QueueRow, format_saved};
 use crate::media::display::format_hms;
 use crate::queue::{DisplayDuration, DurationSource, QueueEntryId};
+use crate::tui::browser::BrowserState;
 use crate::tui::layout::{
     Regions, Tier, inset, regions, take_left, take_right, tier_for, visible_rows,
 };
 use crate::tui::state::{Overlay, UiState};
 use crate::tui::theme::Theme;
 
-/// What the frame shows beyond the view: prepared artwork and spectrum levels.
+/// What the frame shows beyond the view: prepared artwork, spectrum levels
+/// and the open browser.
 #[derive(Default)]
 pub struct Visuals<'a> {
     pub cover: CoverView<'a>,
     /// One level per band, 0.0 to 1.0.
     pub spectrum: Option<&'a [f32]>,
+    /// Drawn while `UiState::overlay` is `Overlay::Browser`.
+    pub browser: Option<&'a BrowserState>,
 }
 
 #[derive(Default)]
@@ -138,7 +145,7 @@ pub fn draw(
     let progress = draw_progress(buffer, regions.progress, view, tier, &theme);
     let rows = draw_queue(buffer, regions.queue, view, ui, tier, &theme);
     draw_footer(buffer, regions.footer, view, &theme);
-    draw_overlay(buffer, area, ui, &theme);
+    draw_overlay(buffer, area, ui, visuals.browser, &theme);
     HitMap {
         rows,
         queue: regions.queue,
@@ -147,14 +154,26 @@ pub fn draw(
     }
 }
 
-/// The help, confirm and input overlays float over everything else the
-/// frame drew; the browser overlay is Task 22's to draw.
-fn draw_overlay(buffer: &mut Buffer, area: Rect, ui: &UiState, theme: &Theme) {
+/// The help, confirm, input and browser overlays float over everything else
+/// the frame drew. The browser overlay needs the browser itself; without it
+/// there is nothing to draw.
+fn draw_overlay(
+    buffer: &mut Buffer,
+    area: Rect,
+    ui: &UiState,
+    browser: Option<&BrowserState>,
+    theme: &Theme,
+) {
     match ui.overlay {
         Overlay::Help => draw_help_overlay(buffer, area, theme),
         Overlay::ConfirmClear => draw_confirm_overlay(buffer, area, theme),
         Overlay::Input => draw_input_overlay(buffer, area, &ui.input, theme),
-        Overlay::Browser | Overlay::None => {}
+        Overlay::Browser => {
+            if let Some(browser) = browser {
+                browser::draw_browser(buffer, area, browser, theme);
+            }
+        }
+        Overlay::None => {}
     }
 }
 

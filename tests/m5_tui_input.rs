@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use continuo::application::runtime::{AppCommand, EnqueueItem};
 use continuo::application::transport::PlaybackPhase;
-use continuo::tui::input::{Effect, handle_key, handle_mouse};
+use continuo::tui::input::{Effect, handle_key, handle_mouse, routes_to_browser};
 use continuo::tui::render::{HitMap, TransportButton, Visuals, draw};
 use continuo::tui::state::{Overlay, UiState};
 use crossterm::event::{
@@ -425,4 +425,37 @@ fn a_ctrl_chord_on_y_does_not_confirm_the_clear() {
     assert_eq!(ui.overlay, Overlay::ConfirmClear);
     assert!(app(&handle_key(ctrl('y'), &mut ui, &view)).is_empty());
     assert_eq!(ui.overlay, Overlay::None, "any key closes the confirmation");
+}
+
+#[test]
+fn the_open_browser_takes_every_key_but_ctrl_c() {
+    let view = sample_view();
+    let mut ui = UiState::new(true);
+    assert!(
+        matches!(
+            &handle_key(key(KeyCode::Char('b')), &mut ui, &view)[..],
+            [Effect::OpenBrowser]
+        ),
+        "b opens the browser"
+    );
+    assert!(!routes_to_browser(&key(KeyCode::Char('q')), &ui));
+
+    ui.overlay = Overlay::Browser;
+    for event in [
+        key(KeyCode::Char('q')),
+        key(KeyCode::Char('b')),
+        key(KeyCode::Esc),
+        key(KeyCode::Char(' ')),
+        ctrl('l'),
+        alt('d'),
+    ] {
+        assert!(routes_to_browser(&event, &ui), "{event:?}");
+        assert!(handle_key(event, &mut ui, &view).is_empty(), "{event:?}");
+    }
+    assert!(!routes_to_browser(&ctrl('c'), &ui));
+    assert!(matches!(
+        &handle_key(ctrl('c'), &mut ui, &view)[..],
+        [Effect::Quit]
+    ));
+    assert_eq!(ui.overlay, Overlay::Browser);
 }

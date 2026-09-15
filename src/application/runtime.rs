@@ -5,7 +5,7 @@
 //!
 //! [`pump`]: PlayerRuntime::pump
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -312,6 +312,18 @@ impl PlayerRuntime {
 
     pub fn set_status(&mut self, message: impl Into<String>) {
         self.status = Some(message.into());
+    }
+
+    /// The directory holding the active queue entry, when that entry is a
+    /// local file; `None` for a remote or podcast entry or no active entry.
+    /// Read from the queue alone — nothing touches the filesystem.
+    pub fn active_local_dir(&self) -> Option<PathBuf> {
+        let queue = self.session.state().queue();
+        let entry = queue.get(queue.active()?)?;
+        match entry.source() {
+            QueueSource::LocalFile(path) => path.as_path().parent().map(Path::to_path_buf),
+            QueueSource::RemoteUrl(_) | QueueSource::Podcast { .. } => None,
+        }
     }
 
     /// The entry a removal suggests selecting next, once.

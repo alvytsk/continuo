@@ -81,3 +81,41 @@ fn sigterm_restores_the_terminal_and_exits_143() {
     assert_eq!(child.wait_exit(Duration::from_secs(10)), Some(143));
     assert!(child.output().contains(LEAVE_ALT));
 }
+
+#[test]
+fn b_browses_the_working_directory_and_enter_enqueues_a_file() {
+    let profile = process::Profile::new().expect("profile");
+    // Sorts ahead of the profile's own state/data/cache/config directories.
+    let music = profile.root().join("0-music");
+    std::fs::create_dir(&music).expect("music dir");
+    std::fs::copy(
+        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/sine.flac"),
+        music.join("track.flac"),
+    )
+    .expect("copy fixture");
+    let mut child = PtyChild::spawn(profile.root(), &["tui"], &[], 100, 30).expect("spawn");
+    assert!(child.wait_for("Queue is empty", Duration::from_secs(10)));
+    child.send(b"b");
+    assert!(
+        child.wait_for("0-music/", Duration::from_secs(10)),
+        "{}",
+        child.output()
+    );
+    child.send(b"\r");
+    assert!(
+        child.wait_for("track.flac", Duration::from_secs(10)),
+        "{}",
+        child.output()
+    );
+    child.send(b"\r");
+    child.send(b"b");
+    assert!(
+        child.wait_for("queue 01", Duration::from_secs(10)),
+        "{}",
+        child.output()
+    );
+    child.send(b"q");
+    assert_eq!(child.wait_exit(Duration::from_secs(10)), Some(0));
+    let state = std::fs::read_to_string(profile.state_file()).expect("flushed");
+    assert!(state.contains("track.flac"), "{state}");
+}

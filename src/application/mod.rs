@@ -6,6 +6,7 @@
 //! any front end can call into it and decide for itself how to show the
 //! result.
 
+pub mod browse;
 pub mod podcast;
 pub mod runtime;
 pub mod seek;

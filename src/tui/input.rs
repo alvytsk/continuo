@@ -51,11 +51,19 @@ pub fn handle_key(key: KeyEvent, ui: &mut UiState, view: &PlayerView) -> Vec<Eff
         Overlay::Input => input_overlay(key, ui),
         Overlay::ConfirmClear => confirm_overlay(key, ui),
         Overlay::Help => help_overlay(key, ui),
-        // Task 22 forwards these keys to `BrowserState::handle_key`, whose
-        // own close maps to `Effect::CloseBrowser`.
+        // Every other key belongs to the browser: `tui::run` forwards it to
+        // `BrowserState::handle_key` (see `routes_to_browser`), whose own
+        // close becomes `Effect::CloseBrowser`.
         Overlay::Browser => Vec::new(),
         Overlay::None => no_overlay(key, ui, view),
     }
+}
+
+/// Whether `key` goes to the open browser's own key handling instead of
+/// [`handle_key`]: every key while the browser overlay is open except
+/// Ctrl-C, which quits from anywhere.
+pub fn routes_to_browser(key: &KeyEvent, ui: &UiState) -> bool {
+    ui.overlay == Overlay::Browser && !is_ctrl_c(key)
 }
 
 /// Maps one mouse event to zero or more effects, mirroring `handle_key`:
@@ -169,7 +177,7 @@ fn is_ctrl_l(key: &KeyEvent) -> bool {
 /// SHIFT set, and those must keep working. The two exceptions that need
 /// CONTROL — Ctrl-C and Ctrl-L — are checked before this and never reach
 /// the callers of this function.
-fn blocks_ordinary_bindings(key: &KeyEvent) -> bool {
+pub(crate) fn blocks_ordinary_bindings(key: &KeyEvent) -> bool {
     key.modifiers
         .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
 }

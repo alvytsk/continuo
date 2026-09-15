@@ -10,7 +10,12 @@
 //!
 //! Each frame is drawn by [`render::draw`] in the size tier the terminal
 //! allows (§7).
+//!
+//! The on-demand browser (§8) is owned here too: its state exists only while
+//! it is open, its keys go to [`browser::BrowserState::handle_key`], and its
+//! reads run on a [`BrowseWorker`] started the first time it opens.
 
+pub mod browser;
 pub mod input;
 pub mod layout;
 pub mod render;
@@ -30,7 +35,10 @@ use crossterm::terminal::{EnterAlternateScreen, enable_raw_mode};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
-use crate::application::runtime::{FlushReport, LibraryStores, PlayerRuntime, RuntimeParts};
+use crate::application::browse::{BrowseRequest, BrowseWorker};
+use crate::application::runtime::{
+    AppCommand, FlushReport, LibraryStores, PlayerRuntime, RuntimeParts,
+};
 use crate::cli::MouseMode;
 use crate::clock::{Clock, SystemClock};
 use crate::error::{AppError, LifecycleError};
@@ -44,9 +52,10 @@ use crate::persistence::store::{LoadOutcome, QueueBackup, StateStore};
 use crate::persistence::writer::{DisabledSink, StateSink, WriterHandle};
 use crate::playback::engine::EngineHandle;
 use crate::session::Session;
-use crate::tui::input::{Effect, handle_key, handle_mouse};
+use crate::tui::browser::{BrowserEffect, BrowserState};
+use crate::tui::input::{Effect, handle_key, handle_mouse, routes_to_browser};
 use crate::tui::render::{HitMap, Visuals};
-use crate::tui::state::UiState;
+use crate::tui::state::{Overlay, UiState};
 
 /// How long one loop pass waits for terminal input before pumping the
 /// runtime again; also the bound on how late a signal or fatal panic is seen.
@@ -218,20 +227,13 @@ fn start_runtime(store: StateStore, loaded: LoadOutcome, clock: Arc<dyn Clock>) 
     } else {
         Box::new(DisabledSink)
     };
-    let library =
-        crate::commands::platform_subscription_stores()
-            .ok()
-            .map(|(subscriptions, cache)| LibraryStores {
-                subscriptions,
-                cache,
-            });
     let mut runtime = PlayerRuntime::new(RuntimeParts {
         session: Session::new(state),
         writer: WriterHandle::spawn(sink, Arc::clone(&clock)),
         persisting: writable,
         clock,
         engine_factory: Box::new(EngineHandle::spawn_for_environment),
-        library,
+        library: library_stores(),
         http_limits: Limits::default(),
     });
     let status = match queue_repair {
@@ -253,6 +255,18 @@ fn start_runtime(store: StateStore, loaded: LoadOutcome, clock: Arc<dyn Clock>) 
         runtime.set_status(status);
     }
     runtime
+}
+
+/// The platform's subscription and feed-cache stores, or `None` when there
+/// is no platform data directory. Both the runtime and the browse worker
+/// call this, each owning its own stores.
+fn library_stores() -> Option<LibraryStores> {
+    crate::commands::platform_subscription_stores()
+        .ok()
+        .map(|(subscriptions, cache)| LibraryStores {
+            subscriptions,
+            cache,
+        })
 }
 
 /// Each change is marked for cleanup as soon as it is made, so a failure
@@ -293,11 +307,21 @@ fn run_loop(
 ) -> Ending {
     // Where the last frame put its clickable parts, for mouse input (Task 21).
     let mut hits = HitMap::default();
+    let mut browsing = Browsing::default();
     loop {
-        if let Err(error) = handle_input(runtime, &mut ui, terminal, cleanup, signals, &hits) {
+        let mut front = Front {
+            runtime,
+            ui: &mut ui,
+            browsing: &mut browsing,
+            terminal,
+            cleanup,
+            signals,
+        };
+        if let Err(error) = handle_input(&mut front, &hits) {
             return Ending::Failed(LifecycleError::Terminal(error).into());
         }
         runtime.pump();
+        browsing.poll();
         if let Some(ending) = interrupted(signals, cleanup) {
             return ending;
         }
@@ -306,62 +330,138 @@ fn run_loop(
         }
         let view = runtime.view();
         ui.reconcile(&view, None);
+        let visuals = Visuals {
+            browser: browsing.state.as_ref(),
+            ..Visuals::default()
+        };
         if let Err(error) = terminal.draw(|frame| {
-            hits = render::draw(frame, &view, &ui, &Visuals::default());
+            hits = render::draw(frame, &view, &ui, &visuals);
         }) {
             return Ending::Failed(LifecycleError::Terminal(error).into());
         }
     }
 }
 
+/// The browser while it is open, and the worker that reads for it.
+#[derive(Default)]
+struct Browsing {
+    state: Option<BrowserState>,
+    /// Started the first time the browser opens, then kept for the run.
+    worker: Option<BrowseWorker>,
+}
+
+impl Browsing {
+    /// Opens the browser at the active local entry's directory, else the
+    /// current working directory, and asks for its listing.
+    fn open(&mut self, runtime: &PlayerRuntime, ui: &mut UiState) {
+        let cwd = runtime
+            .active_local_dir()
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| std::path::PathBuf::from("/"));
+        self.state = Some(BrowserState::new(cwd.clone()));
+        ui.overlay = Overlay::Browser;
+        self.request(BrowseRequest::Directory(cwd));
+    }
+
+    fn close(&mut self, ui: &mut UiState) {
+        self.state = None;
+        if ui.overlay == Overlay::Browser {
+            ui.overlay = Overlay::None;
+        }
+    }
+
+    fn request(&mut self, request: BrowseRequest) {
+        self.worker
+            .get_or_insert_with(|| BrowseWorker::spawn(library_stores()))
+            .request(request);
+    }
+
+    /// Hands every finished read to the open browser; one that finishes
+    /// after the browser closed is dropped.
+    fn poll(&mut self) {
+        let Some(worker) = &self.worker else {
+            return;
+        };
+        while let Some(result) = worker.try_result() {
+            if let Some(state) = &mut self.state {
+                state.apply(result);
+            }
+        }
+    }
+}
+
+/// Everything an input event can act on.
+struct Front<'a> {
+    runtime: &'a mut PlayerRuntime,
+    ui: &'a mut UiState,
+    browsing: &'a mut Browsing,
+    terminal: &'a mut Tty,
+    cleanup: &'a FatalCleanup,
+    signals: &'a ShutdownSignals,
+}
+
 /// Reads at most one input event and runs it through `tui::input::handle_key`
 /// or `tui::input::handle_mouse` — whichever the event is — executing
-/// whatever effects come back exactly the same way for either. `hits` is
-/// where the last drawn frame put its clickable parts (Task 19); every other
-/// event kind (resize, focus, paste) is ignored here since the next loop
-/// pass redraws unconditionally.
-fn handle_input(
-    runtime: &mut PlayerRuntime,
-    ui: &mut UiState,
-    terminal: &mut Tty,
-    cleanup: &FatalCleanup,
-    signals: &ShutdownSignals,
-    hits: &HitMap,
-) -> io::Result<()> {
+/// whatever effects come back exactly the same way for either. While the
+/// browser is open every key but Ctrl-C goes to the browser instead, and its
+/// effects are executed here too. `hits` is where the last drawn frame put
+/// its clickable parts (Task 19); every other event kind (resize, focus,
+/// paste) is ignored here since the next loop pass redraws unconditionally.
+fn handle_input(front: &mut Front<'_>, hits: &HitMap) -> io::Result<()> {
     if !event::poll(INPUT_POLL)? {
         return Ok(());
     }
-    let view = runtime.view();
+    let view = front.runtime.view();
     let effects = match event::read()? {
-        Event::Key(key) => handle_key(key, ui, &view),
-        Event::Mouse(mouse) => handle_mouse(mouse, hits, ui, &view),
+        Event::Key(key) if routes_to_browser(&key, front.ui) => {
+            let Some(browser) = &mut front.browsing.state else {
+                // An overlay with no browser behind it has nothing to show.
+                front.browsing.close(front.ui);
+                return Ok(());
+            };
+            let effects = browser.handle_key(key);
+            for effect in effects {
+                apply_browser_effect(effect, front)?;
+            }
+            return Ok(());
+        }
+        Event::Key(key) => handle_key(key, front.ui, &view),
+        Event::Mouse(mouse) => handle_mouse(mouse, hits, front.ui, &view),
         _ => Vec::new(),
     };
     for effect in effects {
-        apply_effect(effect, runtime, ui, terminal, cleanup, signals)?;
+        apply_effect(effect, front)?;
     }
     Ok(())
 }
 
-/// Executes one effect `tui::input::handle_key` returned. `OpenBrowser` and
-/// `CloseBrowser` are no-ops for now: Task 22 gives the browser its own
-/// state, owned here in `tui::run`, and forwards its keys to it.
-fn apply_effect(
-    effect: Effect,
-    runtime: &mut PlayerRuntime,
-    ui: &mut UiState,
-    terminal: &mut Tty,
-    cleanup: &FatalCleanup,
-    signals: &ShutdownSignals,
-) -> io::Result<()> {
+/// Executes one effect the browser returned: a read goes to the worker, an
+/// enqueue is the ordinary enqueue command, and a close is `CloseBrowser`.
+/// §8 does not say an enqueue closes the browser, so it stays open; the
+/// browser has already cleared its marks.
+fn apply_browser_effect(effect: BrowserEffect, front: &mut Front<'_>) -> io::Result<()> {
+    match effect {
+        BrowserEffect::Request(request) => {
+            front.browsing.request(request);
+            Ok(())
+        }
+        BrowserEffect::Enqueue(items) => {
+            apply_effect(Effect::App(AppCommand::Enqueue(items)), front)
+        }
+        BrowserEffect::Close => apply_effect(Effect::CloseBrowser, front),
+    }
+}
+
+/// Executes one effect `tui::input::handle_key` returned.
+fn apply_effect(effect: Effect, front: &mut Front<'_>) -> io::Result<()> {
     match effect {
         Effect::App(command) => {
-            runtime.handle(command);
-            let hint = runtime.take_selection_hint();
-            ui.reconcile(&runtime.view(), hint);
+            front.runtime.handle(command);
+            let hint = front.runtime.take_selection_hint();
+            front.ui.reconcile(&front.runtime.view(), hint);
         }
-        Effect::Notice(message) => runtime.set_status(message),
-        Effect::Quit => signals.request(),
+        Effect::Notice(message) => front.runtime.set_status(message),
+        Effect::Quit => front.signals.request(),
         Effect::SetMouseCapture(on) => {
             let mut stdout = io::stdout();
             if on {
@@ -369,13 +469,14 @@ fn apply_effect(
             } else {
                 execute!(stdout, DisableMouseCapture)?;
             }
-            cleanup.terminal().set_mouse(on);
+            front.cleanup.terminal().set_mouse(on);
         }
         Effect::FullRedraw => {
-            terminal.clear()?;
+            front.terminal.clear()?;
             // Invalidating prepared cover-art placements is Task 25's job.
         }
-        Effect::OpenBrowser | Effect::CloseBrowser => {}
+        Effect::OpenBrowser => front.browsing.open(front.runtime, front.ui),
+        Effect::CloseBrowser => front.browsing.close(front.ui),
     }
     Ok(())
 }
