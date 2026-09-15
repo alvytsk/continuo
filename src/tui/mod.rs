@@ -28,6 +28,7 @@ pub mod browser;
 pub mod images;
 pub mod input;
 pub mod layout;
+pub mod reader;
 pub mod render;
 pub mod spectrum;
 pub mod state;
@@ -40,7 +41,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crossterm::cursor::Hide;
-use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event, MouseEventKind};
+use crossterm::event::{DisableMouseCapture, EnableMouseCapture, Event, MouseEventKind};
 use crossterm::execute;
 use crossterm::terminal::{EnterAlternateScreen, enable_raw_mode};
 use ratatui::Terminal;
@@ -74,6 +75,7 @@ use crate::tui::browser::{BrowserEffect, BrowserState};
 use crate::tui::images::{CoverCache, failure_status, picker_for, query_terminal};
 use crate::tui::input::{Effect, handle_key, handle_mouse, routes_to_browser};
 use crate::tui::layout::{regions, tier_for};
+use crate::tui::reader::InputReader;
 use crate::tui::render::{CoverView, HitMap, Visuals};
 use crate::tui::spectrum::{DrawSource, SpectrumDisplay, wants_analysis};
 use crate::tui::state::{Overlay, UiState};
@@ -353,6 +355,11 @@ fn run_loop(
     let mut hits = HitMap::default();
     let mut browsing = Browsing::default();
     let mut spectrum = SpectrumDisplay::default();
+    // Only now: the cover-art query in `start_and_loop` has read its answer.
+    let input = match InputReader::spawn(MAX_EVENTS_PER_PASS) {
+        Ok(input) => input,
+        Err(error) => return Ending::Failed(LifecycleError::Terminal(error).into()),
+    };
     loop {
         let mut front = Front {
             runtime,
@@ -362,7 +369,7 @@ fn run_loop(
             cleanup,
             signals,
         };
-        if let Err(error) = handle_input(&mut front, &hits) {
+        if let Err(error) = handle_input(&mut front, &hits, &input) {
             return Ending::Failed(LifecycleError::Terminal(error).into());
         }
         runtime.pump();
@@ -631,16 +638,19 @@ struct Front<'a> {
 /// [`MAX_EVENTS_PER_PASS`], so a flood of it cannot hold a key back by one
 /// frame per motion event; the pass ends after the first event that can act
 /// (see [`drain_after`]) or once a quit request or fatal panic is recorded.
-fn handle_input(front: &mut Front<'_>, hits: &HitMap) -> io::Result<()> {
-    drain_events(event::poll, event::read, |event| {
-        let next = drain_after(&event);
-        handle_event(front, hits, event)?;
-        Ok(if interrupted(front.signals, front.cleanup).is_some() {
-            Drain::Stop
-        } else {
-            next
-        })
-    })
+fn handle_input(front: &mut Front<'_>, hits: &HitMap, input: &InputReader) -> io::Result<()> {
+    drain_events(
+        |wait| input.next(wait),
+        |event| {
+            let next = drain_after(&event);
+            handle_event(front, hits, event)?;
+            Ok(if interrupted(front.signals, front.cleanup).is_some() {
+                Drain::Stop
+            } else {
+                next
+            })
+        },
+    )
     .map(|_| ())
 }
 
@@ -648,12 +658,6 @@ fn handle_input(front: &mut Front<'_>, hits: &HitMap) -> io::Result<()> {
 /// handler acts on, lets it: every other event keeps a frame of its own, as
 /// before, so a click is always tested against the frame drawn after the
 /// previous action.
-///
-/// That also keeps a hung-up pane observable. crossterm 0.29 retries a tty
-/// read that returns end of file or an I/O error without end, so the loop
-/// learns of a hangup from a draw whose write fails. Handling the bytes a
-/// closing pane delivers one pass each gives it that draw before it reads
-/// the tty again; draining them together would not.
 fn drain_after(event: &Event) -> Drain {
     match event {
         Event::Mouse(mouse)
@@ -682,18 +686,20 @@ enum Drain {
 /// Waits up to [`INPUT_POLL`] for the first event, then takes only what is
 /// already pending, handing each to `handle` until the queue is empty,
 /// `handle` says stop, or [`MAX_EVENTS_PER_PASS`] events were handled.
-/// Returns how many were handled. Generic over the event source so the
-/// bound and the stop rule can be tested without a terminal.
+/// Returns how many were handled. `next` waits up to the given time for an
+/// event; it is generic so the bound and the stop rule can be tested without
+/// a terminal.
 fn drain_events(
-    mut poll: impl FnMut(Duration) -> io::Result<bool>,
-    mut read: impl FnMut() -> io::Result<Event>,
+    mut next: impl FnMut(Duration) -> io::Result<Option<Event>>,
     mut handle: impl FnMut(Event) -> io::Result<Drain>,
 ) -> io::Result<usize> {
     let mut wait = INPUT_POLL;
     let mut handled = 0;
-    while handled < MAX_EVENTS_PER_PASS && poll(wait)? {
+    while handled < MAX_EVENTS_PER_PASS {
+        let Some(event) = next(wait)? else {
+            break;
+        };
         wait = Duration::ZERO;
-        let event = read()?;
         handled += 1;
         if handle(event)? == Drain::Stop {
             break;
@@ -872,17 +878,10 @@ mod tests {
         waits: &mut Vec<Duration>,
         mut handle: impl FnMut(Event) -> Drain,
     ) -> usize {
-        let queue = std::cell::RefCell::new(pending);
         drain_events(
             |wait| {
                 waits.push(wait);
-                Ok(!queue.borrow().is_empty())
-            },
-            || {
-                queue
-                    .borrow_mut()
-                    .pop_front()
-                    .ok_or_else(|| io::Error::other("read without a pending event"))
+                Ok(pending.pop_front())
             },
             |event| Ok(handle(event)),
         )

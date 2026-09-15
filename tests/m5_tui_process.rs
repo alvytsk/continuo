@@ -265,6 +265,20 @@ fn a_direct_fd2_write_reaches_the_log_not_the_pty() {
 
 #[test]
 fn a_hung_up_pty_still_flushes_and_releases_the_profile() {
+    hang_up_after_a_volume_change(PtyChild::close_master);
+}
+
+/// A closed pane types nothing, so the hangup is the only thing the input
+/// reader sees: end of file on the terminal, with no key to act on first.
+#[test]
+fn a_silently_closed_pty_still_flushes_and_releases_the_profile() {
+    hang_up_after_a_volume_change(PtyChild::close_master_silently);
+}
+
+/// Lowers the volume in a fresh `tui`, hangs up with `hang_up`, and checks
+/// the run ends, saved the volume and released the profile.
+#[allow(clippy::expect_used)] // Fallible spawn of a fixed test binary.
+fn hang_up_after_a_volume_change(hang_up: fn(&mut PtyChild)) {
     let profile = process::Profile::new().expect("profile");
     let mut child = PtyChild::spawn(profile.root(), &["tui"], &[], 100, 30).expect("spawn");
     assert!(
@@ -274,7 +288,7 @@ fn a_hung_up_pty_still_flushes_and_releases_the_profile() {
     );
     child.send(b"-");
     assert!(child.wait_for("vol 95%", PATIENCE), "{}", child.output());
-    child.close_master();
+    hang_up(&mut child);
     let code = child.wait_exit(PATIENCE);
     assert!(
         matches!(code, Some(129 | 0)),

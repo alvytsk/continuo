@@ -230,6 +230,27 @@ impl PtyChild {
         self.master = None;
     }
 
+    /// Hangs up the way a closed pane does, with no input on the way out.
+    /// Dropping portable-pty's writer types a newline and the terminal's EOF
+    /// character, which the child would read as two keys before the hangup;
+    /// undefining EOF on the terminal first leaves the writer nothing to type.
+    pub fn close_master_silently(&mut self) {
+        let tty = self.master.as_ref().and_then(|master| master.tty_name());
+        let silenced = tty.is_some_and(|tty| {
+            std::process::Command::new("stty")
+                .arg("-F")
+                .arg(tty)
+                .args(["eof", "undef"])
+                .status()
+                .is_ok_and(|status| status.success())
+        });
+        assert!(silenced, "could not undefine EOF on the child's terminal");
+        self.close_master();
+    }
+
+    /// portable-pty's kill sends SIGHUP, waits about 200 ms for the child to
+    /// exit, then sends SIGKILL, so a child that catches SIGHUP (every
+    /// `continuo` player does) or is stuck is still ended.
     fn kill(&mut self) {
         let _ = self.child.kill();
         let deadline = Instant::now() + KILL_PATIENCE;
