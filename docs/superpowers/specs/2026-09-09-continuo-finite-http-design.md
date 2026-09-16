@@ -34,6 +34,14 @@ These are recommendations awaiting review, not previously approved decisions:
    unresolved after a bounded probe is also refused, without calling it live.
 3. Network failures stop the current attempt with position retained. A new
    user-requested attempt may reconnect; no background retry loop is introduced.
+   One exception, added 2026-09-16: a ranged body that ends short after
+   delivering at least one transfer chunk is resumed in place by the same fetch
+   task, with one further range request from the byte the bytes stopped at,
+   carrying `If-Range`. A CDN drops a stream nobody reads from for about a
+   minute (nginx `send_timeout`), which is exactly what a paused player does.
+   A response that dies before delivering one chunk is not resumed, so a
+   server that keeps failing early still fails the attempt on its first
+   response.
 
 ## 2. Alternatives considered
 
@@ -255,7 +263,7 @@ must not re-enter decoder reads or seeks. Network tasks never execute this hook.
 | Seek while active | Preserve current position; cancel obsolete reads; establish requested target through decoder seeking and ranges |
 | Seek while stopped | Store intent only after capability admission; Unknown requires a cancellable probe before acceptance |
 | Restart | Explicitly open from zero; clear completion/checkpoint protection only after successful establishment |
-| Network failure | Preserve captured position, fail current attempt, retire requests; emit a typed error |
+| Network failure | A short ranged body that made progress is resumed in place with one range request (scope choice 3); otherwise preserve captured position, fail current attempt, retire requests; emit a typed error |
 | Play after remote network failure | Permit one explicit reopen at preserved position; fail honestly if restoration is unavailable |
 
 Pause must also work during a stalled read. Service its freeze request without

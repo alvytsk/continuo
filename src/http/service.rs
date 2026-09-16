@@ -187,8 +187,133 @@ pub(super) fn transport_detail(error: reqwest::Error) -> String {
     }
 }
 
+/// Everything one accepted response established, before its body is read.
+struct Opened {
+    response: reqwest::Response,
+    accepted: Accepted,
+    headers: Headers,
+    redirects: u8,
+}
+
+/// What stays fixed across every request one fetch task makes: the opening
+/// one and any resume after a body ended short.
+struct Fetch {
+    client: reqwest::Client,
+    limits: Limits,
+    interrupt: Arc<SourceInterrupt>,
+    generation: u64,
+    origin: Url,
+    operation: Operation,
+}
+
+impl Fetch {
+    /// One request from `origin`, redirects followed and the response validated
+    /// (§7). `Ok(None)` means the generation was cancelled while waiting: the
+    /// caller returns without publishing anything, as every other cancelled wait
+    /// does.
+    async fn request(
+        &self,
+        start: u64,
+        established: Option<&Established>,
+    ) -> Result<Option<Opened>, RemoteFailure> {
+        let Self {
+            client,
+            limits,
+            interrupt,
+            generation,
+            origin,
+            operation,
+        } = self;
+        let (generation, operation) = (*generation, *operation);
+        let mut current = origin.clone();
+        let mut seen: Vec<Url> = Vec::new();
+        let mut redirects: u8 = 0;
+
+        // Manual redirect loop: reqwest's own policy is disabled (`spawn`'s
+        // client is built with `Policy::none()`), so every hop is validated here
+        // before it is followed, and the count is bounded by `limits.max_redirects`.
+        let response = loop {
+            let mut builder = client
+                .get(current.clone())
+                .header(RANGE, format!("bytes={start}-"))
+                .header(ACCEPT_ENCODING, "identity");
+            if let Some(established) = established
+                && let Some(if_range) = if_range_value(&established.validator)
+            {
+                builder = builder.header(IF_RANGE, if_range);
+            }
+            let built = builder.build().map_err(|error| RemoteFailure::Transport {
+                operation,
+                detail: transport_detail(error),
+            })?;
+
+            // Dropping the request future on timeout is fine here — the request
+            // is being abandoned outright — and it does not re-test the freeze,
+            // which is also fine: a pause cannot arrive before the source it
+            // would pause exists yet.
+            let response = tokio::select! {
+                biased;
+                () = interrupt.cancelled(generation) => return Ok(None),
+                result = client.execute(built) => result.map_err(|error| RemoteFailure::Transport {
+                    operation,
+                    detail: transport_detail(error),
+                })?,
+                () = tokio::time::sleep(limits.headers) => {
+                    return Err(RemoteFailure::Timeout { phase: Phase::Headers });
+                }
+            };
+
+            let status = response.status().as_u16();
+            let location = if (300..400).contains(&status) {
+                response
+                    .headers()
+                    .get(LOCATION)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_string)
+            } else {
+                None
+            };
+
+            let Some(location) = location else {
+                break response;
+            };
+
+            let target = accept_redirect(&current, &location, redirects + 1, &seen, limits)?;
+            // §11: redirect count, one line per hop rather than a single total
+            // at the end - bounded by `limits.max_redirects`, never per-chunk, so
+            // this cannot grow into the per-frame noise §11 rules out.
+            tracing::debug!(
+                hop = redirects + 1,
+                url = %redact_url(target.as_str()),
+                "following redirect"
+            );
+            seen.push(current.clone());
+            current = target;
+            redirects += 1;
+        };
+
+        let status = response.status().as_u16();
+        let headers = Headers::from_map(response.headers());
+        let accepted = accept(status, &headers, start, start == 0, established)?;
+        Ok(Some(Opened {
+            response,
+            accepted,
+            headers,
+            redirects,
+        }))
+    }
+}
+
 /// The request-plus-body task `HttpService::fetch` spawns: one per source
 /// generation, running entirely on the service's runtime.
+///
+/// A ranged body that ends short is resumed in place: one more range
+/// request from the byte the bytes stopped at, carrying `If-Range`, feeding
+/// the same channel, so the reader never notices. This is how a stream a CDN
+/// dropped while the player sat paused (nginx's `send_timeout`) comes back.
+/// It is not a retry loop: a response must have delivered at least one
+/// transfer chunk before its end is worth resuming from, so a server that
+/// keeps dying early fails the attempt on the first response that proves it.
 async fn run_fetch(
     client: reqwest::Client,
     limits: Limits,
@@ -196,122 +321,33 @@ async fn run_fetch(
     channel: ByteChannel,
     generation: u64,
 ) {
-    let interrupt = Arc::clone(channel.interrupt());
     let FetchRequest {
         origin,
-        start,
+        mut start,
         established,
         operation,
     } = request;
-
-    // The header phase's cancellation wrapper. Dropping the future on
-    // timeout is fine here — the request is being abandoned outright — and
-    // it does not re-test the freeze, which is also fine: a pause cannot
-    // arrive before the source it would pause exists yet.
-    macro_rules! cancellable {
-        ($fut:expr, $timeout:expr, $phase:expr) => {
-            tokio::select! {
-                biased;
-                () = interrupt.cancelled(generation) => return,
-                result = $fut => result,
-                () = tokio::time::sleep($timeout) => {
-                    interrupt.publish_headers(
-                        generation,
-                        Err(RemoteFailure::Timeout { phase: $phase }),
-                    );
-                    return;
-                }
-            }
-        };
-    }
-
-    let mut current = origin;
-    let mut seen: Vec<Url> = Vec::new();
-    let mut redirects: u8 = 0;
-
-    // Manual redirect loop: reqwest's own policy is disabled (`spawn`'s
-    // client is built with `Policy::none()`), so every hop is validated here
-    // before it is followed, and the count is bounded by `limits.max_redirects`.
-    let mut response = loop {
-        let mut builder = client
-            .get(current.clone())
-            .header(RANGE, format!("bytes={start}-"))
-            .header(ACCEPT_ENCODING, "identity");
-        if let Some(established) = &established
-            && let Some(if_range) = if_range_value(&established.validator)
-        {
-            builder = builder.header(IF_RANGE, if_range);
-        }
-        let built = match builder.build() {
-            Ok(built) => built,
-            Err(error) => {
-                interrupt.publish_headers(
-                    generation,
-                    Err(RemoteFailure::Transport {
-                        operation,
-                        detail: transport_detail(error),
-                    }),
-                );
-                return;
-            }
-        };
-
-        let outcome = cancellable!(client.execute(built), limits.headers, Phase::Headers);
-        let response = match outcome {
-            Ok(response) => response,
-            Err(error) => {
-                interrupt.publish_headers(
-                    generation,
-                    Err(RemoteFailure::Transport {
-                        operation,
-                        detail: transport_detail(error),
-                    }),
-                );
-                return;
-            }
-        };
-
-        let status = response.status().as_u16();
-        let location = if (300..400).contains(&status) {
-            response
-                .headers()
-                .get(LOCATION)
-                .and_then(|value| value.to_str().ok())
-                .map(str::to_string)
-        } else {
-            None
-        };
-
-        let Some(location) = location else {
-            break response;
-        };
-
-        match accept_redirect(&current, &location, redirects + 1, &seen, &limits) {
-            Ok(target) => {
-                // §11: redirect count, one line per hop rather than a single
-                // total at the end - bounded by `limits.max_redirects`, never
-                // per-chunk, so this cannot grow into the per-frame noise §11
-                // rules out.
-                tracing::debug!(
-                    hop = redirects + 1,
-                    url = %redact_url(target.as_str()),
-                    "following redirect"
-                );
-                seen.push(current.clone());
-                current = target;
-                redirects += 1;
-            }
-            Err(failure) => {
-                interrupt.publish_headers(generation, Err(failure));
-                return;
-            }
-        }
+    let fetch = Fetch {
+        client,
+        limits,
+        interrupt: Arc::clone(channel.interrupt()),
+        generation,
+        origin,
+        operation,
     };
+    let Fetch {
+        limits, interrupt, ..
+    } = &fetch;
 
-    let status = response.status().as_u16();
-    let headers = Headers::from_map(response.headers());
-    let accepted = match accept(status, &headers, start, start == 0, established.as_ref()) {
-        Ok(accepted) => accepted,
+    let opened = fetch.request(start, established.as_ref()).await;
+    let Opened {
+        mut response,
+        accepted,
+        headers,
+        redirects,
+    } = match opened {
+        Ok(Some(opened)) => opened,
+        Ok(None) => return,
         Err(failure) => {
             interrupt.publish_headers(generation, Err(failure));
             return;
@@ -322,12 +358,18 @@ async fn run_fetch(
     // short body (§7: `TruncatedBody`) from a body that simply ended a
     // smaller-than-total interval exactly where it said it would (`Eof`,
     // not media EOF).
-    let advertised: Option<u64> = match accepted {
-        Accepted::Sequential { len } => len,
-        Accepted::Ranged { range } => range.len(),
+    let (mut advertised, total, resumable) = match accepted {
+        Accepted::Sequential { len } => (len, len, false),
+        Accepted::Ranged { range } => (range.len(), range.total, true),
     };
 
     let validator = validator_from(&headers);
+    // What every resumed request compares its response against: the
+    // caller's own established facts when it had them, else this response's.
+    let established = established.unwrap_or(Established {
+        total,
+        validator: validator.clone(),
+    });
     interrupt.publish_headers(
         generation,
         Ok(FetchAccepted {
@@ -347,36 +389,39 @@ async fn run_fetch(
         // chunk` in the select leaves the future in place when another
         // branch wins, so nothing is dropped mid-poll and no delivered bytes
         // are lost — `Response::chunk` is not documented cancel-safe, and
-        // rebuilding it on every slice could lose buffered data.
-        let mut chunk = pin!(response.chunk());
-        let mut demanded = Duration::ZERO;
-        let next = loop {
-            // Deliberately no `wait_while_frozen` here (fix round 1):
-            // delivery must not be gated on the freeze level. `ByteChannel::
-            // push` already blocks on capacity once the buffer is full, and
-            // that backpressure — not a producer-side freeze gate — is what
-            // bounds a paused fetch. Gating delivery here instead deadlocked
-            // a seek or a reopen taken while paused: both need bytes from a
-            // fetch task that would otherwise sit here until a `Play` that
-            // may never come (§9). Only the stall-timer's own charging
-            // (below) still checks the level.
-            let slice = TICK.min(limits.stall - demanded);
-            let started = Instant::now();
-            tokio::select! {
-                biased;
-                () = interrupt.cancelled(generation) => return,
-                result = &mut chunk => break result,
-                () = tokio::time::sleep(slice) => {
-                    // Only unfrozen time is charged. A freeze that lands
-                    // inside the sleep is caught on the next slice.
-                    if !interrupt.is_frozen() {
-                        demanded += started.elapsed();
-                    }
-                    if demanded >= limits.stall {
-                        channel.finish(generation, Outcome::Failed(
-                            RemoteFailure::Timeout { phase: Phase::Stall },
-                        ));
-                        return;
+        // rebuilding it on every slice could lose buffered data. Scoped so
+        // the borrow of `response` ends before a resume may replace it.
+        let next = {
+            let mut chunk = pin!(response.chunk());
+            let mut demanded = Duration::ZERO;
+            loop {
+                // Deliberately no `wait_while_frozen` here (fix round 1):
+                // delivery must not be gated on the freeze level. `ByteChannel::
+                // push` already blocks on capacity once the buffer is full, and
+                // that backpressure — not a producer-side freeze gate — is what
+                // bounds a paused fetch. Gating delivery here instead deadlocked
+                // a seek or a reopen taken while paused: both need bytes from a
+                // fetch task that would otherwise sit here until a `Play` that
+                // may never come (§9). Only the stall-timer's own charging
+                // (below) still checks the level.
+                let slice = TICK.min(limits.stall - demanded);
+                let started = Instant::now();
+                tokio::select! {
+                    biased;
+                    () = interrupt.cancelled(generation) => return,
+                    result = &mut chunk => break result,
+                    () = tokio::time::sleep(slice) => {
+                        // Only unfrozen time is charged. A freeze that lands
+                        // inside the sleep is caught on the next slice.
+                        if !interrupt.is_frozen() {
+                            demanded += started.elapsed();
+                        }
+                        if demanded >= limits.stall {
+                            channel.finish(generation, Outcome::Failed(
+                                RemoteFailure::Timeout { phase: Phase::Stall },
+                            ));
+                            return;
+                        }
                     }
                 }
             }
@@ -416,6 +461,39 @@ async fn run_fetch(
             Err(error) => Some(transport_detail(error)),
         };
 
+        let short = advertised.is_some_and(|total| delivered < total);
+        if short && resumable && delivered >= chunk_cap as u64 {
+            start += delivered;
+            // §11: reconnect, with the transport's own reason — which the
+            // `TruncatedBody` below would otherwise discard.
+            tracing::info!(
+                url = %redact_url(fetch.origin.as_str()),
+                start_byte = start,
+                reason = ended.as_deref().unwrap_or("body ended early"),
+                "resuming interrupted body"
+            );
+            match fetch.request(start, Some(&established)).await {
+                Ok(Some(opened)) => {
+                    advertised = match opened.accepted {
+                        Accepted::Ranged { range } => range.len(),
+                        // `accept` refuses a 200 past byte zero, so a
+                        // resumed request can only ever be ranged.
+                        Accepted::Sequential { len } => len,
+                    };
+                    response = opened.response;
+                    delivered = 0;
+                    continue;
+                }
+                Ok(None) => return,
+                Err(failure) => {
+                    channel.finish(generation, Outcome::Failed(failure));
+                    return;
+                }
+            }
+        }
+        if let Some(detail) = &ended {
+            tracing::debug!(delivered, detail, "body ended with a transport error");
+        }
         channel.finish(
             generation,
             classify_body_end(advertised, delivered, operation, ended),

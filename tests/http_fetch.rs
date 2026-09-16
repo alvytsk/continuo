@@ -580,3 +580,69 @@ fn a_retirement_mid_body_closes_the_request_after_the_wait_was_entered() {
     );
     server.shutdown();
 }
+
+const KIB: usize = 1024;
+
+/// Reads until the channel ends, returning every byte and the terminal outcome.
+fn drain_until_end(channel: &ByteChannel) -> (usize, ReadOutcome) {
+    let mut buffer = [0u8; 4096];
+    let mut seen = 0usize;
+    loop {
+        match channel.read(&mut buffer, &NoHook, Duration::from_secs(10)) {
+            ReadOutcome::Bytes(n) => seen += n,
+            other => return (seen, other),
+        }
+    }
+}
+
+#[test]
+fn a_ranged_body_that_dies_after_progress_resumes_in_place() {
+    // A CDN drops a stream nobody has read from for a while (nginx's
+    // `send_timeout`, 60 s by default); when the paused reader comes back
+    // it drains the buffer and then hits the dead stream. The fetch must
+    // pick up where the bytes stopped, with `If-Range`, and the reader must
+    // see one continuous body.
+    let server = TestServer::start(
+        Script::serving(vec![7u8; 512 * KIB])
+            .truncate_body_after(200 * KIB)
+            .truncate_only_first_response(),
+    );
+    let service = service(Limits::default());
+    let (channel, _interrupt, accepted) = open(&service, url(&server.url("/audio")), 0);
+    assert!(accepted.is_ok(), "opening should succeed: {accepted:?}");
+
+    let (seen, outcome) = drain_until_end(&channel);
+    assert!(matches!(outcome, ReadOutcome::Eof), "{outcome:?}");
+    assert_eq!(seen, 512 * KIB, "every byte must arrive exactly once");
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 2, "one reconnect, not a retry loop");
+    assert_eq!(requests[1].range(), Some((200 * KIB as u64, None)));
+    assert!(
+        requests[1].header("if-range").is_some(),
+        "the resumed request must carry the validator"
+    );
+    server.shutdown();
+}
+
+#[test]
+fn a_reconnect_that_makes_no_progress_is_not_retried() {
+    // Every response dies after 1 KiB: less than one transfer chunk, so the
+    // response never proved the server is actually serving. That is the
+    // spec's "no background retry loop": one truncated body, one failure.
+    let server = TestServer::start(Script::serving(vec![7u8; 512 * KIB]).truncate_body_after(KIB));
+    let service = service(Limits::default());
+    let (channel, _interrupt, accepted) = open(&service, url(&server.url("/audio")), 0);
+    assert!(accepted.is_ok(), "opening should succeed: {accepted:?}");
+
+    let (_seen, outcome) = drain_until_end(&channel);
+    assert!(
+        matches!(
+            outcome,
+            ReadOutcome::Failed(RemoteFailure::TruncatedBody { .. })
+        ),
+        "{outcome:?}"
+    );
+    assert_eq!(server.requests().len(), 1, "no reconnect without progress");
+    server.shutdown();
+}
