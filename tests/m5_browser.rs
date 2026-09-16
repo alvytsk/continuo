@@ -718,3 +718,80 @@ fn an_answer_on_the_files_tab_shows_the_notice_and_requests_nothing() {
     assert_eq!(follow_up, None);
     assert_eq!(state.notice.as_ref().map(|n| n.text.as_str()), Some("done"));
 }
+
+#[test]
+fn the_overlay_draws_the_prompt_the_question_and_the_notice_above_rows() {
+    let mut state = podcasts(vec![feed("one"), feed("two")]);
+    press(&mut state, &[KeyCode::Char('a')]);
+    for c in "https://x.example/f".chars() {
+        press(&mut state, &[KeyCode::Char(c)]);
+    }
+    let (text, _) = screen(&state);
+    assert!(text.contains("Feed URL: https://x.example/f"), "{text}");
+    assert!(text.contains("a subscribe"), "podcasts hint: {text}");
+    press(&mut state, &[KeyCode::Esc, KeyCode::Char('d')]);
+    let (text, _) = screen(&state);
+    assert!(text.contains("Remove one? y/N"), "{text}");
+    press(&mut state, &[KeyCode::Char('y')]);
+    let (text, _) = screen(&state);
+    assert!(text.contains("Removing…"), "{text}");
+
+    state.apply(mutation(
+        BrowseRequest::Unsubscribe {
+            slug: "one".to_owned(),
+        },
+        Ok("one: unsubscribed"),
+    ));
+    state.apply(BrowseResult::Feeds(Ok(vec![feed("two")])));
+    let (text, _) = screen(&state);
+    let notice_row = text
+        .lines()
+        .position(|line| line.contains("one: unsubscribed"))
+        .unwrap_or_else(|| panic!("no notice: {text}"));
+    let feed_row = text
+        .lines()
+        .position(|line| line.contains("two title"))
+        .unwrap_or_else(|| panic!("no rows: {text}"));
+    assert!(notice_row < feed_row, "notice above the rows: {text}");
+
+    // An empty feed list points at the key, not the CLI.
+    let empty = podcasts(Vec::new());
+    let (text, _) = screen(&empty);
+    assert!(text.contains("press a to add a feed URL"), "{text}");
+}
+
+#[test]
+fn a_long_notice_is_cut_to_a_third_of_the_list_with_a_marker() {
+    let mut state = podcasts(vec![feed("one")]);
+    press(&mut state, &[KeyCode::Char('R')]);
+    let lines: Vec<String> = (1..=8).map(|n| format!("line{n}")).collect();
+    state.apply(mutation(
+        BrowseRequest::Refresh { slug: None },
+        Err(&lines.join("\n")),
+    ));
+    state.apply(BrowseResult::Feeds(Ok(vec![feed("one")])));
+    let (text, buffer) = screen(&state);
+    // The 90×24 screen gives the list 17 rows; a third is 5.
+    assert!(text.contains("line5"), "{text}");
+    assert!(!text.contains("line6"), "{text}");
+    assert!(text.contains("+3 more lines, see log"), "{text}");
+    assert!(text.contains("one title"), "rows still drawn: {text}");
+    let marker_row = text
+        .lines()
+        .position(|line| line.contains("+3 more lines"))
+        .unwrap_or_else(|| panic!("{text}"));
+    let amber = buffer[(4, u16::try_from(marker_row).unwrap_or(0))].fg;
+    let ok_state = {
+        let mut s = podcasts(vec![feed("one")]);
+        press(&mut s, &[KeyCode::Char('R')]);
+        s.apply(mutation(BrowseRequest::Refresh { slug: None }, Ok("fine")));
+        s
+    };
+    let (ok_text, ok_buffer) = screen(&ok_state);
+    let ok_row = ok_text
+        .lines()
+        .position(|line| line.contains("fine"))
+        .unwrap_or_else(|| panic!("{ok_text}"));
+    let muted = ok_buffer[(4, u16::try_from(ok_row).unwrap_or(0))].fg;
+    assert_ne!(amber, muted, "errors and successes differ in color");
+}

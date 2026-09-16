@@ -83,7 +83,7 @@ const RESIZE_HINTS: &str = "space play · q quit";
 /// listening history.
 const CONFIRM_CLEAR_TEXT: &str = "Clear the queue? Listening history is kept. y to confirm";
 /// The §7 key table, one line per row.
-const HELP_LINES: [&str; 18] = [
+const HELP_LINES: [&str; 19] = [
     "Space           Pause/resume; unloaded/ended behavior follows §4",
     "Enter           Play selected queue entry",
     "Up/Down or j/k  Move selection",
@@ -95,6 +95,7 @@ const HELP_LINES: [&str; 18] = [
     "[ / ]           Previous / next queue entry",
     "d               Remove selected entry",
     "b               Open/close browser",
+    "  in Podcasts   a subscribe · r/R refresh one/all · d unsubscribe",
     "a               Open path/URL input",
     "c               Request queue clear with confirmation",
     "?               Show help",
