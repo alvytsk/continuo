@@ -119,6 +119,9 @@ pub struct Script {
     content_range_override: Option<String>,
     answer_range_with_200: bool,
     truncate_after: Option<usize>,
+    /// Limits `truncate_after` to the first request, so a later range
+    /// request for the rest of the body is served whole.
+    truncate_only_first: bool,
     stall_after: Option<usize>,
     stall_headers: bool,
     // Not in the brief's outline, but `trickle` is in the Interfaces block,
@@ -236,6 +239,11 @@ impl Script {
         self
     }
 
+    pub fn truncate_only_first_response(mut self) -> Self {
+        self.truncate_only_first = true;
+        self
+    }
+
     pub fn stall_body_after(mut self, bytes: usize) -> Self {
         self.stall_after = Some(bytes);
         self
@@ -342,13 +350,15 @@ struct BodyWriter {
 }
 
 impl BodyWriter {
-    fn new(script: &Script, chunked: bool) -> Self {
+    fn new(script: &Script, chunked: bool, ordinal: usize) -> Self {
         let (chunk_size, gap) = script.trickle.unwrap_or((4096, Duration::ZERO));
         Self {
             chunked,
             chunk_size: chunk_size.max(1),
             gap,
-            truncate_after: script.truncate_after,
+            truncate_after: script
+                .truncate_after
+                .filter(|_| !script.truncate_only_first || ordinal <= 1),
             stall_after: script.stall_after,
             stalled_once: false,
             sent: 0,
@@ -636,7 +646,7 @@ fn write_206(
     if stream.write_all(header.as_bytes()).is_err() {
         return;
     }
-    let mut writer = BodyWriter::new(script, script.chunked);
+    let mut writer = BodyWriter::new(script, script.chunked, ordinal);
     let mut offset = 0;
     while offset < slice.len() {
         let take = writer.next_len(slice.len() - offset);
@@ -689,7 +699,7 @@ fn write_whole_body(
     if endless {
         write_endless_body(stream, script, gate, bytes_written);
     } else {
-        let mut writer = BodyWriter::new(script, chunked_framing);
+        let mut writer = BodyWriter::new(script, chunked_framing, ordinal);
         let mut offset = 0;
         while offset < script.body.len() {
             let take = writer.next_len(script.body.len() - offset);
@@ -716,7 +726,7 @@ fn write_endless_body(
         // Nothing to repeat; writing headers only is the best this can do.
         return;
     }
-    let mut writer = BodyWriter::new(script, true);
+    let mut writer = BodyWriter::new(script, true, 1);
     let mut cursor = 0usize;
     loop {
         let take = writer.next_len(script.body.len() - cursor);

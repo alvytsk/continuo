@@ -299,7 +299,7 @@ M4 makes this executable end to end: steps 1–2 are `subscribe` and `episodes`,
 
 M4 adds two dependencies and no more: `quick-xml` for the pull parser, and `getrandom` for the 128 bits of OS randomness a `FeedId` is minted from. `url`'s `serde` feature is activated for the subscription and cache DTOs.
 
-Automated HTTP integration tests use a local test server and have no public-network dependency. They cover range-capable finite files, servers without range support, redirects, invalid range responses, and reconnect-after-stop.
+Automated HTTP integration tests use a local test server and have no public-network dependency. They cover range-capable finite files, servers without range support, redirects, invalid range responses, reconnect-after-stop, and in-place resume of a ranged body that ended short.
 
 `docs/m5-acceptance.md` maps the M5 spec's §12 evidence to the tests that discharge it and records the manual terminal checks.
 
