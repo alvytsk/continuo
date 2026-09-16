@@ -138,9 +138,11 @@ pub(crate) fn platform_state_store() -> Result<StateStore, FeedError> {
 }
 
 /// The one synchronous bridge (§6.6). Every network command enters the
-/// runtime here and nowhere else: `library.rs` stays free of `block_on`, and
-/// `run_resolved`'s decoder path never enters a runtime at all.
-fn wait_http<F: std::future::Future>(service: &HttpService, future: F) -> F::Output {
+/// runtime here and nowhere else, and the browse worker's mutations
+/// ([`crate::application::browse`]) use it too: `library.rs` stays free of
+/// `block_on`, and `run_resolved`'s decoder path never enters a runtime at
+/// all.
+pub(crate) fn wait_http<F: std::future::Future>(service: &HttpService, future: F) -> F::Output {
     service.handle().block_on(future)
 }
 

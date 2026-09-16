@@ -24,6 +24,7 @@ use crossbeam_channel::{Receiver, Sender};
 use crate::application::runtime::LibraryStores;
 use crate::commands::{
     finish_refresh_batch, finish_refresh_one, finish_subscribe, finish_unsubscribe, report,
+    wait_http,
 };
 use crate::http::error::redact_url;
 use crate::http::limits::Limits;
@@ -269,25 +270,19 @@ fn mutate(
     match request {
         BrowseRequest::Subscribe { url } => {
             let service = http_service(http)?;
-            let outcome = service
-                .handle()
-                .block_on(subscribe(&service, subs, cache, url, None))
+            let outcome = wait_http(&service, subscribe(&service, subs, cache, url, None))
                 .map_err(|error| error.to_string())?;
             report(finish_subscribe, outcome)
         }
         BrowseRequest::Refresh { slug: Some(slug) } => {
             let service = http_service(http)?;
-            let outcome = service
-                .handle()
-                .block_on(refresh(&service, subs, cache, slug))
+            let outcome = wait_http(&service, refresh(&service, subs, cache, slug))
                 .map_err(|error| error.to_string())?;
             report(finish_refresh_one, outcome)
         }
         BrowseRequest::Refresh { slug: None } => {
             let service = http_service(http)?;
-            let outcomes = service
-                .handle()
-                .block_on(refresh_all(&service, subs, cache))
+            let outcomes = wait_http(&service, refresh_all(&service, subs, cache))
                 .map_err(|error| error.to_string())?;
             report(finish_refresh_batch, outcomes)
         }

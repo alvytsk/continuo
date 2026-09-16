@@ -204,6 +204,41 @@ fn refresh_all_reports_every_feed_then_the_batch_error() {
     alive.shutdown();
 }
 
+/// §8: removing a subscription is a local edit; the worker never opens a
+/// connection for it.
+#[test]
+fn unsubscribe_touches_no_server() {
+    let root = tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir: {error}"));
+    let server = TestServer::start(Script::documents(vec![reply("/a", 200, rss("Radio T"))]));
+    // Seed through one worker, then remove through a fresh one that has
+    // never made a request.
+    let seeding = BrowseWorker::spawn(Some(stores(root.path())));
+    let _ = answer(
+        &seeding,
+        BrowseRequest::Subscribe {
+            url: server.url("/a"),
+        },
+    );
+    let seen = server.requests().len();
+    drop(seeding);
+
+    let worker = BrowseWorker::spawn(Some(stores(root.path())));
+    let (_, removed) = answer(
+        &worker,
+        BrowseRequest::Unsubscribe {
+            slug: "radio-t".into(),
+        },
+    );
+    assert_eq!(
+        removed.as_deref(),
+        Ok("radio-t: unsubscribed"),
+        "{removed:?}"
+    );
+    assert!(slugs(root.path()).is_empty());
+    assert_eq!(server.requests().len(), seen, "unsubscribe made a request");
+    server.shutdown();
+}
+
 /// Listing requests still touch nothing but the disk.
 #[test]
 fn browsing_makes_no_request() {
