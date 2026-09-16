@@ -169,6 +169,8 @@ The on-demand browser offers local directories and cached subscriptions/episodes
 
 Preserve manual feed refresh: opening the browser or listing episodes never refreshes a feed. Existing subscribe, unsubscribe, and refresh commands remain available through the CLI; full subscription management screens are outside this milestone.
 
+*Superseded for subscribe, refresh and unsubscribe by the M6 design (`2026-09-16-continuo-m6-feed-management-design.md`).*
+
 Use available title, artist, and album tags for local media. Use a filename or existing sanitized display-name fallback when metadata is absent. **Background metadata enrichment is local-file-only**, with at most two cancellable workers and no audio device. Enqueueing, restoring, or browsing a URL/podcast entry performs no metadata network requests and no remote duration probes. Use already-cached feed metadata with declared-duration provenance preserved; otherwise show unknown fields. An explicit playback load may fill remote metadata as a byproduct of the existing bounded HTTP preparation/decode path. Persist enrichment results only through `Session`. Display strings must not emit raw terminal control characters or expose URL credentials.
 
 ## 9. Artwork

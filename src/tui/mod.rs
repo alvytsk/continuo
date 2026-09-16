@@ -609,15 +609,18 @@ impl Browsing {
             .request(request);
     }
 
-    /// Hands every finished read to the open browser; one that finishes
-    /// after the browser closed is dropped.
+    /// Hands every finished read to the open browser, and sends the read a
+    /// mutation's answer asks for; an answer that finishes after the
+    /// browser closed is dropped.
     fn poll(&mut self) {
         let Some(worker) = &self.worker else {
             return;
         };
         while let Some(result) = worker.try_result() {
-            if let Some(state) = &mut self.state {
-                state.apply(result);
+            if let Some(state) = &mut self.state
+                && let Some(follow_up) = state.apply(result)
+            {
+                worker.request(follow_up);
             }
         }
     }

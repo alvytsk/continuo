@@ -2,7 +2,7 @@
 
 A keyboard-first terminal audio player for local audio, finite HTTP media, and podcasts.
 
-Milestones 0 through 5 are implemented: domain types and identities (M0), local playback over Symphonia and CPAL with position tracking (M1), durable checkpoint persistence (M2), finite HTTP media with capability probing and range-based seek (M3), RSS/Atom subscriptions with episode listing and progress (M4), and a Ratatui terminal player with a persistent queue, a browser, cover art and a frequency spectrum (M5). M5's automated suites pass, but its manual checks in real terminals (Ghostty, Zellij, Herdr) have not been run yet; [docs/m5-acceptance.md](docs/m5-acceptance.md) records both. `continuo tui` opens the [terminal player](#terminal-player). `continuo play` keeps its original interface: a status line plus a handful of keys (space to pause, the arrow keys to seek, `s`/`p` to stop/play, `q` to quit).
+Milestones 0 through 6 are implemented: domain types and identities (M0), local playback over Symphonia and CPAL with position tracking (M1), durable checkpoint persistence (M2), finite HTTP media with capability probing and range-based seek (M3), RSS/Atom subscriptions with episode listing and progress (M4), a Ratatui terminal player with a persistent queue, a browser, cover art and a frequency spectrum (M5), and subscribing, refreshing and unsubscribing from the player's Podcasts tab (M6). M5's automated suites pass, but its manual checks in real terminals (Ghostty, Zellij, Herdr) have not been run yet; [docs/m5-acceptance.md](docs/m5-acceptance.md) records both. `continuo tui` opens the [terminal player](#terminal-player). `continuo play` keeps its original interface: a status line plus a handful of keys (space to pause, the arrow keys to seek, `s`/`p` to stop/play, `q` to quit).
 
 ## Development
 
@@ -116,6 +116,7 @@ drop a tier, so 100×20 is compact.
 | `[` / `]` | Previous / next queue entry; never wraps |
 | `d` | Remove the selected entry |
 | `b` | Open the browser |
+| `a` / `r` / `R` / `d` in the browser's Podcasts tab | Subscribe by URL, refresh the highlighted feed, refresh all, remove with `y` to confirm |
 | `a` | Type a path or an `http(s)://` URL to enqueue |
 | `c` | Clear the queue, after a `y` confirmation |
 | `?` | Show the key help |
