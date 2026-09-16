@@ -1,0 +1,247 @@
+//! Design doc M6 §3 and §8: the browse worker's three mutation requests,
+//! answered with the CLI's own wording, against a loopback feed server.
+//! Browsing alone still makes no request.
+
+mod support;
+
+use std::path::Path;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use continuo::application::browse::{BrowseRequest, BrowseResult, BrowseWorker};
+use continuo::application::runtime::LibraryStores;
+use continuo::clock::SystemClock;
+use continuo::feed::cache::CacheStore;
+use continuo::library::list_feeds;
+use continuo::subscription::store::SubscriptionStore;
+use support::server::{DocumentReply, Script, TestServer};
+
+fn rss(title: &str) -> Vec<u8> {
+    format!(
+        r#"<?xml version="1.0"?><rss version="2.0"><channel><title>{title}</title><item><title>e1</title><guid>e1</guid><enclosure url="https://cdn.example.org/1.mp3" type="audio/mpeg"/></item><item><title>e2</title><guid>e2</guid><enclosure url="https://cdn.example.org/2.mp3" type="audio/mpeg"/></item></channel></rss>"#
+    )
+    .into_bytes()
+}
+
+fn reply(path: &str, status: u16, body: Vec<u8>) -> DocumentReply {
+    DocumentReply {
+        path: path.to_string(),
+        status,
+        headers: Vec::new(),
+        body,
+        conditional: false,
+        header_delay: Duration::ZERO,
+    }
+}
+
+/// Stores rooted at `root`; built twice so the test can read what the
+/// worker wrote.
+fn stores(root: &Path) -> LibraryStores {
+    LibraryStores {
+        subscriptions: SubscriptionStore::new(
+            root.join("data/continuo/subscriptions.json"),
+            Arc::new(SystemClock),
+        ),
+        cache: CacheStore::new(root.join("cache/continuo/feeds")),
+    }
+}
+
+fn answer(
+    worker: &BrowseWorker,
+    request: BrowseRequest,
+) -> (BrowseRequest, Result<String, String>) {
+    worker.request(request);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if let Some(result) = worker.try_result() {
+            match result {
+                BrowseResult::Mutation { request, outcome } => return (request, outcome),
+                other => panic!("expected a mutation answer, got {other:?}"),
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the browse worker never answered"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn slugs(root: &Path) -> Vec<String> {
+    let stores = stores(root);
+    list_feeds(&stores.subscriptions, &stores.cache)
+        .unwrap_or_else(|error| panic!("list: {error}"))
+        .into_iter()
+        .map(|feed| feed.slug)
+        .collect()
+}
+
+#[test]
+fn subscribe_refresh_and_unsubscribe_answer_with_the_cli_wording() {
+    let root = tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir: {error}"));
+    let server = TestServer::start(Script::documents(vec![
+        reply("/a", 200, rss("Radio T")),
+        reply("/bad", 500, Vec::new()),
+    ]));
+    let worker = BrowseWorker::spawn(Some(stores(root.path())));
+
+    let request = BrowseRequest::Subscribe {
+        url: server.url("/a"),
+    };
+    let (echoed, outcome) = answer(&worker, request.clone());
+    assert_eq!(echoed, request);
+    assert_eq!(
+        outcome.as_deref(),
+        Ok("radio-t: subscribed, 2 episodes retained, 0 skipped"),
+        "{outcome:?}"
+    );
+    assert_eq!(slugs(root.path()), ["radio-t"]);
+
+    let (_, again) = answer(
+        &worker,
+        BrowseRequest::Subscribe {
+            url: server.url("/a"),
+        },
+    );
+    assert_eq!(
+        again,
+        Err("already subscribed as radio-t".to_string()),
+        "{again:?}"
+    );
+
+    let (_, invalid) = answer(
+        &worker,
+        BrowseRequest::Subscribe {
+            url: "not a url".into(),
+        },
+    );
+    assert!(invalid.is_err(), "{invalid:?}");
+    let (_, failing) = answer(
+        &worker,
+        BrowseRequest::Subscribe {
+            url: server.url("/bad"),
+        },
+    );
+    assert!(failing.is_err(), "{failing:?}");
+    assert_eq!(
+        slugs(root.path()),
+        ["radio-t"],
+        "a failed subscribe changes nothing"
+    );
+
+    let (_, refreshed) = answer(
+        &worker,
+        BrowseRequest::Refresh {
+            slug: Some("radio-t".into()),
+        },
+    );
+    assert_eq!(
+        refreshed.as_deref(),
+        Ok("radio-t: updated, 2 episodes retained, 0 skipped"),
+        "{refreshed:?}"
+    );
+
+    let (_, removed) = answer(
+        &worker,
+        BrowseRequest::Unsubscribe {
+            slug: "radio-t".into(),
+        },
+    );
+    assert_eq!(
+        removed.as_deref(),
+        Ok("radio-t: unsubscribed"),
+        "{removed:?}"
+    );
+    assert!(slugs(root.path()).is_empty());
+    let (_, missing) = answer(
+        &worker,
+        BrowseRequest::Unsubscribe {
+            slug: "radio-t".into(),
+        },
+    );
+    assert_eq!(
+        missing,
+        Err("unknown feed: radio-t".to_string()),
+        "{missing:?}"
+    );
+    server.shutdown();
+}
+
+/// §8: a refresh-all whose first feed succeeds and second fails carries the
+/// first feed's success line, the second's failure and the batch line.
+#[test]
+fn refresh_all_reports_every_feed_then_the_batch_error() {
+    let root = tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir: {error}"));
+    let alive = TestServer::start(Script::documents(vec![reply("/a", 200, rss("Radio T"))]));
+    let doomed = TestServer::start(Script::documents(vec![reply("/b", 200, rss("Other Show"))]));
+    let worker = BrowseWorker::spawn(Some(stores(root.path())));
+    let _ = answer(
+        &worker,
+        BrowseRequest::Subscribe {
+            url: alive.url("/a"),
+        },
+    );
+    let _ = answer(
+        &worker,
+        BrowseRequest::Subscribe {
+            url: doomed.url("/b"),
+        },
+    );
+    assert_eq!(slugs(root.path()), ["radio-t", "other-show"]);
+    doomed.shutdown();
+
+    let (_, outcome) = answer(&worker, BrowseRequest::Refresh { slug: None });
+    let text = outcome.expect_err("one feed failed");
+    assert!(
+        text.contains("radio-t: updated, 2 episodes retained, 0 skipped"),
+        "{text}"
+    );
+    assert!(text.contains("other-show: failed:"), "{text}");
+    assert!(
+        text.ends_with("1 of 2 feeds did not complete successfully"),
+        "{text}"
+    );
+    alive.shutdown();
+}
+
+/// Listing requests still touch nothing but the disk.
+#[test]
+fn browsing_makes_no_request() {
+    let root = tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir: {error}"));
+    let server = TestServer::start(Script::documents(vec![reply("/a", 200, rss("Radio T"))]));
+    let worker = BrowseWorker::spawn(Some(stores(root.path())));
+    let _ = answer(
+        &worker,
+        BrowseRequest::Subscribe {
+            url: server.url("/a"),
+        },
+    );
+    let before = server.requests().len();
+
+    worker.request(BrowseRequest::Feeds);
+    worker.request(BrowseRequest::Episodes {
+        slug: "radio-t".into(),
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut seen = 0;
+    while seen < 2 {
+        assert!(Instant::now() < deadline, "listings never answered");
+        match worker.try_result() {
+            Some(BrowseResult::Feeds(Ok(feeds))) => {
+                assert_eq!(feeds.len(), 1);
+                seen += 1;
+            }
+            Some(BrowseResult::Episodes {
+                episodes: Ok(episodes),
+                ..
+            }) => {
+                assert_eq!(episodes.len(), 2);
+                seen += 1;
+            }
+            Some(other) => panic!("unexpected {other:?}"),
+            None => std::thread::sleep(Duration::from_millis(5)),
+        }
+    }
+    assert_eq!(server.requests().len(), before, "browsing made a request");
+    server.shutdown();
+}

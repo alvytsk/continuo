@@ -91,6 +91,9 @@ impl BrowserState {
                     self.episodes = Some((slug, list));
                 }
             }
+            BrowseResult::Mutation { .. } => {
+                // Mutations are handled by a separate part of the UI (M6).
+            }
         }
         self.cursor = self.cursor.min(self.len().saturating_sub(1));
     }
