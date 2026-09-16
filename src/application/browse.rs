@@ -2,20 +2,39 @@
 //! directory, the subscribed feeds and a feed's cached episodes, each read on
 //! a worker thread so the render loop never waits on the filesystem.
 //!
-//! Nothing here touches the network. The worker owns its own
-//! [`LibraryStores`] and never builds an `HttpService`; the feed listings
-//! are the same read-only snapshot reads `continuo feeds` uses, so opening
-//! the browser or listing episodes never refreshes a feed. A listing is a
+//! Only an explicit `Subscribe` or `Refresh` request touches the network.
+//! The worker owns its own [`LibraryStores`] and builds an `HttpService`
+//! lazily, on the first request that needs one; the feed listings are the
+//! same read-only snapshot reads `continuo feeds` uses, so opening the
+//! browser or listing episodes never refreshes a feed. A listing is a
 //! directory read and a `stat` per entry — no recursion and no media
-//! metadata probing.
+//! metadata probing. Mutations run one at a time, in order with the
+//! listings.
+//!
+//! ponytail: one thread for listings and mutations, so a directory read
+//! issued during a refresh-all waits behind it; a second worker for
+//! mutations is the upgrade if that wait ever matters.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::thread;
 
 use crossbeam_channel::{Receiver, Sender};
 
 use crate::application::runtime::LibraryStores;
-use crate::library::{EpisodeCandidate, FeedSummary, episode_candidates, list_feeds};
+use crate::application::source::resolve_path;
+use crate::commands::{
+    finish_refresh_batch, finish_refresh_one, finish_subscribe, finish_unsubscribe, report,
+    wait_http,
+};
+use crate::http::error::redact_url;
+use crate::http::limits::Limits;
+use crate::http::service::HttpService;
+use crate::library::{
+    EpisodeCandidate, FeedSummary, episode_candidates, list_feeds, refresh, refresh_all, subscribe,
+    unsubscribe,
+};
+use crate::media::id::MediaId;
 
 /// The extensions a listing classifies as audio, compared ASCII
 /// case-insensitively.
@@ -37,6 +56,10 @@ pub struct DirEntry {
     pub name: String,
     pub path: PathBuf,
     pub kind: EntryKind,
+    /// The identity the queue gives an audio file (its canonical path), so
+    /// the browser can tell which rows are already queued; `None` for
+    /// anything else or when the file cannot be resolved.
+    pub media: Option<MediaId>,
 }
 
 /// One level of `path`: directories first, then the rest, each group by
@@ -56,10 +79,14 @@ pub fn list_directory(path: &Path) -> std::io::Result<Vec<DirEntry>> {
         } else {
             EntryKind::Other
         };
+        let media = (kind == EntryKind::Audio)
+            .then(|| resolve_path(&entry_path).ok().map(|(media, _)| media))
+            .flatten();
         entries.push(DirEntry {
             name: entry.file_name().to_string_lossy().into_owned(),
             path: entry_path,
             kind,
+            media,
         });
     }
     entries.sort_by_cached_key(|entry| {
@@ -86,7 +113,21 @@ fn is_audio(path: &Path) -> bool {
 pub enum BrowseRequest {
     Directory(PathBuf),
     Feeds,
-    Episodes { slug: String },
+    Episodes {
+        slug: String,
+    },
+    /// `continuo subscribe <url>`, slug derived.
+    Subscribe {
+        url: String,
+    },
+    /// `continuo refresh [slug]`: one feed, or every feed for `None`.
+    Refresh {
+        slug: Option<String>,
+    },
+    /// `continuo unsubscribe <slug>`.
+    Unsubscribe {
+        slug: String,
+    },
 }
 
 /// A request's answer, naming what it was for so a caller can tell a late
@@ -101,6 +142,12 @@ pub enum BrowseResult {
     Episodes {
         slug: String,
         episodes: Result<Vec<EpisodeCandidate>, String>,
+    },
+    /// A mutation's answer, echoing the request so the browser can tell
+    /// whose answer it is. The text is the CLI's own wording (§3).
+    Mutation {
+        request: BrowseRequest,
+        outcome: Result<String, String>,
     },
 }
 
@@ -152,8 +199,9 @@ fn serve(
     requests: &Receiver<BrowseRequest>,
     results: &Sender<BrowseResult>,
 ) {
+    let mut http = None;
     for request in requests {
-        if results.send(answer(library, request)).is_err() {
+        if results.send(answer(library, &mut http, request)).is_err() {
             return;
         }
     }
@@ -171,10 +219,20 @@ fn answer_with(request: BrowseRequest, message: &str) -> BrowseResult {
             slug,
             episodes: Err(message.to_owned()),
         },
+        request @ (BrowseRequest::Subscribe { .. }
+        | BrowseRequest::Refresh { .. }
+        | BrowseRequest::Unsubscribe { .. }) => BrowseResult::Mutation {
+            request,
+            outcome: Err(message.to_owned()),
+        },
     }
 }
 
-fn answer(library: Option<&LibraryStores>, request: BrowseRequest) -> BrowseResult {
+fn answer(
+    library: Option<&LibraryStores>,
+    http: &mut Option<Arc<HttpService>>,
+    request: BrowseRequest,
+) -> BrowseResult {
     match request {
         BrowseRequest::Directory(path) => {
             let entries = list_directory(&path).map_err(|error| error.to_string());
@@ -194,5 +252,82 @@ fn answer(library: Option<&LibraryStores>, request: BrowseRequest) -> BrowseResu
             }
             None => answer_with(BrowseRequest::Episodes { slug }, NO_LIBRARY),
         },
+        request @ (BrowseRequest::Subscribe { .. }
+        | BrowseRequest::Refresh { .. }
+        | BrowseRequest::Unsubscribe { .. }) => {
+            let outcome = match library {
+                Some(stores) => mutate(stores, http, &request),
+                None => Err(NO_LIBRARY.to_owned()),
+            };
+            match &outcome {
+                Ok(text) => tracing::info!(request = %describe(&request), "{text}"),
+                Err(text) => tracing::info!(request = %describe(&request), "failed: {text}"),
+            }
+            BrowseResult::Mutation { request, outcome }
+        }
+    }
+}
+
+/// Runs one mutation the way its CLI command does, and reports it the way
+/// the CLI prints it (§3). Only `Subscribe` and `Refresh` need the service.
+fn mutate(
+    stores: &LibraryStores,
+    http: &mut Option<Arc<HttpService>>,
+    request: &BrowseRequest,
+) -> Result<String, String> {
+    let subs = &stores.subscriptions;
+    let cache = &stores.cache;
+    match request {
+        BrowseRequest::Subscribe { url } => {
+            let service = http_service(http)?;
+            let outcome = wait_http(&service, subscribe(&service, subs, cache, url, None))
+                .map_err(|error| error.to_string())?;
+            report(finish_subscribe, outcome)
+        }
+        BrowseRequest::Refresh { slug: Some(slug) } => {
+            let service = http_service(http)?;
+            let outcome = wait_http(&service, refresh(&service, subs, cache, slug))
+                .map_err(|error| error.to_string())?;
+            report(finish_refresh_one, outcome)
+        }
+        BrowseRequest::Refresh { slug: None } => {
+            let service = http_service(http)?;
+            let outcomes = wait_http(&service, refresh_all(&service, subs, cache))
+                .map_err(|error| error.to_string())?;
+            report(finish_refresh_batch, outcomes)
+        }
+        BrowseRequest::Unsubscribe { slug } => {
+            let outcome = unsubscribe(subs, cache, slug).map_err(|error| error.to_string())?;
+            report(finish_unsubscribe, outcome)
+        }
+        BrowseRequest::Directory(_) | BrowseRequest::Feeds | BrowseRequest::Episodes { .. } => {
+            Err("not a mutation".to_owned())
+        }
+    }
+}
+
+/// The worker's HTTP service, built on the first request that needs one
+/// and kept for the thread's lifetime. A failure to start is this request's
+/// error; the next request tries again.
+fn http_service(slot: &mut Option<Arc<HttpService>>) -> Result<Arc<HttpService>, String> {
+    if let Some(service) = slot {
+        return Ok(Arc::clone(service));
+    }
+    let service = HttpService::spawn(Limits::default()).map_err(|error| error.to_string())?;
+    *slot = Some(Arc::clone(&service));
+    Ok(service)
+}
+
+/// Returns a redacted description of the request for logging, redacting any
+/// URLs to prevent userinfo or signed queries from reaching the log.
+fn describe(request: &BrowseRequest) -> String {
+    match request {
+        BrowseRequest::Directory(_) => "Directory".to_string(),
+        BrowseRequest::Feeds => "Feeds".to_string(),
+        BrowseRequest::Episodes { slug } => format!("Episodes({})", slug),
+        BrowseRequest::Subscribe { url } => format!("Subscribe({})", redact_url(url)),
+        BrowseRequest::Refresh { slug: Some(slug) } => format!("Refresh({})", slug),
+        BrowseRequest::Refresh { slug: None } => "Refresh(all)".to_string(),
+        BrowseRequest::Unsubscribe { slug } => format!("Unsubscribe({})", slug),
     }
 }

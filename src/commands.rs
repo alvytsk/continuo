@@ -138,9 +138,11 @@ pub(crate) fn platform_state_store() -> Result<StateStore, FeedError> {
 }
 
 /// The one synchronous bridge (§6.6). Every network command enters the
-/// runtime here and nowhere else: `library.rs` stays free of `block_on`, and
-/// `run_resolved`'s decoder path never enters a runtime at all.
-fn wait_http<F: std::future::Future>(service: &HttpService, future: F) -> F::Output {
+/// runtime here and nowhere else, and the browse worker's mutations
+/// ([`crate::application::browse`]) use it too: `library.rs` stays free of
+/// `block_on`, and `run_resolved`'s decoder path never enters a runtime at
+/// all.
+pub(crate) fn wait_http<F: std::future::Future>(service: &HttpService, future: F) -> F::Output {
     service.handle().block_on(future)
 }
 
@@ -152,6 +154,24 @@ fn stdout_failure(source: std::io::Error) -> FeedError {
         op: "write command output to",
         source,
     })
+}
+
+/// The CLI's report of `outcome` as text, for a front end that shows it
+/// instead of printing it: `Ok` is what stdout would have carried, `Err`
+/// that text (when any) followed by the error the exit status would have
+/// named. Trailing whitespace is dropped; the TUI splits on the rest.
+pub(crate) fn report<T>(
+    finish: impl FnOnce(&mut dyn Write, T) -> Result<(), FeedError>,
+    outcome: T,
+) -> Result<String, String> {
+    let mut out = Vec::new();
+    let status = finish(&mut out, outcome);
+    let text = String::from_utf8_lossy(&out).trim_end().to_owned();
+    match status {
+        Ok(()) => Ok(text),
+        Err(error) if text.is_empty() => Err(error.to_string()),
+        Err(error) => Err(format!("{text}\n{error}")),
+    }
 }
 
 // --- Formatting (§6.1, §6.2) -----------------------------------------
@@ -504,7 +524,7 @@ fn write_refresh(out: &mut dyn Write, outcome: &RefreshOutcome) -> Result<(), Fe
 /// `continuo refresh` with no slug (§6.4): every feed is printed, and only
 /// then does the count of feeds that did not complete decide the exit
 /// status. One bad feed neither hides the others nor exits zero.
-fn finish_refresh_batch(
+pub(crate) fn finish_refresh_batch(
     out: &mut dyn Write,
     outcomes: Vec<RefreshOutcome>,
 ) -> Result<(), FeedError> {
@@ -529,7 +549,10 @@ fn finish_refresh_batch(
 /// `continuo refresh <slug>` (§6.4): the concrete error, after printing what
 /// did commit. A batch count would tell a single-feed caller nothing it did
 /// not already know.
-fn finish_refresh_one(out: &mut dyn Write, outcome: RefreshOutcome) -> Result<(), FeedError> {
+pub(crate) fn finish_refresh_one(
+    out: &mut dyn Write,
+    outcome: RefreshOutcome,
+) -> Result<(), FeedError> {
     write_refresh(out, &outcome)?;
     match outcome {
         RefreshOutcome::Failed { error, .. } => Err(error),
@@ -545,7 +568,10 @@ fn finish_refresh_one(out: &mut dyn Write, outcome: RefreshOutcome) -> Result<()
 /// behind unreferenced and *nothing is subscribed*. Reporting that as a
 /// subscription would send the listener looking for a feed that `continuo
 /// feeds` will not show.
-fn finish_subscribe(out: &mut dyn Write, outcome: SubscribeOutcome) -> Result<(), FeedError> {
+pub(crate) fn finish_subscribe(
+    out: &mut dyn Write,
+    outcome: SubscribeOutcome,
+) -> Result<(), FeedError> {
     let SubscribeOutcome {
         slug,
         retained,
@@ -574,7 +600,10 @@ fn finish_subscribe(out: &mut dyn Write, outcome: SubscribeOutcome) -> Result<()
 /// so a followup failure means the subscription is genuinely gone and only
 /// its cache file remains — recoverable, and reported rather than silently
 /// left behind.
-fn finish_unsubscribe(out: &mut dyn Write, outcome: UnsubscribeOutcome) -> Result<(), FeedError> {
+pub(crate) fn finish_unsubscribe(
+    out: &mut dyn Write,
+    outcome: UnsubscribeOutcome,
+) -> Result<(), FeedError> {
     let UnsubscribeOutcome { slug, followup } = outcome;
     let Some(failure) = followup else {
         return writeln!(out, "{slug}: unsubscribed").map_err(stdout_failure);

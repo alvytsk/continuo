@@ -5,21 +5,24 @@
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Widget};
 
 use super::{centered_box, clock, row};
 use crate::application::browse::EntryKind;
 use crate::commands::displayable;
-use crate::tui::browser::{BrowserState, BrowserTab};
+use crate::tui::browser::{BrowserState, BrowserTab, NoticeKind};
 use crate::tui::layout::{inset, take_left, take_right, visible_rows};
 use crate::tui::theme::Theme;
 
-const HINTS: &str = "enter open/add · space mark · tab files/podcasts · ⌫ back · b close";
+const HINTS: &str = "enter open/add/remove · space mark · tab files/podcasts · ⌫ back · b close";
+const PODCAST_HINTS: &str =
+    "enter open/add/remove · space mark · a subscribe · r/R refresh · d remove · ⌫ back · b close";
+const NO_FEEDS: &str = "No subscriptions — press a to add a feed URL";
+const PROMPT: &str = "Feed URL: ";
 const LOADING: &str = "Loading…";
 const EMPTY_DIRECTORY: &str = "(empty directory)";
-const NO_FEEDS: &str = "No subscriptions — subscribe with `continuo subscribe`";
 const NO_EPISODES: &str = "No cached episodes";
 const UNTITLED: &str = "(untitled)";
 const MARK_COLUMNS: u16 = 2;
@@ -48,8 +51,12 @@ pub(super) fn draw_browser(buffer: &mut Buffer, area: Rect, browser: &BrowserSta
     Line::styled(location(browser), Style::new().fg(theme.muted))
         .render(row(body, body.y.saturating_add(1)), buffer);
     let hint_y = body.bottom().saturating_sub(1);
+    let hints = match browser.tab {
+        BrowserTab::Files => HINTS,
+        BrowserTab::Podcasts => PODCAST_HINTS,
+    };
     if body.height >= 4 {
-        Line::styled(HINTS, Style::new().fg(theme.muted)).render(row(body, hint_y), buffer);
+        Line::styled(hints, Style::new().fg(theme.muted)).render(row(body, hint_y), buffer);
     }
     let list = Rect {
         y: body.y.saturating_add(2),
@@ -102,6 +109,10 @@ fn draw_list(buffer: &mut Buffer, area: Rect, browser: &BrowserState, theme: &Th
     if area.is_empty() {
         return;
     }
+    let rows = draw_notice_block(buffer, area, browser, theme);
+    if rows.is_empty() {
+        return;
+    }
     let notice = if browser.loading {
         Some((LOADING.to_owned(), theme.muted))
     } else if let Some(error) = &browser.error {
@@ -117,7 +128,7 @@ fn draw_list(buffer: &mut Buffer, area: Rect, browser: &BrowserState, theme: &Th
         None
     };
     if let Some((text, color)) = notice {
-        Line::styled(text, Style::new().fg(color)).render(row(area, area.y), buffer);
+        Line::styled(text, Style::new().fg(color)).render(row(rows, rows.y), buffer);
         return;
     }
 
@@ -125,18 +136,19 @@ fn draw_list(buffer: &mut Buffer, area: Rect, browser: &BrowserState, theme: &Th
         browser.len(),
         0,
         Some(browser.cursor),
-        usize::from(area.height),
+        usize::from(rows.height),
     );
-    let mut y = area.y;
+    let mut y = rows.y;
     for index in window {
         let Some(cells) = row_cells(browser, index, theme) else {
             break;
         };
         draw_row(
             buffer,
-            row(area, y),
+            row(rows, y),
             cells,
             browser.marked.contains(&index),
+            browser.queued_at(index).is_some(),
             index == browser.cursor,
             theme,
         );
@@ -201,6 +213,7 @@ fn draw_row(
     rect: Rect,
     cells: RowCells,
     marked: bool,
+    queued: bool,
     under_cursor: bool,
     theme: &Theme,
 ) {
@@ -219,6 +232,14 @@ fn draw_row(
             Style::new().fg(theme.amber)
         };
         Line::styled("●", mark_style).render(mark, buffer);
+    } else if queued {
+        // The acknowledgement that the row is in the queue.
+        let tick_style = if under_cursor {
+            style
+        } else {
+            Style::new().fg(theme.green)
+        };
+        Line::styled("✓", tick_style).render(mark, buffer);
     }
     if let Some(detail) = cells.detail
         && rest.width >= DETAIL_MIN_ROW
@@ -230,4 +251,68 @@ fn draw_row(
             .render(column, buffer);
     }
     Line::styled(cells.label, style).render(rest, buffer);
+}
+
+/// The prompt, the confirmation question or the mutation notice, as a block
+/// of up to a third of `area` (two rows at minimum when the text is cut), the
+/// last row of a cut block being the marker; returns what is left for the rows.
+/// The full text is logged once at info level through `tracing`.
+fn draw_notice_block(
+    buffer: &mut Buffer,
+    area: Rect,
+    browser: &BrowserState,
+    theme: &Theme,
+) -> Rect {
+    let Some((lines, color)) = notice_lines(browser, theme) else {
+        return area;
+    };
+    let third = usize::from(area.height / 3);
+    let (shown, hidden) = if lines.len() <= third.max(1) {
+        (lines.len(), 0)
+    } else {
+        // The marker takes the last budgeted row; two rows at minimum so a
+        // tiny area still shows one line above it.
+        let budget = third.max(2);
+        (budget - 1, lines.len() - (budget - 1))
+    };
+    let height = u16::try_from(shown + usize::from(hidden > 0)).unwrap_or(u16::MAX);
+    let mut y = area.y;
+    for line in lines.iter().take(shown) {
+        Line::styled(line.clone(), Style::new().fg(color)).render(row(area, y), buffer);
+        y = y.saturating_add(1);
+    }
+    if hidden > 0 {
+        Line::styled(
+            format!("+{hidden} more lines, see log"),
+            Style::new().fg(color).add_modifier(Modifier::DIM),
+        )
+        .render(row(area, y), buffer);
+    }
+    Rect {
+        y: area.y.saturating_add(height),
+        height: area.height.saturating_sub(height),
+        ..area
+    }
+    .intersection(area)
+}
+
+fn notice_lines(browser: &BrowserState, theme: &Theme) -> Option<(Vec<String>, Color)> {
+    if let Some(prompt) = &browser.prompt {
+        return Some((
+            vec![format!("{PROMPT}{}▏", displayable(prompt))],
+            theme.text,
+        ));
+    }
+    if let Some(slug) = &browser.confirm {
+        return Some((
+            vec![format!("Remove {}? y/N", displayable(slug))],
+            theme.amber,
+        ));
+    }
+    let notice = browser.notice.as_ref()?;
+    let color = match notice.kind {
+        NoticeKind::Err => theme.amber,
+        NoticeKind::Working | NoticeKind::Ok => theme.muted,
+    };
+    Some((notice.text.lines().map(displayable).collect(), color))
 }

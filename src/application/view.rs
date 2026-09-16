@@ -62,6 +62,7 @@ pub fn format_saved(history: SavedHistory) -> String {
 #[derive(Clone, Debug)]
 pub struct QueueRow {
     pub id: QueueEntryId,
+    pub media: MediaId,
     pub title: String,
     pub subtitle: Option<String>,
     pub duration: Option<DisplayDuration>,
@@ -120,6 +121,7 @@ pub(crate) fn queue_rows(state: &PersistedState) -> Vec<QueueRow> {
         .iter()
         .map(|entry| QueueRow {
             id: entry.id(),
+            media: entry.media().clone(),
             title: entry_title(entry),
             subtitle: entry_subtitle(entry),
             duration: entry.display().duration,

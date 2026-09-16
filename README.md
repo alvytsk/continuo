@@ -2,7 +2,7 @@
 
 A keyboard-first terminal audio player for local audio, finite HTTP media, and podcasts.
 
-Milestones 0 through 5 are implemented: domain types and identities (M0), local playback over Symphonia and CPAL with position tracking (M1), durable checkpoint persistence (M2), finite HTTP media with capability probing and range-based seek (M3), RSS/Atom subscriptions with episode listing and progress (M4), and a Ratatui terminal player with a persistent queue, a browser, cover art and a frequency spectrum (M5). M5's automated suites pass, but its manual checks in real terminals (Ghostty, Zellij, Herdr) have not been run yet; [docs/m5-acceptance.md](docs/m5-acceptance.md) records both. `continuo tui` opens the [terminal player](#terminal-player). `continuo play` keeps its original interface: a status line plus a handful of keys (space to pause, the arrow keys to seek, `s`/`p` to stop/play, `q` to quit).
+Milestones 0 through 6 are implemented: domain types and identities (M0), local playback over Symphonia and CPAL with position tracking (M1), durable checkpoint persistence (M2), finite HTTP media with capability probing and range-based seek (M3), RSS/Atom subscriptions with episode listing and progress (M4), a Ratatui terminal player with a persistent queue, a browser, cover art and a frequency spectrum (M5), and subscribing, refreshing and unsubscribing from the player's Podcasts tab (M6). M5's automated suites pass, but its manual checks in real terminals (Ghostty, Zellij, Herdr) have not been run yet; [docs/m5-acceptance.md](docs/m5-acceptance.md) records both. M6's automated suites also pass, but its manual check against a real Radio-T feed has not been run yet; [docs/m6-acceptance.md](docs/m6-acceptance.md) records it. `continuo tui` opens the [terminal player](#terminal-player). `continuo play` keeps its original interface: a status line plus a handful of keys (space to pause, the arrow keys to seek, `s`/`p` to stop/play, `q` to quit).
 
 ## Development
 
@@ -116,6 +116,7 @@ drop a tier, so 100×20 is compact.
 | `[` / `]` | Previous / next queue entry; never wraps |
 | `d` | Remove the selected entry |
 | `b` | Open the browser |
+| `a` / `r` / `R` / `d` in the browser's Podcasts tab | Subscribe by URL, refresh the highlighted feed, refresh all, remove with `y` to confirm |
 | `a` | Type a path or an `http(s)://` URL to enqueue |
 | `c` | Clear the queue, after a `y` confirmation |
 | `?` | Show the key help |
@@ -152,13 +153,18 @@ directory, else the directory `tui` was started in — and over cached podcast
 subscriptions. Up/Down or `j`/`k` move, Tab switches between Files and
 Podcasts, Enter opens a directory or a feed and enqueues a file or an episode,
 Space marks several rows to enqueue together, Backspace or Left goes back up,
-and `b` or Esc closes it. Directories are read one level at a time; nothing
-indexes a library recursively.
+and `b` or Esc closes it. A row already in the queue shows a green `✓`, and
+Enter on it removes that entry from the queue again; marking skips such rows.
+A feed's episodes are listed newest first, with undated ones after the dated
+ones in feed order (`continuo episodes` keeps feed order, so its indices do
+not move). Directories are read one level at a time; nothing indexes a
+library recursively.
 
 **Opening the browser never refreshes a feed.** The Podcasts tab lists what
-`continuo subscribe` and `continuo refresh` last cached, exactly like
-`continuo episodes`, and the only way to update it is still `continuo refresh`
-from a shell. Enqueueing or restoring a URL or an episode makes no network
+was last cached, exactly like `continuo episodes`; updating it is an explicit
+act, `r` or `R` in the browser or `continuo refresh` from a shell, and the
+same goes for `a` and `d` beside `continuo subscribe` and `continuo
+unsubscribe`. Enqueueing or restoring a URL or an episode makes no network
 request either; only playing it does.
 
 ### The queue

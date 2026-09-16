@@ -264,8 +264,9 @@ Runtime code forbids unsafe code and denies `unwrap` and `expect`. Tests may use
 | **M3** | Finite HTTP media, capability probing, range-based seek, `RemoteFile` vs `LiveStream` — shipped |
 | **M4** | RSS/Atom feeds, subscriptions, episode listing and progress — shipped |
 | **M5** | Ratatui TUI over the existing application interfaces: queue, browser, artwork, spectrum, profile lock, signal contract — implemented; manual terminal acceptance pending (`docs/m5-acceptance.md`) |
+| **M6** | Feed management from the terminal player: subscribe, refresh one/all and unsubscribe on the browser's Podcasts tab, over the same library functions the CLI calls — implemented; manual check pending (`docs/m6-acceptance.md`) |
 
-M0 explicitly defers `PlaybackCommand` and `PlaybackEvent`, the executable state machine, channels, worker threads, callback accounting, buffer management, detailed decoder and device errors, checkpoint storage, completion policy, HTTP buffering, and capability probing. All of those deferrals have since been implemented: playback (M1), persistence (M2), HTTP fetching (M3), feeds and subscriptions (M4), and the TUI (M5).
+M0 explicitly defers `PlaybackCommand` and `PlaybackEvent`, the executable state machine, channels, worker threads, callback accounting, buffer management, detailed decoder and device errors, checkpoint storage, completion policy, HTTP buffering, and capability probing. All of those deferrals have since been implemented: playback (M1), persistence (M2), HTTP fetching (M3), feeds and subscriptions (M4), and the TUI (M5). M6 adds the three subscription commands to the browser (`docs/superpowers/specs/2026-09-16-continuo-m6-feed-management-design.md`).
 
 M1 used Symphonia and CPAL directly to control buffering, cancellation, and position accounting. This choice does not claim that Rodio cannot seek; Rodio's Symphonia backend implements accurate seek refinement. HTTP range support belongs to the source layer, not CPAL. Commands and events will form the application boundary, so no speculative backend trait is introduced. Rodio remains a contingency if M1 uncovers a concrete blocker.
 

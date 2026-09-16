@@ -127,6 +127,7 @@ fn restoring_enqueueing_and_browsing_remote_entries_make_no_requests() {
         ),
         title: None,
         declared_duration: None,
+        published: None,
     };
     let local = std::fs::canonicalize(LOCAL).unwrap_or_else(|error| panic!("fixture: {error}"));
     rig.runtime.handle(AppCommand::Enqueue(vec![

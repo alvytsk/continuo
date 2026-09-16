@@ -387,6 +387,9 @@ fn run_loop(
         }
         let view = runtime.view();
         ui.reconcile(&view, None);
+        if let Some(browser) = &mut browsing.state {
+            browser.sync_queue(&view.rows);
+        }
         if let Err(error) = update_spectrum(runtime, terminal, &view, &mut spectrum) {
             return Ending::Failed(LifecycleError::Terminal(error).into());
         }
@@ -609,15 +612,18 @@ impl Browsing {
             .request(request);
     }
 
-    /// Hands every finished read to the open browser; one that finishes
-    /// after the browser closed is dropped.
+    /// Hands every finished read to the open browser, and sends the read a
+    /// mutation's answer asks for; an answer that finishes after the
+    /// browser closed is dropped.
     fn poll(&mut self) {
         let Some(worker) = &self.worker else {
             return;
         };
         while let Some(result) = worker.try_result() {
-            if let Some(state) = &mut self.state {
-                state.apply(result);
+            if let Some(state) = &mut self.state
+                && let Some(follow_up) = state.apply(result)
+            {
+                worker.request(follow_up);
             }
         }
     }
@@ -725,6 +731,7 @@ fn handle_event(front: &mut Front<'_>, hits: &HitMap, event: Event) -> io::Resul
                 front.browsing.close(front.ui);
                 return Ok(());
             };
+            browser.sync_queue(&view.rows);
             let effects = browser.handle_key(key);
             for effect in effects {
                 apply_browser_effect(effect, front)?;
@@ -758,6 +765,7 @@ fn apply_browser_effect(effect: BrowserEffect, front: &mut Front<'_>) -> io::Res
         BrowserEffect::Enqueue(items) => {
             apply_effect(Effect::App(AppCommand::Enqueue(items)), front)
         }
+        BrowserEffect::Remove(id) => apply_effect(Effect::App(AppCommand::Remove(id)), front),
         BrowserEffect::Close => apply_effect(Effect::CloseBrowser, front),
     }
 }

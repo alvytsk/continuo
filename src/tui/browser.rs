@@ -9,20 +9,39 @@
 //! another directory, feed or tab empties the list and marks it loading, and
 //! an answer for anywhere else is dropped.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 
 use crate::application::browse::{BrowseRequest, BrowseResult, DirEntry, EntryKind};
 use crate::application::runtime::EnqueueItem;
+use crate::application::view::QueueRow;
 use crate::library::{EpisodeCandidate, FeedSummary};
+use crate::media::id::MediaId;
+use crate::queue::QueueEntryId;
 use crate::tui::input::blocks_ordinary_bindings;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BrowserTab {
     Files,
     Podcasts,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NoticeKind {
+    /// A mutation is in flight.
+    Working,
+    Ok,
+    Err,
+}
+
+/// A mutation's progress or outcome (design doc M6 §5), drawn above the
+/// rows and kept until the next key that changes what is shown.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Notice {
+    pub text: String,
+    pub kind: NoticeKind,
 }
 
 #[derive(Clone, Debug)]
@@ -43,12 +62,26 @@ pub struct BrowserState {
     pub loading: bool,
     /// Why the visible list could not be read.
     pub error: Option<String>,
+    /// The feed URL being typed after `a`.
+    pub prompt: Option<String>,
+    /// The slug whose removal awaits `y`.
+    pub confirm: Option<String>,
+    /// The mutation in flight: blocks a second one and identifies its
+    /// answer (M6 §5).
+    pub pending: Option<BrowseRequest>,
+    pub notice: Option<Notice>,
+    /// What the queue holds, by media identity, as of the last
+    /// [`sync_queue`](Self::sync_queue): a queued row draws a tick and Enter
+    /// removes it instead of adding it again.
+    pub queued: HashMap<MediaId, QueueEntryId>,
 }
 
 #[derive(Clone, Debug)]
 pub enum BrowserEffect {
     Request(BrowseRequest),
     Enqueue(Vec<EnqueueItem>),
+    /// Enter on a row already in the queue takes it out again.
+    Remove(QueueEntryId),
     Close,
 }
 
@@ -66,13 +99,36 @@ impl BrowserState {
             marked: BTreeSet::new(),
             loading: true,
             error: None,
+            prompt: None,
+            confirm: None,
+            pending: None,
+            notice: None,
+            queued: HashMap::new(),
         }
     }
 
-    /// Takes in a worker's answer when it is for the list on screen;
-    /// otherwise — a directory already left, a feed no longer viewed, the
-    /// other tab — drops it.
-    pub fn apply(&mut self, result: BrowseResult) {
+    /// Records which media the queue holds; with duplicates, the later row
+    /// is the one Enter removes.
+    pub fn sync_queue(&mut self, rows: &[QueueRow]) {
+        self.queued = rows.iter().map(|row| (row.media.clone(), row.id)).collect();
+    }
+
+    /// The queue entry row `index` is already in, if any.
+    pub fn queued_at(&self, index: usize) -> Option<QueueEntryId> {
+        let media = match (self.tab, &self.episodes) {
+            (BrowserTab::Files, _) => self.entries.get(index)?.media.as_ref()?,
+            (BrowserTab::Podcasts, None) => return None,
+            (BrowserTab::Podcasts, Some((_, episodes))) => &episodes.get(index)?.media,
+        };
+        self.queued.get(media).copied()
+    }
+
+    /// Takes in a worker's answer when it is for the list on screen or for
+    /// the mutation in flight; otherwise — a directory already left, a feed
+    /// no longer viewed, the other tab, a mutation from a browser since
+    /// closed — drops it. Returns the follow-up read a mutation calls for.
+    pub fn apply(&mut self, result: BrowseResult) -> Option<BrowseRequest> {
+        let mut follow_up = None;
         match result {
             BrowseResult::Directory { path, entries } => {
                 if self.tab == BrowserTab::Files && path == self.cwd {
@@ -87,12 +143,50 @@ impl BrowserState {
             BrowseResult::Episodes { slug, episodes } => {
                 let viewing = matches!(&self.episodes, Some((current, _)) if *current == slug);
                 if self.tab == BrowserTab::Podcasts && viewing {
-                    let list = self.settle(episodes);
+                    let mut list = self.settle(episodes);
+                    // Newest first; undated episodes keep their stored order
+                    // after the dated ones. The CLI keeps stored order so
+                    // `play <slug> <index>` stays stable.
+                    list.sort_by_key(|episode| std::cmp::Reverse(episode.published));
                     self.episodes = Some((slug, list));
+                }
+            }
+            BrowseResult::Mutation { request, outcome } => {
+                // ponytail: an identical mutation resubmitted after a close
+                // and reopen adopts the earlier answer; both committed, and
+                // the list is re-read either way.
+                if self.pending.as_ref() != Some(&request) {
+                    return None;
+                }
+                self.pending = None;
+                if let BrowseRequest::Unsubscribe { slug } = &request
+                    && matches!(&self.episodes, Some((open, _)) if open == slug)
+                {
+                    // Removed before any cache cleanup could fail, and an
+                    // unknown slug was already gone: the view has to go.
+                    self.leave_episodes();
+                }
+                self.notice = Some(match outcome {
+                    Ok(text) => Notice {
+                        text,
+                        kind: NoticeKind::Ok,
+                    },
+                    Err(text) => Notice {
+                        text,
+                        kind: NoticeKind::Err,
+                    },
+                });
+                if self.tab == BrowserTab::Podcasts {
+                    self.loading = true;
+                    follow_up = Some(match &self.episodes {
+                        Some((slug, _)) => BrowseRequest::Episodes { slug: slug.clone() },
+                        None => BrowseRequest::Feeds,
+                    });
                 }
             }
         }
         self.cursor = self.cursor.min(self.len().saturating_sub(1));
+        follow_up
     }
 
     /// Ends loading for the visible list, recording an error in its place.
@@ -112,10 +206,26 @@ impl BrowserState {
     }
 
     /// Up/Down/`j`/`k` move, Tab switches tabs, Enter opens or enqueues,
-    /// Space marks, Backspace/Left goes back, `b`/Esc closes. A Ctrl or Alt
-    /// chord does nothing, as in the rest of the keyboard map.
+    /// Space marks, Backspace/Left goes back, `b`/Esc closes. On the
+    /// Podcasts tab `a` prompts for a feed URL, `r`/`R` refresh one/all and
+    /// `d` asks before removing (M6 §4); the prompt and the question take
+    /// every key while they are up. A Ctrl or Alt chord does nothing, as in
+    /// the rest of the keyboard map.
     pub fn handle_key(&mut self, key: KeyEvent) -> Vec<BrowserEffect> {
-        if key.kind != KeyEventKind::Press || blocks_ordinary_bindings(&key) {
+        if key.kind != KeyEventKind::Press {
+            return Vec::new();
+        }
+        if self.prompt.is_some() {
+            return self.prompt_key(key);
+        }
+        if let Some(slug) = self.confirm.take() {
+            return if key.code == KeyCode::Char('y') && !blocks_ordinary_bindings(&key) {
+                self.submit(BrowseRequest::Unsubscribe { slug })
+            } else {
+                Vec::new()
+            };
+        }
+        if blocks_ordinary_bindings(&key) {
             return Vec::new();
         }
         match key.code {
@@ -139,6 +249,25 @@ impl BrowserState {
             }
             KeyCode::Backspace | KeyCode::Left => self.back(),
             KeyCode::Char('b') | KeyCode::Esc => vec![BrowserEffect::Close],
+            KeyCode::Char('a') if self.can_manage() => {
+                self.notice = None;
+                self.prompt = Some(String::new());
+                Vec::new()
+            }
+            KeyCode::Char('r') if self.can_manage() => match self.target_slug() {
+                Some(slug) => self.submit(BrowseRequest::Refresh { slug: Some(slug) }),
+                None => Vec::new(),
+            },
+            KeyCode::Char('R') if self.can_manage() && !self.feeds.is_empty() => {
+                self.submit(BrowseRequest::Refresh { slug: None })
+            }
+            KeyCode::Char('d') if self.can_manage() => {
+                if let Some(slug) = self.target_slug() {
+                    self.notice = None;
+                    self.confirm = Some(slug);
+                }
+                Vec::new()
+            }
             _ => Vec::new(),
         }
     }
@@ -171,8 +300,88 @@ impl BrowserState {
         }
     }
 
+    /// Whether a management key may act: the Podcasts tab, nothing loading,
+    /// no mutation in flight.
+    fn can_manage(&self) -> bool {
+        self.tab == BrowserTab::Podcasts && !self.loading && self.pending.is_none()
+    }
+
+    /// The feed `r` and `d` act on: the open feed, else the cursor's row.
+    fn target_slug(&self) -> Option<String> {
+        match &self.episodes {
+            Some((slug, _)) => Some(slug.clone()),
+            None => self.feeds.get(self.cursor).map(|feed| feed.slug.clone()),
+        }
+    }
+
+    /// Sends a mutation and remembers it until its answer arrives.
+    fn submit(&mut self, request: BrowseRequest) -> Vec<BrowserEffect> {
+        let text = match &request {
+            BrowseRequest::Subscribe { .. } => "Subscribing…",
+            BrowseRequest::Refresh { .. } => "Refreshing…",
+            BrowseRequest::Unsubscribe { .. } => "Removing…",
+            BrowseRequest::Directory(_) | BrowseRequest::Feeds | BrowseRequest::Episodes { .. } => {
+                "Loading…"
+            }
+        };
+        self.notice = Some(Notice {
+            text: text.to_owned(),
+            kind: NoticeKind::Working,
+        });
+        self.pending = Some(request.clone());
+        vec![BrowserEffect::Request(request)]
+    }
+
+    /// Printable characters append, Backspace pops, Enter submits the
+    /// trimmed URL (nothing when empty), Esc cancels. Shortcuts never fire.
+    fn prompt_key(&mut self, key: KeyEvent) -> Vec<BrowserEffect> {
+        match key.code {
+            KeyCode::Esc => {
+                self.prompt = None;
+                Vec::new()
+            }
+            KeyCode::Backspace => {
+                if let Some(prompt) = &mut self.prompt {
+                    prompt.pop();
+                }
+                Vec::new()
+            }
+            KeyCode::Enter => {
+                let url = self.prompt.take().unwrap_or_default().trim().to_owned();
+                if url.is_empty() {
+                    Vec::new()
+                } else {
+                    self.submit(BrowseRequest::Subscribe { url })
+                }
+            }
+            KeyCode::Char(c) if !c.is_control() && !blocks_ordinary_bindings(&key) => {
+                if let Some(prompt) = &mut self.prompt {
+                    prompt.push(c);
+                }
+                Vec::new()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// Returns from an episode view to the feed list, cursor on the feed
+    /// just left, cached rows still showing.
+    fn leave_episodes(&mut self) {
+        if let Some((slug, _)) = self.episodes.take() {
+            self.cursor = self
+                .feeds
+                .iter()
+                .position(|feed| feed.slug == slug)
+                .unwrap_or(0);
+            self.marked.clear();
+            self.loading = false;
+            self.error = None;
+        }
+    }
+
     /// Empties the visible list and marks it loading.
     fn start_loading(&mut self) {
+        self.notice = None;
         self.cursor = 0;
         self.marked.clear();
         self.loading = true;
@@ -231,8 +440,14 @@ impl BrowserState {
     }
 
     /// The marked rows in listing order, or the cursor's row when nothing is
-    /// marked; the marks clear once they are enqueued.
+    /// marked; the marks clear once they are enqueued. Rows already in the
+    /// queue are skipped, and Enter on one alone takes it out instead.
     fn enqueue_selection(&mut self) -> Vec<BrowserEffect> {
+        if self.marked.is_empty()
+            && let Some(id) = self.queued_at(self.cursor)
+        {
+            return vec![BrowserEffect::Remove(id)];
+        }
         let indices: Vec<usize> = if self.marked.is_empty() {
             vec![self.cursor]
         } else {
@@ -240,7 +455,7 @@ impl BrowserState {
         };
         let items: Vec<EnqueueItem> = indices
             .into_iter()
-            .filter(|index| self.enqueueable(*index))
+            .filter(|index| self.enqueueable(*index) && self.queued_at(*index).is_none())
             .filter_map(|index| match (self.tab, &self.episodes) {
                 (BrowserTab::Files, _) => self
                     .entries
@@ -269,17 +484,14 @@ impl BrowserState {
                 None => Vec::new(),
             },
             BrowserTab::Podcasts => {
-                if let Some((slug, _)) = self.episodes.take() {
-                    self.cursor = self
-                        .feeds
-                        .iter()
-                        .position(|feed| feed.slug == slug)
-                        .unwrap_or(0);
-                    self.marked.clear();
-                    self.loading = false;
-                    self.error = None;
+                if self.episodes.is_none() {
+                    return Vec::new();
                 }
-                Vec::new()
+                self.leave_episodes();
+                self.notice = None;
+                // Re-read rather than trust rows cached before a mutation;
+                // the cached rows stay up until the answer lands (M6 §4).
+                vec![BrowserEffect::Request(BrowseRequest::Feeds)]
             }
         }
     }
