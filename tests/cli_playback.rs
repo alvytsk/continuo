@@ -105,3 +105,32 @@ fn a_rejected_file_still_reports_without_a_device_or_a_terminal() {
         "expected the regular-file rule: {text}"
     );
 }
+
+/// `--probe-only` prints decoder metadata, which is untrusted: a tagged
+/// title reaches stdout through the same escaping playback and the feed
+/// listings use, never raw.
+#[test]
+fn probe_only_escapes_a_title_carrying_terminal_controls() {
+    let profile = process::Profile::new().unwrap();
+    let output = profile
+        .command()
+        .args(["play", "tests/fixtures/sine-tagged.flac", "--probe-only"])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !text.contains('\u{1b}'),
+        "raw escape reached stdout: {text:?}"
+    );
+    assert_eq!(
+        text.lines().count(),
+        1,
+        "an injected newline split the line: {text:?}"
+    );
+    assert!(
+        text.starts_with(r"Sine\u{1b}[2J\nInjected 44100"),
+        "{text:?}"
+    );
+}

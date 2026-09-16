@@ -479,12 +479,16 @@ fn run_probe_only(source: &str) -> Result<(), PlaybackError> {
         }
     }
 
-    let title = prepared
-        .source
-        .metadata()
-        .title
-        .clone()
-        .unwrap_or_else(|| "(untitled)".to_string());
+    // Decoder metadata is untrusted, local files included: escaped the way
+    // playback's status row and the feed listings escape it.
+    let title = crate::commands::displayable(
+        prepared
+            .source
+            .metadata()
+            .title
+            .as_deref()
+            .unwrap_or("(untitled)"),
+    );
     println!(
         "{title} {rate} Hz {channels} ch {duration:?} continuity={continuity:?} seek={seek:?} resume={resume:?}",
         rate = prepared.source.sample_rate(),
