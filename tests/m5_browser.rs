@@ -9,7 +9,7 @@ use continuo::application::browse::{
 use continuo::application::runtime::EnqueueItem;
 use continuo::library::{EpisodeCandidate, FeedSummary};
 use continuo::media::id::{EpisodeKey, FeedId, MediaId};
-use continuo::tui::browser::{BrowserEffect, BrowserState, BrowserTab};
+use continuo::tui::browser::{BrowserEffect, BrowserState, BrowserTab, NoticeKind};
 use continuo::tui::render::{Visuals, draw};
 use continuo::tui::state::{Overlay, UiState};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -317,7 +317,8 @@ fn podcasts_tab_lists_feeds_then_episodes_and_skips_unplayable_marks() {
     assert!(press(&mut state, &[KeyCode::Up, KeyCode::Enter]).is_empty());
 
     // Back to the feed list, with the cursor on the feed just left.
-    assert!(press(&mut state, &[KeyCode::Backspace]).is_empty());
+    let effects = press(&mut state, &[KeyCode::Backspace]);
+    assert_eq!(requests(&effects), [BrowseRequest::Feeds]);
     assert!(state.episodes.is_none());
     assert_eq!(state.cursor, 1);
 
@@ -442,4 +443,278 @@ fn the_worker_reports_failures_as_error_values() {
         ),
         "{results:?}"
     );
+}
+
+/// A Podcasts tab showing `feeds`.
+fn podcasts(feeds: Vec<FeedSummary>) -> BrowserState {
+    let mut state = BrowserState::new(PathBuf::from("/music"));
+    press(&mut state, &[KeyCode::Tab]);
+    state.apply(BrowseResult::Feeds(Ok(feeds)));
+    state
+}
+
+fn requests(effects: &[BrowserEffect]) -> Vec<BrowseRequest> {
+    effects
+        .iter()
+        .filter_map(|effect| match effect {
+            BrowserEffect::Request(request) => Some(request.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn mutation(request: BrowseRequest, outcome: Result<&str, &str>) -> BrowseResult {
+    BrowseResult::Mutation {
+        request,
+        outcome: outcome.map(str::to_owned).map_err(str::to_owned),
+    }
+}
+
+#[test]
+fn the_prompt_swallows_shortcuts_and_enter_subscribes() {
+    let mut state = podcasts(vec![feed("one")]);
+    assert!(press(&mut state, &[KeyCode::Char('a')]).is_empty());
+    assert_eq!(state.prompt.as_deref(), Some(""));
+
+    // `q`, `b`, space and `d` are text now, not shortcuts.
+    let typed = press(
+        &mut state,
+        &[
+            KeyCode::Char('q'),
+            KeyCode::Char('b'),
+            KeyCode::Char(' '),
+            KeyCode::Char('d'),
+        ],
+    );
+    assert!(typed.is_empty(), "{typed:?}");
+    assert_eq!(state.prompt.as_deref(), Some("qb d"));
+    assert!(state.confirm.is_none());
+
+    press(
+        &mut state,
+        &[
+            KeyCode::Backspace,
+            KeyCode::Backspace,
+            KeyCode::Backspace,
+            KeyCode::Backspace,
+        ],
+    );
+    assert!(
+        press(&mut state, &[KeyCode::Enter]).is_empty(),
+        "empty submits nothing"
+    );
+    assert!(state.prompt.is_none());
+
+    press(&mut state, &[KeyCode::Char('a'), KeyCode::Char('x')]);
+    assert!(
+        press(&mut state, &[KeyCode::Esc]).is_empty(),
+        "Esc cancels, never closes"
+    );
+    assert!(state.prompt.is_none());
+
+    press(&mut state, &[KeyCode::Char('a')]);
+    for c in "https://x.example/f ".chars() {
+        press(&mut state, &[KeyCode::Char(c)]);
+    }
+    let effects = press(&mut state, &[KeyCode::Enter]);
+    let expected = BrowseRequest::Subscribe {
+        url: "https://x.example/f".to_owned(),
+    };
+    assert_eq!(requests(&effects), vec![expected.clone()]);
+    assert_eq!(state.pending, Some(expected));
+    assert_eq!(
+        state.notice.as_ref().map(|n| n.kind),
+        Some(NoticeKind::Working)
+    );
+    assert!(state.prompt.is_none());
+}
+
+#[test]
+fn refresh_and_remove_need_a_feed_and_no_pending_mutation() {
+    let mut empty = podcasts(Vec::new());
+    for code in [KeyCode::Char('r'), KeyCode::Char('R'), KeyCode::Char('d')] {
+        assert!(press(&mut empty, &[code]).is_empty(), "{code:?}");
+    }
+    assert!(empty.confirm.is_none());
+
+    let mut state = podcasts(vec![feed("one"), feed("two")]);
+    press(&mut state, &[KeyCode::Down]);
+    let effects = press(&mut state, &[KeyCode::Char('r')]);
+    let expected = BrowseRequest::Refresh {
+        slug: Some("two".to_owned()),
+    };
+    assert_eq!(requests(&effects), vec![expected.clone()]);
+    assert_eq!(state.pending, Some(expected.clone()));
+
+    // Everything management-related waits while a mutation is pending.
+    for code in [
+        KeyCode::Char('a'),
+        KeyCode::Char('r'),
+        KeyCode::Char('R'),
+        KeyCode::Char('d'),
+    ] {
+        assert!(press(&mut state, &[code]).is_empty(), "{code:?}");
+    }
+    assert!(state.prompt.is_none() && state.confirm.is_none());
+
+    let mut all = podcasts(vec![feed("one")]);
+    assert_eq!(
+        requests(&press(&mut all, &[KeyCode::Char('R')])),
+        [BrowseRequest::Refresh { slug: None }]
+    );
+}
+
+#[test]
+fn remove_asks_first_and_only_y_confirms() {
+    let mut state = podcasts(vec![feed("one"), feed("two")]);
+    assert!(press(&mut state, &[KeyCode::Char('d')]).is_empty());
+    assert_eq!(state.confirm.as_deref(), Some("one"));
+    assert!(press(&mut state, &[KeyCode::Char('n')]).is_empty());
+    assert!(state.confirm.is_none() && state.pending.is_none());
+
+    press(&mut state, &[KeyCode::Char('d')]);
+    let effects = press(&mut state, &[KeyCode::Char('y')]);
+    let expected = BrowseRequest::Unsubscribe {
+        slug: "one".to_owned(),
+    };
+    assert_eq!(requests(&effects), vec![expected.clone()]);
+    assert_eq!(state.pending, Some(expected));
+}
+
+#[test]
+fn r_and_d_inside_an_open_feed_act_on_that_feed() {
+    let mut state = podcasts(vec![feed("one"), feed("two")]);
+    press(&mut state, &[KeyCode::Down, KeyCode::Enter]);
+    state.apply(BrowseResult::Episodes {
+        slug: "two".to_owned(),
+        episodes: Ok(vec![episode("g1", Some("https://cdn.example.org/1.mp3"))]),
+    });
+    assert_eq!(
+        requests(&press(&mut state, &[KeyCode::Char('r')])),
+        [BrowseRequest::Refresh {
+            slug: Some("two".to_owned())
+        }]
+    );
+    let follow_up = state.apply(mutation(
+        BrowseRequest::Refresh {
+            slug: Some("two".to_owned()),
+        },
+        Ok("two: updated"),
+    ));
+    assert_eq!(
+        follow_up,
+        Some(BrowseRequest::Episodes {
+            slug: "two".to_owned()
+        }),
+        "an open feed re-reads its episodes"
+    );
+    // The re-read is loading until its answer lands; management keys wait.
+    assert!(press(&mut state, &[KeyCode::Char('d')]).is_empty());
+    assert!(state.confirm.is_none());
+    state.apply(BrowseResult::Episodes {
+        slug: "two".to_owned(),
+        episodes: Ok(Vec::new()),
+    });
+    press(&mut state, &[KeyCode::Char('d')]);
+    assert_eq!(state.confirm.as_deref(), Some("two"));
+}
+
+#[test]
+fn back_re_reads_the_feed_list_while_keeping_the_cached_rows() {
+    let mut state = podcasts(vec![feed("one"), feed("two")]);
+    press(&mut state, &[KeyCode::Down, KeyCode::Enter]);
+    state.apply(BrowseResult::Episodes {
+        slug: "two".to_owned(),
+        episodes: Ok(Vec::new()),
+    });
+    let effects = press(&mut state, &[KeyCode::Backspace]);
+    assert_eq!(requests(&effects), [BrowseRequest::Feeds]);
+    assert!(state.episodes.is_none());
+    assert_eq!(state.feeds.len(), 2, "cached rows stay up");
+    assert_eq!(state.cursor, 1);
+    assert!(!state.loading);
+}
+
+#[test]
+fn a_matching_answer_shows_the_notice_and_re_reads_the_list() {
+    let mut state = podcasts(vec![feed("one")]);
+    press(&mut state, &[KeyCode::Char('r')]);
+    let request = BrowseRequest::Refresh {
+        slug: Some("one".to_owned()),
+    };
+
+    // Someone else's answer, and a listing answer, leave `pending` alone.
+    assert_eq!(
+        state.apply(mutation(BrowseRequest::Refresh { slug: None }, Ok("x"))),
+        None
+    );
+    assert!(state.pending.is_some());
+
+    let follow_up = state.apply(mutation(request.clone(), Ok("one: updated")));
+    assert_eq!(follow_up, Some(BrowseRequest::Feeds));
+    assert!(state.pending.is_none());
+    assert!(state.loading);
+    let notice = state.notice.clone().expect("a notice");
+    assert_eq!(
+        (notice.text.as_str(), notice.kind),
+        ("one: updated", NoticeKind::Ok)
+    );
+
+    // The listing answer settles loading but keeps the notice.
+    state.apply(BrowseResult::Feeds(Ok(vec![feed("one")])));
+    assert!(!state.loading);
+    assert_eq!(
+        state.notice.as_ref().map(|n| n.text.as_str()),
+        Some("one: updated")
+    );
+
+    press(&mut state, &[KeyCode::Char('r')]);
+    state.apply(mutation(request, Err("one: failed: boom")));
+    assert_eq!(state.notice.as_ref().map(|n| n.kind), Some(NoticeKind::Err));
+
+    // A fresh browser has nothing pending, so a late answer changes nothing.
+    let mut fresh = podcasts(vec![feed("one")]);
+    assert_eq!(
+        fresh.apply(mutation(BrowseRequest::Refresh { slug: None }, Ok("late"))),
+        None
+    );
+    assert!(fresh.notice.is_none());
+}
+
+#[test]
+fn removing_the_open_feed_returns_to_the_list_whatever_the_outcome() {
+    for outcome in [
+        Ok("two: unsubscribed"),
+        Err("two: the subscription was removed, but its cached episodes could not be deleted: x"),
+        Err("unknown feed: two"),
+    ] {
+        let mut state = podcasts(vec![feed("one"), feed("two")]);
+        press(&mut state, &[KeyCode::Down, KeyCode::Enter]);
+        state.apply(BrowseResult::Episodes {
+            slug: "two".to_owned(),
+            episodes: Ok(Vec::new()),
+        });
+        press(&mut state, &[KeyCode::Char('d'), KeyCode::Char('y')]);
+        let follow_up = state.apply(mutation(
+            BrowseRequest::Unsubscribe {
+                slug: "two".to_owned(),
+            },
+            outcome,
+        ));
+        assert!(state.episodes.is_none(), "{outcome:?}");
+        assert_eq!(follow_up, Some(BrowseRequest::Feeds), "{outcome:?}");
+        assert!(state.notice.is_some());
+    }
+}
+
+#[test]
+fn an_answer_on_the_files_tab_shows_the_notice_and_requests_nothing() {
+    let mut state = podcasts(vec![feed("one")]);
+    press(&mut state, &[KeyCode::Char('R')]);
+    press(&mut state, &[KeyCode::Tab]);
+    assert_eq!(state.tab, BrowserTab::Files);
+    assert!(state.pending.is_some(), "a tab switch keeps the mutation");
+    let follow_up = state.apply(mutation(BrowseRequest::Refresh { slug: None }, Ok("done")));
+    assert_eq!(follow_up, None);
+    assert_eq!(state.notice.as_ref().map(|n| n.text.as_str()), Some("done"));
 }
