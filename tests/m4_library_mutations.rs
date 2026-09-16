@@ -551,3 +551,33 @@ fn a_subscription_file_obstruction_fails_unsubscribe_before_touching_the_cache()
     );
     Ok(())
 }
+
+// --- Subscription lock -------------------------------------------------
+
+/// Every mutation holds `subscriptions.lock` (beside `subscriptions.json`)
+/// for its whole read-modify-write, so a second writer refuses instead of
+/// saving a stale snapshot over the first one's commit.
+#[test]
+fn a_mutation_refuses_while_another_holds_the_subscription_lock()
+-> Result<(), Box<dyn std::error::Error>> {
+    use continuo::lifecycle::lock::ProfileLock;
+    let rig = feeds::Rig::new()?;
+    let sub = rig.seed(RADIO_T, "https://example.org/feed")?;
+    let held = ProfileLock::acquire_file(&rig.subs.path().with_file_name("subscriptions.lock"))?;
+
+    match library::unsubscribe(&rig.subs, &rig.cache, &sub.slug) {
+        Err(error @ FeedError::SubscriptionsBusy) => {
+            assert_eq!(
+                error.to_string(),
+                "Another subscription update is in progress"
+            );
+        }
+        other => return Err(format!("expected SubscriptionsBusy, got {other:?}").into()),
+    }
+    assert_eq!(library::list_feeds(&rig.subs, &rig.cache)?.len(), 1);
+
+    drop(held);
+    library::unsubscribe(&rig.subs, &rig.cache, &sub.slug)?;
+    assert!(library::list_feeds(&rig.subs, &rig.cache)?.is_empty());
+    Ok(())
+}

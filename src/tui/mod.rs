@@ -51,7 +51,7 @@ use ratatui_image::picker::{Picker, ProtocolType};
 use crate::application::browse::{BrowseRequest, BrowseWorker};
 use crate::application::enrich::default_probe;
 use crate::application::runtime::{
-    AppCommand, FlushReport, LibraryStores, PlayerRuntime, RuntimeParts,
+    AppCommand, CoverKey, FlushReport, LibraryStores, PlayerRuntime, RuntimeParts,
 };
 use crate::application::view::PlayerView;
 use crate::artwork::worker::{ArtworkWorker, default_loader};
@@ -456,6 +456,9 @@ struct Artwork {
     /// The entry whose cover was last requested; `None` while the active
     /// entry has no cover source (see `PlayerRuntime::active_cover`).
     requested: Option<MediaId>,
+    /// The `cover_key` last seen; the cover is resolved only when it moves,
+    /// because resolving a podcast's cover reads the feed cache from disk.
+    key: Option<CoverKey>,
     covers: CoverCache,
 }
 
@@ -467,6 +470,7 @@ impl Artwork {
             hook,
             worker: None,
             requested: None,
+            key: None,
             covers: CoverCache::new(hook),
         }
     }
@@ -481,10 +485,14 @@ impl Artwork {
         if self.mode == ArtworkMode::Off {
             return;
         }
-        let active = runtime.active_cover();
-        let media = active.as_ref().map(|(media, _)| media);
-        if media != self.requested.as_ref() {
-            match active {
+        let key = runtime.cover_key();
+        if key != self.key {
+            self.key = key;
+            match runtime.active_cover() {
+                // A key move for a media already requested (its load landed,
+                // say) resolves to the same cover; only a new entry, or one
+                // whose cover just became available, is requested.
+                Some((media, _)) if self.requested.as_ref() == Some(&media) => {}
                 Some((media, source)) => {
                     self.covers.set_image(media.clone(), None);
                     let hook = self.hook;

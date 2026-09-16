@@ -36,6 +36,7 @@ use crate::playback::state::PlaybackState;
 use crate::playback::timeline::PositionQuality;
 use crate::playback::volume::Volume;
 use crate::session::{Action, LoadTarget, Session, resume_intent_for};
+use unicode_width::UnicodeWidthStr;
 
 /// Re-exported so a test can drive the exact key routing this file's own key
 /// loop uses, with no tty and no crossterm event in the loop at all.
@@ -479,12 +480,16 @@ fn run_probe_only(source: &str) -> Result<(), PlaybackError> {
         }
     }
 
-    let title = prepared
-        .source
-        .metadata()
-        .title
-        .clone()
-        .unwrap_or_else(|| "(untitled)".to_string());
+    // Decoder metadata is untrusted, local files included: escaped the way
+    // playback's status row and the feed listings escape it.
+    let title = crate::commands::displayable(
+        prepared
+            .source
+            .metadata()
+            .title
+            .as_deref()
+            .unwrap_or("(untitled)"),
+    );
     println!(
         "{title} {rate} Hz {channels} ch {duration:?} continuity={continuity:?} seek={seek:?} resume={resume:?}",
         rate = prepared.source.sample_rate(),
@@ -961,7 +966,7 @@ fn status_parts(mirror: &Mirror) -> (String, String) {
 /// still cut rather than wrapped, because a wrapped row is what breaks the
 /// in-place repaint.
 fn fit_status(name: &str, fields: &str, width: usize) -> String {
-    let fields_width = fields.chars().count();
+    let fields_width = UnicodeWidthStr::width(fields);
     if fields_width >= width {
         return fit_to_width(&format!("{name}{fields}"), width);
     }
@@ -1436,6 +1441,17 @@ mod tests {
             12,
         );
         assert_eq!(row.chars().count(), 12);
+    }
+
+    /// The name budget is in columns: a CJK name is cut so the whole row,
+    /// fields included, still fits the terminal width.
+    #[test]
+    fn a_wide_name_is_cut_by_columns_so_the_row_still_fits() {
+        let fields = " [playing] 00:00:04 / 03:07:31  vol 80%";
+        let row = fit_status(&"界".repeat(40), fields, 60);
+        assert!(row.ends_with(fields), "{row}");
+        assert!(UnicodeWidthStr::width(row.as_str()) <= 60, "{row}");
+        assert!(UnicodeWidthStr::width(row.as_str()) >= 59, "{row}");
     }
 
     #[test]

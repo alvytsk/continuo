@@ -22,6 +22,7 @@ Every audio fixture in this directory, and what it is for:
 | `sine-noxing.mp3` | 5 s, MP3, **no Xing/LAME header** | `Continuity::Unresolved` is reachable: nothing in the container or the transport declares a length |
 | `sine-long-noxing.mp3` | 600 s, mono CBR MP3, no Xing | A rescan long enough to *time* (M3.1's seek wedge) |
 | `sine-long-vbr-noxing.mp3` | 600 s, mono, genuinely VBR, no Xing | The byte-offset estimate's actual failure mode, not just its cost |
+| `sine-tagged.flac` | `sine.flac` with a `TITLE` tag carrying `ESC [2J` and a newline | `--probe-only` escapes decoder metadata instead of printing it raw |
 
 M4 adds no audio fixture. `sine-5s.flac` is the one it reuses: `tests/m4_playback_identity.rs` and `tests/m4_cli.rs`'s probe test both serve it from the loopback server as a podcast episode's enclosure.
 
@@ -32,6 +33,11 @@ M4 adds no audio fixture. `sine-5s.flac` is the one it reuses: `tests/m4_playbac
 
 `sine.mp3` and `sine.flac` are transcoded from `sine.wav` with
 `-c:a libmp3lame -b:a 128k` and `-c:a flac` respectively.
+
+`sine-tagged.flac` is `sine.flac` retagged:
+
+    cp sine.flac sine-tagged.flac
+    metaflac --remove-all-tags --set-tag=$'TITLE=Sine\x1b[2J\nInjected' sine-tagged.flac
 
 MP3 and FLAC are present because M1 promises those formats. Testing WAV alone
 would leave both promised codecs unexercised, and symphonia's `mp3` feature is

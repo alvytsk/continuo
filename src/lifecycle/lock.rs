@@ -47,9 +47,17 @@ impl ProfileLock {
     /// nor reads.
     pub fn acquire(state_file: &Path) -> Result<Self, LockError> {
         let dir = state_file.parent().unwrap_or_else(|| Path::new("."));
+        Self::acquire_file(&dir.join("state.lock"))
+    }
+
+    /// Acquires an exclusive OS lock on exactly `path`, preparing its parent
+    /// directory first. `acquire` is this with the profile's `state.lock`;
+    /// the subscription writers use it with `subscriptions.lock`.
+    pub fn acquire_file(path: &Path) -> Result<Self, LockError> {
+        let dir = path.parent().unwrap_or_else(|| Path::new("."));
         prepare_directory(dir).map_err(LockError::Directory)?;
 
-        let path = dir.join("state.lock");
+        let path = path.to_path_buf();
         let file = lock_options().open(&path).map_err(|source| LockError::Io {
             path: path.clone(),
             op: "open",

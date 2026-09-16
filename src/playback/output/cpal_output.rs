@@ -94,21 +94,20 @@ impl AudioOutput for CpalOutput {
             .default_output_config()
             .map_err(PlaybackError::Output)?;
         // The stream is built with an `f32` buffer, so the device has to accept
-        // f32. Its DEFAULT config may not be f32 while an f32 config is still
-        // on offer, so fall back to searching what it supports before refusing
-        // - preferring one that can run at the default's sample rate.
-        let config = if config.sample_format() == cpal::SampleFormat::F32 {
+        // f32, and the engine drives mono or stereo only. The DEFAULT config
+        // may fail either test while a usable config is still on offer - a
+        // six- or eight-channel f32 default is routine on HDMI and PipeWire -
+        // so fall back to searching what it supports before refusing,
+        // preferring one that can run at the default's sample rate.
+        let usable = |range: &cpal::SupportedStreamConfigRange| {
+            range.sample_format() == cpal::SampleFormat::F32 && matches!(range.channels(), 1 | 2)
+        };
+        let default_usable =
+            config.sample_format() == cpal::SampleFormat::F32 && matches!(config.channels(), 1 | 2);
+        let config = if default_usable {
             config
         } else {
             let wanted = config.sample_rate();
-            // Filter on channel count as well as format. This milestone drives
-            // mono or stereo only, and the engine refuses anything wider, so a
-            // six-channel f32 range is not a usable answer even though it is an
-            // f32 one - picking it would refuse a device that offers stereo.
-            let usable = |range: &cpal::SupportedStreamConfigRange| {
-                range.sample_format() == cpal::SampleFormat::F32
-                    && matches!(range.channels(), 1 | 2)
-            };
             let chosen = device
                 .supported_output_configs()
                 .map_err(PlaybackError::Output)?
@@ -132,7 +131,9 @@ impl AudioOutput for CpalOutput {
                         path: Default::default(),
                         reason: format!(
                             "the audio device offers no mono or stereo f32 configuration \
-                             (its default is {:?}); this build outputs f32 only",
+                             (its default is {} channels of {:?}); this build outputs \
+                             f32 mono or stereo only",
+                            config.channels(),
                             config.sample_format()
                         ),
                     });

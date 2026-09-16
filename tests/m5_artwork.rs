@@ -258,6 +258,7 @@ fn a_remote_streams_embedded_front_cover_becomes_the_active_cover_source() {
 
     rig.runtime.pump();
     assert!(rig.runtime.active_cover().is_none(), "nothing before play");
+    let key_before = rig.runtime.cover_key();
     let remote = row_ids(&rig.runtime)[0];
     rig.runtime.handle(AppCommand::PlayEntry(remote));
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -274,6 +275,13 @@ fn a_remote_streams_embedded_front_cover_becomes_the_active_cover_source() {
         std::thread::sleep(Duration::from_millis(10));
     };
     assert!(matches!(source, CoverSource::Embedded(_)));
+    // The media did not change, but the cover became available: the cheap
+    // key the player polls must reflect that, or the placeholder would stay.
+    assert_ne!(
+        rig.runtime.cover_key(),
+        key_before,
+        "loading made the cover available without changing the media"
+    );
     let requests_before = server.requests().len();
     let image = default_loader(TestHook::None)(&source).expect("embedded cover decodes");
     assert_eq!((image.width(), image.height()), (4, 3));

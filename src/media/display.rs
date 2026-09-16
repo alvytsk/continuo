@@ -5,6 +5,8 @@
 
 use std::time::Duration;
 
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
 use url::Url;
 
 use crate::http::error::redact_url;
@@ -64,21 +66,29 @@ pub fn remote_display_name(url: &str) -> String {
 /// podcast episode's canonical id runs to about 110 characters and makes that
 /// reachable with ordinary input, but a long enough filename always could.
 ///
-/// Counting is by `char`, which keeps multi-byte titles intact — Cyrillic
-/// episode names are the common case here. It still treats a wide glyph as one
-/// column, so a CJK title can cut one row short of the edge; erring narrow
-/// keeps the redraw correct, which is the property that matters.
+/// Measured in terminal columns, not characters: a two-byte Cyrillic letter
+/// is one column but a CJK glyph is two, and counting either as "a char"
+/// would let a CJK title run past the edge and wrap. The prefix is taken by
+/// accumulated column width, leaving one column for the ellipsis, so the
+/// result never exceeds `width` even when the cut lands beside a wide glyph.
 pub fn fit_to_width(text: &str, width: usize) -> String {
     if width == 0 {
         return String::new();
     }
-    if text.chars().count() <= width {
+    if UnicodeWidthStr::width(text) <= width {
         return text.to_owned();
     }
-    text.chars()
-        .take(width.saturating_sub(1))
-        .chain(std::iter::once('…'))
-        .collect()
+    let budget = width - 1;
+    let mut used = 0;
+    let mut fitted: String = text
+        .chars()
+        .take_while(|glyph| {
+            used += UnicodeWidthChar::width(*glyph).unwrap_or(0);
+            used <= budget
+        })
+        .collect();
+    fitted.push('…');
+    fitted
 }
 
 pub fn format_hms(duration: Duration) -> String {
@@ -151,6 +161,20 @@ mod tests {
         let fitted = fit_to_width("Радио-Т 1030 играет прямо сейчас", 10);
         assert_eq!(fitted.chars().count(), 10);
         assert_eq!(fitted, "Радио-Т 1…");
+    }
+
+    /// Width is terminal columns, not characters: a CJK glyph takes two. Ten
+    /// of them are twenty columns, and passing them through a ten-column
+    /// budget untouched is exactly the wrap the function exists to prevent.
+    #[test]
+    fn a_wide_glyph_counts_as_two_columns() {
+        let wide = "界".repeat(10);
+        assert_eq!(fit_to_width(&wide, 20), wide);
+        let fitted = fit_to_width(&wide, 10);
+        assert_eq!(fitted, format!("{}…", "界".repeat(4)));
+        assert_eq!(UnicodeWidthStr::width(fitted.as_str()), 9);
+        // A budget that lands mid-glyph stops one column short rather than over.
+        assert_eq!(UnicodeWidthStr::width(fit_to_width(&wide, 9).as_str()), 9);
     }
 
     #[test]

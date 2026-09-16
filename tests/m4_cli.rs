@@ -414,14 +414,43 @@ mod cli_process {
         assert!(listing.contains("SLUG"), "{listing}");
         assert_eq!(listing.lines().count(), 1, "{listing}");
 
-        // `refresh` over an empty snapshot is an empty, successful batch.
-        let batch = succeeded(&run_cli(root.path(), &["refresh"])?)?;
-        assert!(batch.is_empty(), "{batch}");
-
         assert!(!root.path().join("data").exists());
         assert!(!root.path().join("cache").exists());
         assert!(!root.path().join("state").exists());
+
+        // `refresh` over an empty snapshot is an empty, successful batch. As a
+        // writer it takes `subscriptions.lock`, and that file is the only
+        // thing it leaves behind: no subscriptions, no cache, no state.
+        let batch = succeeded(&run_cli(root.path(), &["refresh"])?)?;
+        assert!(batch.is_empty(), "{batch}");
+        assert_eq!(
+            files_under(&root.path().join("data")),
+            ["subscriptions.lock"]
+        );
+        assert!(!root.path().join("cache").exists());
+        assert!(!root.path().join("state").exists());
         Ok(())
+    }
+
+    /// Every regular file below `dir`, by name, sorted.
+    fn files_under(dir: &std::path::Path) -> Vec<String> {
+        let mut names = Vec::new();
+        let mut pending = vec![dir.to_path_buf()];
+        while let Some(dir) = pending.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else {
+                    names.push(entry.file_name().to_string_lossy().into_owned());
+                }
+            }
+        }
+        names.sort();
+        names
     }
 
     /// §5.5/§8.4: the listings are answered from disk, so they keep working
