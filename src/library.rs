@@ -55,6 +55,7 @@ use crate::feed::parse::{ParseWarning, parse_feed};
 use crate::http::document::{DocumentOutcome, DocumentRequest};
 use crate::http::error::{RemoteFailure, redact_url};
 use crate::http::service::HttpService;
+use crate::lifecycle::lock::{LockError, ProfileLock};
 use crate::media::id::{FeedId, MediaId, NormalizedUrl};
 use crate::media::source::SourceLocation;
 use crate::persistence::model::PersistedCheckpoint;
@@ -375,6 +376,23 @@ pub struct UnsubscribeOutcome {
 /// [`crate::persistence::store::LoadReason`] but `Loaded` and `Missing`
 /// (both `writable`) becomes a visible [`FeedError::SubscriptionsUnreadable`]
 /// instead, naming the quarantine path where there is one.
+/// Serializes the subscription writers. Every mutating function holds this
+/// for its whole read-modify-write — the fetch included — so a snapshot read
+/// before the network call can never be saved over another writer's commit.
+/// A separate `subscriptions.lock` beside `subscriptions.json`, not the
+/// player's `state.lock`: feed commands keep working while a player runs.
+/// Contention refuses at once; there is no waiting or retry.
+fn lock_subscriptions(subs: &SubscriptionStore) -> Result<ProfileLock, FeedError> {
+    ProfileLock::acquire_file(&subs.path().with_file_name("subscriptions.lock")).map_err(|error| {
+        match error {
+            LockError::Contended => FeedError::SubscriptionsBusy,
+            other => FeedError::SubscriptionsUnreadable {
+                reason: format!("cannot lock subscriptions: {other}"),
+            },
+        }
+    })
+}
+
 fn load_mutating(subs: &SubscriptionStore) -> Result<SubscriptionSnapshot, FeedError> {
     let SubscriptionLoad {
         snapshot,
@@ -538,6 +556,7 @@ pub async fn subscribe(
     url: &str,
     slug: Option<&str>,
 ) -> Result<SubscribeOutcome, FeedError> {
+    let _guard = lock_subscriptions(subs)?;
     let mut snapshot = load_mutating(subs)?;
 
     let origin = validate_public_url(url)?;
@@ -648,6 +667,7 @@ pub fn unsubscribe(
     cache: &CacheStore,
     slug: &str,
 ) -> Result<UnsubscribeOutcome, FeedError> {
+    let _guard = lock_subscriptions(subs)?;
     let mut snapshot = load_mutating(subs)?;
     let subscription = find_subscription(&snapshot, slug)?;
     snapshot
@@ -857,6 +877,7 @@ pub async fn refresh(
     cache: &CacheStore,
     slug: &str,
 ) -> Result<RefreshOutcome, FeedError> {
+    let _guard = lock_subscriptions(subs)?;
     let mut snapshot = load_mutating(subs)?;
     let subscription = find_subscription(&snapshot, slug)?;
     let index = snapshot
@@ -870,7 +891,7 @@ pub async fn refresh(
 }
 
 /// `continuo refresh` with no slug (§6.1, §6.6). Executes strictly
-/// sequentially — no lock, no background task, no retries on a generic
+/// sequentially — no background task, no retries on a generic
 /// network failure — for deterministic outcomes and bounded resource use.
 ///
 /// The outer `Result` is reserved for a failure that prevents enumeration
@@ -883,6 +904,7 @@ pub async fn refresh_all(
     subs: &SubscriptionStore,
     cache: &CacheStore,
 ) -> Result<Vec<RefreshOutcome>, FeedError> {
+    let _guard = lock_subscriptions(subs)?;
     let mut snapshot = load_mutating(subs)?;
     let mut results = Vec::with_capacity(snapshot.subscriptions.len());
     for index in 0..snapshot.subscriptions.len() {
