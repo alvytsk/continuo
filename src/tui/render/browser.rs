@@ -244,9 +244,9 @@ fn draw_row(
 }
 
 /// The prompt, the confirmation question or the mutation notice, as a block
-/// of up to a third of `area` above the rows (M6 §5); returns what is left
-/// for the rows. A notice with more lines than fit ends in a marker; the
-/// worker logged the whole text.
+/// of up to a third of `area` (two rows at minimum when the text is cut), the
+/// last row of a cut block being the marker; returns what is left for the rows.
+/// The full text is logged once at info level through `tracing`.
 fn draw_notice_block(
     buffer: &mut Buffer,
     area: Rect,
@@ -256,9 +256,15 @@ fn draw_notice_block(
     let Some((lines, color)) = notice_lines(browser, theme) else {
         return area;
     };
-    let budget = usize::from(area.height / 3).max(1);
-    let shown = lines.len().min(budget);
-    let hidden = lines.len() - shown;
+    let third = usize::from(area.height / 3);
+    let (shown, hidden) = if lines.len() <= third.max(1) {
+        (lines.len(), 0)
+    } else {
+        // The marker takes the last budgeted row; two rows at minimum so a
+        // tiny area still shows one line above it.
+        let budget = third.max(2);
+        (budget - 1, lines.len() - (budget - 1))
+    };
     let height = u16::try_from(shown + usize::from(hidden > 0)).unwrap_or(u16::MAX);
     let mut y = area.y;
     for line in lines.iter().take(shown) {

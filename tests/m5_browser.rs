@@ -771,14 +771,14 @@ fn a_long_notice_is_cut_to_a_third_of_the_list_with_a_marker() {
     ));
     state.apply(BrowseResult::Feeds(Ok(vec![feed("one")])));
     let (text, buffer) = screen(&state);
-    // The 90×24 screen gives the list 17 rows; a third is 5.
-    assert!(text.contains("line5"), "{text}");
-    assert!(!text.contains("line6"), "{text}");
-    assert!(text.contains("+3 more lines, see log"), "{text}");
+    // The 90×24 screen gives the list 17 rows; a third is 5, the marker takes the fifth.
+    assert!(text.contains("line4"), "{text}");
+    assert!(!text.contains("line5"), "{text}");
+    assert!(text.contains("+4 more lines, see log"), "{text}");
     assert!(text.contains("one title"), "rows still drawn: {text}");
     let marker_row = text
         .lines()
-        .position(|line| line.contains("+3 more lines"))
+        .position(|line| line.contains("+4 more lines"))
         .unwrap_or_else(|| panic!("{text}"));
     let amber = buffer[(4, u16::try_from(marker_row).unwrap_or(0))].fg;
     let ok_state = {
