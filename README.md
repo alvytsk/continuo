@@ -157,9 +157,10 @@ and `b` or Esc closes it. Directories are read one level at a time; nothing
 indexes a library recursively.
 
 **Opening the browser never refreshes a feed.** The Podcasts tab lists what
-`continuo subscribe` and `continuo refresh` last cached, exactly like
-`continuo episodes`, and the only way to update it is still `continuo refresh`
-from a shell. Enqueueing or restoring a URL or an episode makes no network
+was last cached, exactly like `continuo episodes`; updating it is an explicit
+act, `r` or `R` in the browser or `continuo refresh` from a shell, and the
+same goes for `a` and `d` beside `continuo subscribe` and `continuo
+unsubscribe`. Enqueueing or restoring a URL or an episode makes no network
 request either; only playing it does.
 
 ### The queue
