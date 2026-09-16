@@ -72,7 +72,7 @@ Submitting a mutation sets `pending` to the request and shows a working notice (
 **On a matching answer,** in this order:
 
 1. `pending` clears.
-2. If the request was `Unsubscribe { slug }` and an episode view for that slug is open, leave it as `back()` does — whether the outcome is `Ok` or `Err`, because the subscription is removed before cache cleanup (M4 §5.3), so a follow-up failure still means the feed is gone, and an `UnknownSlug` error means it was already gone.
+2. If the request was `Unsubscribe { slug }` and an episode view for that slug is open, leave it the way `back()` changes the view (episodes cleared, cursor on the feed list, marks cleared) but without its `Feeds` request, which step 4 issues — whether the outcome is `Ok` or `Err`, because the subscription is removed before cache cleanup (M4 §5.3), so a follow-up failure still means the feed is gone, and an `UnknownSlug` error means it was already gone.
 3. The notice becomes the outcome text with its kind (`Ok` or `Err`).
 4. The visible list is re-requested when the Podcasts tab is showing: `Feeds` on the feed list, `Episodes { slug }` in an episode view. On the Files tab nothing is requested; switching back to Podcasts already requests `Feeds`.
 
