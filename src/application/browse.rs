@@ -25,6 +25,7 @@ use crate::application::runtime::LibraryStores;
 use crate::commands::{
     finish_refresh_batch, finish_refresh_one, finish_subscribe, finish_unsubscribe, report,
 };
+use crate::http::error::redact_url;
 use crate::http::limits::Limits;
 use crate::http::service::HttpService;
 use crate::library::{
@@ -248,8 +249,8 @@ fn answer(
                 None => Err(NO_LIBRARY.to_owned()),
             };
             match &outcome {
-                Ok(text) => tracing::info!(?request, "{text}"),
-                Err(text) => tracing::info!(?request, "failed: {text}"),
+                Ok(text) => tracing::info!(request = %describe(&request), "{text}"),
+                Err(text) => tracing::info!(request = %describe(&request), "failed: {text}"),
             }
             BrowseResult::Mutation { request, outcome }
         }
@@ -310,4 +311,18 @@ fn http_service(slot: &mut Option<Arc<HttpService>>) -> Result<Arc<HttpService>,
     let service = HttpService::spawn(Limits::default()).map_err(|error| error.to_string())?;
     *slot = Some(Arc::clone(&service));
     Ok(service)
+}
+
+/// Returns a redacted description of the request for logging, redacting any
+/// URLs to prevent userinfo or signed queries from reaching the log.
+fn describe(request: &BrowseRequest) -> String {
+    match request {
+        BrowseRequest::Directory(_) => "Directory".to_string(),
+        BrowseRequest::Feeds => "Feeds".to_string(),
+        BrowseRequest::Episodes { slug } => format!("Episodes({})", slug),
+        BrowseRequest::Subscribe { url } => format!("Subscribe({})", redact_url(url)),
+        BrowseRequest::Refresh { slug: Some(slug) } => format!("Refresh({})", slug),
+        BrowseRequest::Refresh { slug: None } => "Refresh(all)".to_string(),
+        BrowseRequest::Unsubscribe { slug } => format!("Unsubscribe({})", slug),
+    }
 }

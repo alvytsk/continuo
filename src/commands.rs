@@ -157,7 +157,7 @@ fn stdout_failure(source: std::io::Error) -> FeedError {
 /// The CLI's report of `outcome` as text, for a front end that shows it
 /// instead of printing it: `Ok` is what stdout would have carried, `Err`
 /// that text (when any) followed by the error the exit status would have
-/// named. Trailing newlines are dropped; the TUI splits on the rest.
+/// named. Trailing whitespace is dropped; the TUI splits on the rest.
 pub(crate) fn report<T>(
     finish: impl FnOnce(&mut dyn Write, T) -> Result<(), FeedError>,
     outcome: T,
