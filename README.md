@@ -153,8 +153,12 @@ directory, else the directory `tui` was started in — and over cached podcast
 subscriptions. Up/Down or `j`/`k` move, Tab switches between Files and
 Podcasts, Enter opens a directory or a feed and enqueues a file or an episode,
 Space marks several rows to enqueue together, Backspace or Left goes back up,
-and `b` or Esc closes it. Directories are read one level at a time; nothing
-indexes a library recursively.
+and `b` or Esc closes it. A row already in the queue shows a green `✓`, and
+Enter on it removes that entry from the queue again; marking skips such rows.
+A feed's episodes are listed newest first, with undated ones after the dated
+ones in feed order (`continuo episodes` keeps feed order, so its indices do
+not move). Directories are read one level at a time; nothing indexes a
+library recursively.
 
 **Opening the browser never refreshes a feed.** The Podcasts tab lists what
 was last cached, exactly like `continuo episodes`; updating it is an explicit

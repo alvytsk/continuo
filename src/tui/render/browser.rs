@@ -16,9 +16,9 @@ use crate::tui::browser::{BrowserState, BrowserTab, NoticeKind};
 use crate::tui::layout::{inset, take_left, take_right, visible_rows};
 use crate::tui::theme::Theme;
 
-const HINTS: &str = "enter open/add · space mark · tab files/podcasts · ⌫ back · b close";
+const HINTS: &str = "enter open/add/remove · space mark · tab files/podcasts · ⌫ back · b close";
 const PODCAST_HINTS: &str =
-    "enter open/add · space mark · a subscribe · r/R refresh · d remove · ⌫ back · b close";
+    "enter open/add/remove · space mark · a subscribe · r/R refresh · d remove · ⌫ back · b close";
 const NO_FEEDS: &str = "No subscriptions — press a to add a feed URL";
 const PROMPT: &str = "Feed URL: ";
 const LOADING: &str = "Loading…";
@@ -148,6 +148,7 @@ fn draw_list(buffer: &mut Buffer, area: Rect, browser: &BrowserState, theme: &Th
             row(rows, y),
             cells,
             browser.marked.contains(&index),
+            browser.queued_at(index).is_some(),
             index == browser.cursor,
             theme,
         );
@@ -212,6 +213,7 @@ fn draw_row(
     rect: Rect,
     cells: RowCells,
     marked: bool,
+    queued: bool,
     under_cursor: bool,
     theme: &Theme,
 ) {
@@ -230,6 +232,14 @@ fn draw_row(
             Style::new().fg(theme.amber)
         };
         Line::styled("●", mark_style).render(mark, buffer);
+    } else if queued {
+        // The acknowledgement that the row is in the queue.
+        let tick_style = if under_cursor {
+            style
+        } else {
+            Style::new().fg(theme.green)
+        };
+        Line::styled("✓", tick_style).render(mark, buffer);
     }
     if let Some(detail) = cells.detail
         && rest.width >= DETAIL_MIN_ROW

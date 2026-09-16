@@ -234,6 +234,7 @@ pub struct EpisodeCandidate {
     pub enclosure: Option<Url>,
     pub title: Option<String>,
     pub declared_duration: Option<Duration>,
+    pub published: Option<OffsetDateTime>,
 }
 
 /// Candidates for `slug`, in the same stored (never re-sorted) order as
@@ -258,6 +259,7 @@ pub fn episode_candidates(
                 enclosure: cached_episode.enclosure_url.clone(),
                 title: episode.title,
                 declared_duration: episode.declared_duration,
+                published: episode.published,
             }
         })
         .collect())

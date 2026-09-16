@@ -9,14 +9,17 @@
 //! another directory, feed or tab empties the list and marks it loading, and
 //! an answer for anywhere else is dropped.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 
 use crate::application::browse::{BrowseRequest, BrowseResult, DirEntry, EntryKind};
 use crate::application::runtime::EnqueueItem;
+use crate::application::view::QueueRow;
 use crate::library::{EpisodeCandidate, FeedSummary};
+use crate::media::id::MediaId;
+use crate::queue::QueueEntryId;
 use crate::tui::input::blocks_ordinary_bindings;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -67,12 +70,18 @@ pub struct BrowserState {
     /// answer (M6 §5).
     pub pending: Option<BrowseRequest>,
     pub notice: Option<Notice>,
+    /// What the queue holds, by media identity, as of the last
+    /// [`sync_queue`](Self::sync_queue): a queued row draws a tick and Enter
+    /// removes it instead of adding it again.
+    pub queued: HashMap<MediaId, QueueEntryId>,
 }
 
 #[derive(Clone, Debug)]
 pub enum BrowserEffect {
     Request(BrowseRequest),
     Enqueue(Vec<EnqueueItem>),
+    /// Enter on a row already in the queue takes it out again.
+    Remove(QueueEntryId),
     Close,
 }
 
@@ -94,7 +103,24 @@ impl BrowserState {
             confirm: None,
             pending: None,
             notice: None,
+            queued: HashMap::new(),
         }
+    }
+
+    /// Records which media the queue holds; with duplicates, the later row
+    /// is the one Enter removes.
+    pub fn sync_queue(&mut self, rows: &[QueueRow]) {
+        self.queued = rows.iter().map(|row| (row.media.clone(), row.id)).collect();
+    }
+
+    /// The queue entry row `index` is already in, if any.
+    pub fn queued_at(&self, index: usize) -> Option<QueueEntryId> {
+        let media = match (self.tab, &self.episodes) {
+            (BrowserTab::Files, _) => self.entries.get(index)?.media.as_ref()?,
+            (BrowserTab::Podcasts, None) => return None,
+            (BrowserTab::Podcasts, Some((_, episodes))) => &episodes.get(index)?.media,
+        };
+        self.queued.get(media).copied()
     }
 
     /// Takes in a worker's answer when it is for the list on screen or for
@@ -117,7 +143,11 @@ impl BrowserState {
             BrowseResult::Episodes { slug, episodes } => {
                 let viewing = matches!(&self.episodes, Some((current, _)) if *current == slug);
                 if self.tab == BrowserTab::Podcasts && viewing {
-                    let list = self.settle(episodes);
+                    let mut list = self.settle(episodes);
+                    // Newest first; undated episodes keep their stored order
+                    // after the dated ones. The CLI keeps stored order so
+                    // `play <slug> <index>` stays stable.
+                    list.sort_by_key(|episode| std::cmp::Reverse(episode.published));
                     self.episodes = Some((slug, list));
                 }
             }
@@ -410,8 +440,14 @@ impl BrowserState {
     }
 
     /// The marked rows in listing order, or the cursor's row when nothing is
-    /// marked; the marks clear once they are enqueued.
+    /// marked; the marks clear once they are enqueued. Rows already in the
+    /// queue are skipped, and Enter on one alone takes it out instead.
     fn enqueue_selection(&mut self) -> Vec<BrowserEffect> {
+        if self.marked.is_empty()
+            && let Some(id) = self.queued_at(self.cursor)
+        {
+            return vec![BrowserEffect::Remove(id)];
+        }
         let indices: Vec<usize> = if self.marked.is_empty() {
             vec![self.cursor]
         } else {
@@ -419,7 +455,7 @@ impl BrowserState {
         };
         let items: Vec<EnqueueItem> = indices
             .into_iter()
-            .filter(|index| self.enqueueable(*index))
+            .filter(|index| self.enqueueable(*index) && self.queued_at(*index).is_none())
             .filter_map(|index| match (self.tab, &self.episodes) {
                 (BrowserTab::Files, _) => self
                     .entries

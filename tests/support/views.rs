@@ -39,6 +39,14 @@ pub fn ids() -> Vec<QueueEntryId> {
         .unwrap_or_else(|error| panic!("three entries fit: {error}"))
 }
 
+/// The identity `ids()` gave entry `name`.
+pub fn media(name: &str) -> MediaId {
+    MediaId::LocalFile(
+        AbsolutePath::new(format!("/music/{name}.flac").into())
+            .unwrap_or_else(|error| panic!("absolute path: {error}")),
+    )
+}
+
 pub fn decoded(seconds: u64) -> DisplayDuration {
     DisplayDuration {
         value: Duration::from_secs(seconds),
@@ -52,6 +60,7 @@ pub fn view(phase: PlaybackPhase, now: Option<NowPlaying>) -> PlayerView {
         rows: vec![
             QueueRow {
                 id: ids[0],
+                media: media("a"),
                 title: "Morning Tide".into(),
                 subtitle: Some("Harbor".into()),
                 duration: Some(decoded(185)),
@@ -59,6 +68,7 @@ pub fn view(phase: PlaybackPhase, now: Option<NowPlaying>) -> PlayerView {
             },
             QueueRow {
                 id: ids[1],
+                media: media("b"),
                 title: "Long Episode".into(),
                 subtitle: None,
                 duration: Some(DisplayDuration {
@@ -72,6 +82,7 @@ pub fn view(phase: PlaybackPhase, now: Option<NowPlaying>) -> PlayerView {
             },
             QueueRow {
                 id: ids[2],
+                media: media("c"),
                 title: "Done".into(),
                 subtitle: None,
                 duration: None,

@@ -22,6 +22,7 @@ use std::thread;
 use crossbeam_channel::{Receiver, Sender};
 
 use crate::application::runtime::LibraryStores;
+use crate::application::source::resolve_path;
 use crate::commands::{
     finish_refresh_batch, finish_refresh_one, finish_subscribe, finish_unsubscribe, report,
     wait_http,
@@ -33,6 +34,7 @@ use crate::library::{
     EpisodeCandidate, FeedSummary, episode_candidates, list_feeds, refresh, refresh_all, subscribe,
     unsubscribe,
 };
+use crate::media::id::MediaId;
 
 /// The extensions a listing classifies as audio, compared ASCII
 /// case-insensitively.
@@ -54,6 +56,10 @@ pub struct DirEntry {
     pub name: String,
     pub path: PathBuf,
     pub kind: EntryKind,
+    /// The identity the queue gives an audio file (its canonical path), so
+    /// the browser can tell which rows are already queued; `None` for
+    /// anything else or when the file cannot be resolved.
+    pub media: Option<MediaId>,
 }
 
 /// One level of `path`: directories first, then the rest, each group by
@@ -73,10 +79,14 @@ pub fn list_directory(path: &Path) -> std::io::Result<Vec<DirEntry>> {
         } else {
             EntryKind::Other
         };
+        let media = (kind == EntryKind::Audio)
+            .then(|| resolve_path(&entry_path).ok().map(|(media, _)| media))
+            .flatten();
         entries.push(DirEntry {
             name: entry.file_name().to_string_lossy().into_owned(),
             path: entry_path,
             kind,
+            media,
         });
     }
     entries.sort_by_cached_key(|entry| {

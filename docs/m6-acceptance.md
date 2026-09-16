@@ -9,7 +9,7 @@
 | Prompt, confirm, refresh keys, pending, correlation, reconciliation, notice drawing | `tests/m5_browser.rs` (the tests added for M6; §8's close-and-reopen case is covered in-state by the "fresh browser" block of `a_matching_answer_shows_the_notice_and_re_reads_the_list`, rather than through a delayed-response server, since `apply` is a pure function and the assertion is the same without loopback timing) |
 | Worker answers with the CLI's wording; failures are values; refresh-all reports every feed; browsing makes no request | `tests/m6_feed_management.rs` |
 | Browsing, enqueueing and restoring make no request | `tests/m5_no_network.rs` (unchanged) |
-| Gates | `cargo fmt --check`, `cargo clippy --locked --all-targets --all-features -- -D warnings`, `cargo test --locked` — all exit 0; `cargo test --locked` across 83 binaries: 1030 passed, 0 failed, 1 ignored |
+| Gates | `cargo fmt --check`, `cargo clippy --locked --all-targets --all-features -- -D warnings`, `cargo test --locked` — all exit 0; `cargo test --locked` across 83 binaries: 1033 passed, 0 failed, 1 ignored (after the queue-tick and newest-first change) |
 
 ## Manual, Ghostty, Radio-T
 
@@ -20,4 +20,6 @@
 | `R` on the feed list with two feeds: both lines reported | not run — requires a human at the terminal |
 | `d`, `n`: nothing happens; `d`, `y` inside the feed: back on the list, feed gone, "radio-t: unsubscribed" | not run — requires a human at the terminal |
 | Resubscribe: the feed returns with a fresh count | not run — requires a human at the terminal |
+| Enter on an episode: a green `✓` appears on its row; Enter again removes it from the queue and the tick goes; Space-marking a ticked row and an unticked one then Enter adds only the unticked one | not run — requires a human at the terminal |
+| Open a feed that lists oldest first in its XML (web-standards): the newest episode is at the top | not run — requires a human at the terminal |
 | Typing `q`, `b`, space in the prompt inserts text and nothing else happens | not run — requires a human at the terminal |

@@ -7,8 +7,10 @@ use continuo::application::browse::{
     BrowseRequest, BrowseResult, BrowseWorker, DirEntry, EntryKind, list_directory,
 };
 use continuo::application::runtime::EnqueueItem;
+use continuo::application::view::QueueRow;
 use continuo::library::{EpisodeCandidate, FeedSummary};
-use continuo::media::id::{EpisodeKey, FeedId, MediaId};
+use continuo::media::id::{AbsolutePath, EpisodeKey, FeedId, MediaId};
+use continuo::queue::QueueEntryId;
 use continuo::tui::browser::{BrowserEffect, BrowserState, BrowserTab, NoticeKind};
 use continuo::tui::render::{Visuals, draw};
 use continuo::tui::state::{Overlay, UiState};
@@ -16,6 +18,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::style::Modifier;
+use time::OffsetDateTime;
 
 #[path = "support/views.rs"]
 mod views;
@@ -57,19 +60,35 @@ fn listed(root: &Path) -> BrowserState {
 fn a_listing_is_one_level_directories_first_and_classifies_audio() {
     let (_dir, root) = sample_dir();
     let entries = list_directory(&root).unwrap_or_else(|error| panic!("list: {error}"));
+    let listed: Vec<(&str, &Path, EntryKind)> = entries
+        .iter()
+        .map(|entry| (entry.name.as_str(), entry.path.as_path(), entry.kind))
+        .collect();
     let expected = [
         ("z", EntryKind::Directory),
         ("a.flac", EntryKind::Audio),
         ("b.MP3", EntryKind::Audio),
         ("notes.txt", EntryKind::Other),
     ]
-    .map(|(name, kind)| DirEntry {
-        name: name.to_owned(),
-        path: root.join(name),
-        kind,
-    });
-    assert_eq!(entries, expected);
+    .map(|(name, kind)| (name, root.join(name), kind));
+    let expected: Vec<(&str, &Path, EntryKind)> = expected
+        .iter()
+        .map(|(name, path, kind)| (*name, path.as_path(), *kind))
+        .collect();
+    assert_eq!(listed, expected);
     assert!(entries.iter().all(|entry| entry.name != "deep.flac"));
+
+    // An audio file carries the identity the queue will use for it, so the
+    // browser can tell which rows are already queued; nothing else does.
+    let canonical = root
+        .join("a.flac")
+        .canonicalize()
+        .unwrap_or_else(|error| panic!("canonicalize: {error}"));
+    let expected_media = MediaId::LocalFile(
+        AbsolutePath::new(canonical).unwrap_or_else(|error| panic!("absolute: {error}")),
+    );
+    assert_eq!(entries[1].media, Some(expected_media));
+    assert!(entries[0].media.is_none() && entries[3].media.is_none());
 }
 
 #[test]
@@ -234,6 +253,26 @@ fn episode(guid: &str, enclosure: Option<&str>) -> EpisodeCandidate {
         enclosure: enclosure.map(|url| url.parse().unwrap_or_else(|error| panic!("url: {error}"))),
         title: Some(guid.to_owned()),
         declared_duration: None,
+        published: None,
+    }
+}
+
+fn dated(guid: &str, unix: i64) -> EpisodeCandidate {
+    let mut candidate = episode(guid, Some("https://cdn.example.org/x.mp3"));
+    candidate.published = Some(
+        OffsetDateTime::from_unix_timestamp(unix).unwrap_or_else(|error| panic!("time: {error}")),
+    );
+    candidate
+}
+
+fn queue_row(id: QueueEntryId, media: MediaId) -> QueueRow {
+    QueueRow {
+        id,
+        media,
+        title: "queued".to_owned(),
+        subtitle: None,
+        duration: None,
+        saved: None,
     }
 }
 
@@ -368,11 +407,13 @@ fn the_overlay_draws_safe_names_marks_and_dimmed_unplayable_episodes() {
                 name: "albums".to_owned(),
                 path: root.join("albums"),
                 kind: EntryKind::Directory,
+                media: None,
             },
             DirEntry {
                 name: "evil\u{1b}[2Jname.mp3".to_owned(),
                 path: root.join("evil.mp3"),
                 kind: EntryKind::Audio,
+                media: None,
             },
         ]),
     });
@@ -794,4 +835,123 @@ fn a_long_notice_is_cut_to_a_third_of_the_list_with_a_marker() {
         .unwrap_or_else(|| panic!("{ok_text}"));
     let muted = ok_buffer[(4, u16::try_from(ok_row).unwrap_or(0))].fg;
     assert_ne!(amber, muted, "errors and successes differ in color");
+}
+
+#[test]
+fn enter_on_a_queued_row_removes_it_and_marks_skip_queued_rows() {
+    let (_dir, root) = sample_dir();
+    let mut state = listed(&root);
+    let ids = views::ids();
+    let a_flac = state.entries[1]
+        .media
+        .clone()
+        .unwrap_or_else(|| panic!("audio has an identity"));
+    state.sync_queue(&[queue_row(ids[0], a_flac)]);
+
+    // The tick is the acknowledgement that the row is in the queue.
+    let (text, _) = screen(&state);
+    let row = text
+        .lines()
+        .find(|line| line.contains("a.flac"))
+        .unwrap_or_else(|| panic!("{text}"));
+    assert!(row.contains('✓'), "{row}");
+    assert!(
+        !text
+            .lines()
+            .any(|line| line.contains("b.MP3") && line.contains('✓'))
+    );
+
+    press(&mut state, &[KeyCode::Down]);
+    let effects = press(&mut state, &[KeyCode::Enter]);
+    assert!(
+        matches!(&effects[..], [BrowserEffect::Remove(id)] if *id == ids[0]),
+        "{effects:?}"
+    );
+
+    // Marked together with an unqueued row, only the unqueued one is added.
+    press(
+        &mut state,
+        &[KeyCode::Char(' '), KeyCode::Down, KeyCode::Char(' ')],
+    );
+    let effects = press(&mut state, &[KeyCode::Enter]);
+    match &effects[..] {
+        [BrowserEffect::Enqueue(items)] => {
+            assert_eq!(items.len(), 1, "{items:?}");
+            assert!(
+                matches!(&items[0], EnqueueItem::Path(path) if path.ends_with("b.MP3")),
+                "{items:?}"
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+
+    // Once the queue no longer holds it, Enter adds it again.
+    state.sync_queue(&[]);
+    press(&mut state, &[KeyCode::Up]);
+    let effects = press(&mut state, &[KeyCode::Enter]);
+    assert!(
+        matches!(&effects[..], [BrowserEffect::Enqueue(_)]),
+        "{effects:?}"
+    );
+}
+
+#[test]
+fn a_queued_episode_is_ticked_and_enter_removes_it() {
+    let mut state = podcasts(vec![feed("one")]);
+    press(&mut state, &[KeyCode::Enter]);
+    let queued = episode("g1", Some("https://cdn.example.org/1.mp3"));
+    state.apply(BrowseResult::Episodes {
+        slug: "one".to_owned(),
+        episodes: Ok(vec![
+            queued.clone(),
+            episode("g2", Some("https://cdn.example.org/2.mp3")),
+        ]),
+    });
+    let ids = views::ids();
+    state.sync_queue(&[queue_row(ids[2], queued.media.clone())]);
+    let (text, _) = screen(&state);
+    assert!(
+        text.lines()
+            .any(|line| line.contains("g1") && line.contains('✓')),
+        "{text}"
+    );
+    assert!(
+        !text
+            .lines()
+            .any(|line| line.contains("g2") && line.contains('✓'))
+    );
+    let effects = press(&mut state, &[KeyCode::Enter]);
+    assert!(
+        matches!(&effects[..], [BrowserEffect::Remove(id)] if *id == ids[2]),
+        "{effects:?}"
+    );
+}
+
+#[test]
+fn episodes_list_newest_first_with_undated_ones_last() {
+    let mut state = podcasts(vec![feed("one")]);
+    press(&mut state, &[KeyCode::Enter]);
+    state.apply(BrowseResult::Episodes {
+        slug: "one".to_owned(),
+        episodes: Ok(vec![
+            dated("old", 1_000),
+            episode("undated-a", None),
+            dated("new", 2_000),
+            episode("undated-b", None),
+        ]),
+    });
+    let order: Vec<Option<&str>> = state
+        .episodes
+        .as_ref()
+        .map(|(_, episodes)| episodes.iter().map(guid_of).collect())
+        .unwrap_or_default();
+    assert_eq!(
+        order,
+        [
+            Some("new"),
+            Some("old"),
+            Some("undated-a"),
+            Some("undated-b")
+        ]
+    );
 }
