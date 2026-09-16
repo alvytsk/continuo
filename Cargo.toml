@@ -30,6 +30,7 @@ ratatui = { version = "0.30.2", default-features = false, features = ["crossterm
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png"] }
 ratatui-image = { version = "11.0.8", default-features = false, features = ["crossterm"] }
 rustfft = "6.4.1"
+unicode-width = "0.2.2"
 
 [target.'cfg(unix)'.dependencies]
 signal-hook = "0.4.4"
