@@ -176,6 +176,14 @@ pub(crate) fn shut_down_engine(
     );
 }
 
+/// See [`PlayerRuntime::cover_key`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CoverKey {
+    media: MediaId,
+    load: Option<LoadRequestId>,
+    http: bool,
+}
+
 /// The adopted playback as the engine last reported it. Exists only while
 /// the engine still holds the adopted load: any later load outcome means the
 /// worker tore that playback down, and a queue release ends it too.
@@ -367,6 +375,25 @@ impl PlayerRuntime {
             QueueSource::LocalFile(path) => path.as_path().parent().map(Path::to_path_buf),
             QueueSource::RemoteUrl(_) | QueueSource::Podcast { .. } => None,
         }
+    }
+
+    /// Everything `active_cover` depends on, cheap enough to read every
+    /// tick: the active entry, the load it is mirrored under, and whether
+    /// the HTTP service is up. While the key is unchanged the answer is
+    /// unchanged, so a caller resolves a cover only when it moves — and it
+    /// does move without the media changing, when a load brings HTTP up or
+    /// delivers the stream's embedded cover.
+    // ponytail: a feed refresh that changes an episode's artwork URL is not
+    // in the key; the new art shows on the next load. Add a cache stamp if
+    // that ever matters.
+    pub fn cover_key(&self) -> Option<CoverKey> {
+        let queue = self.session.state().queue();
+        let entry = queue.get(queue.active()?)?;
+        Some(CoverKey {
+            media: entry.media().clone(),
+            load: self.mirror.as_ref().map(|mirror| mirror.load),
+            http: self.http.is_some(),
+        })
     }
 
     /// The active queue entry's identity and where its cover comes from: a
