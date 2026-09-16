@@ -509,6 +509,10 @@ fn the_prompt_swallows_shortcuts_and_enter_subscribes() {
     assert!(press(&mut state, &[KeyCode::Enter]).is_empty(), "empty submits nothing");
     assert!(state.prompt.is_none());
 
+    press(&mut state, &[KeyCode::Char('a'), KeyCode::Char('x')]);
+    assert!(press(&mut state, &[KeyCode::Esc]).is_empty(), "Esc cancels, never closes");
+    assert!(state.prompt.is_none());
+
     press(&mut state, &[KeyCode::Char('a')]);
     for c in "https://x.example/f ".chars() {
         press(&mut state, &[KeyCode::Char(c)]);
@@ -521,10 +525,6 @@ fn the_prompt_swallows_shortcuts_and_enter_subscribes() {
     assert_eq!(state.pending, Some(expected));
     assert_eq!(state.notice.as_ref().map(|n| n.kind), Some(NoticeKind::Working));
     assert!(state.prompt.is_none());
-
-    press(&mut state, &[KeyCode::Char('a')]);
-    press(&mut state, &[KeyCode::Char('x'), KeyCode::Esc]);
-    assert!(state.prompt.is_none(), "Esc cancels");
 }
 
 #[test]
@@ -601,6 +601,13 @@ fn r_and_d_inside_an_open_feed_act_on_that_feed() {
         }),
         "an open feed re-reads its episodes"
     );
+    // The re-read is loading until its answer lands; management keys wait.
+    assert!(press(&mut state, &[KeyCode::Char('d')]).is_empty());
+    assert!(state.confirm.is_none());
+    state.apply(BrowseResult::Episodes {
+        slug: "two".to_owned(),
+        episodes: Ok(Vec::new()),
+    });
     press(&mut state, &[KeyCode::Char('d')]);
     assert_eq!(state.confirm.as_deref(), Some("two"));
 }
