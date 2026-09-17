@@ -192,6 +192,7 @@ pub struct HttpMediaSource {
     /// re-entering the channel (§8).
     retired: bool,
     consumed: u64,
+    station_name: Option<String>,
 }
 
 impl HttpMediaSource {
@@ -246,10 +247,15 @@ impl HttpMediaSource {
             }
         };
 
-        let (byte_len, byte_seekable, live) = match accepted.accepted {
-            Accepted::Sequential { len } => (len, false, false),
-            Accepted::Ranged { range } => (range.total, true, false),
-            Accepted::Live => (None, false, true),
+        let (byte_len, byte_seekable, live, station_name) = match accepted.accepted {
+            Accepted::Sequential { len } => (len, false, false, None),
+            Accepted::Ranged { range } => (range.total, true, false, None),
+            Accepted::Live => (
+                None,
+                false,
+                true,
+                accepted.headers.get("icy-name").map(str::to_string),
+            ),
         };
         let established = Established {
             total: byte_len,
@@ -291,8 +297,14 @@ impl HttpMediaSource {
             at_byte_eof: false,
             retired: false,
             consumed: 0,
+            station_name,
         };
         Ok((source, opening_limits))
+    }
+
+    /// The `icy-name` of a live source. Display text: the caller escapes it.
+    pub fn station_name(&self) -> Option<&str> {
+        self.station_name.as_deref()
     }
 
     pub fn evidence(&self) -> SourceEvidence {

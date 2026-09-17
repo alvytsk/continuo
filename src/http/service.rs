@@ -363,6 +363,7 @@ async fn run_fetch(
         Accepted::Ranged { range } => (range.len(), range.total, true),
         Accepted::Live => (None, None, false),
     };
+    let live = matches!(accepted, Accepted::Live);
 
     let validator = validator_from(&headers);
     // What every resumed request compares its response against: the
@@ -496,10 +497,14 @@ async fn run_fetch(
         if let Some(detail) = &ended {
             tracing::debug!(delivered, detail, "body ended with a transport error");
         }
-        channel.finish(
-            generation,
-            classify_body_end(advertised, delivered, operation, ended),
-        );
+        let outcome = if live {
+            // M7 §4: every end of a live body is a disconnect, a clean one
+            // included. `Eof` here would drain to `EndOfTrack`.
+            Outcome::Failed(RemoteFailure::LiveEnded)
+        } else {
+            classify_body_end(advertised, delivered, operation, ended)
+        };
+        channel.finish(generation, outcome);
         return;
     }
 }
