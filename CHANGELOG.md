@@ -54,7 +54,7 @@ First release. Published to crates.io as `tenuto`.
 - Feed management from the player: subscribe, refresh and unsubscribe.
 - A bare `tenuto` opens the player.
 
-[Unreleased]: https://github.com/alvytsk/tenuto/compare/v0.1.2...HEAD
-[0.1.2]: https://github.com/alvytsk/tenuto/compare/29da62c...v0.1.2
+[Unreleased]: https://github.com/alvytsk/tenuto/compare/855fcb5...HEAD
+[0.1.2]: https://github.com/alvytsk/tenuto/compare/29da62c...855fcb5
 [0.1.1]: https://github.com/alvytsk/tenuto/compare/2167690b3e89979eb61b05b3b3b9af6f69057eb2...29da62c
 [0.1.0]: https://github.com/alvytsk/tenuto/commit/2167690b3e89979eb61b05b3b3b9af6f69057eb2

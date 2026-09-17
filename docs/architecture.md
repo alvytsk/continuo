@@ -455,11 +455,15 @@ Build requirements:
 Key dependencies: Symphonia for demux and decode, CPAL for output, rtrb for the callback ring, rubato for resampling, crossbeam-channel for the protocol, Tokio and reqwest with rustls for HTTP, quick-xml for feeds, Ratatui and crossterm for the terminal, ratatui-image and image for cover art, rustfft for the spectrum.
 
 The crate ships to crates.io as `tenuto`, the same name as the published
-binary and the library target. A release is
-cut by pushing a `v*` tag, which triggers `.github/workflows/release.yml`:
-it verifies the tag matches the manifest version, runs the suite, and
-publishes through crates.io Trusted Publishing. The package excludes
-`/tests` and `/docs`, so the 17 MB of audio fixtures stay out of it.
+binary and the library target. A release is a pull request that bumps
+the manifest version and adds the changelog entry, followed by
+`cargo publish --locked` from a clean checkout of `main` with a
+maintainer's own crates.io token. No tags are pushed; the changelog
+links compare commits. `.github/workflows/release.yml` is a manual
+rehearsal only (`workflow_dispatch`: the suite plus a publish dry run);
+the tag-triggered Trusted Publishing path it was written for was never
+configured on crates.io and is not used. The package excludes `/tests`
+and `/docs`, so the 17 MB of audio fixtures stay out of it.
 
 ## 12. Decisions and limits
 

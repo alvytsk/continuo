@@ -1,20 +1,23 @@
-name: Release
+name: Release rehearsal
+
+# Publishing is done by hand: `cargo publish --locked` from a clean checkout
+# of main with a maintainer's own token (docs/architecture.md, section 11).
+# This workflow only rehearses it on demand. The tag-triggered Trusted
+# Publishing path it started as was never configured on crates.io; if that
+# changes, the version at 2167690 has the full tag-verify-and-publish job.
 
 on:
-  push:
-    tags: ["v*"]
   workflow_dispatch:
 
 permissions:
   contents: read
-  id-token: write
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  publish:
-    name: Publish to crates.io
+  rehearse:
+    name: Test and publish dry run
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -27,27 +30,6 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Verify the tag matches the manifest version
-        if: github.event_name == 'push'
-        run: |
-          manifest=$(cargo metadata --no-deps --format-version 1 \
-            | python3 -c "import json,sys; print(next(p['version'] for p in json.load(sys.stdin)['packages'] if p['name'] == 'tenuto'))")
-          tag="${GITHUB_REF_NAME#v}"
-          echo "manifest=$manifest tag=$tag"
-          test "$manifest" = "$tag"
+      - run: cargo test --locked --no-fail-fast
 
-      - run: cargo test --locked
-
-      - name: Authenticate to crates.io
-        uses: rust-lang/crates-io-auth-action@v1
-        id: auth
-
-      - name: Publish
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            cargo publish --dry-run --locked
-          else
-            cargo publish --locked
-          fi
+      - run: cargo publish --dry-run --locked
