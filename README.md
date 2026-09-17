@@ -8,23 +8,32 @@ A keyboard-first terminal audio player for local files, finite HTTP media, and p
 - Ships a full-screen terminal player with a persistent queue, a file and podcast browser, cover art and a spectrum display.
 - Never plays, fetches or refreshes anything on its own. Every network request follows a key you pressed or a command you ran.
 
-![The terminal player: cover art, track information, spectrum, transport and the queue](docs/images/tui.webp)
+![The terminal player: cover art, track information, spectrum, transport and the queue](https://raw.githubusercontent.com/alvytsk/tenuto/main/docs/images/tui.webp)
 
-Milestones 0 through 6 are implemented. The automated suites pass. The manual terminal checks for the player and for feed management have not been run yet. [docs/m5-acceptance.md](docs/m5-acceptance.md) and [docs/m6-acceptance.md](docs/m6-acceptance.md) record them.
+Milestones 0 through 6 are implemented. The automated suites pass. The manual terminal checks for the player and for feed management have not been run yet. [docs/m5-acceptance.md](https://github.com/alvytsk/tenuto/blob/main/docs/m5-acceptance.md) and [docs/m6-acceptance.md](https://github.com/alvytsk/tenuto/blob/main/docs/m6-acceptance.md) record them.
 
 ## Install
 
-Tenuto builds from source with Cargo.
+```sh
+cargo install tenuto
+```
 
-1. Install Rust through rustup. The repository pins Rust 1.98.1 with the rustfmt and clippy components.
-2. On Linux, install `libasound2-dev`. CPAL needs the ALSA headers. The runtime `libasound.so.2` alone is not enough.
+On Linux, install `libasound2-dev` first. CPAL needs the ALSA headers, and
+the runtime `libasound.so.2` alone is not enough.
+
+### From source
+
+1. Install Rust through rustup. The repository pins Rust 1.98.1 with the
+   rustfmt and clippy components.
+2. On Linux, install `libasound2-dev`.
 3. Build from the repository root:
 
 ```sh
 cargo build --release --locked
 ```
 
-The binary is `target/release/tenuto`. The examples below assume it is on your `PATH`.
+The binary is `target/release/tenuto`. The examples below assume it is on
+your `PATH`.
 
 ## Quick start
 
@@ -35,12 +44,14 @@ tenuto subscribe http://feeds.rucast.net/radio-t --as radio-t
 tenuto episodes radio-t -n 5
 tenuto play radio-t 3
 tenuto tui
+tenuto            # same as `tenuto tui`
 ```
 
 ## Commands
 
 | Command | Action |
 |---|---|
+| _(no arguments)_ | Open the full-screen player on the saved queue |
 | `play <path-or-url>` | Play one file or URL with a status line and a few keys |
 | `play <slug> <index>` | Play a subscribed feed's episode by its 1-based index |
 | `play ... --probe-only` | Open the source, print what was found, and exit without a device or a terminal |
@@ -314,4 +325,4 @@ cargo test --locked
 
 Dependency versions are recorded in the committed `Cargo.lock`. Runtime code forbids unsafe code and denies `unwrap` and `expect`. Tests may use them for assertions and fixtures. `TENUTO_AUDIO_OUTPUT=null` runs the player against a paced virtual output on a machine with no sound device. It is a test switch, not user configuration.
 
-Read the [architecture](docs/architecture.md) for the C4 views, the execution contexts and the contracts. The design specs live under [docs/superpowers/specs/](docs/superpowers/specs/), starting with the [foundation spec](docs/superpowers/specs/2026-09-07-tenuto-foundation-design.md). Known limitations: non-UTF-8 local paths are unsupported, position is an estimate when device latency is unavailable, and seek support may stay unknown until probed.
+Read the [architecture](https://github.com/alvytsk/tenuto/blob/main/docs/architecture.md) for the C4 views, the execution contexts and the contracts. The design specs live under [docs/superpowers/specs/](https://github.com/alvytsk/tenuto/tree/main/docs/superpowers/specs), starting with the [foundation spec](https://github.com/alvytsk/tenuto/blob/main/docs/superpowers/specs/2026-09-07-tenuto-foundation-design.md). Known limitations: non-UTF-8 local paths are unsupported, position is an estimate when device latency is unavailable, and seek support may stay unknown until probed.
