@@ -450,7 +450,7 @@ Build requirements:
 | Rust | 1.98.1, pinned in `rust-toolchain.toml`, with `rustfmt` and `clippy` |
 | Linux | `libasound2-dev` for CPAL. The runtime `libasound.so.2` alone is not enough |
 | Lock file | `Cargo.lock` is committed. Every command runs with `--locked` |
-| Gates | `cargo fmt --check`, `cargo clippy --locked --all-targets --all-features -- -D warnings`, `cargo test --locked` on Linux and macOS, `cargo doc --locked --no-deps` with `RUSTDOCFLAGS=-D warnings`, `cargo publish --dry-run --locked` |
+| Gates | `cargo fmt --check`, `cargo clippy --locked --all-targets --all-features -- -D warnings`, `cargo test --locked` on Linux, and on macOS as a non-blocking leg, `cargo doc --locked --no-deps` with `RUSTDOCFLAGS=-D warnings`, `cargo publish --dry-run --locked` |
 
 Key dependencies: Symphonia for demux and decode, CPAL for output, rtrb for the callback ring, rubato for resampling, crossbeam-channel for the protocol, Tokio and reqwest with rustls for HTTP, quick-xml for feeds, Ratatui and crossterm for the terminal, ratatui-image and image for cover art, rustfft for the spectrum.
 

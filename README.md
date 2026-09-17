@@ -21,6 +21,10 @@ cargo install tenuto
 On Linux, install `libasound2-dev` first. CPAL needs the ALSA headers, and
 the runtime `libasound.so.2` alone is not enough.
 
+Linux is the verified platform. The crate also builds on macOS and CI runs
+the suite there, but one playback test still fails on macOS, so it is not
+claimed as supported yet. Windows is neither built nor claimed.
+
 ### From source
 
 1. Install Rust through rustup. The repository pins Rust 1.98.1 with the
