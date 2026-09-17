@@ -2184,6 +2184,27 @@ impl Worker {
                 }
             }
             PlaybackState::Reconnecting => {
+                // M7 §6: a cancellation already in hand ends recovery *now*.
+                // An attempt begun here blocks this whole pass inside an open
+                // that may last `limits.headers`, or inside a priming read a
+                // silent station never answers; the stop, pause or replacing
+                // load that cancels it is only looked at when the loop comes
+                // back round, so recovery would outlive the explicit Play it
+                // belongs to by a whole attempt. The interrupt word covers a
+                // stop or a shutdown raised since step 1 consumed the flags
+                // (the loop's `select!` is free to answer the wake that
+                // carried one and leave the flag standing for the next pass);
+                // a queued command covers a pause or a replacing load, which
+                // travel on the command channel and cannot be peeked at. Any
+                // queued command is reason enough to come back for it: the
+                // loop takes one per pass, so an attempt is postponed by a
+                // pass, never dropped. Commands are only taken while nothing
+                // is backed up, so a blocked outbox must not be allowed to
+                // stall recovery indefinitely - hence the backlog test.
+                let command_waiting = self.pending_events.is_empty() && !self.commands.is_empty();
+                if self.interrupted() || command_waiting {
+                    return;
+                }
                 if !self
                     .outage
                     .as_ref()
