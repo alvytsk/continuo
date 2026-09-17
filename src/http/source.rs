@@ -16,7 +16,7 @@ use url::Url;
 use super::channel::{ByteChannel, HeaderOutcome, ReadOutcome, SourceInterrupt, WaitHook};
 use super::error::{Operation, Phase, RemoteFailure, redact_url};
 use super::limits::Limits;
-use super::response::{self, Accepted, Established};
+use super::response::{Accepted, Established};
 use super::service::{FetchRequest, HttpService};
 use crate::media::capabilities::{DemuxerSeek, SourceEvidence};
 
@@ -246,11 +246,11 @@ impl HttpMediaSource {
             }
         };
 
-        let (byte_len, byte_seekable) = match accepted.accepted {
-            Accepted::Sequential { len } => (len, false),
-            Accepted::Ranged { range } => (range.total, true),
+        let (byte_len, byte_seekable, live) = match accepted.accepted {
+            Accepted::Sequential { len } => (len, false, false),
+            Accepted::Ranged { range } => (range.total, true, false),
+            Accepted::Live => (None, false, true),
         };
-        let live = response::is_live(&accepted.headers);
         let established = Established {
             total: byte_len,
             validator: accepted.validator,

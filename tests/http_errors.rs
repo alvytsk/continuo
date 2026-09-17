@@ -73,3 +73,44 @@ fn every_category_the_spec_names_has_a_distinct_variant() {
     }
     assert_eq!(categories.len(), 14);
 }
+
+#[test]
+fn only_failures_that_say_nothing_about_the_location_are_retryable() {
+    use tenuto::http::error::{Operation, Phase, RedirectRejection, RemoteFailure};
+    let status = |status| RemoteFailure::Status {
+        status,
+        operation: Operation::Open,
+    };
+    for failure in [
+        RemoteFailure::LiveEnded,
+        RemoteFailure::Timeout {
+            phase: Phase::Stall,
+        },
+        RemoteFailure::Transport {
+            operation: Operation::Read,
+            detail: "reset".into(),
+        },
+        status(429),
+        status(500),
+        status(503),
+    ] {
+        assert!(failure.is_retryable(), "{failure:?}");
+    }
+    for failure in [
+        status(401),
+        status(403),
+        status(404),
+        status(410),
+        RemoteFailure::Cancelled,
+        RemoteFailure::ResourceChanged,
+        RemoteFailure::IcyFramingUnsupported,
+        RemoteFailure::UnsupportedLiveMedia,
+        RemoteFailure::ContinuityUndetermined,
+        RemoteFailure::Redirect {
+            reason: RedirectRejection::Loop,
+        },
+        RemoteFailure::TruncatedBody { missing: 1 },
+    ] {
+        assert!(!failure.is_retryable(), "{failure:?}");
+    }
+}

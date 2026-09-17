@@ -54,15 +54,17 @@ fn probe_only_on_a_range_less_server_reports_no_seek_support() {
 fn a_live_stream_is_refused_legibly_and_not_played() {
     // `TestServer` always receives a `Range` header (`HttpMediaSource::open`
     // sends one unconditionally), so a script that still advertises ranges is
-    // answered 206 - and only the 200 path emits the icy headers `is_live`
-    // looks for (see `tests/prepare.rs`'s `an_explicit_live_source_is_refused_
-    // as_live`, which hits this exact seam). `.without_ranges()` is what
-    // makes this actually exercise a live response.
+    // answered 206 - and only the 200 path emits the icy headers `accept`
+    // classifies as live (see `tests/prepare.rs`'s `an_explicit_live_source_
+    // is_refused_as_live`, which hits this exact seam). `.without_ranges()`
+    // is what makes this actually exercise a live response. `.live()` also
+    // sends `icy-metaint`, which `accept` refuses as unsupported framing
+    // rather than accepting as live.
     let server = TestServer::start(Script::from_fixture("sine-5s.flac").live().without_ranges());
     let output = run(&["play", &server.url("/audio.flac"), "--probe-only"]);
     assert!(!output.status.success());
     let text = String::from_utf8_lossy(&output.stderr);
-    assert!(text.contains("live"), "{text}");
+    assert!(text.contains("interleaves metadata"), "{text}");
     server.shutdown();
 }
 

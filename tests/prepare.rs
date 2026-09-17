@@ -145,11 +145,13 @@ fn chunked_media_with_decoder_evidence_is_finite() {
 fn an_explicit_live_source_is_refused_as_live() {
     // `TestServer` always receives a `Range` header (`HttpMediaSource::open`
     // sends one unconditionally), so a script that still advertises ranges is
-    // answered 206 — and only the 200 path emits the icy headers `is_live`
-    // looks for (see `tests/http_source.rs`, which hits this same seam).
-    // `.without_ranges()` is what makes this scenario actually exercise a
-    // live response, matching how a real icecast origin usually has no range
-    // support to begin with.
+    // answered 206 — and only the 200 path emits the icy headers `accept`
+    // classifies as live (see `tests/http_source.rs`, which hits this same
+    // seam). `.without_ranges()` is what makes this scenario actually
+    // exercise a live response, matching how a real icecast origin usually
+    // has no range support to begin with. `.live()` also sends
+    // `icy-metaint`, which `accept` refuses as unsupported framing rather
+    // than accepting as live.
     let server = TestServer::start(Script::from_fixture("sine-5s.flac").live().without_ranges());
     let error = match prepare(&remote(&server), &context()) {
         Err(error) => error,
@@ -158,7 +160,7 @@ fn an_explicit_live_source_is_refused_as_live() {
     assert!(
         matches!(
             error,
-            PlaybackError::Remote(RemoteFailure::UnsupportedLiveMedia)
+            PlaybackError::Remote(RemoteFailure::IcyFramingUnsupported)
         ),
         "{error}"
     );

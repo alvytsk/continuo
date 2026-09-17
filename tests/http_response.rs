@@ -1,8 +1,8 @@
-use tenuto::http::error::{RangeRejection, RedirectRejection, RemoteFailure};
+use tenuto::http::error::{Operation, RangeRejection, RedirectRejection, RemoteFailure};
 use tenuto::http::limits::Limits;
 use tenuto::http::response::{
     Accepted, ByteRange, Established, Headers, Validator, accept, accept_redirect, if_range_value,
-    is_live, parse_content_range,
+    parse_content_range,
 };
 use url::Url;
 
@@ -426,15 +426,6 @@ fn ordinary_status_failures_carry_the_status() {
 }
 
 #[test]
-fn icy_and_explicit_live_semantics_are_recognized() {
-    assert!(is_live(&headers(&[("icy-name", "Radio X")])));
-    assert!(is_live(&headers(&[("icy-metaint", "16000")])));
-    assert!(!is_live(&headers(&[("content-length", "8192")])));
-    // A missing Content-Length is not by itself live evidence (§6).
-    assert!(!is_live(&headers(&[("transfer-encoding", "chunked")])));
-}
-
-#[test]
 fn redirects_are_bounded_checked_and_never_downgraded() {
     let limits = Limits::default();
     let from = url("https://a.example/x.mp3");
@@ -501,4 +492,62 @@ fn an_http_origin_may_redirect_to_http() {
         ),
         Ok(url("http://b.example/y.mp3"))
     );
+}
+
+fn icy(extra: &[(&str, &str)]) -> Headers {
+    let mut pairs = vec![("icy-name", "Test Radio"), ("icy-br", "128")];
+    pairs.extend_from_slice(extra);
+    Headers::from_pairs(&pairs)
+}
+
+#[test]
+fn an_icy_200_at_origin_is_live_whatever_length_it_declares() {
+    assert_eq!(accept(200, &icy(&[]), 0, true, None), Ok(Accepted::Live));
+    assert_eq!(
+        accept(200, &icy(&[("content-length", "1000")]), 0, true, None),
+        Ok(Accepted::Live)
+    );
+}
+
+#[test]
+fn an_icy_206_from_zero_is_live_and_from_anywhere_else_is_a_wrong_start() {
+    let ranged = icy(&[("content-range", "bytes 0-999/1000")]);
+    assert_eq!(accept(206, &ranged, 0, true, None), Ok(Accepted::Live));
+    let later = icy(&[("content-range", "bytes 5-999/1000")]);
+    assert_eq!(
+        accept(206, &later, 5, false, None),
+        Err(RemoteFailure::InvalidRange {
+            reason: RangeRejection::WrongStart
+        })
+    );
+}
+
+#[test]
+fn metadata_framing_is_refused_until_it_can_be_demultiplexed() {
+    assert_eq!(
+        accept(200, &icy(&[("icy-metaint", "16000")]), 0, true, None),
+        Err(RemoteFailure::IcyFramingUnsupported)
+    );
+}
+
+#[test]
+fn an_hls_playlist_is_refused_before_any_probe() {
+    let headers = Headers::from_pairs(&[("content-type", "application/vnd.apple.mpegurl")]);
+    assert_eq!(
+        accept(200, &headers, 0, true, None),
+        Err(RemoteFailure::UnsupportedLiveMedia)
+    );
+}
+
+#[test]
+fn an_error_status_is_never_live_whatever_icy_headers_it_carries() {
+    for status in [404u16, 429, 503] {
+        assert_eq!(
+            accept(status, &icy(&[]), 0, true, None),
+            Err(RemoteFailure::Status {
+                status,
+                operation: Operation::Open
+            })
+        );
+    }
 }

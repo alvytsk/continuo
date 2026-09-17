@@ -361,6 +361,7 @@ async fn run_fetch(
     let (mut advertised, total, resumable) = match accepted {
         Accepted::Sequential { len } => (len, len, false),
         Accepted::Ranged { range } => (range.len(), range.total, true),
+        Accepted::Live => (None, None, false),
     };
 
     let validator = validator_from(&headers);
@@ -479,6 +480,7 @@ async fn run_fetch(
                         // `accept` refuses a 200 past byte zero, so a
                         // resumed request can only ever be ranged.
                         Accepted::Sequential { len } => len,
+                        Accepted::Live => None,
                     };
                     response = opened.response;
                     delivered = 0;

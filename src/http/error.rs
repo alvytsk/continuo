@@ -87,6 +87,11 @@ pub enum RemoteFailure {
     ContinuityUndetermined,
     #[error("live streams are not supported")]
     UnsupportedLiveMedia,
+    #[error("this stream interleaves metadata, which is not supported yet")]
+    IcyFramingUnsupported,
+    /// A live body ended. Never completion: a station has no end (M7 §3.3).
+    #[error("the live stream ended")]
+    LiveEnded,
     #[error("this server cannot seek or resume this recording")]
     SeekUnavailable,
     #[error("the response used {encoding} content encoding, not identity")]
@@ -110,6 +115,18 @@ pub enum RemoteFailure {
     /// the cache backing the conditional request was missing or corrupt.
     #[error("received HTTP 304 without a usable conditional request")]
     UnsolicitedNotModified,
+}
+
+impl RemoteFailure {
+    /// Whether trying the same location again can help (M7 §4). A failure
+    /// that says the location itself is unusable is never retried.
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            Self::Transport { .. } | Self::Timeout { .. } | Self::LiveEnded => true,
+            Self::Status { status, .. } => *status == 429 || (500..600).contains(status),
+            _ => false,
+        }
+    }
 }
 
 /// Scheme, host, port and path only.
