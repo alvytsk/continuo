@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-09-17
+
+### Fixed
+
+- Opening a slow remote source could report "the server went quiet" as a
+  stall when it was the opening deadline that had run out: a wait whose
+  budget had been clipped to the remaining opening time reported its own
+  phase on expiry. Such a timeout now reports the opening phase.
+
 ## [0.1.1] - 2026-09-17
 
 ### Fixed
@@ -33,6 +42,7 @@ First release. Published to crates.io as `tenuto`.
 - Feed management from the player: subscribe, refresh and unsubscribe.
 - A bare `tenuto` opens the player.
 
-[Unreleased]: https://github.com/alvytsk/tenuto/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/alvytsk/tenuto/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/alvytsk/tenuto/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/alvytsk/tenuto/compare/2167690b3e89979eb61b05b3b3b9af6f69057eb2...v0.1.1
 [0.1.0]: https://github.com/alvytsk/tenuto/commit/2167690b3e89979eb61b05b3b3b9af6f69057eb2
