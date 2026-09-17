@@ -396,7 +396,11 @@ impl TestEngine {
     /// `stall` deadline generous enough that draining the ring and reading
     /// the frozen position afterwards cannot itself race the brisk 500 ms
     /// one into a spurious `Failed`.
-    pub fn load_remote_with_limits(&mut self, url: &str, limits: Limits) {
+    ///
+    /// Hands back the token it allocated, so a caller that needs both custom
+    /// limits and a `PlayLoaded` for this very load can name it. Ignoring the
+    /// return value is the common case.
+    pub fn load_remote_with_limits(&mut self, url: &str, limits: Limits) -> LoadRequestId {
         let request = self.next_request();
         self.load_remote_inner(
             request,
@@ -405,6 +409,7 @@ impl TestEngine {
             Some(limits),
             true,
         );
+        request
     }
 
     /// `load_remote`, but for a load this test expects to fail rather than

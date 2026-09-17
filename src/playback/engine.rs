@@ -18,7 +18,7 @@ use crossbeam_channel::{Receiver, RecvError, Sender, TrySendError, select};
 use url::Url;
 
 use crate::http::channel::{ByteChannel, ReadOutcome, SourceInterrupt, WaitHook};
-use crate::http::error::{RemoteFailure, redact_url};
+use crate::http::error::{Operation, RemoteFailure, redact_url};
 use crate::http::limits::Limits;
 use crate::http::service::HttpService;
 use crate::http::source::{is_retired, remote_cause};
@@ -440,10 +440,21 @@ impl EngineHandle {
     /// `Pause`, plus the freeze level that reaches a read already blocked
     /// inside the byte channel (G2): a bit cleared by the loop's own
     /// `swap(0)` would be gone before that read ever looked.
+    ///
+    /// A station is closed rather than frozen (M7 §6.2): freezing suspends
+    /// the stall timer, so a stalled live read that is frozen never wakes at
+    /// all. Aimed at the generation observed *before* the send, exactly like
+    /// `submit_seek` — a superseded generation means the worker is no longer
+    /// blocked in anything this had to wake.
     pub fn submit_pause(&self) -> Admission {
+        let generation = self.source_interrupt.generation();
         let admission = self.try_send(PlaybackCommand::Pause);
         if admission == Admission::Accepted {
-            self.source_interrupt.freeze();
+            if self.traits.indefinite.load(Ordering::Acquire) {
+                self.source_interrupt.retire_generation(generation);
+            } else {
+                self.source_interrupt.freeze();
+            }
             let _ = self.wake.try_send(());
         }
         admission
@@ -727,6 +738,12 @@ struct Worker {
     converter_flushed: bool,
     decoder_drained: bool,
     degraded: bool,
+    /// Whether a `fresh_open` is priming a source it has not adopted yet
+    /// (M7 §5.2). While set, `source_ended` reports through `attempt_failure`
+    /// instead of transitioning the session, so a station that dies during
+    /// priming is the attempt's failure rather than the session's.
+    attempting: bool,
+    attempt_failure: Option<RemoteFailure>,
     shutting_down: bool,
     receivers_gone: bool,
     pending_events: VecDeque<PlaybackEvent>,
@@ -865,6 +882,8 @@ impl Worker {
             converter_flushed: false,
             decoder_drained: false,
             degraded: false,
+            attempting: false,
+            attempt_failure: None,
             shutting_down: false,
             receivers_gone: false,
             pending_events: VecDeque::new(),
@@ -1429,17 +1448,23 @@ impl Worker {
             });
         }
         self.capture_and_teardown();
-        let target = self.position;
-        match self.reseek(target) {
-            Ok((actual, provenance)) => {
-                self.position = adopt_preserved(target, actual);
-                self.position_provenance = provenance;
-            }
-            Err(error) => {
-                if !is_cancelled(&error) {
-                    self.fail(format!("cannot recover after {reason}: {error}"));
+        // M7 §5.2: a station's decoder is exactly where the listener is, and
+        // the position it kept is listening time rather than a byte offset.
+        // Re-seeking it would fail on a source that cannot seek at all, and
+        // turn a device fault into a lost session.
+        if !self.is_indefinite() {
+            let target = self.position;
+            match self.reseek(target) {
+                Ok((actual, provenance)) => {
+                    self.position = adopt_preserved(target, actual);
+                    self.position_provenance = provenance;
                 }
-                return Err(error);
+                Err(error) => {
+                    if !is_cancelled(&error) {
+                        self.fail(format!("cannot recover after {reason}: {error}"));
+                    }
+                    return Err(error);
+                }
             }
         }
         self.session_rev += 1;
@@ -1568,6 +1593,88 @@ impl Worker {
         Ok(())
     }
 
+    /// M7 §5.2. One sequence for reconnect attempts and for every Play on an
+    /// established station. Never seeks; never reports a seek or a restart.
+    ///
+    /// `Ok` means `Playing` was announced. On `Err` nothing of the new source
+    /// remains adopted, and no transport it opened is left behind — a refusal
+    /// in step 1 returns before the previous generation's transport is torn
+    /// down, so what the listener already has in the ring keeps playing while
+    /// the caller decides what the failure means.
+    fn fresh_open(&mut self) -> Result<(), PlaybackError> {
+        let Some(location) = self.descriptor.clone() else {
+            return Err(PlaybackError::UnsupportedInput {
+                path: Default::default(),
+                reason: "no media is loaded".into(),
+            });
+        };
+        // 0. Whatever is still open goes first. This session shares ONE
+        //    `SourceInterrupt`, and dropping an `HttpMediaSource` retires it
+        //    (its `Drop`) — so a decoder still held here would be dropped by
+        //    step 4's assignment and kill the generation step 1 had just
+        //    begun. Nothing is lost by closing early: this sequence exists to
+        //    replace whatever is open, and every caller either has no source
+        //    left (a pause, a stop, a failure) or is explicitly rejoining the
+        //    live edge.
+        self.source_interrupt.retire();
+        self.retire_remote_source();
+        // 1. Prepared, not adopted. A changed continuity is refused in here,
+        //    before this session's position or state has been given up.
+        let mut context = self.prepare_context();
+        context.expected = Some(Continuity::Indefinite);
+        let prepared = prepare(&location, &context)?;
+        // 2.
+        if self.source_interrupt.is_retired() || self.interrupted() {
+            return Err(PlaybackError::Cancelled);
+        }
+        // 3. The old generation's final played position becomes the anchor;
+        //    its ring is discarded with it.
+        self.capture_and_teardown();
+        // 4. Capabilities are unchanged by construction: nothing to announce.
+        self.source = Some(prepared.source);
+        // 5 + 6. `open_transport(false)` builds conversion for THIS decoder
+        //    and primes once. While `attempting`, a source that dies during
+        //    priming reports through `attempt_failure` instead of
+        //    transitioning the session.
+        self.attempting = true;
+        self.attempt_failure = None;
+        let opened = self.open_transport(false);
+        self.attempting = false;
+        let primed = self.source.is_some() && (self.pushed_total > 0 || !self.staging.is_empty());
+        let failure = self.attempt_failure.take();
+        if let Err(error) = opened {
+            self.abandon_attempt();
+            return Err(error);
+        }
+        if let Some(failure) = failure {
+            self.abandon_attempt();
+            return Err(failure.into());
+        }
+        if !primed {
+            self.abandon_attempt();
+            return Err(RemoteFailure::LiveEnded.into());
+        }
+        // 7.
+        if self.source_interrupt.is_retired() || self.interrupted() {
+            self.abandon_attempt();
+            return Err(PlaybackError::Cancelled);
+        }
+        self.start_running();
+        self.announce_playing();
+        if let SourceLocation::Http(url) = &location {
+            tracing::debug!(url = %redact_url(url.as_str()), "live source opened fresh");
+        }
+        Ok(())
+    }
+
+    /// Give up what `fresh_open` had opened but not yet announced, leaving no
+    /// transport and no half-adopted decoder behind.
+    fn abandon_attempt(&mut self) {
+        self.teardown();
+        self.source_interrupt.retire();
+        self.retire_remote_source();
+    }
+
     /// Re-adopt the existing transport under a fresh generation: discard the
     /// ring the old generation filled, install, prime, and release.
     fn reinstall(&mut self, playing: bool) -> Result<(), PlaybackError> {
@@ -1656,11 +1763,24 @@ impl Worker {
         if !playing {
             return;
         }
+        self.start_running();
+    }
+
+    /// Release the current generation into `Run`. `prime_and_run`'s tail,
+    /// extracted so `fresh_open` can prime first and only start the output
+    /// once the new source has proven it produces audio (M7 §5.2).
+    fn start_running(&mut self) {
         let mut guard = lock(&self.transport);
         if let Some(core) = guard.as_mut() {
             let generation = core.handshake.generation();
             core.start_running(generation);
         }
+    }
+
+    /// Whether a stop or a shutdown is pending. Read rather than consumed:
+    /// the loop's own `swap(0)` is what acts on it.
+    fn interrupted(&self) -> bool {
+        stop_or_shutdown(self.interrupt.load(Ordering::Acquire))
     }
 
     /// Freeze the callback and read back the frames it really played.
@@ -1883,6 +2003,12 @@ impl Worker {
             };
             match decoded {
                 Ok(true) => {}
+                // M7 §3.3: a station has no EOF. A body that ends is a
+                // disconnect, and `source_ended` is the single exit for it.
+                Ok(false) if self.is_indefinite() => {
+                    self.source_ended(RemoteFailure::LiveEnded);
+                    return;
+                }
                 Ok(false) => self.source_eof = true,
                 Err(error) if is_retired_read(&error) => {
                     // Not EOF and not a fault: a stop, seek or shutdown
@@ -1891,6 +2017,17 @@ impl Worker {
                     // interrupt the loop is about to act on decides what
                     // happens next (§8).
                     self.retire_remote_source();
+                    return;
+                }
+                // After the retirement arm above, never before it: a
+                // cancellation is never a disconnect (M7 §6.1).
+                Err(error) if self.is_indefinite() => {
+                    let failure =
+                        remote_cause(&error).unwrap_or_else(|| RemoteFailure::Transport {
+                            operation: Operation::Read,
+                            detail: format!("decoding failed: {error}"),
+                        });
+                    self.source_ended(failure);
                     return;
                 }
                 Err(error) => match (remote_cause(&error), self.source_is_remote()) {
@@ -1917,6 +2054,20 @@ impl Worker {
                 },
             }
         }
+    }
+
+    /// The single exit from `pump_audio` for indefinite media (M7 §5.2).
+    ///
+    /// While `fresh_open` is priming, the source has not been adopted yet, so
+    /// its death is that attempt's failure and the caller decides what it
+    /// means. Otherwise the established session has lost its station.
+    fn source_ended(&mut self, failure: RemoteFailure) {
+        if self.attempting {
+            self.attempt_failure = Some(failure);
+            self.source = None;
+            return;
+        }
+        self.fail_with(format!("{failure}"), Some(failure));
     }
 
     /// End of track fires only once every pushed frame has been played, which
@@ -2054,16 +2205,16 @@ impl Worker {
                 source,
                 resume,
             } => self.load(request, media, source, resume),
-            PlaybackCommand::Play => self.play(),
+            PlaybackCommand::Play => self.play(false),
             PlaybackCommand::PlayLoaded { request } => {
                 if self.adopted_load == Some(request) && self.state == PlaybackState::Paused {
-                    self.play();
+                    self.play(true);
                 }
             }
             PlaybackCommand::Pause => self.pause(),
             PlaybackCommand::TogglePause => match self.state {
                 PlaybackState::Playing | PlaybackState::Reconnecting => self.pause(),
-                _ => self.play(),
+                _ => self.play(false),
             },
             PlaybackCommand::SeekTo(target) => self.seek_to(target),
             PlaybackCommand::SeekBy(delta) => {
@@ -2318,8 +2469,15 @@ impl Worker {
         }
     }
 
-    fn play(&mut self) {
+    /// `primed`: whether this Play is the `PlayLoaded` of the load that primed
+    /// the current transport. Only that one may release it; every other Play
+    /// on a station rejoins the live edge instead (M7 §5.3).
+    fn play(&mut self, primed: bool) {
         match self.state {
+            // M7 §5.3: a plain `Play`, a `TogglePause` or a `PlayLoaded` for
+            // some other load opens fresh rather than releasing a transport
+            // primed against a connection that has since moved on.
+            PlaybackState::Paused if self.is_indefinite() && !primed => self.restore(),
             // `Reconnecting` alongside `Playing`: playback is already what
             // the listener asked for, the transport is simply waiting on the
             // station (M7 §5).
@@ -2387,6 +2545,21 @@ impl Worker {
     /// or at a target stored while stopped - the one case where resuming
     /// establishes a new position rather than preserving one.
     fn restore(&mut self) {
+        // M7 §5.2, before every seek-shaped gate below: for a station,
+        // `position` is listening time, never a target. The one sequence
+        // opens a fresh connection and keeps it.
+        if self.is_indefinite() {
+            if self.requested_target.take().is_some() {
+                self.warn("a stored seek target was dropped: live media cannot seek".into());
+            }
+            match self.fresh_open() {
+                Ok(()) => {}
+                Err(error) if is_cancelled(&error) => {}
+                // An explicit Play is one attempt (M7 §7): it fails honestly.
+                Err(error) => self.fail_from(error),
+            }
+            return;
+        }
         // §9: a source that cannot seek cannot restore a nonzero position,
         // and starting at zero silently would be exactly the reset the
         // milestone's invariant forbids. Checked *before* any reopen (fix
@@ -2474,6 +2647,12 @@ impl Worker {
     /// keeps its audio, the callback keeps counting from where it stopped, and
     /// the timeline keeps its floor, so resuming is a single `release`.
     fn pause(&mut self) {
+        // First, ahead of the `Playing`-only guard below: a `Reconnecting`
+        // station is pausable too, and a station never parks — it closes.
+        if self.is_indefinite() {
+            self.pause_indefinite();
+            return;
+        }
         if self.state != PlaybackState::Playing {
             return;
         }
@@ -2528,6 +2707,34 @@ impl Worker {
         // already clears this same flag; this is its missing counterpart.
         self.reconcile_frozen_by_hook();
         self.set_state(PlaybackState::Paused);
+    }
+
+    /// M7 §6.2. Both pause routes end here: the dispatched `Pause`, and the
+    /// one where the hook parked first and already announced `Paused`.
+    ///
+    /// A station holds no connection while paused. Listening time survives in
+    /// `self.position`, and the next Play rejoins the live edge from there.
+    fn pause_indefinite(&mut self) {
+        if !matches!(
+            self.state,
+            PlaybackState::Playing | PlaybackState::Reconnecting
+        ) {
+            return;
+        }
+        // No transport will remain for a thaw to release, and
+        // `WaitService::park` answers `true` with none — so both the flag and
+        // the level go, or the next thaw announces `Playing` over nothing.
+        let announced = std::mem::take(&mut lock(&self.facts).frozen_by_hook);
+        self.source_interrupt.thaw();
+        self.capture_and_teardown();
+        self.source_interrupt.retire();
+        self.retire_remote_source();
+        self.session_rev += 1;
+        if announced {
+            self.state = PlaybackState::Paused;
+        } else {
+            self.set_state(PlaybackState::Paused);
+        }
     }
 
     /// Set `frozen_by_hook` to match reality after this dispatch parked the
@@ -3054,7 +3261,14 @@ impl Worker {
         // one narrow gap left is a retirement landing in the instant between
         // `prepare` returning and this check, which is the same single-
         // instant race every other cancellation check in this file accepts.
-        let prepared = prepare(&location, &self.prepare_context())?;
+        // M7 §3.5, the symmetric half of `fresh_open`'s guard: an established
+        // finite session that reopens to find a station is a changed
+        // resource, refused before anything adopts it.
+        let mut context = self.prepare_context();
+        if self.media.is_some() && self.capabilities.continuity == Continuity::Finite {
+            context.expected = Some(Continuity::Finite);
+        }
+        let prepared = prepare(&location, &context)?;
         if self.source_interrupt.is_retired() {
             return Err(PlaybackError::Cancelled);
         }
