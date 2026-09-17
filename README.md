@@ -1,11 +1,13 @@
 # Tenuto
 
-A keyboard-first terminal audio player for local files, finite HTTP media, and podcasts.
+[![CI](https://github.com/alvytsk/tenuto/actions/workflows/ci.yml/badge.svg)](https://github.com/alvytsk/tenuto/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/tenuto.svg)](https://crates.io/crates/tenuto)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/alvytsk/tenuto/blob/main/LICENSE)
 
-- Plays MP3, FLAC, WAV and M4A files, direct `http(s)://` URLs, and episodes of subscribed RSS or Atom feeds.
-- Remembers where you stopped in every track, URL and episode, and resumes there.
-- Seeks over HTTP with range requests, including MP3 podcasts with no seek index.
-- Ships a full-screen terminal player with a persistent queue, a file and podcast browser, cover art and a spectrum display.
+A keyboard-first terminal audio player for local files, HTTP media and podcasts.
+
+- Plays MP3, FLAC, WAV and M4A files, direct `http(s)://` URLs, and episodes of the podcasts you subscribe to.
+- Remembers where you stopped in every track and episode, and resumes there next time.
 - Never plays, fetches or refreshes anything on its own. Every network request follows a key you pressed or a command you ran.
 
 ![The terminal player: cover art, track information, spectrum, transport and the queue](https://raw.githubusercontent.com/alvytsk/tenuto/main/docs/images/tui.webp)
@@ -37,65 +39,39 @@ cargo build --release --locked
 The binary is `target/release/tenuto`. The examples below assume it is on
 your `PATH`.
 
-## Quick start
+## Your first ten minutes
+
+**Play a file.** Point Tenuto at any MP3, FLAC, WAV or M4A:
 
 ```sh
 tenuto play ~/Music/episode.mp3
-tenuto play https://example.com/podcast/episode-42.mp3
+```
+
+The terminal shows one status line with the track name, the state, the position, the duration and the volume, and a help line under it. Space pauses, the arrow keys seek ten seconds, `q` quits.
+
+**Come back later.** Quit halfway through and run the same command again. Playback resumes where you stopped. Tenuto remembers a position for every file, URL and episode it has played.
+
+**Open the player.** Run `tenuto` with no arguments:
+
+```sh
+tenuto
+```
+
+The full-screen player opens on your queue, which is empty the first time, and nothing plays until you ask. Press `a`, type a path or an `http(s)://` URL, and press Enter to add it to the queue. Press Space to play. The keys you need most are listed along the bottom of the screen, and `?` shows all of them.
+
+**Subscribe to a podcast.** Press `b` to open the browser, then Tab to switch to the Podcasts tab. Press `a`, paste the feed URL and press Enter. The feed is fetched once and its episodes appear in the list. Move to an episode and press Enter to add it to the queue, then Space to play it. The same works from a shell:
+
+```sh
 tenuto subscribe http://feeds.rucast.net/radio-t --as radio-t
 tenuto episodes radio-t -n 5
 tenuto play radio-t 3
-tenuto tui
-tenuto            # same as `tenuto tui`
 ```
 
-## Commands
+**Quit.** `q` or Ctrl-C saves your position and leaves the terminal as it found it.
 
-| Command | Action |
-|---|---|
-| _(no arguments)_ | Open the full-screen player on the saved queue |
-| `play <path-or-url>` | Play one file or URL with a status line and a few keys |
-| `play <slug> <index>` | Play a subscribed feed's episode by its 1-based index |
-| `play ... --probe-only` | Open the source, print what was found, and exit without a device or a terminal |
-| `tui [--mouse on\|off] [--artwork auto\|blocks\|off]` | Open the full-screen player on the saved queue |
-| `subscribe <url> [--as <slug>]` | Fetch a feed once, store the subscription, cache its episodes |
-| `feeds` | List every subscription |
-| `episodes <slug> [-n N] [--reverse]` | List a feed's cached episodes with your progress |
-| `refresh [<slug>]` | Refresh one subscription, or all of them |
-| `unsubscribe <slug>` | Remove a subscription and its cache. Checkpoints are kept |
+## The player
 
-`play` uses these keys: space pauses or resumes, the arrow keys seek, `s` stops, `p` plays, and `q` quits.
-
-## Playing over HTTP
-
-- A range-capable server can seek and resume. This includes MP3 files with no seek index, which is most podcasts.
-- A range-less server plays through from the start. It cannot seek or resume.
-- A live stream, or a source whose continuity cannot be established, is refused.
-- A dropped connection fails. There is no automatic reconnection. Playing again makes one attempt to reopen at the preserved position.
-
-### Seeking accuracy
-
-A seek on MP3 computes a byte offset instead of scanning forward, which keeps a seek on a long podcast fast. A file with a Xing, Info or VBRI header lands exactly, or within a fraction of a second for variable-bitrate audio.
-
-A file with no such header lands on a rough estimate. The landing can be in a substantially different part of the recording. On a worst-case 600-second variable-bitrate file, a seek to one third of the way through landed five seconds from the end. Constant-bitrate files without a header land exactly, but nothing in the file says which kind it is before the seek runs. Every landing on an index-less MP3 is therefore reported as an estimate, never as a confirmed position. Listings and the player show an estimate with a leading `~`.
-
-## Terminal player
-
-```sh
-tenuto tui [--mouse on|off] [--artwork auto|blocks|off]
-```
-
-`tui` restores the queue, the active entry, the volume and every checkpoint. It never starts playing on its own. No track is loaded and nothing is fetched until you press a playback key. Local files' tags and the active local entry's cover are read in the background. The audio device is created on the first load, so the player opens on a machine with no output device.
-
-Options:
-
-- `--mouse off` starts with mouse capture disabled and leaves the terminal's own selection and scrolling alone. `m` toggles it at any time. The default is `on`.
-- `--artwork auto` asks the terminal which image protocol it supports and falls back to colored half-blocks after 250 ms without an answer. `blocks` always uses half-blocks. `off` never loads artwork and shows only the placeholder.
-- Under tmux, `auto` and `blocks` run `tmux set -p allow-passthrough on` for the current pane. `off` avoids that.
-
-The layout adapts to the terminal size. At 80 columns by 28 rows and above the player shows the cover, track information, spectrum, transport and progress above the queue. Below 80 columns or 28 rows it is compact. Below 50 columns or 18 rows it is minimal, with no cover and no spectrum. Below 30 columns or 8 rows it asks for a larger window, while space and `q` keep working. Either dimension alone drops a tier.
-
-### Keys
+The player restores your queue, the active entry, the volume and every saved position. It never starts playing on its own, and nothing is fetched until you press a playback key. Cover art is read from the file's tag, from a `cover.jpg` or `folder.jpg` beside it, or for a podcast from the feed's own image.
 
 | Key | Action |
 |---|---|
@@ -118,15 +94,11 @@ The layout adapts to the terminal size. At 80 columns by 28 rows and above the p
 | Esc | Close the open overlay or cancel typing |
 | `q`, Ctrl-C | Quit |
 
-Ctrl-C quits and Ctrl-L redraws from anywhere, including while typing and inside overlays. Every other key belongs to what is open. While typing after `a`, printable keys are text, Enter enqueues and Esc cancels. The clear confirmation takes `y` and treats any other key as no. A Ctrl or Alt chord never fires a plain shortcut.
-
-Seeking before anything is loaded answers `Play a track before seeking`. While a track is loading it answers `Still loading`. After the last entry ended, Left and Right answer `Track ended; press play to replay`. With an empty queue, the playback keys answer `Queue is empty`.
-
-With mouse capture on, a click selects a queue row and a second click on the selected row plays it. The wheel moves the selection over the queue. The transport buttons act like their keys. A click on the progress bar seeks, only for a loaded track whose duration the decoder confirmed. The mouse does nothing while an overlay is open.
+With the mouse on, a click selects a queue row, a second click plays it, the wheel scrolls the queue, the transport buttons work, and a click on the progress bar seeks. `tenuto tui --mouse off` leaves the mouse to the terminal, and `--artwork blocks` or `--artwork off` change how the cover is drawn. The [reference](https://github.com/alvytsk/tenuto/blob/main/docs/reference.md#the-terminal-player) covers the options, the layout tiers and every message the player can answer with.
 
 ### The browser
 
-`b` opens a browser with two tabs. Files shows one directory at a time, starting at the active local entry's directory or the directory `tui` started in. Podcasts shows the cached subscriptions.
+`b` opens a browser with two tabs. Files shows one directory at a time. Podcasts shows your subscriptions and their cached episodes.
 
 | Key | Action |
 |---|---|
@@ -140,71 +112,24 @@ With mouse capture on, a click selects a queue row and a second click on the sel
 | `d` (Podcasts) | Unsubscribe after a `y` confirmation |
 | `b`, Esc | Close the browser |
 
-A row already in the queue shows a green `✓`. A feed's episodes are listed newest first, with undated ones after the dated ones in feed order. `tenuto episodes` keeps feed order, so its indices do not move. Directories are read one level at a time. Nothing indexes a library recursively.
-
-Opening the browser never refreshes a feed. The Podcasts tab lists what was last cached. Updating it is an explicit act: `r` or `R` in the browser, or `tenuto refresh` from a shell. Enqueueing or restoring a URL or an episode makes no network request. Only playing it does.
+A row already in the queue shows a green `✓`. Opening the browser never refreshes a feed. `r` and `R` do, and so does `tenuto refresh` from a shell.
 
 ### The queue
 
-Enqueueing appends and never changes what is playing. The queue is saved in `state.json` with the checkpoints and survives a restart. The same track may appear twice. Duplicates share one listening history but keep their own places. When a track ends, the next entry starts from its own resume point. A finished entry replays from the beginning. The last entry simply ends. There is no wrap, shuffle or repeat. A load that fails leaves the queue alone and waits for you.
+Adding appends to the queue and never interrupts what is playing. The queue is saved and survives a restart. When a track ends the next one starts from its own saved position, and the last one simply ends. There is no shuffle and no repeat. Before a track is loaded its row shows what was saved: `12:34 saved`, `~12:34 saved` for an estimate, or `played` for a finished track. The [reference](https://github.com/alvytsk/tenuto/blob/main/docs/reference.md#the-queue) has the caps and the exact rules.
 
-The queue holds at most 256 occurrences. An enqueue that would go past that is refused whole with `Queue is full (256 entries)`. Checkpoints keep their own cap of 512 media. A queued track's history can still be evicted by enough other listening. The entry stays queued and then starts from zero.
+## Podcasts from the shell
 
-A queue entry for a podcast episode remembers the episode, not a list position. Before loading it, the player looks the episode up in the local feed cache and uses its current enclosure. When the episode, the subscription or the cache is gone, it plays the URL it last saw and says `Using saved episode source`.
-
-Before the active entry is loaded, the progress line and the queue rows show saved history, not a live position:
-
-| Label | Meaning |
+| Command | Action |
 |---|---|
-| `12:34 saved` | The checkpoint's resume point |
-| `~12:34 saved` | An estimated resume point |
-| `played` | Finished. Playing it starts from the beginning |
-| `position unknown` | A checkpoint without a position |
-
-### Cover art
-
-A podcast episode's cover is the feed's `itunes:image`, the episode's own first, then the channel's, as recorded at the last refresh. It is downloaded only after playback has opened a network connection. A podcast with no feed image, and a plain URL entry, show the front cover embedded in the stream's own tag once the track is loaded. A local entry uses its embedded cover, then `cover.jpg`, `cover.png`, `folder.jpg` or `folder.png` beside it. Until then, and when there is none, the placeholder shows.
-
-### Saving, quitting and signals
-
-`q` and Ctrl-C exit 0. SIGINT, SIGHUP and SIGTERM, including a closing pane or window, capture and flush the final position, restore the terminal, and exit with `128 + signal number`. `tenuto play` follows the same contract. A flush that fails is reported as `State was not saved: ...` after the terminal is restored. SIGKILL, a crash or power loss keep only the last completed write.
-
-A write that fails while the player runs shows `not saving` in the header until a later write succeeds. If the state file cannot be repaired safely at startup, the session runs unsaved and shows `unsaved`.
-
-### Logs
-
-While `tui` runs, everything written to standard error goes to a new log file instead of the screen:
+| `subscribe <url> [--as <slug>]` | Fetch a feed once, store the subscription, cache its episodes |
+| `feeds` | List every subscription |
+| `episodes <slug> [-n N] [--reverse]` | List a feed's cached episodes with your progress |
+| `play <slug> <index>` | Play an episode by the number `episodes` shows |
+| `refresh [<slug>]` | Refresh one subscription, or all of them |
+| `unsubscribe <slug>` | Remove a subscription and its cache. Saved positions are kept |
 
 ```text
-$XDG_STATE_HOME/tenuto/logs/tenuto-tui-<UTC timestamp>-<pid>.log
-```
-
-Each run creates its own file and keeps the five most recent earlier ones. `RUST_LOG=tenuto=debug tenuto tui` works as usual and lands in that file. A crash prints its panic message on the restored terminal.
-
-## Podcasts
-
-```sh
-tenuto subscribe http://feeds.rucast.net/radio-t --as radio-t
-tenuto feeds
-tenuto episodes radio-t -n 5
-tenuto episodes web-standarts --reverse -n 5
-tenuto play radio-t 3
-tenuto refresh radio-t
-tenuto refresh
-tenuto unsubscribe radio-t
-```
-
-`subscribe` fetches the feed once, stores the subscription, and caches the episodes. Everything after that reads the cache. `feeds`, `episodes` and `play` never touch the network for feed data, so they work offline. Nothing refreshes on its own. A feed's episode list changes only when you run `refresh`. There is no background poller, no refresh on listing, and no retry loop.
-
-There is no offline audio. Only the episode list is cached. Playing an episode streams its enclosure over HTTP every time.
-
-### Listing
-
-```text
-$ tenuto feeds
-SLUG        EPISODES  REFRESHED (UTC)   TITLE
-radio-t            4  2026-09-11 18:33  Радио-Т
-
 $ tenuto episodes radio-t
   #  PROGRESS            AUDIO  PUBLISHED (UTC)  TITLE
   1  23:14               -      2026-09-06       Радио-Т 987
@@ -213,113 +138,45 @@ $ tenuto episodes radio-t
   4  position unknown    none   2026-08-09       Bonus: outtakes
 ```
 
-Every timestamp is UTC. No local conversion is attempted.
+Everything after `subscribe` reads the local cache, so listing and playing work offline. Nothing refreshes on its own: a feed's episode list changes only when you run `refresh`. Only the episode list is cached. Playing an episode streams it every time.
 
-`PROGRESS` has five states:
+The slug is the short name you use in commands. Pass `--as` to choose it, or let Tenuto derive one from the feed's title. `~` marks an estimated position, `played` a finished episode, and the duration in parentheses is the feed's own claim, unverified. Slug rules, episode numbering, what a refresh reports and what happens when a feed moves its audio are all in the [reference](https://github.com/alvytsk/tenuto/blob/main/docs/reference.md#podcasts).
 
-| Cell | Meaning |
-|---|---|
-| `—` | No checkpoint. This episode has never been opened |
-| `23:14` | A decoder-confirmed resume point |
-| `~18:02` | An estimated position left by a byte-offset seek on an index-less MP3 |
-| `played` | Finished. Reopening starts from the beginning |
-| `position unknown` | A checkpoint exists but carries no position |
+## Playing over HTTP
 
-`/ (1:42:00)` beside a position is the feed's own `itunes:duration` claim. It is in parentheses because nothing has verified it. `AUDIO: none` means the item has an identity but no usable enclosure, so there is nothing to play.
+- A server that supports range requests can seek and resume. Most podcast hosts do, including for MP3 files with no seek index.
+- A server without range support plays through from the start and cannot seek or resume.
+- A live stream is refused. Tenuto plays finite media only.
+- A dropped connection fails rather than reconnecting. Playing again makes one attempt to reopen at the saved position.
 
-A subscription whose cache file has gone shows `—` episodes and `never`, and `feeds` exits zero for it. A cache that exists but cannot be read is an error. See [When the cache is unusable](#when-the-cache-is-unusable).
+A seek inside an MP3 with no seek index lands on an estimate, which can be some way off on a long variable-bitrate file. Such positions are shown with a leading `~`. [Seeking accuracy](https://github.com/alvytsk/tenuto/blob/main/docs/reference.md#seeking-accuracy) explains why.
 
-A state file that cannot be read fails the listing instead of printing every episode as unplayed.
-
-### Indices
-
-Episode indices are 1-based and follow feed order, never a sort by date or title. `-n 5` changes how many rows are displayed, never what an index means. `--reverse` starts from the end of the feed, and `-n` then counts from the end. Every row keeps its index, so `play` resolves the number you read. Indices renumber only when a `refresh` replaces the cache.
-
-Feeds are not all ordered the same way. Radio-T lists its newest episode first. Some feeds list their oldest first, so `--reverse -n 5` shows their five newest.
-
-### Slugs
-
-`--as <slug>` names a subscription explicitly. A slug is 1 to 32 ASCII lowercase letters, digits or hyphens. An explicit slug that is taken is refused.
-
-Without `--as`, the slug comes from the feed's title. ASCII letters are lowercased and kept, digits are kept, and every other run of characters collapses to one `-`. No transliteration is attempted. A title in a non-ASCII script yields nothing, and the slug falls back to the feed URL's host with a leading `www.` stripped. `Радио-Т` at `https://radio-t.com/rss/` becomes `radio-t-com`. A derived slug that collides takes the first free `-2`, `-3` suffix within 32 characters.
-
-### Refreshing and exit status
-
-`refresh <slug>` updates one subscription. `refresh` with no slug updates every one in order, with no concurrency and no retries. Both send a conditional request when a usable cache exists, so an unchanged feed costs a 304.
-
-```text
-$ tenuto refresh
-radio-t: updated, 412 episodes retained, 3 skipped
-sysdesign: failed: network error while Open: ...
-tenuto: 1 of 2 feeds did not complete successfully
-```
-
-A batch prints every feed, then exits nonzero if any of them did not complete. The rule is general: a partial success never exits zero. `subscribe`, `unsubscribe` and `refresh` each commit in two steps across two files. When the second step fails, the command says exactly what did and did not happen and exits nonzero. Read the line before trusting the status.
-
-### When the cache is unusable
-
-```text
-tenuto: no cached episodes for radio-t; run tenuto refresh radio-t
-tenuto: corrupt cache for radio-t: cache file is malformed (syntax error at line 1, column 2); run tenuto refresh radio-t
-tenuto: cache parser 99 differs from 1 for radio-t; run tenuto refresh radio-t
-```
-
-All three name the same recovery. The cache is refetchable data, and `refresh` rebuilds it unconditionally when it is missing, corrupt, or stamped by a parser this build does not recognize. A corrupt file is left where it is. Listing a feed never rewrites, quarantines or deletes anything.
-
-### Identities
-
-A podcast episode and a direct URL are different things to Tenuto, even when the bytes are identical. `tenuto play radio-t 3` checkpoints the episode: the feed's identity plus the item's GUID, or its enclosure URL, or its link, in that order. `tenuto play https://cdn.example.org/987.mp3` checkpoints the URL. Progress does not carry from one to the other.
-
-An item with a GUID keeps its position when the show moves its audio to another CDN. An item with no GUID takes its identity from the enclosure URL, so a move loses its position.
-
-`unsubscribe` removes the subscription and its cache and keeps every checkpoint. Resubscribing mints a new feed identity, so those checkpoints are orphaned and the episodes show as unplayed again. Reattaching would require trusting a feed URL to mean the same feed forever.
-
-### Feed-format limits
-
-- RSS 2.0 and Atom 1.0 only. RSS 1.0 is refused by name. JSON Feed is not supported.
-- Bytes decide the encoding. A document that will not decode is refused, not repaired.
-- Item titles are display text. An Atom `title[type=html]` is decoded once and then kept literally, markup and all. HTML entities that are not XML entities survive as text.
-- A publication date is read as RFC 2822, plus the `UTC` zone spelling real feeds use. A date that will not parse leaves `PUBLISHED` as `—` and keeps the episode.
-- An item with no GUID, no enclosure and no link has no identity and is skipped and counted.
-- An item with an identity but no usable enclosure is kept and listed with `AUDIO: none`.
-
-## Files and state
+## Where Tenuto keeps things
 
 | Location | Contents |
 |---|---|
-| `$XDG_STATE_HOME/tenuto/state.json` | Checkpoints, volume, the queue and its active entry |
-| `$XDG_STATE_HOME/tenuto/state.lock` | The player lock. Empty, never deleted |
-| `$XDG_STATE_HOME/tenuto/logs/` | One log per `tui` run. The five most recent earlier ones are kept |
-| `$XDG_DATA_HOME/tenuto/subscriptions.json` | Subscriptions. Durable user data |
-| `$XDG_DATA_HOME/tenuto/subscriptions.lock` | The subscription writer lock |
-| `$XDG_CACHE_HOME/tenuto/feeds/<feed-id>.json` | Cached episodes. Refetchable |
+| `$XDG_STATE_HOME/tenuto/state.json` | Saved positions, volume and the queue |
+| `$XDG_STATE_HOME/tenuto/logs/` | One log per player run |
+| `$XDG_DATA_HOME/tenuto/subscriptions.json` | Your subscriptions |
+| `$XDG_CACHE_HOME/tenuto/feeds/` | Cached episode lists |
 
-On macOS these resolve to the platform's own data, cache and local-data directories. The cache and the logs are disposable. Subscriptions and checkpoints are not.
+On macOS these resolve to the platform's own directories. The cache and the logs can be deleted at any time. Subscriptions and saved positions cannot be recovered once deleted.
 
-### Playback state
+## When something goes wrong
 
-`state.json` holds one checkpoint per media identity, capped at 512 entries, plus the queue. It is replaced atomically, so a crash mid-write cannot leave a truncated file. Reaching the end of a track marks it complete. Reopening a completed track starts from the beginning.
+**`Another Tenuto player is using this state profile`.** Only one player runs per profile. Quit the other one. Feed commands can run beside a player.
 
-A file this build cannot read is preserved. Garbage is moved aside as `state.json.rejected-<timestamp>`. A file from a newer build is left where it is, with writing disabled for that session. If only the queue part is damaged, only the queue is reset. The original bytes are copied to `state.json.queue-recovery-<timestamp>` first, and the player says what was reset.
+**`no cached episodes for radio-t; run tenuto refresh radio-t`.** The feed's cache is missing or unreadable. `refresh` rebuilds it. The same command fixes a `corrupt cache` message.
 
-Deleting `state.json` forgets every remembered position. There is no supported way to edit it by hand. A checkpoint key this build cannot parse makes the whole file unreadable.
+**`not saving` in the player's header.** A write to the state file failed. The player keeps running and tries again on the next save. `unsaved` means the state file could not be repaired at startup and the session runs without saving.
 
-### One player per profile
-
-`tenuto tui` and `tenuto play` take an exclusive lock on `state.lock` before they read any playback state. A second player on the same profile refuses to start before it opens an audio device or touches the terminal:
-
-```text
-tenuto: Another Tenuto player is using this state profile
-```
-
-Feed commands and `play --probe-only` take no player lock and can run beside a player. Every subscription change, from the CLI or from the player's browser, holds `subscriptions.lock` for its whole duration. A second one refuses at once with `Another subscription update is in progress`.
+**Something else.** While the player runs, everything it would have printed to standard error goes to a log file under the logs directory above, one per run. `RUST_LOG=tenuto=debug tenuto` writes more. A crash prints its message on the restored terminal.
 
 ## Development
 
 ```sh
 cargo run --locked -- play <path-or-url>
 cargo run --locked -- tui
-RUST_LOG=tenuto=debug cargo run --locked -- play <path-or-url>
 cargo fmt --check
 cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo test --locked
@@ -327,8 +184,12 @@ RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps
 cargo publish --dry-run --locked
 ```
 
-CI runs every gate above on each pull request. The tests run on Linux, and on macOS as a non-blocking leg. Releases are listed in the [changelog](https://github.com/alvytsk/tenuto/blob/main/CHANGELOG.md).
+CI runs every gate above on each pull request. The tests run on Linux, and on macOS as a non-blocking leg. Runtime code forbids unsafe code and denies `unwrap` and `expect`. `TENUTO_AUDIO_OUTPUT=null` runs the player against a paced virtual output on a machine with no sound device.
 
-Dependency versions are recorded in the committed `Cargo.lock`. Runtime code forbids unsafe code and denies `unwrap` and `expect`. Tests may use them for assertions and fixtures. `TENUTO_AUDIO_OUTPUT=null` runs the player against a paced virtual output on a machine with no sound device. It is a test switch, not user configuration.
+- [Reference](https://github.com/alvytsk/tenuto/blob/main/docs/reference.md): the exact rules for the player, the queue, feeds, files and state, and the known limitations.
+- [Architecture](https://github.com/alvytsk/tenuto/blob/main/docs/architecture.md): the C4 views, the execution contexts and the contracts.
+- [Changelog](https://github.com/alvytsk/tenuto/blob/main/CHANGELOG.md).
 
-Read the [architecture](https://github.com/alvytsk/tenuto/blob/main/docs/architecture.md) for the C4 views, the execution contexts and the contracts. Known limitations: non-UTF-8 local paths are unsupported, position is an estimate when device latency is unavailable, and seek support may stay unknown until probed.
+## License
+
+[MIT](https://github.com/alvytsk/tenuto/blob/main/LICENSE) © 2026 Alexey Vymyatnin
