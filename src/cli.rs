@@ -7,8 +7,11 @@ use clap::{Parser, Subcommand};
 #[derive(Debug, Parser)]
 #[command(name = "continuo", about = "A keyboard-first terminal audio player")]
 pub struct Cli {
+    /// The subcommand to run. Absent means a bare `continuo`, which opens
+    /// the full-screen player on the saved queue with the same defaults
+    /// `continuo tui` uses when its flags are omitted.
     #[command(subcommand)]
-    pub command: CliCommand,
+    pub command: Option<CliCommand>,
 }
 
 /// Whether `continuo tui` captures the mouse. Off leaves the terminal's own

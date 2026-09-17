@@ -57,7 +57,15 @@ const HELP_LINE: &str =
 /// program prints for a feed command, the one synchronous bridge into the
 /// HTTP runtime, and the exit status a partial failure has to carry.
 pub fn run(cli: cli::Cli) -> Result<RunOutcome, crate::error::AppError> {
-    match cli.command {
+    // A bare `continuo` opens the player. The defaults are the ones
+    // `continuo tui` applies when neither flag is given.
+    let Some(command) = cli.command else {
+        return crate::tui::run(crate::tui::TuiOptions {
+            mouse: cli::MouseMode::default(),
+            artwork: cli::ArtworkMode::default(),
+        });
+    };
+    match command {
         CliCommand::Play {
             source,
             index: None,

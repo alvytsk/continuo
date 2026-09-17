@@ -50,6 +50,21 @@ fn tui_opens_idle_on_an_empty_queue_and_q_restores_the_terminal() {
 }
 
 #[test]
+fn a_bare_invocation_opens_the_player_and_q_restores_the_terminal() {
+    let profile = process::Profile::new().expect("profile");
+    // No arguments at all, where `["tui"]` would normally go.
+    let mut child = PtyChild::spawn(profile.root(), &[], &[], 100, 30).expect("spawn");
+    assert!(
+        child.wait_for("Queue is empty", Duration::from_secs(10)),
+        "{}",
+        child.output()
+    );
+    child.send(b"q");
+    assert_eq!(child.wait_exit(Duration::from_secs(10)), Some(0));
+    assert!(child.output().contains(LEAVE_ALT));
+}
+
+#[test]
 fn tui_refuses_a_held_profile_before_entering_raw_mode() {
     let profile = process::Profile::new().expect("profile");
     let _held =

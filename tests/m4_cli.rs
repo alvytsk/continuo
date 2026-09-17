@@ -23,7 +23,7 @@ fn play_selectors_are_positive_and_single_source_still_parses()
     assert!(Cli::try_parse_from(["continuo", "play", "radio-t", "newest"]).is_err());
     assert!(Cli::try_parse_from(["continuo", "episodes", "radio-t", "-n", "0"]).is_err());
     let parsed = Cli::try_parse_from(["continuo", "refresh"])?;
-    assert!(matches!(parsed.command, CliCommand::Refresh { slug: None }));
+    assert!(matches!(parsed.command, Some(CliCommand::Refresh { slug: None })));
     Ok(())
 }
 
@@ -54,14 +54,17 @@ fn reverse_is_an_episodes_option_that_composes_with_the_limit()
     ] {
         let parsed = Cli::try_parse_from(&args)?;
         assert!(
-            matches!(parsed.command, CliCommand::Episodes { reverse: true, .. }),
+            matches!(
+                parsed.command,
+                Some(CliCommand::Episodes { reverse: true, .. })
+            ),
             "{args:?}"
         );
     }
     let plain = Cli::try_parse_from(["continuo", "episodes", "web-standarts"])?;
     assert!(matches!(
         plain.command,
-        CliCommand::Episodes { reverse: false, .. }
+        Some(CliCommand::Episodes { reverse: false, .. })
     ));
     assert!(Cli::try_parse_from(["continuo", "--reverse", "episodes", "web-standarts"]).is_err());
     Ok(())
@@ -75,20 +78,20 @@ fn play_takes_one_or_two_positionals_and_never_three() -> Result<(), Box<dyn std
     let one = Cli::try_parse_from(["continuo", "play", "file.mp3"])?;
     assert!(matches!(
         one.command,
-        CliCommand::Play {
+        Some(CliCommand::Play {
             index: None,
             probe_only: false,
             ..
-        }
+        })
     ));
 
     let two = Cli::try_parse_from(["continuo", "play", "radio-t", "3"])?;
     match two.command {
-        CliCommand::Play {
+        Some(CliCommand::Play {
             source,
             index: Some(index),
             probe_only,
-        } => {
+        }) => {
             assert_eq!(source, "radio-t");
             assert_eq!(index.get(), 3);
             assert!(!probe_only);
@@ -113,10 +116,10 @@ fn probe_only_parses_with_either_play_form() -> Result<(), Box<dyn std::error::E
         assert!(
             matches!(
                 parsed.command,
-                CliCommand::Play {
+                Some(CliCommand::Play {
                     probe_only: true,
                     ..
-                }
+                })
             ),
             "{args:?} must set probe_only"
         );
@@ -128,7 +131,7 @@ fn probe_only_parses_with_either_play_form() -> Result<(), Box<dyn std::error::E
 fn subscribe_takes_a_url_and_an_optional_alias() -> Result<(), Box<dyn std::error::Error>> {
     let bare = Cli::try_parse_from(["continuo", "subscribe", "https://example.org/feed"])?;
     match bare.command {
-        CliCommand::Subscribe { url, slug } => {
+        Some(CliCommand::Subscribe { url, slug }) => {
             assert_eq!(url, "https://example.org/feed");
             assert_eq!(slug, None);
         }
@@ -143,7 +146,7 @@ fn subscribe_takes_a_url_and_an_optional_alias() -> Result<(), Box<dyn std::erro
         "radio-t",
     ])?;
     match aliased.command {
-        CliCommand::Subscribe { slug, .. } => assert_eq!(slug.as_deref(), Some("radio-t")),
+        Some(CliCommand::Subscribe { slug, .. }) => assert_eq!(slug.as_deref(), Some("radio-t")),
         other => panic!("expected subscribe, got {other:?}"),
     }
 
@@ -157,12 +160,12 @@ fn unsubscribe_and_feeds_take_exactly_their_own_arguments() -> Result<(), Box<dy
     let unsubscribe = Cli::try_parse_from(["continuo", "unsubscribe", "radio-t"])?;
     assert!(matches!(
         unsubscribe.command,
-        CliCommand::Unsubscribe { ref slug } if slug == "radio-t"
+        Some(CliCommand::Unsubscribe { ref slug }) if slug == "radio-t"
     ));
     assert!(Cli::try_parse_from(["continuo", "unsubscribe"]).is_err());
 
     let feeds = Cli::try_parse_from(["continuo", "feeds"])?;
-    assert!(matches!(feeds.command, CliCommand::Feeds));
+    assert!(matches!(feeds.command, Some(CliCommand::Feeds)));
     assert!(Cli::try_parse_from(["continuo", "feeds", "radio-t"]).is_err());
     Ok(())
 }
@@ -172,16 +175,16 @@ fn episodes_requires_a_slug_and_a_positive_limit() -> Result<(), Box<dyn std::er
     let bare = Cli::try_parse_from(["continuo", "episodes", "radio-t"])?;
     assert!(matches!(
         bare.command,
-        CliCommand::Episodes {
+        Some(CliCommand::Episodes {
             ref slug,
             limit: None,
             reverse: false,
-        } if slug == "radio-t"
+        }) if slug == "radio-t"
     ));
 
     let limited = Cli::try_parse_from(["continuo", "episodes", "radio-t", "-n", "5"])?;
     match limited.command {
-        CliCommand::Episodes { limit: Some(n), .. } => assert_eq!(n.get(), 5),
+        Some(CliCommand::Episodes { limit: Some(n), .. }) => assert_eq!(n.get(), 5),
         other => panic!("expected episodes with a limit, got {other:?}"),
     }
 
@@ -194,12 +197,12 @@ fn episodes_requires_a_slug_and_a_positive_limit() -> Result<(), Box<dyn std::er
 #[test]
 fn refresh_takes_an_optional_slug() -> Result<(), Box<dyn std::error::Error>> {
     let all = Cli::try_parse_from(["continuo", "refresh"])?;
-    assert!(matches!(all.command, CliCommand::Refresh { slug: None }));
+    assert!(matches!(all.command, Some(CliCommand::Refresh { slug: None })));
 
     let one = Cli::try_parse_from(["continuo", "refresh", "radio-t"])?;
     assert!(matches!(
         one.command,
-        CliCommand::Refresh { slug: Some(ref slug) } if slug == "radio-t"
+        Some(CliCommand::Refresh { slug: Some(ref slug) }) if slug == "radio-t"
     ));
 
     assert!(Cli::try_parse_from(["continuo", "refresh", "radio-t", "extra"]).is_err());
