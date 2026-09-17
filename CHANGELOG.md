@@ -34,5 +34,5 @@ First release. Published to crates.io as `tenuto`.
 - A bare `tenuto` opens the player.
 
 [Unreleased]: https://github.com/alvytsk/tenuto/compare/v0.1.1...HEAD
-[0.1.1]: https://github.com/alvytsk/tenuto/compare/v0.1.0...v0.1.1
-[0.1.0]: https://github.com/alvytsk/tenuto/releases/tag/v0.1.0
+[0.1.1]: https://github.com/alvytsk/tenuto/compare/2167690b3e89979eb61b05b3b3b9af6f69057eb2...v0.1.1
+[0.1.0]: https://github.com/alvytsk/tenuto/commit/2167690b3e89979eb61b05b3b3b9af6f69057eb2
