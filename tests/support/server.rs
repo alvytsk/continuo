@@ -131,6 +131,11 @@ pub struct Script {
     // instead of the media-serving logic below; `None` leaves every existing
     // `Script` behavior untouched.
     documents: Option<Vec<DocumentReply>>,
+    /// ICY response headers without metadata framing: a station M7 plays.
+    icy_station: bool,
+    /// Connection n (1-based) is served by `sequence[n - 2]` once n > 1; the
+    /// last entry serves every later connection.
+    sequence: Vec<Script>,
 }
 
 impl Script {
@@ -275,6 +280,28 @@ impl Script {
     pub fn trickle(mut self, bytes: usize, gap: Duration) -> Self {
         self.trickle = Some((bytes, gap));
         self
+    }
+
+    pub fn icy_station(mut self) -> Self {
+        self.icy_station = true;
+        self
+    }
+
+    pub fn then(mut self, next: Script) -> Self {
+        self.sequence.push(next);
+        self
+    }
+
+    /// The script that answers connection `ordinal` (1-based).
+    fn for_ordinal(&self, ordinal: usize) -> &Script {
+        match ordinal.checked_sub(2) {
+            None => self,
+            Some(index) => self
+                .sequence
+                .get(index)
+                .or_else(|| self.sequence.last())
+                .unwrap_or(self),
+        }
     }
 }
 
@@ -666,7 +693,7 @@ fn write_whole_body(
     gate: &StallGate,
     bytes_written: &AtomicUsize,
 ) {
-    let endless = script.live || script.unresolved;
+    let endless = script.live || script.unresolved || script.icy_station;
     let chunked_framing = script.chunked || endless;
 
     let mut header = String::from("HTTP/1.1 200 OK\r\n");
@@ -685,6 +712,9 @@ fn write_whole_body(
     if script.live {
         header.push_str("icy-name: Test Radio\r\nicy-metaint: 16000\r\n");
     }
+    if script.icy_station {
+        header.push_str("icy-name: Test Radio\r\nicy-br: 128\r\n");
+    }
     if chunked_framing {
         header.push_str("Transfer-Encoding: chunked\r\n");
     } else {
@@ -697,7 +727,7 @@ fn write_whole_body(
     }
 
     if endless {
-        write_endless_body(stream, script, gate, bytes_written);
+        write_endless_body(stream, script, ordinal, gate, bytes_written);
     } else {
         let mut writer = BodyWriter::new(script, chunked_framing, ordinal);
         let mut offset = 0;
@@ -719,6 +749,7 @@ fn write_whole_body(
 fn write_endless_body(
     stream: &mut TcpStream,
     script: &Script,
+    ordinal: usize,
     gate: &StallGate,
     bytes_written: &AtomicUsize,
 ) {
@@ -726,7 +757,7 @@ fn write_endless_body(
         // Nothing to repeat; writing headers only is the best this can do.
         return;
     }
-    let mut writer = BodyWriter::new(script, true, 1);
+    let mut writer = BodyWriter::new(script, true, ordinal);
     let mut cursor = 0usize;
     loop {
         let take = writer.next_len(script.body.len() - cursor);
@@ -803,6 +834,7 @@ fn handle_connection(
         guard.push(recorded.clone());
         guard.len()
     };
+    let script = script.for_ordinal(ordinal);
 
     if script.stall_headers {
         gate.park();

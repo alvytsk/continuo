@@ -129,3 +129,57 @@ fn a_reversed_range_is_answered_with_416_rather_than_panicking() {
     assert!(response.contains("Content-Range: bytes */10"), "{response}");
     server.shutdown();
 }
+
+fn raw_get(server: &TestServer, path: &str, headers: &[(&str, &str)]) -> String {
+    use std::io::{Read, Write};
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", server.port()))
+        .unwrap_or_else(|error| panic!("connect: {error}"));
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_millis(300)))
+        .unwrap_or_else(|error| panic!("timeout: {error}"));
+    let mut request = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n");
+    for (name, value) in headers {
+        request.push_str(&format!("{name}: {value}\r\n"));
+    }
+    request.push_str("\r\n");
+    stream
+        .write_all(request.as_bytes())
+        .unwrap_or_else(|error| panic!("write: {error}"));
+    let mut out = Vec::new();
+    let mut buffer = [0u8; 4096];
+    // An endless body never closes: read what arrives inside the timeout.
+    while let Ok(n) = stream.read(&mut buffer) {
+        if n == 0 || out.len() > 64 * 1024 {
+            break;
+        }
+        out.extend_from_slice(&buffer[..n]);
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+#[test]
+fn an_icy_station_sends_name_and_bitrate_but_no_metaint() {
+    let server = TestServer::start(Script::from_fixture("sine-noxing.mp3").icy_station());
+    let response = raw_get(&server, "/radio", &[]);
+    let head = response.to_ascii_lowercase();
+    assert!(head.contains("icy-name: test radio"), "{head}");
+    assert!(head.contains("icy-br: 128"), "{head}");
+    assert!(!head.contains("icy-metaint"), "{head}");
+    assert!(head.contains("transfer-encoding: chunked"), "{head}");
+    server.shutdown();
+}
+
+#[test]
+fn a_script_chain_serves_each_connection_its_own_script_and_repeats_the_last() {
+    let server = TestServer::start(
+        Script::serving(b"first".to_vec())
+            .without_ranges()
+            .then(Script::serving(Vec::new()).status(503))
+            .then(Script::serving(b"third".to_vec()).without_ranges()),
+    );
+    assert!(raw_get(&server, "/a", &[]).ends_with("first"));
+    assert!(raw_get(&server, "/a", &[]).starts_with("HTTP/1.1 503"));
+    assert!(raw_get(&server, "/a", &[]).ends_with("third"));
+    assert!(raw_get(&server, "/a", &[]).ends_with("third"));
+    server.shutdown();
+}
