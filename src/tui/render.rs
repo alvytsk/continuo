@@ -657,7 +657,7 @@ fn draw_queue(
         };
         bordered(theme)
             .title(Line::styled(
-                " PLAYLIST ",
+                " QUEUE ",
                 Style::new().fg(theme.cream).add_modifier(Modifier::BOLD),
             ))
             .title(Line::styled(count, Style::new().fg(theme.muted)).right_aligned())
