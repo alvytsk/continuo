@@ -269,6 +269,11 @@ fn a_seek_against_a_stalled_source_fails_within_its_deadline() {
 
 #[test]
 fn pause_stop_and_quit_are_serviced_during_a_seek() {
+    // DIAG (macOS leg): engine tracing on stderr, shown only if the test fails.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::new("tenuto=debug"))
+        .with_test_writer()
+        .try_init();
     // The wedge this task fixes made pause/resume "appear dead" while a
     // rescan ran, because the worker dispatched no commands at all while
     // parked inside `FormatReader::seek()`. A seek against a source slow
@@ -285,14 +290,34 @@ fn pause_stop_and_quit_are_serviced_during_a_seek() {
     engine.play_for(Duration::from_millis(200));
 
     let requests_before = server.requests().len();
+    let seek_submitted = Instant::now();
+    let generation_before = engine.handle().source_interrupt().generation();
     assert_eq!(
         engine.handle().submit_seek(Duration::from_secs(300)),
         Admission::Accepted
     );
-    assert!(
-        wait_for_new_request(&server, requests_before, Duration::from_secs(5)),
-        "the seek's own request never reached the server"
-    );
+    let reached = wait_for_new_request(&server, requests_before, Duration::from_secs(5));
+    if !reached {
+        let interrupt = engine.handle().source_interrupt();
+        let requests: Vec<String> = server
+            .requests()
+            .iter()
+            .map(|r| format!("{} {} range={:?}", r.method, r.path, r.header("range")))
+            .collect();
+        panic!(
+            "DIAG the seek's own request never reached the server after {:?}: \
+             requests_before={requests_before} requests_now={requests:?} \
+             generation_before={generation_before} generation_now={} retired={} frozen={} \
+             state={:?} progress={:?} inbox={:?}",
+            seek_submitted.elapsed(),
+            interrupt.generation(),
+            interrupt.is_retired(),
+            interrupt.is_frozen(),
+            engine.state(),
+            engine.progress(),
+            std::iter::from_fn(|| engine.try_event()).collect::<Vec<_>>(),
+        );
+    }
 
     let pause_deadline = Instant::now() + Duration::from_millis(750);
     assert_eq!(engine.handle().submit_pause(), Admission::Accepted);
