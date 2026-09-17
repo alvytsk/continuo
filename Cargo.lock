@@ -407,7 +407,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "continuo"
+name = "continuo-player"
 version = "0.1.0"
 dependencies = [
  "clap",
