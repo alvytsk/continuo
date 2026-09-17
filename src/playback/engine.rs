@@ -170,6 +170,21 @@ impl EventStream {
     }
 }
 
+/// What the handle is allowed to assume about the open source before the
+/// worker has looked at the command it is submitting (M7 §6.1).
+///
+/// A cache of two bits of `Worker::capabilities`, published by
+/// `Worker::set_capabilities` — the one place that field is written — so the
+/// two views cannot disagree for longer than the single command in flight.
+/// Wrong for that instant costs nothing either way: a seek the handle thought
+/// was seekable is still rejected by the worker, and one it thought was not
+/// simply reaches the worker without the retirement it did not need.
+#[derive(Debug, Default)]
+pub(crate) struct SourceTraits {
+    pub indefinite: AtomicBool,
+    pub seek_unsupported: AtomicBool,
+}
+
 pub struct EngineHandle {
     commands: Sender<PlaybackCommand>,
     stream: EventStream,
@@ -185,6 +200,9 @@ pub struct EngineHandle {
     /// the command queue, so a blocked read is reachable without waiting for
     /// the worker to drain its backlog.
     source_interrupt: Arc<SourceInterrupt>,
+    /// The worker's published view of the open source, read by `submit_seek`
+    /// to decide whether retiring the source is worth anything (M7 §6.1).
+    traits: Arc<SourceTraits>,
     /// `None` until `set_http` installs one. Shared with the worker so
     /// `Worker::load` can build a `PrepareContext` from whatever is
     /// installed at the moment it runs.
@@ -255,6 +273,7 @@ impl EngineHandle {
         // the moment it exists, not the byte-at-a-time placeholder that used
         // to sit here only so `WaitService` had something to poll.
         let source_interrupt = SourceInterrupt::new(Limits::default().buffer_bytes);
+        let traits = Arc::new(SourceTraits::default());
         let http = Arc::new(Mutex::new(None));
         // Shared by the callback (writer), the decode worker, `WaitService`
         // and the spectrum worker, which schedules frames against it.
@@ -271,6 +290,7 @@ impl EngineHandle {
             wake_rx,
             Arc::clone(&interrupt),
             Arc::clone(&source_interrupt),
+            Arc::clone(&traits),
             Arc::clone(&http),
             device_clock,
             spectrum_port,
@@ -290,6 +310,7 @@ impl EngineHandle {
             wake: wake_tx,
             worker: join,
             source_interrupt,
+            traits,
             http,
             spectrum,
             spectrum_thread,
@@ -370,8 +391,16 @@ impl EngineHandle {
     /// source read. §8: queue admission and waking belong together, so a
     /// caller cannot queue a command and forget to wake anything.
     pub fn submit(&self, command: PlaybackCommand) -> Admission {
+        // A load tears the current source down whatever it is, so its blocked
+        // read or open is woken now rather than waited out (M7 §6.1). Aimed at
+        // the generation observed *before* the send, like `submit_seek`.
+        let replaced = matches!(command, PlaybackCommand::Load { .. })
+            .then(|| self.source_interrupt.generation());
         let admission = self.try_send(command);
         if admission == Admission::Accepted {
+            if let Some(generation) = replaced {
+                self.source_interrupt.retire_generation(generation);
+            }
             let _ = self.wake.try_send(());
         }
         admission
@@ -398,8 +427,12 @@ impl EngineHandle {
         if admission != Admission::Accepted {
             return admission;
         }
-        self.source_interrupt.retire_generation(generation);
-        self.interrupt.fetch_or(SEEK, Ordering::Release);
+        // A source that cannot seek is going to answer `SeekRejected`; retiring
+        // it first would cost the listener the stream for nothing (M7 §3.4).
+        if !self.traits.seek_unsupported.load(Ordering::Acquire) {
+            self.source_interrupt.retire_generation(generation);
+            self.interrupt.fetch_or(SEEK, Ordering::Release);
+        }
         let _ = self.wake.try_send(());
         admission
     }
@@ -725,6 +758,9 @@ struct Worker {
     /// every source this worker ever opens, and to `WaitService` at
     /// construction — the same instance throughout, never swapped.
     source_interrupt: Arc<SourceInterrupt>,
+    /// The handle's out-of-band view of `capabilities`, written only by
+    /// `set_capabilities` (M7 §6.1).
+    traits: Arc<SourceTraits>,
     /// Shared with `EngineHandle::set_http`, so a service installed after
     /// this worker was spawned is visible the next time `load` builds a
     /// `PrepareContext`.
@@ -763,6 +799,7 @@ impl Worker {
         wake: Receiver<()>,
         interrupt: Arc<AtomicU8>,
         source_interrupt: Arc<SourceInterrupt>,
+        traits: Arc<SourceTraits>,
         http: Arc<Mutex<Option<Arc<HttpService>>>>,
         device_clock: Arc<AtomicU64>,
         spectrum: SpectrumPort,
@@ -848,6 +885,7 @@ impl Worker {
             facts,
             service,
             source_interrupt,
+            traits,
             http,
             device_clock,
             backlog_empty,
@@ -2059,6 +2097,13 @@ impl Worker {
         resume: ResumeIntent,
     ) {
         self.capture_and_teardown();
+        // The source the handle was reasoning about is gone and the incoming
+        // one is not known yet, so the handle gets the conservative answer
+        // until `set_capabilities` below says otherwise (M7 §6.1): a seek
+        // submitted in the gap retires a generation that is being replaced
+        // anyway.
+        self.traits.indefinite.store(false, Ordering::Release);
+        self.traits.seek_unsupported.store(false, Ordering::Release);
         self.source = None;
         self.session_rev += 1;
         self.media = Some(media.clone());
@@ -2112,7 +2157,7 @@ impl Worker {
             }
         };
         let mut decoded = prepared.source;
-        self.capabilities = prepared.capabilities;
+        self.set_capabilities(prepared.capabilities);
 
         // A `Candidate` is decided now, against the duration this decoder just
         // reported - the same rule `decide_resume` applies wherever a
@@ -2218,7 +2263,7 @@ impl Worker {
                     // too, rather than only inferring it from a later seek.
                     if was_unknown {
                         decoded.note_demuxer_proven();
-                        self.capabilities = decoded.capabilities();
+                        self.set_capabilities(decoded.capabilities());
                         self.emit_capabilities(self.capabilities);
                     }
                 }
@@ -2650,8 +2695,9 @@ impl Worker {
                     && let Some(source) = self.source.as_mut()
                 {
                     source.note_demuxer_proven();
-                    self.capabilities = source.capabilities();
-                    self.emit_capabilities(self.capabilities);
+                    let capabilities = source.capabilities();
+                    self.set_capabilities(capabilities);
+                    self.emit_capabilities(capabilities);
                 }
                 if let Err(error) = self.reinstall(playing) {
                     if !is_cancelled(&error) {
@@ -2926,6 +2972,26 @@ impl Worker {
         }
     }
 
+    /// The one place `capabilities` is written, so the handle's out-of-band
+    /// view (M7 §6.1) can never disagree with the worker's for longer than
+    /// one command.
+    fn set_capabilities(&mut self, capabilities: MediaCapabilities) {
+        self.capabilities = capabilities;
+        self.traits.indefinite.store(
+            capabilities.continuity == Continuity::Indefinite,
+            Ordering::Release,
+        );
+        self.traits.seek_unsupported.store(
+            capabilities.seek == SeekSupport::Unsupported,
+            Ordering::Release,
+        );
+    }
+
+    #[allow(dead_code)] // used from Task 6 (M7)
+    fn is_indefinite(&self) -> bool {
+        self.capabilities.continuity == Continuity::Indefinite
+    }
+
     fn emit_capabilities(&mut self, capabilities: MediaCapabilities) {
         let session_rev = self.session_rev;
         self.emit(PlaybackEvent::CapabilitiesChanged {
@@ -2974,7 +3040,7 @@ impl Worker {
         if self.capabilities != prepared.capabilities {
             self.emit_capabilities(prepared.capabilities);
         }
-        self.capabilities = prepared.capabilities;
+        self.set_capabilities(prepared.capabilities);
         self.source = Some(prepared.source);
         // §11: reconnect - this is the one path that reopens a remote source
         // the worker previously retired (a stop, or a failure), rather than
@@ -3029,8 +3095,9 @@ impl Worker {
                     // (this method's one caller gates on exactly that), so a
                     // successful trial is always a change to `Native` -
                     // nothing to compare here.
-                    self.capabilities = source.capabilities();
-                    self.emit_capabilities(self.capabilities);
+                    let capabilities = source.capabilities();
+                    self.set_capabilities(capabilities);
+                    self.emit_capabilities(capabilities);
                 }
                 Ok(true)
             }

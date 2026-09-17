@@ -37,7 +37,7 @@ use tenuto::http::service::HttpService;
 use tenuto::media::id::{AbsolutePath, MediaId, NormalizedUrl};
 use tenuto::media::source::SourceLocation;
 use tenuto::playback::callback::CallbackCore;
-use tenuto::playback::command::{LoadRequestId, PlaybackCommand, ResumeIntent};
+use tenuto::playback::command::{Admission, LoadRequestId, PlaybackCommand, ResumeIntent};
 use tenuto::playback::engine::EngineHandle;
 use tenuto::playback::error::PlaybackError;
 use tenuto::playback::event::{PlaybackEvent, Progress, ShutdownReport, StartDisposition};
@@ -477,12 +477,22 @@ impl TestEngine {
             Ok(normalized) => MediaId::RemoteUrl(normalized),
             Err(error) => panic!("test URL {url:?} must normalize: {error}"),
         };
-        self.send(PlaybackCommand::Load {
+        // Through `submit`, not the bare command channel: a remote `Load` is
+        // one of the submissions that acts on the source interrupt out of
+        // band (M7 §6.1 - it retires the source it is about to replace), so
+        // a harness that side-steps `submit` would exercise a path the
+        // application never takes.
+        let admission = self.handle().submit(PlaybackCommand::Load {
             request,
             media,
             source: SourceLocation::Http(parsed),
             resume,
         });
+        assert_eq!(
+            admission,
+            Admission::Accepted,
+            "the engine must accept the load"
+        );
         if await_paused {
             self.await_state(PlaybackState::Paused);
         }
