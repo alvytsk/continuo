@@ -23,7 +23,10 @@ fn play_selectors_are_positive_and_single_source_still_parses()
     assert!(Cli::try_parse_from(["continuo", "play", "radio-t", "newest"]).is_err());
     assert!(Cli::try_parse_from(["continuo", "episodes", "radio-t", "-n", "0"]).is_err());
     let parsed = Cli::try_parse_from(["continuo", "refresh"])?;
-    assert!(matches!(parsed.command, Some(CliCommand::Refresh { slug: None })));
+    assert!(matches!(
+        parsed.command,
+        Some(CliCommand::Refresh { slug: None })
+    ));
     Ok(())
 }
 
@@ -197,7 +200,10 @@ fn episodes_requires_a_slug_and_a_positive_limit() -> Result<(), Box<dyn std::er
 #[test]
 fn refresh_takes_an_optional_slug() -> Result<(), Box<dyn std::error::Error>> {
     let all = Cli::try_parse_from(["continuo", "refresh"])?;
-    assert!(matches!(all.command, Some(CliCommand::Refresh { slug: None })));
+    assert!(matches!(
+        all.command,
+        Some(CliCommand::Refresh { slug: None })
+    ));
 
     let one = Cli::try_parse_from(["continuo", "refresh", "radio-t"])?;
     assert!(matches!(

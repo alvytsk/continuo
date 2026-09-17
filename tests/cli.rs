@@ -11,7 +11,10 @@ use continuo::cli::{Cli, CliCommand};
 #[test]
 fn a_bare_invocation_parses_to_no_subcommand() -> Result<(), Box<dyn std::error::Error>> {
     let parsed = Cli::try_parse_from(["continuo"])?;
-    assert!(parsed.command.is_none(), "bare invocation carries no subcommand");
+    assert!(
+        parsed.command.is_none(),
+        "bare invocation carries no subcommand"
+    );
 
     // Every existing subcommand still parses as it did.
     let tui = Cli::try_parse_from(["continuo", "tui"])?;
