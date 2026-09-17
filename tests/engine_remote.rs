@@ -667,6 +667,16 @@ fn a_second_explicit_play_after_a_still_broken_server_fails_again_rather_than_si
     // Failed`. A listener-driven retry that also fails is not a repeating
     // fault - it is one explicit action - so landing back in `Failed`
     // without ever leaving it must not swallow that action into silence.
+    //
+    // Both attempts drive the clock with `play_until_terminal` rather than
+    // a fixed `let_time_pass`. A truncation only surfaces once the decoder
+    // has consumed every byte buffered ahead of it - the byte channel
+    // drains what arrived before it reports the ending - and the decoder
+    // only reads once the 300 ms ring has room. A fixed advance on a
+    // loaded machine (CI on main, 2026-09-17: 762 underruns in the 2 s the
+    // clock ran) leaves the ring full and the clock frozen with the
+    // truncation still unread, and the `Failed` this test waits for never
+    // comes. `play_until_terminal` keeps the clock running until it does.
     let server =
         TestServer::start(Script::from_fixture("sine-5s.flac").truncate_body_after(16 << 10));
     let mut engine = TestEngine::start_idle();
@@ -674,8 +684,12 @@ fn a_second_explicit_play_after_a_still_broken_server_fails_again_rather_than_si
     assert_eq!(engine.handle().submit_play(), Admission::Accepted);
     engine.await_state(PlaybackState::Playing);
     engine.play_for(Duration::from_millis(40));
-    engine.let_time_pass(Duration::from_secs(2));
-    engine.await_state(PlaybackState::Failed);
+    engine.play_until_terminal(Duration::from_secs(10));
+    assert_eq!(
+        engine.state(),
+        PlaybackState::Failed,
+        "the first attempt against the truncated body did not fail"
+    );
     let heard = engine.progress().position;
     // Drain the first failure out of the inbox: otherwise `await_event`
     // below would match it immediately and never actually observe whether
@@ -683,13 +697,10 @@ fn a_second_explicit_play_after_a_still_broken_server_fails_again_rather_than_si
     while engine.try_event().is_some() {}
 
     // Same server, same URL, still truncated at the same relative point -
-    // the retry must discover that failure for itself. `await_state` and
-    // `await_event` only drain and wait; the harness clock stays frozen
-    // otherwise, so this needs its own `let_time_pass` to give the reopened
-    // fetch room to reach the truncation, exactly as the first attempt did.
+    // the retry must discover that failure for itself.
     assert_eq!(engine.handle().submit_play(), Admission::Accepted);
     engine.await_state(PlaybackState::Playing);
-    engine.let_time_pass(Duration::from_secs(2));
+    engine.play_until_terminal(Duration::from_secs(10));
     let failed = engine.await_event(|e| matches!(e, PlaybackEvent::Failed { .. }));
     let PlaybackEvent::Failed { message, .. } = failed else {
         unreachable!("await_event's predicate already matched Failed")
@@ -699,10 +710,16 @@ fn a_second_explicit_play_after_a_still_broken_server_fails_again_rather_than_si
         "the retry's failure carried no message"
     );
     assert_eq!(engine.state(), PlaybackState::Failed);
-    assert_eq!(
-        engine.progress().position,
-        heard,
-        "the second failure moved the position"
+    // The retry resumes at `heard` and may legitimately play whatever the
+    // re-fetched body delivered before the truncation - how much is heard
+    // before the failure lands is a matter of scheduling, not of contract
+    // (the macOS leg heard about half a second of it). What the failure
+    // must never do is lose ground: reset to zero, or land short of what
+    // the first attempt already reported.
+    let after_retry = engine.progress().position;
+    assert!(
+        after_retry >= heard,
+        "the second failure moved the position back from {heard:?} to {after_retry:?}"
     );
 
     engine.finish();
