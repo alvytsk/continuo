@@ -1,4 +1,4 @@
-# Continuo M2 — durable playback state (design)
+# Tenuto M2 — durable playback state (design)
 
 Status: approved and implemented.
 Date: 2026-09-08. Revised the same day after design review, and again on
@@ -15,7 +15,7 @@ section deferred to M2.
 - **Why.** M1 proved logical position survives *transport* recreation inside one
   process. M2 extends the same invariant across *process* restarts, completing
   step 11 of the architecture doc's acceptance scenario for local media.
-- **Who.** A single local user running one `continuo play <file>` at a time.
+- **Who.** A single local user running one `tenuto play <file>` at a time.
 - **Key constraint.** The playback engine stays ignorant of persistence. It
   publishes truth (`Progress`, `PlaybackEvent`); the application layer decides
   what to store and when; a writer thread owns the disk. No filesystem concern
@@ -623,7 +623,7 @@ tempdir to stage session 1 → persist → session 2.
 
 ## 17. Risks and deferred debt
 
-- **Cross-process concurrency.** Two Continuo processes: last writer wins, no
+- **Cross-process concurrency.** Two Tenuto processes: last writer wins, no
   locking. Documented limitation, not solved in M2.
 - **Non-Unix permissions.** Windows and macOS fall back to platform defaults.
 - **`m1-known-debt.md` seek entry stands.** Sidestepped by D6, not fixed; a future

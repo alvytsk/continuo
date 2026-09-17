@@ -1,14 +1,14 @@
-# Continuo M2 — Durable Playback State Implementation Plan
+# Tenuto M2 — Durable Playback State Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Persist playback position, completion and volume to an atomically written JSON file, so quitting and relaunching `continuo play <file>` resumes close to where the listener left off.
+**Goal:** Persist playback position, completion and volume to an atomically written JSON file, so quitting and relaunching `tenuto play <file>` resumes close to where the listener left off.
 
 **Architecture:** The playback engine stays ignorant of persistence — it publishes `Progress` and `PlaybackEvent`, nothing more. A pure `Session` policy turns that stream into `PersistedState` snapshots; a dedicated writer thread owns a keep-latest slot and the disk. Four small engine changes make the facts the policy needs reachable: a position on `Loaded`, a final published position at shutdown, and a shutdown report that carries the events the app never drained.
 
 **Tech Stack:** Rust 2024, `serde` + `serde_json`, `directories` (state path), `time` (RFC 3339 timestamps), `crossbeam-channel`, `tracing`. Dev: `tempfile`.
 
-**Spec:** `docs/superpowers/specs/2026-09-08-continuo-durable-state-design.md` — read it alongside this plan. Every decision reference below (`D1`…`D20`, `§3`…`§18`) points into that document.
+**Spec:** `docs/superpowers/specs/2026-09-08-tenuto-durable-state-design.md` — read it alongside this plan. Every decision reference below (`D1`…`D20`, `§3`…`§18`) points into that document.
 
 ## Global Constraints
 
@@ -76,7 +76,7 @@
 
 **Interfaces:**
 - Consumes: nothing.
-- Produces: `continuo::clock::{Clock, ClockSample, SystemClock, FakeClock}`. `Clock::sample(&self) -> ClockSample`; `ClockSample { monotonic: std::time::Instant, wall: time::OffsetDateTime }`. `FakeClock::{new, advance, advance_monotonic, set_wall}`.
+- Produces: `tenuto::clock::{Clock, ClockSample, SystemClock, FakeClock}`. `Clock::sample(&self) -> ClockSample`; `ClockSample { monotonic: std::time::Instant, wall: time::OffsetDateTime }`. `FakeClock::{new, advance, advance_monotonic, set_wall}`.
 
 **Why two hands (D16):** deadlines and the 5 s capture interval use `monotonic`; `updated_at` uses `wall`. A wall clock that steps backwards must not stall a deadline, and an `Instant` cannot be written into an RFC 3339 field.
 
@@ -286,15 +286,15 @@ without the other."
 - Test: `tests/persistence_model.rs`
 
 **Interfaces:**
-- Consumes: `continuo::playback::checkpoint::PlaybackCheckpoint`, `continuo::playback::volume::Volume`, `continuo::media::id::MediaId`.
+- Consumes: `tenuto::playback::checkpoint::PlaybackCheckpoint`, `tenuto::playback::volume::Volume`, `tenuto::media::id::MediaId`.
 - Produces:
-  - `continuo::persistence::model::{PersistedState, PersistedCheckpoint, SCHEMA_VERSION, MAX_ENTRIES}`
+  - `tenuto::persistence::model::{PersistedState, PersistedCheckpoint, SCHEMA_VERSION, MAX_ENTRIES}`
   - `PersistedState::{default, volume, set_volume, current_media (pub field), checkpoints (pub field), record, checkpoint_for, entry_for, completed_for}`
   - `PersistedState::record(&mut self, checkpoint: &PlaybackCheckpoint, completed: bool)`
   - `PersistedState::checkpoint_for(&self, media: &MediaId) -> Option<PlaybackCheckpoint>`
   - `PersistedState::entry_for(&self, media: &MediaId) -> Option<&PersistedCheckpoint>`
   - `PersistedState::completed_for(&self, media: &MediaId) -> bool`
-  - `continuo::persistence::PersistenceError`
+  - `tenuto::persistence::PersistenceError`
 
 **Why `MediaId` needs `Ord`:** D2 keys the map by `MediaId` and §5 built its string serde precisely to serve as a JSON map key. A `BTreeMap` key needs `Ord`, which the M0 identity types do not derive. The derives are purely additive — every one of these newtypes wraps a `String` or another newtype that does.
 
@@ -309,10 +309,10 @@ Create `tests/persistence_model.rs`:
 
 use std::time::Duration;
 
-use continuo::media::id::{AbsolutePath, MediaId};
-use continuo::persistence::model::{MAX_ENTRIES, PersistedState, SCHEMA_VERSION};
-use continuo::playback::checkpoint::PlaybackCheckpoint;
-use continuo::playback::volume::Volume;
+use tenuto::media::id::{AbsolutePath, MediaId};
+use tenuto::persistence::model::{MAX_ENTRIES, PersistedState, SCHEMA_VERSION};
+use tenuto::playback::checkpoint::PlaybackCheckpoint;
+use tenuto::playback::volume::Volume;
 use time::OffsetDateTime;
 
 fn media(name: &str) -> MediaId {
@@ -475,7 +475,7 @@ fn a_hand_edited_volume_cannot_deafen_or_silence() {
 - [ ] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test --test persistence_model 2>&1 | tail -20`
-Expected: FAIL to compile — `unresolved import continuo::persistence`.
+Expected: FAIL to compile — `unresolved import tenuto::persistence`.
 
 - [ ] **Step 3: Give the identity types a total order**
 
@@ -738,7 +738,7 @@ make the derivation the only way in."
 **Interfaces:**
 - Consumes: `PersistedState`, `SCHEMA_VERSION`, `PersistenceError` (Task 2); `Clock` (Task 1).
 - Produces:
-  - `continuo::persistence::store::{StateStore, LoadOutcome, LoadReason}`
+  - `tenuto::persistence::store::{StateStore, LoadOutcome, LoadReason}`
   - `StateStore::new(path: PathBuf, clock: Arc<dyn Clock>) -> Self`
   - `StateStore::platform_path() -> Result<PathBuf, PersistenceError>`
   - `StateStore::load(&self) -> LoadOutcome` — never fails; always yields a usable state
@@ -762,11 +762,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use continuo::clock::FakeClock;
-use continuo::media::id::{AbsolutePath, MediaId};
-use continuo::persistence::model::PersistedState;
-use continuo::persistence::store::{LoadReason, StateStore};
-use continuo::playback::checkpoint::PlaybackCheckpoint;
+use tenuto::clock::FakeClock;
+use tenuto::media::id::{AbsolutePath, MediaId};
+use tenuto::persistence::model::PersistedState;
+use tenuto::persistence::store::{LoadReason, StateStore};
+use tenuto::playback::checkpoint::PlaybackCheckpoint;
 use time::OffsetDateTime;
 
 /// The stamp a `FakeClock` produces, which starts at the epoch.
@@ -980,7 +980,7 @@ fn the_directory_and_the_file_are_private() {
     use std::os::unix::fs::PermissionsExt;
 
     let root = tempfile::tempdir().unwrap();
-    let nested = root.path().join("continuo");
+    let nested = root.path().join("tenuto");
     let store = StateStore::new(nested.join("state.json"), Arc::new(FakeClock::new()));
     store.write(&state_with("a", 1)).unwrap();
 
@@ -996,7 +996,7 @@ fn an_existing_permissive_directory_is_tightened() {
     use std::os::unix::fs::PermissionsExt;
 
     let root = tempfile::tempdir().unwrap();
-    let nested = root.path().join("continuo");
+    let nested = root.path().join("tenuto");
     fs::create_dir_all(&nested).unwrap();
     fs::set_permissions(&nested, fs::Permissions::from_mode(0o755)).unwrap();
 
@@ -1014,7 +1014,7 @@ fn an_existing_permissive_directory_is_tightened() {
 - [ ] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test --test persistence_store 2>&1 | tail -20`
-Expected: FAIL to compile — `unresolved import continuo::persistence::store`.
+Expected: FAIL to compile — `unresolved import tenuto::persistence::store`.
 
 - [ ] **Step 3: Write the store**
 
@@ -1090,7 +1090,7 @@ impl StateStore {
     /// The platform state path. Only `app` calls this, which is what keeps the
     /// tests off `$HOME` (§13).
     pub fn platform_path() -> Result<PathBuf, PersistenceError> {
-        let dirs = directories::ProjectDirs::from("", "", "continuo")
+        let dirs = directories::ProjectDirs::from("", "", "tenuto")
             .ok_or(PersistenceError::NoStateDirectory)?;
         // `state_dir` honors XDG_STATE_HOME on Linux and is None elsewhere.
         let base = dirs
@@ -1372,7 +1372,7 @@ exhausted-candidates path testable at all."
 **Interfaces:**
 - Consumes: `PersistedState`, `PersistenceError`, `StateStore` (Tasks 2–3); `Clock` (Task 1).
 - Produces:
-  - `continuo::persistence::writer::{Urgency, StateSink, WriterHandle, ShutdownOutcome, COALESCE_WINDOW}`
+  - `tenuto::persistence::writer::{Urgency, StateSink, WriterHandle, ShutdownOutcome, COALESCE_WINDOW}`
   - `Urgency::{Ordinary, Forced}` — derives `Clone, Copy, Debug, Eq, PartialEq`
   - `StateSink: Send { fn write(&self, state: &PersistedState) -> Result<(), PersistenceError>; }`, implemented for `StateStore`
   - `WriterHandle::spawn(sink: Box<dyn StateSink>, clock: Arc<dyn Clock>) -> Self`
@@ -1397,11 +1397,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use continuo::clock::{Clock, FakeClock};
-use continuo::persistence::PersistenceError;
-use continuo::persistence::model::PersistedState;
-use continuo::persistence::writer::{ShutdownOutcome, StateSink, Urgency, WriterHandle};
-use continuo::playback::volume::Volume;
+use tenuto::clock::{Clock, FakeClock};
+use tenuto::persistence::PersistenceError;
+use tenuto::persistence::model::PersistedState;
+use tenuto::persistence::writer::{ShutdownOutcome, StateSink, Urgency, WriterHandle};
+use tenuto::playback::volume::Volume;
 
 const PATIENCE: Duration = Duration::from_secs(5);
 
@@ -1604,7 +1604,7 @@ Note `shutdown_flushes_what_is_pending_and_confirms_it` asserts `Written` even t
 - [ ] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test --test persistence_writer 2>&1 | tail -20`
-Expected: FAIL to compile — `unresolved import continuo::persistence::writer`.
+Expected: FAIL to compile — `unresolved import tenuto::persistence::writer`.
 
 - [ ] **Step 3: Write the slot and its unit tests**
 
@@ -1854,7 +1854,7 @@ impl WriterHandle {
             let shared = Arc::clone(&shared);
             let clock = Arc::clone(&clock);
             std::thread::Builder::new()
-                .name("continuo-state".into())
+                .name("tenuto-state".into())
                 .spawn(move || run(shared, sink, clock, ack_tx))
                 .ok()
         };
@@ -2036,7 +2036,7 @@ unconditional join defeats the bound it enforces."
 - Consumes: nothing new.
 - Produces:
   - `PlaybackEvent::Loaded { session_rev, media, metadata, capabilities, position: Duration }` (D8)
-  - `continuo::playback::event::ShutdownReport { progress: Progress, events: Vec<PlaybackEvent> }` (D19)
+  - `tenuto::playback::event::ShutdownReport { progress: Progress, events: Vec<PlaybackEvent> }` (D19)
   - `EngineHandle::join(self) -> ShutdownReport`
   - `TestEngine::start_at(name: &str, start_at: Duration) -> Self`
   - `TestEngine::shutdown_report(&mut self) -> Option<ShutdownReport>`
@@ -2056,10 +2056,10 @@ Create `tests/engine_shutdown.rs`:
 
 use std::time::Duration;
 
-use continuo::playback::command::PlaybackCommand;
-use continuo::playback::event::PlaybackEvent;
-use continuo::playback::state::PlaybackState;
-use continuo::playback::volume::Volume;
+use tenuto::playback::command::PlaybackCommand;
+use tenuto::playback::event::PlaybackEvent;
+use tenuto::playback::state::PlaybackState;
+use tenuto::playback::volume::Volume;
 
 mod support;
 
@@ -2278,7 +2278,7 @@ The spawn site changes only in that the closure now yields a value:
 
 ```rust
         let join = std::thread::Builder::new()
-            .name("continuo-decode".into())
+            .name("tenuto-decode".into())
             .spawn(move || worker.run())
             .ok();
 ```
@@ -2317,7 +2317,7 @@ Import `ShutdownReport` in `engine.rs` alongside the existing `event` imports.
 
 - [ ] **Step 5: Extend the harness, additively**
 
-In `tests/support/mod.rs`, add `use continuo::playback::event::ShutdownReport;` to the imports, then refactor `start` to delegate and add the two new methods:
+In `tests/support/mod.rs`, add `use tenuto::playback::event::ShutdownReport;` to the imports, then refactor `start` to delegate and add the two new methods:
 
 ```rust
     pub fn start(name: &str) -> Self {
@@ -2417,7 +2417,7 @@ None of this knows that persistence exists."
 **Interfaces:**
 - Consumes: `ClockSample` (Task 1), `PersistedState` (Task 2), `Urgency` (Task 4), `PlaybackEvent`/`Progress` (Task 5).
 - Produces:
-  - `continuo::session::{Session, Action, CAPTURE_INTERVAL}`
+  - `tenuto::session::{Session, Action, CAPTURE_INTERVAL}`
   - `Session::new(state: PersistedState) -> Self`
   - `Session::observe(&mut self, event: &PlaybackEvent, now: ClockSample) -> Action`
   - `Session::tick(&mut self, progress: &Progress, now: ClockSample) -> Action`
@@ -2438,17 +2438,17 @@ Create `tests/session_policy.rs`:
 
 use std::time::Duration;
 
-use continuo::clock::{Clock, FakeClock};
-use continuo::media::capabilities::{Continuity, MediaCapabilities, SeekSupport};
-use continuo::media::id::{AbsolutePath, MediaId};
-use continuo::media::metadata::MediaMetadata;
-use continuo::persistence::model::PersistedState;
-use continuo::persistence::writer::Urgency;
-use continuo::playback::event::{PlaybackEvent, Progress};
-use continuo::playback::state::PlaybackState;
-use continuo::playback::timeline::PositionQuality;
-use continuo::playback::volume::Volume;
-use continuo::session::{Action, Session};
+use tenuto::clock::{Clock, FakeClock};
+use tenuto::media::capabilities::{Continuity, MediaCapabilities, SeekSupport};
+use tenuto::media::id::{AbsolutePath, MediaId};
+use tenuto::media::metadata::MediaMetadata;
+use tenuto::persistence::model::PersistedState;
+use tenuto::persistence::writer::Urgency;
+use tenuto::playback::event::{PlaybackEvent, Progress};
+use tenuto::playback::state::PlaybackState;
+use tenuto::playback::timeline::PositionQuality;
+use tenuto::playback::volume::Volume;
+use tenuto::session::{Action, Session};
 
 fn media(name: &str) -> MediaId {
     // A bare helper, so it handles its own error: the lint exemption stops at
@@ -2664,7 +2664,7 @@ fn reloading_the_same_media_submits_nothing() {
 fn playing_clears_a_completed_flag_carried_in_from_the_file() {
     let mut opening = PersistedState::default();
     opening.record(
-        &continuo::playback::checkpoint::PlaybackCheckpoint {
+        &tenuto::playback::checkpoint::PlaybackCheckpoint {
             media: media("a"),
             position: Duration::from_secs(240),
             updated_at: time::OffsetDateTime::UNIX_EPOCH,
@@ -2690,7 +2690,7 @@ fn playing_clears_a_completed_flag_carried_in_from_the_file() {
 - [ ] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test --test session_policy 2>&1 | tail -20`
-Expected: FAIL to compile — `unresolved import continuo::session`.
+Expected: FAIL to compile — `unresolved import tenuto::session`.
 
 - [ ] **Step 3: Add the revision accessor**
 
@@ -2972,7 +2972,7 @@ slot cannot promise that an intermediate submission reaches disk."
 - Consumes: everything from Task 6.
 - Produces:
   - `Session::shutdown_snapshot(&mut self, progress: &Progress, now: ClockSample) -> PersistedState`
-  - `continuo::session::Trigger::{Paused, Stopped, SeekCompleted}`
+  - `tenuto::session::Trigger::{Paused, Stopped, SeekCompleted}`
 
 **The three rules this task adds, and why each exists:**
 
@@ -3193,7 +3193,7 @@ fn a_launch_that_never_establishes_writes_no_checkpoint() {
     // opening the device, and the device refuses to open.
     let mut opening = PersistedState::default();
     opening.record(
-        &continuo::playback::checkpoint::PlaybackCheckpoint {
+        &tenuto::playback::checkpoint::PlaybackCheckpoint {
             media: media("a"),
             position: Duration::from_secs(240),
             updated_at: time::OffsetDateTime::UNIX_EPOCH,
@@ -3611,7 +3611,7 @@ write that zero over the position completion deliberately retains."
 **Interfaces:**
 - Consumes: `PersistedCheckpoint` (Task 2).
 - Produces:
-  - `continuo::session::{decide_resume, ResumeDecision}`
+  - `tenuto::session::{decide_resume, ResumeDecision}`
   - `decide_resume(entry: Option<&PersistedCheckpoint>, duration: Option<Duration>) -> ResumeDecision`
   - `ResumeDecision::start_at(&self) -> Duration`
 
@@ -3902,14 +3902,14 @@ Create `tests/resume_contract.rs`:
 use std::sync::Arc;
 use std::time::Duration;
 
-use continuo::clock::{Clock, FakeClock};
-use continuo::media::id::{AbsolutePath, MediaId};
-use continuo::persistence::model::PersistedState;
-use continuo::persistence::store::StateStore;
-use continuo::playback::command::PlaybackCommand;
-use continuo::playback::state::PlaybackState;
-use continuo::playback::volume::Volume;
-use continuo::session::{Action, Session, decide_resume};
+use tenuto::clock::{Clock, FakeClock};
+use tenuto::media::id::{AbsolutePath, MediaId};
+use tenuto::persistence::model::PersistedState;
+use tenuto::persistence::store::StateStore;
+use tenuto::playback::command::PlaybackCommand;
+use tenuto::playback::state::PlaybackState;
+use tenuto::playback::volume::Volume;
+use tenuto::session::{Action, Session, decide_resume};
 
 mod support;
 
@@ -4231,7 +4231,7 @@ fn a_position_past_the_end_is_refused_as_a_start() {
     let store = StateStore::new(dir.path().join("state.json"), injected);
     let mut state = PersistedState::default();
     state.record(
-        &continuo::playback::checkpoint::PlaybackCheckpoint {
+        &tenuto::playback::checkpoint::PlaybackCheckpoint {
             media: track_id(),
             position: Duration::from_secs(600),
             updated_at: time::OffsetDateTime::UNIX_EPOCH,
@@ -4505,8 +4505,8 @@ Append to `README.md`:
 Position, completion and volume are written to a small JSON file so that
 quitting and relaunching the same file resumes where you left off.
 
-- **Linux:** `$XDG_STATE_HOME/continuo/state.json`, falling back to
-  `~/.local/state/continuo/state.json`
+- **Linux:** `$XDG_STATE_HOME/tenuto/state.json`, falling back to
+  `~/.local/state/tenuto/state.json`
 - **macOS and Windows:** the platform's local data directory
 
 The file holds one checkpoint per media identity, capped at 512 entries, and is
@@ -4523,7 +4523,7 @@ In `docs/architecture.md` §6, after the sentence deferring the persistence
 policy to M2, add:
 
 ```markdown
-M2 settles this: see `docs/superpowers/specs/2026-09-08-continuo-durable-state-design.md`
+M2 settles this: see `docs/superpowers/specs/2026-09-08-tenuto-durable-state-design.md`
 for the decisions — completion semantics, the per-identity map and its cap,
 rejected-file handling, and the checkpoint triggers.
 ```
@@ -4575,4 +4575,4 @@ The engine change count in §14 therefore reads "four changes" to `engine.rs` pl
 
 **One §16 item is not covered by a test:** "a render failure still writes the final checkpoint" (D18). Task 9 Step 8 replaces it with a structural check and says why. Everything else in §16 has a named test.
 
-**Known gap carried forward.** `src/persistence/store.rs` checks `candidate.exists()` before renaming rather than claiming the name atomically. §17 already documents that Continuo is single-user and single-process with no cross-process locking, so the window is not reachable by anything this milestone supports.
+**Known gap carried forward.** `src/persistence/store.rs` checks `candidate.exists()` before renaming rather than claiming the name atomically. §17 already documents that Tenuto is single-user and single-process with no cross-process locking, so the window is not reachable by anything this milestone supports.

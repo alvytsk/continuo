@@ -13,20 +13,20 @@ mod runtime;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use continuo::application::browse::{BrowseRequest, BrowseResult, BrowseWorker};
-use continuo::application::enrich::TagProbe;
-use continuo::application::runtime::{AppCommand, EnqueueItem, LibraryStores};
-use continuo::clock::{Clock, SystemClock};
-use continuo::feed::cache::CacheStore;
-use continuo::library::EpisodeCandidate;
-use continuo::media::id::{EpisodeKey, FeedId, MediaId, NormalizedUrl};
-use continuo::media::tags::probe_local_tags;
-use continuo::persistence::model::PersistedState;
-use continuo::queue::{NewQueueEntry, QueueSource};
-use continuo::session::Session;
-use continuo::subscription::store::SubscriptionStore;
 use runtime::{pump_for, rig_with, rig_with_probe, row_ids};
 use support::server::{Script, TestServer};
+use tenuto::application::browse::{BrowseRequest, BrowseResult, BrowseWorker};
+use tenuto::application::enrich::TagProbe;
+use tenuto::application::runtime::{AppCommand, EnqueueItem, LibraryStores};
+use tenuto::clock::{Clock, SystemClock};
+use tenuto::feed::cache::CacheStore;
+use tenuto::library::EpisodeCandidate;
+use tenuto::media::id::{EpisodeKey, FeedId, MediaId, NormalizedUrl};
+use tenuto::media::tags::probe_local_tags;
+use tenuto::persistence::model::PersistedState;
+use tenuto::queue::{NewQueueEntry, QueueSource};
+use tenuto::session::Session;
+use tenuto::subscription::store::SubscriptionStore;
 
 const FEED_URL: &str = "https://feeds.example/radio-t.xml";
 const LOCAL: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/sine.flac");
@@ -154,10 +154,10 @@ fn restoring_enqueueing_and_browsing_remote_entries_make_no_requests() {
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let worker = BrowseWorker::spawn(Some(LibraryStores {
         subscriptions: SubscriptionStore::new(
-            library.root.path().join("data/continuo/subscriptions.json"),
+            library.root.path().join("data/tenuto/subscriptions.json"),
             clock,
         ),
-        cache: CacheStore::new(library.root.path().join("cache/continuo/feeds")),
+        cache: CacheStore::new(library.root.path().join("cache/tenuto/feeds")),
     }));
     worker.request(BrowseRequest::Feeds);
     assert!(

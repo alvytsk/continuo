@@ -1,9 +1,9 @@
-use continuo::lifecycle::lock::{LockError, ProfileLock};
+use tenuto::lifecycle::lock::{LockError, ProfileLock};
 
 #[test]
 fn a_second_acquisition_is_contended_until_the_first_is_dropped() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let state = dir.path().join("continuo").join("state.json");
+    let state = dir.path().join("tenuto").join("state.json");
     let first = ProfileLock::acquire(&state).expect("first");
     assert!(first.path().ends_with("state.lock"));
     assert!(matches!(
@@ -35,7 +35,7 @@ fn a_failed_initialization_after_acquisition_releases_the_profile() {
 fn the_contention_message_is_exact() {
     assert_eq!(
         LockError::Contended.to_string(),
-        "Another Continuo player is using this state profile"
+        "Another Tenuto player is using this state profile"
     );
 }
 

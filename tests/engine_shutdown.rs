@@ -3,11 +3,11 @@
 
 use std::time::Duration;
 
-use continuo::playback::command::PlaybackCommand;
-use continuo::playback::event::PlaybackEvent;
-use continuo::playback::state::PlaybackState;
-use continuo::playback::timeline::PositionQuality;
-use continuo::playback::volume::Volume;
+use tenuto::playback::command::PlaybackCommand;
+use tenuto::playback::event::PlaybackEvent;
+use tenuto::playback::state::PlaybackState;
+use tenuto::playback::timeline::PositionQuality;
+use tenuto::playback::volume::Volume;
 
 mod support;
 

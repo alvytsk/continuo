@@ -2,11 +2,11 @@ use std::io::Write;
 use std::{error::Error, process::ExitCode};
 
 use clap::Parser;
-use continuo::{app, cli, telemetry};
+use tenuto::{app, cli, telemetry};
 
 fn main() -> ExitCode {
     if let Err(error) = telemetry::init() {
-        eprintln!("continuo: {error}");
+        eprintln!("tenuto: {error}");
         let fallback = tracing_subscriber::fmt()
             .with_writer(std::io::stderr)
             .with_ansi(false)
@@ -40,7 +40,7 @@ fn main() -> ExitCode {
         Ok(outcome) => ExitCode::from(outcome.exit_status()),
         Err(error) => {
             // A closed terminal must not turn the report into a panic.
-            let _ = writeln!(std::io::stderr(), "continuo: {error}");
+            let _ = writeln!(std::io::stderr(), "tenuto: {error}");
             tracing::error!(error = ?error, "playback failed");
             ExitCode::FAILURE
         }

@@ -1,4 +1,4 @@
-# Continuo Foundation (Milestone 0) Implementation Plan
+# Tenuto Foundation (Milestone 0) Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -8,12 +8,12 @@
 
 **Tech Stack:** Rust 1.98.1, edition 2024; thiserror 2, serde 1, tracing 0.1, tracing-subscriber 0.3, url 2, percent-encoding 2, time 0.3; serde_json 1 for tests.
 
-**Spec:** `docs/superpowers/specs/2026-09-07-continuo-foundation-design.md` (approved; read alongside this plan).
+**Spec:** `docs/superpowers/specs/2026-09-07-tenuto-foundation-design.md` (approved; read alongside this plan).
 
 ## Global Constraints
 
 - `rust-toolchain.toml` pinning Rust **1.98.1** with `rustfmt` and `clippy`.
-- `Cargo.lock` committed; Continuo is an application.
+- `Cargo.lock` committed; Tenuto is an application.
 - `thiserror`, `serde` (derive), `tracing`, `tracing-subscriber` (env-filter), `url`, `percent-encoding`, `time` (serde + RFC 3339).
 - Dev-dependencies: `serde_json`.
 - No `clap` — argument parsing arrives with the M1 CLI. No `anyhow` — `thiserror` throughout, to keep error modeling honest rather than stringly-typed.
@@ -34,7 +34,7 @@
 
 ## Starting point and implementation decisions
 
-The repository currently has `Cargo.toml` (package `continuo`, edition 2024, no dependencies), a minimal committed `Cargo.lock`, `.gitignore`, and `src/main.rs` printing “Hello, world!”. There are no existing domain modules or tests. The local default compiler reports Rust 1.98.1, but the named pinned toolchain may still need installation at execution time. Do not silently change the required version if rustup cannot retrieve it.
+The repository currently has `Cargo.toml` (package `tenuto`, edition 2024, no dependencies), a minimal committed `Cargo.lock`, `.gitignore`, and `src/main.rs` printing “Hello, world!”. There are no existing domain modules or tests. The local default compiler reports Rust 1.98.1, but the named pinned toolchain may still need installation at execution time. Do not silently change the required version if rustup cannot retrieve it.
 
 This is one plan because the approved scope is one small foundation library. The independent runtime subsystems belong to M1–M5 and must receive their own plans then.
 
@@ -76,14 +76,14 @@ Each task ends in an independently testable deliverable. Add the named files onl
 
 **Files:** Modify `Cargo.toml`, `Cargo.lock`; create `rust-toolchain.toml`, `clippy.toml`, `src/lib.rs`, `src/media/mod.rs`, `src/media/capabilities.rs`, `tests/capabilities.rs`.
 
-**Interfaces:** Consumes no domain APIs. Produces `continuo::media::capabilities::{Continuity, SeekSupport, ResumeCapability, MediaCapabilities}` and `MediaCapabilities::resume_capability(&self) -> ResumeCapability`.
+**Interfaces:** Consumes no domain APIs. Produces `tenuto::media::capabilities::{Continuity, SeekSupport, ResumeCapability, MediaCapabilities}` and `MediaCapabilities::resume_capability(&self) -> ResumeCapability`.
 
 - [ ] **Step 1: Establish compiler and dependency configuration.** Preserve existing package identity and `.gitignore`. Set the following manifest and create the two configuration files; these are prerequisites for the domain test, not a separate scaffold task.
 
 ```toml
 # Cargo.toml
 [package]
-name = "continuo"
+name = "tenuto"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.98.1"
@@ -127,7 +127,7 @@ Run `cargo generate-lockfile`, then `cargo --version` and `rustc --version`. Exp
 - [ ] **Step 2: Write the matrix regression test.** Create `tests/capabilities.rs`:
 
 ```rust
-use continuo::media::capabilities::{Continuity as C, MediaCapabilities, ResumeCapability as R, SeekSupport as S};
+use tenuto::media::capabilities::{Continuity as C, MediaCapabilities, ResumeCapability as R, SeekSupport as S};
 
 #[test]
 fn resume_capability_covers_every_pair() {
@@ -146,7 +146,7 @@ fn resume_capability_covers_every_pair() {
 }
 ```
 
-- [ ] **Step 3: Run the failing test.** Run `cargo test --locked --test capabilities`. Expected: unresolved `continuo` library or capability module, rather than dependency/toolchain failure.
+- [ ] **Step 3: Run the failing test.** Run `cargo test --locked --test capabilities`. Expected: unresolved `tenuto` library or capability module, rather than dependency/toolchain failure.
 
 - [ ] **Step 4: Implement the library and derived capability method.** `src/lib.rs` initially contains `pub mod media;`; `src/media/mod.rs` initially contains `pub mod capabilities;`. Create `src/media/capabilities.rs`:
 
@@ -185,7 +185,7 @@ impl MediaCapabilities {
 - [ ] **Step 1: Write validation and priority tests.** Create `tests/identity_values.rs`:
 
 ```rust
-use continuo::media::id::{AbsolutePath, EpisodeKey, FeedId, NormalizedUrl};
+use tenuto::media::id::{AbsolutePath, EpisodeKey, FeedId, NormalizedUrl};
 use std::path::PathBuf;
 use url::Url;
 
@@ -345,7 +345,7 @@ The private episode-key formatting method arrives with its consumer in Task 3.
 - [ ] **Step 1: Write adversarial identity tests.** Create `tests/media_id.rs`:
 
 ```rust
-use continuo::media::id::{AbsolutePath, EpisodeKey, FeedId, MediaId, NormalizedUrl};
+use tenuto::media::id::{AbsolutePath, EpisodeKey, FeedId, MediaId, NormalizedUrl};
 use std::{collections::HashMap, path::PathBuf};
 
 #[allow(clippy::unwrap_used)] // Fallible construction of fixed test fixtures.
@@ -501,8 +501,8 @@ The final equality check also rejects malformed `%` escapes, lowercase escapes, 
 - [ ] **Step 1: Write behavioral boundary tests.** Create `tests/domain_values.rs`:
 
 ```rust
-use continuo::media::{Episode, id::{EpisodeKey, FeedId, MediaId, NormalizedUrl}, metadata::MediaMetadata, source::SourceLocation};
-use continuo::playback::checkpoint::PlaybackCheckpoint;
+use tenuto::media::{Episode, id::{EpisodeKey, FeedId, MediaId, NormalizedUrl}, metadata::MediaMetadata, source::SourceLocation};
+use tenuto::playback::checkpoint::PlaybackCheckpoint;
 use std::time::Duration;
 use time::OffsetDateTime;
 use url::Url;
@@ -609,12 +609,12 @@ pub struct PlaybackCheckpoint {
 - [ ] **Step 1: Write initialization and process boundary tests.** Create `tests/telemetry.rs`:
 
 ```rust
-use continuo::telemetry;
+use tenuto::telemetry;
 
 #[test]
 fn validates_filter_without_installing_global_state() {
-    assert!(telemetry::subscriber("continuo=debug,warn").is_ok());
-    let error = match telemetry::subscriber("continuo=not-a-level") {
+    assert!(telemetry::subscriber("tenuto=debug,warn").is_ok());
+    let error = match telemetry::subscriber("tenuto=not-a-level") {
         Ok(_) => panic!("invalid filter accepted"),
         Err(error) => error,
     };
@@ -629,14 +629,14 @@ use std::process::Command;
 
 #[test]
 fn startup_is_minimal_and_reports_filter_errors() {
-    let success = Command::new(env!("CARGO_BIN_EXE_continuo")).env("RUST_LOG", "continuo=info").output().unwrap();
+    let success = Command::new(env!("CARGO_BIN_EXE_tenuto")).env("RUST_LOG", "tenuto=info").output().unwrap();
     assert!(success.status.success());
     assert!(success.stdout.is_empty());
-    assert!(String::from_utf8_lossy(&success.stderr).contains("Continuo foundation initialized"));
-    let failure = Command::new(env!("CARGO_BIN_EXE_continuo")).env("RUST_LOG", "continuo=not-a-level").output().unwrap();
+    assert!(String::from_utf8_lossy(&success.stderr).contains("Tenuto foundation initialized"));
+    let failure = Command::new(env!("CARGO_BIN_EXE_tenuto")).env("RUST_LOG", "tenuto=not-a-level").output().unwrap();
     assert!(!failure.status.success());
     let stderr = String::from_utf8_lossy(&failure.stderr);
-    assert!(stderr.contains("continuo: invalid tracing filter"));
+    assert!(stderr.contains("tenuto: invalid tracing filter"));
     assert!(stderr.contains("application startup failed"));
 }
 ```
@@ -676,7 +676,7 @@ pub fn subscriber(filter: &str) -> Result<impl tracing::Subscriber + Send + Sync
 pub fn init() -> Result<(), TelemetryError> {
     let filter = match std::env::var("RUST_LOG") {
         Ok(value) => value,
-        Err(std::env::VarError::NotPresent) => "continuo=info".into(),
+        Err(std::env::VarError::NotPresent) => "tenuto=info".into(),
         Err(error) => return Err(TelemetryError::Environment(error)),
     };
     tracing::subscriber::set_global_default(subscriber(&filter)?)?;
@@ -687,12 +687,12 @@ pub fn init() -> Result<(), TelemetryError> {
 - [ ] **Step 4: Replace the greeting with the application boundary.** Use a local fallback subscriber when tracing itself fails, so the full startup error is still logged. Replace `src/main.rs`:
 
 ```rust
-use continuo::{error::TelemetryError, telemetry};
+use tenuto::{error::TelemetryError, telemetry};
 use std::{error::Error, process::ExitCode};
 
 fn run() -> Result<(), TelemetryError> {
     telemetry::init()?;
-    tracing::info!("Continuo foundation initialized");
+    tracing::info!("Tenuto foundation initialized");
     Ok(())
 }
 
@@ -700,7 +700,7 @@ fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("continuo: {error}");
+            eprintln!("tenuto: {error}");
             let fallback = tracing_subscriber::fmt()
                 .with_writer(std::io::stderr)
                 .with_ansi(false)
@@ -740,12 +740,12 @@ fn main() -> ExitCode {
   8. **Milestones and backend:** reproduce M0–M5 table and explicit M0 deferrals. Symphonia + CPAL is M1 choice for control; do not claim Rodio cannot seek; range support belongs to sources. No speculative backend trait; Rodio is contingency. Record all v0.1 exclusions, including deferred MPRIS/media keys. M1 requires ALSA development headers on Linux; M0 does not.
   9. **Future acceptance:** copy all eleven Radio-T manual scenario steps from §8, noting the full feed-driven case becomes executable with M4 while M3 exercises its HTTP playback portion. Specify local-server automated cases: ranges, no ranges, redirects, invalid range responses, reconnect-after-stop. No public-network dependency for automated tests.
 
-Link back to `superpowers/specs/2026-09-07-continuo-foundation-design.md` from `docs/architecture.md`. Do not replace the approved spec or imply deferred behavior works today.
+Link back to `superpowers/specs/2026-09-07-tenuto-foundation-design.md` from `docs/architecture.md`. Do not replace the approved spec or imply deferred behavior works today.
 
 - [ ] **Step 2: Write `README.md`.** Use this concise starting content, with the existing identity grammar explained in architecture rather than duplicated:
 
 ```markdown
-# Continuo
+# Tenuto
 
 A keyboard-first terminal audio player being built for local audio, finite HTTP media, and podcasts.
 
@@ -758,7 +758,7 @@ Install Rust through rustup. The repository pins Rust 1.98.1 and the rustfmt and
 Run from the repository root:
 
     cargo run --locked
-    RUST_LOG=continuo=debug cargo run --locked
+    RUST_LOG=tenuto=debug cargo run --locked
     cargo fmt --check
     cargo clippy --locked --all-targets --all-features -- -D warnings
     cargo test --locked
@@ -769,7 +769,7 @@ M0 has no audio system dependency. M1 will require libasound2-dev on Linux when 
 
 ## Design and roadmap
 
-Read the [architecture](docs/architecture.md) and [approved foundation spec](docs/superpowers/specs/2026-09-07-continuo-foundation-design.md).
+Read the [architecture](docs/architecture.md) and [approved foundation spec](docs/superpowers/specs/2026-09-07-tenuto-foundation-design.md).
 
 M1 adds local playback; M2 adds durable resume; M3 adds finite HTTP playback; M4 adds feeds and subscriptions; M5 adds the TUI.
 

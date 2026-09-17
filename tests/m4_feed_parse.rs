@@ -8,8 +8,8 @@
 
 use std::time::Duration;
 
-use continuo::feed::error::FeedError;
-use continuo::feed::parse::{ParseWarning, WarningKind, parse_feed};
+use tenuto::feed::error::FeedError;
+use tenuto::feed::parse::{ParseWarning, WarningKind, parse_feed};
 use url::Url;
 
 const RSS2_MINIMAL: &[u8] = include_bytes!("fixtures/feeds/rss2-minimal.xml");

@@ -9,13 +9,13 @@ mod support;
 
 use std::time::Duration;
 
-use continuo::{
+use support::server::{DocumentReply, Script, TestServer};
+use tenuto::{
     feed::error::FeedError,
     http::{limits::Limits, service::HttpService},
     library::{self, FollowupStep, SubscribeOutcome},
     persistence::model::PersistedState,
 };
-use support::server::{DocumentReply, Script, TestServer};
 
 /// One RSS document, one item, an ASCII title that derives to `radio-t`.
 const RADIO_T: &[u8] =
@@ -321,7 +321,7 @@ fn a_feed_parse_failure_writes_neither_store() -> Result<(), Box<dyn std::error:
     }
     assert!(!rig.subs.path().exists(), "no subscription was ever saved");
     assert!(
-        std::fs::read_dir(rig.root.path().join("cache/continuo/feeds")).is_err(),
+        std::fs::read_dir(rig.root.path().join("cache/tenuto/feeds")).is_err(),
         "no cache entry was ever created"
     );
     server.shutdown();
@@ -516,10 +516,10 @@ fn a_cache_file_obstruction_leaves_the_subscription_removed_and_the_sentinel_unt
     std::fs::create_dir(&path)?;
     std::fs::write(path.join("sentinel"), b"keep")?;
 
-    let result = continuo::library::unsubscribe(&rig.subs, &rig.cache, &sub.slug)?;
+    let result = tenuto::library::unsubscribe(&rig.subs, &rig.cache, &sub.slug)?;
     assert!(matches!(
         result.followup.as_ref().map(|f| &f.step),
-        Some(continuo::library::FollowupStep::RemoveCache)
+        Some(tenuto::library::FollowupStep::RemoveCache)
     ));
     assert!(rig.subs.read_snapshot()?.subscriptions.is_empty());
     assert_eq!(std::fs::read(path.join("sentinel"))?, b"keep");
@@ -560,7 +560,7 @@ fn a_subscription_file_obstruction_fails_unsubscribe_before_touching_the_cache()
 #[test]
 fn a_mutation_refuses_while_another_holds_the_subscription_lock()
 -> Result<(), Box<dyn std::error::Error>> {
-    use continuo::lifecycle::lock::ProfileLock;
+    use tenuto::lifecycle::lock::ProfileLock;
     let rig = feeds::Rig::new()?;
     let sub = rig.seed(RADIO_T, "https://example.org/feed")?;
     let held = ProfileLock::acquire_file(&rig.subs.path().with_file_name("subscriptions.lock"))?;

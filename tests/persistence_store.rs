@@ -8,11 +8,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use continuo::clock::FakeClock;
-use continuo::persistence::model::{PersistedState, SCHEMA_VERSION};
-use continuo::persistence::store::{LoadReason, MAX_QUARANTINE_CANDIDATES, StateStore};
-use continuo::playback::checkpoint::PlaybackCheckpoint;
 use support::media;
+use tenuto::clock::FakeClock;
+use tenuto::persistence::model::{PersistedState, SCHEMA_VERSION};
+use tenuto::persistence::store::{LoadReason, MAX_QUARANTINE_CANDIDATES, StateStore};
+use tenuto::playback::checkpoint::PlaybackCheckpoint;
 use time::OffsetDateTime;
 
 /// The stamp a `FakeClock` produces, which starts at the epoch.
@@ -389,7 +389,7 @@ fn the_directory_and_the_file_are_private() {
     use std::os::unix::fs::PermissionsExt;
 
     let root = tempfile::tempdir().unwrap();
-    let nested = root.path().join("continuo");
+    let nested = root.path().join("tenuto");
     let store = StateStore::new(nested.join("state.json"), Arc::new(FakeClock::new()));
     store.write(&state_with("a", 1)).unwrap();
 
@@ -415,7 +415,7 @@ fn an_existing_permissive_directory_is_tightened() {
     use std::os::unix::fs::PermissionsExt;
 
     let root = tempfile::tempdir().unwrap();
-    let nested = root.path().join("continuo");
+    let nested = root.path().join("tenuto");
     fs::create_dir_all(&nested).unwrap();
     fs::set_permissions(&nested, fs::Permissions::from_mode(0o755)).unwrap();
 

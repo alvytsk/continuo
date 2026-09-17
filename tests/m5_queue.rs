@@ -1,7 +1,7 @@
 #[cfg(test)]
 mod tests {
-    use continuo::media::id::{AbsolutePath, MediaId};
-    use continuo::queue::{
+    use tenuto::media::id::{AbsolutePath, MediaId};
+    use tenuto::queue::{
         Direction, DisplayMetadata, MAX_QUEUE_ENTRIES, NewQueueEntry, Queue, QueueError,
         QueueSource,
     };
@@ -72,7 +72,7 @@ mod tests {
             [ids[0], ids[2], ids[1]]
         );
         assert!(!queue.move_entry(ids[0], Direction::Up).expect("known"));
-        let unknown_id = continuo_unknown_id(&mut queue);
+        let unknown_id = tenuto_unknown_id(&mut queue);
         assert!(matches!(
             queue.move_entry(unknown_id, Direction::Down),
             Err(QueueError::UnknownEntry(_))
@@ -80,7 +80,7 @@ mod tests {
     }
 
     /// An ID that no longer exists: enqueue then remove it.
-    fn continuo_unknown_id(queue: &mut Queue) -> continuo::queue::QueueEntryId {
+    fn tenuto_unknown_id(queue: &mut Queue) -> tenuto::queue::QueueEntryId {
         let id = queue.enqueue(vec![local("gone")]).expect("fits")[0];
         queue.remove(id).expect("known");
         id

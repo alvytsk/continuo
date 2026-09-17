@@ -1,4 +1,4 @@
-//! Cross-cutting concerns shared by every `continuo` invocation that touches
+//! Cross-cutting concerns shared by every `tenuto` invocation that touches
 //! a state profile: the exclusive profile lock, shutdown-signal handling,
 //! deterministic test hooks, background-job panic containment, idempotent
 //! terminal cleanup, terminal input read off the main loop, and the

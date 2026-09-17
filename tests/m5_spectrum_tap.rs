@@ -4,14 +4,14 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
-use continuo::playback::output::Nanos;
-use continuo::playback::spectrum::tap::tap_pair;
+use tenuto::playback::output::Nanos;
+use tenuto::playback::spectrum::tap::tap_pair;
 
 fn pair(
     enabled: bool,
 ) -> (
-    continuo::playback::spectrum::tap::TapWriter,
-    continuo::playback::spectrum::tap::TapReader,
+    tenuto::playback::spectrum::tap::TapWriter,
+    tenuto::playback::spectrum::tap::TapReader,
 ) {
     tap_pair(7, 2, 48_000, Arc::new(AtomicBool::new(enabled)))
 }

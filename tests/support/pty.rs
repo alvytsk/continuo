@@ -1,4 +1,4 @@
-//! Drives `continuo` inside a pseudo-terminal, for tests that need a real
+//! Drives `tenuto` inside a pseudo-terminal, for tests that need a real
 //! terminal on the child's stdin, stdout and stderr (M5 §12). The child is
 //! launched from [`crate::process::binary`] with [`crate::process::profile_env`]
 //! applied, so it gets the same isolated profile as every other launch.
@@ -29,7 +29,7 @@ const DRAIN_PATIENCE: Duration = Duration::from_secs(2);
 const KILL_PATIENCE: Duration = Duration::from_secs(2);
 /// Variables a test must opt into explicitly: an inherited hook or output
 /// selection would silently change what the child does.
-const OPT_IN_VARIABLES: [&str; 2] = ["CONTINUO_TEST_HOOK", "CONTINUO_AUDIO_OUTPUT"];
+const OPT_IN_VARIABLES: [&str; 2] = ["TENUTO_TEST_HOOK", "TENUTO_AUDIO_OUTPUT"];
 /// The terminal every child is told it runs in, whatever terminal runs the
 /// suite. Under tmux, image protocol detection runs
 /// `tmux set -p allow-passthrough on`, which would change the developer's own
@@ -62,7 +62,7 @@ fn io_error(error: impl std::fmt::Display) -> std::io::Error {
     std::io::Error::other(error.to_string())
 }
 
-/// The command `PtyChild::spawn` runs: `continuo <args>` in `root` with its
+/// The command `PtyChild::spawn` runs: `tenuto <args>` in `root` with its
 /// isolated profile, the opt-in variables removed, a fixed terminal type and
 /// no trace of a multiplexer, then `env` on top.
 pub fn command(root: &Path, args: &[&str], env: &[(&str, &str)]) -> CommandBuilder {
@@ -83,8 +83,8 @@ pub fn command(root: &Path, args: &[&str], env: &[(&str, &str)]) -> CommandBuild
 }
 
 impl PtyChild {
-    /// Launches `continuo <args>` on a new `cols`×`rows` PTY under the
-    /// profile at `root`. `CONTINUO_TEST_HOOK` and `CONTINUO_AUDIO_OUTPUT`
+    /// Launches `tenuto <args>` on a new `cols`×`rows` PTY under the
+    /// profile at `root`. `TENUTO_TEST_HOOK` and `TENUTO_AUDIO_OUTPUT`
     /// are removed unless `env` sets them.
     pub fn spawn(
         root: &Path,
@@ -250,7 +250,7 @@ impl PtyChild {
 
     /// portable-pty's kill sends SIGHUP, waits about 200 ms for the child to
     /// exit, then sends SIGKILL, so a child that catches SIGHUP (every
-    /// `continuo` player does) or is stuck is still ended.
+    /// `tenuto` player does) or is stuck is still ended.
     fn kill(&mut self) {
         let _ = self.child.kill();
         let deadline = Instant::now() + KILL_PATIENCE;

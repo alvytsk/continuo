@@ -5,14 +5,14 @@ mod support;
 
 use std::time::{Duration, Instant};
 
-use continuo::playback::event::PlaybackEvent;
-use continuo::playback::output::Nanos;
-use continuo::playback::spectrum::registry::{TapMapping, TapRegistry};
-use continuo::playback::spectrum::worker::{
+use support::TestEngine;
+use tenuto::playback::event::PlaybackEvent;
+use tenuto::playback::output::Nanos;
+use tenuto::playback::spectrum::registry::{TapMapping, TapRegistry};
+use tenuto::playback::spectrum::worker::{
     AnalyzedWindow, FRAME_MAX_AGE, FrameSchedule, MappingKey, SlotUpdate, SpectrumFrame,
     frame_is_fresh,
 };
-use support::TestEngine;
 
 fn mapping(instance: u64, generation: u16, epoch: u32, rev: u64) -> TapMapping {
     TapMapping {
@@ -68,7 +68,7 @@ fn playback_publishes_frames_labelled_with_the_current_revision_only() {
     assert_eq!(frame.levels.len(), frame.bands.len());
 
     engine.interrupt_stop();
-    engine.await_state(continuo::playback::state::PlaybackState::Stopped);
+    engine.await_state(tenuto::playback::state::PlaybackState::Stopped);
     let deadline = Instant::now() + Duration::from_secs(5);
     while spectrum.latest().is_some() {
         assert!(

@@ -1,11 +1,11 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use continuo::cli::ArtworkMode;
-use continuo::media::id::{AbsolutePath, MediaId};
-use continuo::tui::images::{CoverCache, picker_for};
 use ratatui::layout::Rect;
 use ratatui_image::picker::Picker;
+use tenuto::cli::ArtworkMode;
+use tenuto::media::id::{AbsolutePath, MediaId};
+use tenuto::tui::images::{CoverCache, picker_for};
 
 #[allow(clippy::expect_used)] // A literal absolute path always parses.
 fn media(name: &str) -> MediaId {
@@ -25,7 +25,7 @@ fn off_disables_images_blocks_never_queries_and_auto_falls_back() {
 #[test]
 fn a_prepared_cover_is_reused_until_media_mode_or_area_changes() {
     let picker = Picker::halfblocks();
-    let mut cache = CoverCache::new(continuo::lifecycle::hooks::TestHook::None);
+    let mut cache = CoverCache::new(tenuto::lifecycle::hooks::TestHook::None);
     let area = Some(Rect::new(0, 0, 14, 7));
     cache.set_image(
         media("a"),
@@ -74,7 +74,7 @@ fn a_prepared_cover_is_reused_until_media_mode_or_area_changes() {
 #[test]
 fn no_image_or_no_area_renders_the_placeholder() {
     let picker = Picker::halfblocks();
-    let mut cache = CoverCache::new(continuo::lifecycle::hooks::TestHook::None);
+    let mut cache = CoverCache::new(tenuto::lifecycle::hooks::TestHook::None);
     cache.set_image(media("a"), None);
     assert!(!cache.prepare(
         Some(&picker),
@@ -95,9 +95,9 @@ fn no_image_or_no_area_renders_the_placeholder() {
 
 #[test]
 fn an_encoding_panic_is_contained_and_a_later_preparation_succeeds() {
-    use continuo::artwork::decode::ArtworkError;
-    use continuo::lifecycle::panic::in_contained_job;
-    use continuo::tui::images::prepare_contained;
+    use tenuto::artwork::decode::ArtworkError;
+    use tenuto::lifecycle::panic::in_contained_job;
+    use tenuto::tui::images::prepare_contained;
     let contained_inside = AtomicBool::new(false);
     let failed = prepare_contained(|| -> Result<(), ArtworkError> {
         contained_inside.store(in_contained_job(), Ordering::SeqCst);

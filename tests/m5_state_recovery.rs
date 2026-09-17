@@ -1,8 +1,8 @@
-use continuo::clock::FakeClock;
-use continuo::persistence::queue_codec::{QueueProblem, QueueReset};
-use continuo::persistence::store::{LoadReason, QueueBackup, StateStore};
 use serde_json::json;
 use std::sync::Arc;
+use tenuto::clock::FakeClock;
+use tenuto::persistence::queue_codec::{QueueProblem, QueueReset};
+use tenuto::persistence::store::{LoadReason, QueueBackup, StateStore};
 
 mod support;
 use support::media;

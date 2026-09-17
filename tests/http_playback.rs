@@ -11,17 +11,17 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use continuo::clock::{Clock, FakeClock};
-use continuo::http::limits::Limits;
-use continuo::media::capabilities::SeekSupport;
-use continuo::media::id::{MediaId, NormalizedUrl};
-use continuo::persistence::model::PersistedState;
-use continuo::persistence::store::StateStore;
-use continuo::playback::command::{Admission, ResumeIntent};
-use continuo::playback::event::{PlaybackEvent, StartDisposition};
-use continuo::playback::state::PlaybackState;
-use continuo::resume::resume_candidate;
-use continuo::session::{Action, LoadTarget, Session};
+use tenuto::clock::{Clock, FakeClock};
+use tenuto::http::limits::Limits;
+use tenuto::media::capabilities::SeekSupport;
+use tenuto::media::id::{MediaId, NormalizedUrl};
+use tenuto::persistence::model::PersistedState;
+use tenuto::persistence::store::StateStore;
+use tenuto::playback::command::{Admission, ResumeIntent};
+use tenuto::playback::event::{PlaybackEvent, StartDisposition};
+use tenuto::playback::state::PlaybackState;
+use tenuto::resume::resume_candidate;
+use tenuto::session::{Action, LoadTarget, Session};
 
 use support::TestEngine;
 use support::server::{Script, TestServer};

@@ -9,13 +9,13 @@ mod support;
 
 use std::time::Duration;
 
-use continuo::{
+use support::server::{DocumentReply, Script, TestServer};
+use tenuto::{
     feed::error::FeedError,
     http::{document::CacheValidators, error::RemoteFailure, limits::Limits, service::HttpService},
     library::{self, FollowupStep, RefreshOutcome},
     persistence::model::PersistedState,
 };
-use support::server::{DocumentReply, Script, TestServer};
 
 /// One RSS document, one item, an ASCII title that derives to `radio-t`.
 const RADIO_T: &[u8] =
@@ -98,7 +98,7 @@ fn unchanged_preserves_representation_and_advances_check_time()
 // --- Step 6, group A: an unusable cache forces an unconditional fetch -----
 
 /// Rewrites `path`'s cache entry as JSON with `parser_version` bumped so it
-/// no longer matches [`continuo::feed::cache::PARSER_VERSION`], corrupts it
+/// no longer matches [`tenuto::feed::cache::PARSER_VERSION`], corrupts it
 /// outright, or removes it, per `mode`.
 fn break_cache(path: &std::path::Path, mode: &str) -> Result<(), Box<dyn std::error::Error>> {
     match mode {

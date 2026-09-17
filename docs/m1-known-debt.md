@@ -258,7 +258,7 @@ table rather than a design judgement.
   `estimate_num_mpeg_frames` and populates `track.num_frames` from a
   ~16-frame sample, so `max_ts` is available and `preseek_coarse` proceeds —
   it does not refuse. Verified both by reading the source and by exercising
-  it (`docs/superpowers/specs/2026-09-10-continuo-estimated-seek-design.md`
+  it (`docs/superpowers/specs/2026-09-10-tenuto-estimated-seek-design.md`
   §5.2).
 
   **Fixed by M3.1 Task 4.** `seek_refined` (`src/playback/decode.rs`) now
@@ -389,7 +389,7 @@ such changes be explicit rather than silent:
 # Milestone 3.1 — carried debt
 
 Findings from executing the estimated-seeking amendment
-(`docs/superpowers/specs/2026-09-10-continuo-estimated-seek-design.md`) that
+(`docs/superpowers/specs/2026-09-10-tenuto-estimated-seek-design.md`) that
 were judged fine to carry. None threatens the amendment's invariant (an
 estimated position or duration may drive display and resume, but must never
 replace an established checkpoint or drive a destructive decision). All four

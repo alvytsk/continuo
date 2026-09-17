@@ -1,7 +1,7 @@
 //! Task 17 (design doc M5 §11): per-session TUI log files, retention of the
 //! five most recent prior logs, and (Unix) fd 2 redirection.
 
-use continuo::lifecycle::stderr::{KEPT_PRIOR_LOGS, log_dir, open_session_log, retain_recent_logs};
+use tenuto::lifecycle::stderr::{KEPT_PRIOR_LOGS, log_dir, open_session_log, retain_recent_logs};
 use time::OffsetDateTime;
 
 #[test]
@@ -10,7 +10,7 @@ fn retention_keeps_the_five_most_recent_prior_logs_and_ignores_other_files() {
     for day in 1..=8 {
         std::fs::write(
             dir.path()
-                .join(format!("continuo-tui-2026090{day}T000000Z-1.log")),
+                .join(format!("tenuto-tui-2026090{day}T000000Z-1.log")),
             b"x",
         )
         .expect("seed");
@@ -25,14 +25,14 @@ fn retention_keeps_the_five_most_recent_prior_logs_and_ignores_other_files() {
     left.sort();
     assert_eq!(left.len(), 6);
     assert!(left.contains(&"notes.txt".to_string()));
-    assert!(left.contains(&"continuo-tui-20260908T000000Z-1.log".to_string()));
-    assert!(!left.contains(&"continuo-tui-20260903T000000Z-1.log".to_string()));
+    assert!(left.contains(&"tenuto-tui-20260908T000000Z-1.log".to_string()));
+    assert!(!left.contains(&"tenuto-tui-20260903T000000Z-1.log".to_string()));
 }
 
 #[test]
 fn each_session_gets_a_new_unique_log_under_the_profile() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let state = dir.path().join("continuo").join("state.json");
+    let state = dir.path().join("tenuto").join("state.json");
     // 2026-09-14T12:00:00Z. `time`'s `macros` feature is not enabled, so this
     // is built from a verified Unix timestamp rather than `datetime!`.
     let wall = OffsetDateTime::from_unix_timestamp(1_789_387_200).expect("timestamp");

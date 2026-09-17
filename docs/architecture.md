@@ -1,12 +1,12 @@
-# Continuo architecture
+# Tenuto architecture
 
-Continuo is a keyboard-first terminal audio player for local files, finite remote audio over HTTP, and podcast episodes from RSS or Atom feeds. It ships as one Rust binary, `continuo`, with a plain `play` command and a full-screen `tui` player.
+Tenuto is a keyboard-first terminal audio player for local files, finite remote audio over HTTP, and podcast episodes from RSS or Atom feeds. It ships as one Rust binary, `tenuto`, with a plain `play` command and a full-screen `tui` player.
 
 This document describes the system as built through milestone 6. It uses the C4 model: context, containers, components, one runtime sequence, and deployment. The design decisions behind each part live in the specs under [`superpowers/specs/`](superpowers/specs/). The acceptance records live in [`m3-acceptance.md`](m3-acceptance.md), [`m5-acceptance.md`](m5-acceptance.md) and [`m6-acceptance.md`](m6-acceptance.md). Known debt lives in [`m1-known-debt.md`](m1-known-debt.md).
 
 ## 1. Scope and invariants
 
-Transport and media semantics are separate. HTTP does not by itself make media finite, seekable, resumable, or live. Continuo refuses a live stream instead of playing it.
+Transport and media semantics are separate. HTTP does not by itself make media finite, seekable, resumable, or live. Tenuto refuses a live stream instead of playing it.
 
 The one invariant every other rule serves:
 
@@ -38,7 +38,7 @@ Other fixed rules:
 ```mermaid
 flowchart LR
     listener(["Listener<br/>at a terminal"])
-    continuo["Continuo<br/>terminal audio player<br/>(one Rust binary)"]
+    tenuto["Tenuto<br/>terminal audio player<br/>(one Rust binary)"]
     term["Terminal emulator<br/>keys, mouse, image protocol"]
     device["Audio device<br/>ALSA, CoreAudio, WASAPI via CPAL"]
     media["Media servers<br/>finite HTTP audio, CDNs"]
@@ -46,31 +46,31 @@ flowchart LR
     fs[("XDG directories<br/>state, data, cache, logs")]
 
     listener -- "keys, mouse" --> term
-    term -- "input events" --> continuo
-    continuo -- "frames, cover art" --> term
-    continuo -- "PCM" --> device
-    continuo -- "GET, Range, redirects" --> media
-    continuo -- "conditional GET" --> feeds
-    continuo -- "atomic JSON writes" --> fs
+    term -- "input events" --> tenuto
+    tenuto -- "frames, cover art" --> term
+    tenuto -- "PCM" --> device
+    tenuto -- "GET, Range, redirects" --> media
+    tenuto -- "conditional GET" --> feeds
+    tenuto -- "atomic JSON writes" --> fs
 ```
 
-Continuo talks to nothing else. There is no daemon, no client, no remote control, and no third-party service integration.
+Tenuto talks to nothing else. There is no daemon, no client, no remote control, and no third-party service integration.
 
 ## 3. Containers
 
-Continuo is one process. Its containers are the binary and the files it owns.
+Tenuto is one process. Its containers are the binary and the files it owns.
 
 ```mermaid
 flowchart TB
     subgraph host["Listener's machine"]
         direction TB
-        bin["continuo binary<br/>CLI commands and the TUI player"]
-        state[("state.json<br/>$XDG_STATE_HOME/continuo<br/>checkpoints, queue, volume<br/>schema 3, one atomic snapshot")]
+        bin["tenuto binary<br/>CLI commands and the TUI player"]
+        state[("state.json<br/>$XDG_STATE_HOME/tenuto<br/>checkpoints, queue, volume<br/>schema 3, one atomic snapshot")]
         lock[("state.lock<br/>player profile lock")]
-        subs[("subscriptions.json<br/>$XDG_DATA_HOME/continuo<br/>durable user data")]
+        subs[("subscriptions.json<br/>$XDG_DATA_HOME/tenuto<br/>durable user data")]
         slock[("subscriptions.lock<br/>subscription writer lock")]
-        cache[("feeds/&lt;feed-id&gt;.json<br/>$XDG_CACHE_HOME/continuo<br/>refetchable episodes")]
-        logs[("logs/continuo-tui-*.log<br/>$XDG_STATE_HOME/continuo<br/>one per tui run, five kept")]
+        cache[("feeds/&lt;feed-id&gt;.json<br/>$XDG_CACHE_HOME/tenuto<br/>refetchable episodes")]
+        logs[("logs/tenuto-tui-*.log<br/>$XDG_STATE_HOME/tenuto<br/>one per tui run, five kept")]
     end
     device["Audio device"]
     net["Media and feed servers"]
@@ -192,18 +192,18 @@ Each thread has strict ownership. The names below are the OS thread names.
 | Context | Thread | Owns | Must not |
 |---|---|---|---|
 | Application | main | Input decoding, `AppCommand` routing, pumping the runtime, drawing, the command sender and the event receiver | Hold a decoder or a CPAL stream. Block on a worker's result |
-| Input reader | `continuo-input` | The crossterm read loop, handed over a bounded channel. Isolates the main loop from a hung-up terminal | Interpret keys |
-| Decode worker | `continuo-decode` | Symphonia demux and decode, resampling, command processing, PCM production, position anchoring, the CPAL stream's full lifecycle | Block on the Tokio runtime |
+| Input reader | `tenuto-input` | The crossterm read loop, handed over a bounded channel. Isolates the main loop from a hung-up terminal | Interpret keys |
+| Decode worker | `tenuto-decode` | Symphonia demux and decode, resampling, command processing, PCM production, position anchoring, the CPAL stream's full lifecycle | Block on the Tokio runtime |
 | CPAL callback | device thread | Drain the bounded SPSC ring, emit silence on underrun, push one `SpanRecord` per fill, write the optional output tap | Lock, allocate, wait, or perform I/O |
-| Null output | `continuo-null-output` | With `CONTINUO_AUDIO_OUTPUT=null`: pace the real callback core against a wall clock and discard the samples | Exist in production use |
-| State writer | `continuo-state` | Serialize and atomically write the keep-latest snapshot, coalesced over 2 s | Run on Tokio |
+| Null output | `tenuto-null-output` | With `TENUTO_AUDIO_OUTPUT=null`: pace the real callback core against a wall clock and discard the samples | Exist in production use |
+| State writer | `tenuto-state` | Serialize and atomically write the keep-latest snapshot, coalesced over 2 s | Run on Tokio |
 | HTTP runtime | Tokio, one worker | The reqwest client, one fetch task per source generation, one document fetch per call | Touch decoder or device state |
-| HTTP source adapter | runs on `continuo-decode` | `HttpMediaSource`: synchronous, cancellable reads and seeks over `ByteChannel` | Call into Tokio directly |
-| Signal listener | `continuo-signal-listener` | Record the first of SIGINT, SIGHUP, SIGTERM. Set the shutdown flag. Wake the application | Render, load state, or flush |
-| Metadata workers | `continuo-metadata-1`, `-2` | Tag probes for untitled local queue entries, each inside `run_contained` | Touch `Session`, the terminal or the network |
-| Artwork worker | `continuo-artwork` | One latest-wins slot: resolve and decode the active entry's cover within 10 MiB encoded and 16 million pixels, inside `run_contained` | Encode for the terminal or open its own connection |
-| Spectrum worker | `continuo-spectrum` | Read the output taps, run the 2048-sample Hann FFT, publish at most 20 frames per second into a latest-value slot | Block or allocate on the callback's behalf. Catch its own panics |
-| Browse worker | `continuo-browse` | One request at a time: a directory level, the subscription list, one feed's cached episodes, and since M6 the subscribe, refresh and unsubscribe mutations through `library` | Recurse into a library or touch `Session` |
+| HTTP source adapter | runs on `tenuto-decode` | `HttpMediaSource`: synchronous, cancellable reads and seeks over `ByteChannel` | Call into Tokio directly |
+| Signal listener | `tenuto-signal-listener` | Record the first of SIGINT, SIGHUP, SIGTERM. Set the shutdown flag. Wake the application | Render, load state, or flush |
+| Metadata workers | `tenuto-metadata-1`, `-2` | Tag probes for untitled local queue entries, each inside `run_contained` | Touch `Session`, the terminal or the network |
+| Artwork worker | `tenuto-artwork` | One latest-wins slot: resolve and decode the active entry's cover within 10 MiB encoded and 16 million pixels, inside `run_contained` | Encode for the terminal or open its own connection |
+| Spectrum worker | `tenuto-spectrum` | Read the output taps, run the 2048-sample Hann FFT, publish at most 20 frames per second into a latest-value slot | Block or allocate on the callback's behalf. Catch its own panics |
+| Browse worker | `tenuto-browse` | One request at a time: a directory level, the subscription list, one feed's cached episodes, and since M6 the subscribe, refresh and unsubscribe mutations through `library` | Recurse into a library or touch `Session` |
 
 The Tokio runtime exists only when the source is an HTTP URL. A local-file session runs with no Tokio runtime at all.
 
@@ -222,10 +222,10 @@ sequenceDiagram
     participant S as Session
     participant C as Feed cache
     participant E as EngineHandle
-    participant D as continuo-decode
+    participant D as tenuto-decode
     participant H as HttpService (Tokio)
     participant O as CPAL callback
-    participant W as continuo-state
+    participant W as tenuto-state
 
     L->>T: Enter on a queue row
     T->>R: AppCommand::PlayEntry
@@ -382,7 +382,7 @@ A missing, corrupt, or parser-mismatched cache means "nothing to revalidate agai
 
 ### 9.3 Locks and startup order
 
-`tui` and `play` take a nonblocking exclusive lock on `state.lock` before any state read and hold it through the final flush. Contention refuses with `Another Continuo player is using this state profile` before any device or raw mode. `play` resolves its source first, so a source error wins over contention.
+`tui` and `play` take a nonblocking exclusive lock on `state.lock` before any state read and hold it through the final flush. Contention refuses with `Another Tenuto player is using this state profile` before any device or raw mode. `play` resolves its source first, so a source error wins over contention.
 
 Every subscription mutation, CLI or browser, holds `subscriptions.lock` for its whole read-modify-write, fetch included. Contention refuses at once with `Another subscription update is in progress`. Feed listings and `--probe-only` take no lock.
 
@@ -390,7 +390,7 @@ Every subscription mutation, CLI or browser, holds `subscriptions.lock` for its 
 
 ## 10. Diagnostics and errors
 
-Tracing is controlled by `RUST_LOG`. The default filter is `continuo=info`. An invalid filter fails startup. Logs go to stderr, except under `tui`, where fd 2 is redirected for the whole run to `logs/continuo-tui-<stamp>-<pid>.log`. Per-frame logging is forbidden.
+Tracing is controlled by `RUST_LOG`. The default filter is `tenuto=info`. An invalid filter fails startup. Logs go to stderr, except under `tui`, where fd 2 is redirected for the whole run to `logs/tenuto-tui-<stamp>-<pid>.log`. Per-frame logging is forbidden.
 
 Errors are typed. `PlaybackEvent::Failed` carries `cause: Option<RemoteFailure>` with one variant per remote failure category. `FeedError` is the single type for feed operations. `AppError` is the transparent union `app::run` returns.
 
@@ -402,27 +402,27 @@ Three redaction rules bind messages and logs alike:
 
 No parsed item, cached feed, document request or validator record is ever logged whole. `tests/m4_diagnostics.rs` audits this through the real binary.
 
-An uncontained panic restores the terminal and fd 2 before the previous hook runs, so the diagnostic reaches the primary screen. Two environment variables are test switches only: `CONTINUO_AUDIO_OUTPUT=null` selects the paced null output, and `CONTINUO_TEST_HOOK` triggers one fixed-stage panic or probe. Subprocess suites run on Linux only, with every XDG variable set per child.
+An uncontained panic restores the terminal and fd 2 before the previous hook runs, so the diagnostic reaches the primary screen. Two environment variables are test switches only: `TENUTO_AUDIO_OUTPUT=null` selects the paced null output, and `TENUTO_TEST_HOOK` triggers one fixed-stage panic or probe. Subprocess suites run on Linux only, with every XDG variable set per child.
 
 One recorded inaccuracy: `main.rs` labels every error log line `playback failed`, including feed commands.
 
 ## 11. Deployment
 
-There is one deployable: a statically linked `continuo` binary per platform. No installer, no service, no configuration file is required.
+There is one deployable: a statically linked `tenuto` binary per platform. No installer, no service, no configuration file is required.
 
 ```mermaid
 flowchart TB
     subgraph machine["Listener's machine"]
-        subgraph proc["continuo process"]
+        subgraph proc["tenuto process"]
             direction LR
             mainT["main thread<br/>input routing, pump, draw"]
-            inputT["continuo-input"]
-            decodeT["continuo-decode"]
+            inputT["tenuto-input"]
+            decodeT["tenuto-decode"]
             cb["CPAL callback"]
             tokioT["Tokio worker (HTTP only)"]
-            stateT["continuo-state"]
-            sigT["continuo-signal-listener"]
-            bg["continuo-browse<br/>continuo-artwork<br/>continuo-metadata-1, -2<br/>continuo-spectrum"]
+            stateT["tenuto-state"]
+            sigT["tenuto-signal-listener"]
+            bg["tenuto-browse<br/>tenuto-artwork<br/>tenuto-metadata-1, -2<br/>tenuto-spectrum"]
         end
         files[("state.json, state.lock<br/>subscriptions.json, subscriptions.lock<br/>feeds/*.json, logs/")]
         dev["Audio device"]

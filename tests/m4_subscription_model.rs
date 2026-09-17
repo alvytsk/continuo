@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 
-use continuo::feed::error::FeedError;
-use continuo::subscription::model::{choose_slug, new_feed_id, validate_feed_id, validate_slug};
+use tenuto::feed::error::FeedError;
+use tenuto::subscription::model::{choose_slug, new_feed_id, validate_feed_id, validate_slug};
 
 #[test]
 fn cyrillic_title_uses_host_and_suffix_stays_bounded() -> Result<(), Box<dyn std::error::Error>> {

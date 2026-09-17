@@ -9,23 +9,23 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use continuo::clock::{Clock, FakeClock};
-use continuo::media::capabilities::{Continuity, MediaCapabilities, SeekSupport};
-use continuo::media::id::{AbsolutePath, MediaId};
-use continuo::media::metadata::MediaMetadata;
-use continuo::persistence::model::{PersistedCheckpoint, PersistedState, SCHEMA_VERSION};
-use continuo::persistence::store::StateStore;
-use continuo::persistence::writer::Urgency;
-use continuo::playback::checkpoint::PlaybackCheckpoint;
-use continuo::playback::command::{PlaybackCommand, ResumeIntent};
-use continuo::playback::decode::DecodedSource;
-use continuo::playback::event::{PlaybackEvent, Progress, StartDisposition};
-use continuo::playback::provenance::PositionProvenance;
-use continuo::playback::state::PlaybackState;
-use continuo::playback::timeline::PositionQuality;
-use continuo::playback::volume::Volume;
-use continuo::resume::{RestartPreference, decide_resume, restart_preference, resume_candidate};
-use continuo::session::{Action, CAPTURE_INTERVAL, LoadTarget, Session};
+use tenuto::clock::{Clock, FakeClock};
+use tenuto::media::capabilities::{Continuity, MediaCapabilities, SeekSupport};
+use tenuto::media::id::{AbsolutePath, MediaId};
+use tenuto::media::metadata::MediaMetadata;
+use tenuto::persistence::model::{PersistedCheckpoint, PersistedState, SCHEMA_VERSION};
+use tenuto::persistence::store::StateStore;
+use tenuto::persistence::writer::Urgency;
+use tenuto::playback::checkpoint::PlaybackCheckpoint;
+use tenuto::playback::command::{PlaybackCommand, ResumeIntent};
+use tenuto::playback::decode::DecodedSource;
+use tenuto::playback::event::{PlaybackEvent, Progress, StartDisposition};
+use tenuto::playback::provenance::PositionProvenance;
+use tenuto::playback::state::PlaybackState;
+use tenuto::playback::timeline::PositionQuality;
+use tenuto::playback::volume::Volume;
+use tenuto::resume::{RestartPreference, decide_resume, restart_preference, resume_candidate};
+use tenuto::session::{Action, CAPTURE_INTERVAL, LoadTarget, Session};
 
 mod support;
 

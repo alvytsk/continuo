@@ -1,4 +1,4 @@
-//! Seeding and reading an isolated `continuo tui` profile for process tests
+//! Seeding and reading an isolated `tenuto tui` profile for process tests
 //! (M5 §6, §11): a schema-3 `state.json` written before the child starts,
 //! and the child's session logs under `<state dir>/logs/` read afterwards.
 //! Every wait here is bounded by the caller's patience.
@@ -8,8 +8,8 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use continuo::media::id::{AbsolutePath, MediaId, NormalizedUrl};
 use serde_json::{Value, json};
+use tenuto::media::id::{AbsolutePath, MediaId, NormalizedUrl};
 
 use crate::process::Profile;
 

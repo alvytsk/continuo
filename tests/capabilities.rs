@@ -1,4 +1,4 @@
-use continuo::media::capabilities::{
+use tenuto::media::capabilities::{
     Continuity as C, MediaCapabilities, ResumeCapability as R, SeekSupport as S,
 };
 

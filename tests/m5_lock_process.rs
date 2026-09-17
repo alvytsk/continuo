@@ -7,7 +7,7 @@ use std::process::Stdio;
 use std::time::{Duration, Instant};
 use support::server::{Script, TestServer};
 
-const CONTENDED: &str = "Another Continuo player is using this state profile";
+const CONTENDED: &str = "Another Tenuto player is using this state profile";
 
 fn wait_exit(
     child: &mut std::process::Child,
@@ -47,7 +47,7 @@ fn a_second_play_refuses_while_the_first_holds_the_profile() {
             "play",
             concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/sine.flac"),
         ])
-        .env("CONTINUO_AUDIO_OUTPUT", "null")
+        .env("TENUTO_AUDIO_OUTPUT", "null")
         .output()
         .expect("second");
     assert!(!second.status.success());
@@ -61,8 +61,7 @@ fn a_second_play_refuses_while_the_first_holds_the_profile() {
 #[test]
 fn source_errors_are_reported_before_profile_contention() {
     let profile = process::Profile::new().expect("profile");
-    let _held =
-        continuo::lifecycle::lock::ProfileLock::acquire(&profile.state_file()).expect("hold");
+    let _held = tenuto::lifecycle::lock::ProfileLock::acquire(&profile.state_file()).expect("hold");
     let absent = profile
         .command()
         .args(["play", "/nonexistent/definitely-not-here.flac"])
@@ -88,8 +87,7 @@ fn source_errors_are_reported_before_profile_contention() {
 #[test]
 fn probe_only_and_feed_listing_ignore_a_held_profile() {
     let profile = process::Profile::new().expect("profile");
-    let _held =
-        continuo::lifecycle::lock::ProfileLock::acquire(&profile.state_file()).expect("hold");
+    let _held = tenuto::lifecycle::lock::ProfileLock::acquire(&profile.state_file()).expect("hold");
     let probe = profile
         .command()
         .args([

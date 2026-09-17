@@ -12,7 +12,7 @@
 //!
 //! The reader thread is never joined. After a hangup it stays inside
 //! crossterm until the process exits; otherwise it notices within
-//! [`READ_POLL`] that its [`InputReader`] is gone and returns, so it does not
+//! `READ_POLL` that its [`InputReader`] is gone and returns, so it does not
 //! go on taking keys meant for the shell once the player has quit.
 
 use std::io;
@@ -44,7 +44,7 @@ impl InputReader {
         let stop = Arc::new(AtomicBool::new(false));
         let stopping = Arc::clone(&stop);
         std::thread::Builder::new()
-            .name("continuo-input".to_owned())
+            .name("tenuto-input".to_owned())
             .spawn(move || read_events(&sender, &stopping))?;
         Ok(Self { events, stop })
     }

@@ -192,7 +192,7 @@ pub struct EngineHandle {
     /// The analysis worker's application side (§10), handed out by
     /// [`Self::spectrum`].
     spectrum: SpectrumHandle,
-    /// The `continuo-spectrum` thread: stopped and joined by [`Self::join`]
+    /// The `tenuto-spectrum` thread: stopped and joined by [`Self::join`]
     /// and by `Drop`, so it never outlives the engine.
     spectrum_thread: SpectrumThread,
 }
@@ -213,11 +213,11 @@ impl EngineHandle {
     }
 
     /// Spawn over whichever output the environment calls for: the paced,
-    /// deviceless [`NullOutput`] when `CONTINUO_AUDIO_OUTPUT=null` (what a
+    /// deviceless [`NullOutput`] when `TENUTO_AUDIO_OUTPUT=null` (what a
     /// subprocess test sets on a CI machine with no sound device), otherwise
     /// the real default device.
     pub fn spawn_for_environment() -> Self {
-        if std::env::var("CONTINUO_AUDIO_OUTPUT").as_deref() == Ok("null") {
+        if std::env::var("TENUTO_AUDIO_OUTPUT").as_deref() == Ok("null") {
             Self::spawn(Box::new(NullOutput::new()))
         } else {
             Self::spawn_cpal()
@@ -276,7 +276,7 @@ impl EngineHandle {
             spectrum_port,
         );
         let join = std::thread::Builder::new()
-            .name("continuo-decode".into())
+            .name("tenuto-decode".into())
             .spawn(move || worker.run())
             .ok();
         Self {

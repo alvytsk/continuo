@@ -1,13 +1,13 @@
 mod support;
 use std::time::Duration;
 
-use continuo::http::{
+use support::server::{Script, TestServer};
+use tenuto::http::{
     document::{DocumentOutcome, DocumentRequest},
     error::{Phase, RemoteFailure},
     limits::Limits,
     service::HttpService,
 };
-use support::server::{Script, TestServer};
 
 #[test]
 fn fetches_a_document_without_a_media_range() -> Result<(), Box<dyn std::error::Error>> {

@@ -14,7 +14,7 @@ use std::time::Duration;
 use support::server::{Script, TestServer};
 use tui_profile::Seed;
 
-const CONTENDED: &str = "Another Continuo player is using this state profile";
+const CONTENDED: &str = "Another Tenuto player is using this state profile";
 const LEAVE_ALT: &str = "\x1b[?1049l";
 
 #[test]
@@ -50,10 +50,24 @@ fn tui_opens_idle_on_an_empty_queue_and_q_restores_the_terminal() {
 }
 
 #[test]
+fn a_bare_invocation_opens_the_player_and_q_restores_the_terminal() {
+    let profile = process::Profile::new().expect("profile");
+    // No arguments at all, where `["tui"]` would normally go.
+    let mut child = PtyChild::spawn(profile.root(), &[], &[], 100, 30).expect("spawn");
+    assert!(
+        child.wait_for("Queue is empty", Duration::from_secs(10)),
+        "{}",
+        child.output()
+    );
+    child.send(b"q");
+    assert_eq!(child.wait_exit(Duration::from_secs(10)), Some(0));
+    assert!(child.output().contains(LEAVE_ALT));
+}
+
+#[test]
 fn tui_refuses_a_held_profile_before_entering_raw_mode() {
     let profile = process::Profile::new().expect("profile");
-    let _held =
-        continuo::lifecycle::lock::ProfileLock::acquire(&profile.state_file()).expect("hold");
+    let _held = tenuto::lifecycle::lock::ProfileLock::acquire(&profile.state_file()).expect("hold");
     let mut child = PtyChild::spawn(profile.root(), &["tui"], &[], 100, 30).expect("spawn");
     let code = child.wait_exit(Duration::from_secs(10));
     assert!(matches!(code, Some(c) if c != 0));
@@ -77,7 +91,7 @@ fn play_refuses_while_tui_holds_the_profile_and_tui_keeps_its_volume() {
             "play",
             concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/sine.flac"),
         ])
-        .env("CONTINUO_AUDIO_OUTPUT", "null")
+        .env("TENUTO_AUDIO_OUTPUT", "null")
         .output()
         .expect("play");
     assert!(String::from_utf8_lossy(&play.stderr).contains(CONTENDED));
@@ -153,10 +167,10 @@ fn b_browses_the_working_directory_and_enter_enqueues_a_file() {
 const SIGNALS: [(&str, u32); 3] = [("INT", 2), ("HUP", 1), ("TERM", 15)];
 const FIXTURE_5S: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/sine-5s.flac");
 const FIXTURE_SHORT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/sine.flac");
-const NULL_OUTPUT: (&str, &str) = ("CONTINUO_AUDIO_OUTPUT", "null");
+const NULL_OUTPUT: (&str, &str) = ("TENUTO_AUDIO_OUTPUT", "null");
 /// Shown on the key-hint row of every frame with a queue or without one.
 const DRAWN: &str = "Quit";
-const HOOK_PREFIX: &str = "continuo test hook";
+const HOOK_PREFIX: &str = "tenuto test hook";
 const CONTAINED: &str = "contained panic in background job";
 const PATIENCE: Duration = Duration::from_secs(10);
 
@@ -243,7 +257,7 @@ fn a_direct_fd2_write_reaches_the_log_not_the_pty() {
     let mut child = PtyChild::spawn(
         profile.root(),
         &["tui"],
-        &[("CONTINUO_TEST_HOOK", "stderr-probe")],
+        &[("TENUTO_TEST_HOOK", "stderr-probe")],
         100,
         30,
     )
@@ -257,10 +271,10 @@ fn a_direct_fd2_write_reaches_the_log_not_the_pty() {
     assert_eq!(child.wait_exit(PATIENCE), Some(0), "{}", child.output());
     let log = tui_profile::newest_log_text(&profile);
     // The shell's write has no `-rust` suffix, so it is the second match.
-    assert_eq!(log.matches("continuo-stderr-probe").count(), 2, "{log}");
-    assert!(log.contains("continuo-stderr-probe-rust"), "{log}");
+    assert_eq!(log.matches("tenuto-stderr-probe").count(), 2, "{log}");
+    assert!(log.contains("tenuto-stderr-probe-rust"), "{log}");
     let output = child.output();
-    assert!(!output.contains("continuo-stderr-probe"), "{output}");
+    assert!(!output.contains("tenuto-stderr-probe"), "{output}");
 }
 
 #[test]
@@ -305,7 +319,7 @@ fn a_panic_before_redirection_reaches_the_terminal() {
     let mut child = PtyChild::spawn(
         profile.root(),
         &["tui"],
-        &[("CONTINUO_TEST_HOOK", "panic-before-redirect")],
+        &[("TENUTO_TEST_HOOK", "panic-before-redirect")],
         100,
         30,
     )
@@ -313,7 +327,7 @@ fn a_panic_before_redirection_reaches_the_terminal() {
     assert_eq!(child.wait_exit(PATIENCE), Some(101), "{}", child.output());
     let output = child.output();
     assert!(
-        output.contains("continuo test hook: panic-before-redirect"),
+        output.contains("tenuto test hook: panic-before-redirect"),
         "{output}"
     );
     for log in tui_profile::session_logs(&profile) {
@@ -328,7 +342,7 @@ fn a_panic_right_after_redirection_is_printed_on_restored_stderr() {
     let mut child = PtyChild::spawn(
         profile.root(),
         &["tui"],
-        &[("CONTINUO_TEST_HOOK", "panic-after-redirect")],
+        &[("TENUTO_TEST_HOOK", "panic-after-redirect")],
         100,
         30,
     )
@@ -336,7 +350,7 @@ fn a_panic_right_after_redirection_is_printed_on_restored_stderr() {
     assert_eq!(child.wait_exit(PATIENCE), Some(101), "{}", child.output());
     let output = child.output();
     assert!(
-        output.contains("continuo test hook: panic-after-redirect"),
+        output.contains("tenuto test hook: panic-after-redirect"),
         "{output}"
     );
 }
@@ -347,7 +361,7 @@ fn a_panic_after_terminal_entry_leaves_the_alternate_screen_first() {
     let mut child = PtyChild::spawn(
         profile.root(),
         &["tui"],
-        &[("CONTINUO_TEST_HOOK", "panic-after-terminal")],
+        &[("TENUTO_TEST_HOOK", "panic-after-terminal")],
         100,
         30,
     )
@@ -355,7 +369,7 @@ fn a_panic_after_terminal_entry_leaves_the_alternate_screen_first() {
     assert_eq!(child.wait_exit(PATIENCE), Some(101), "{}", child.output());
     let output = child.output();
     let message = output
-        .find("continuo test hook: panic-after-terminal")
+        .find("tenuto test hook: panic-after-terminal")
         .unwrap_or_else(|| panic!("no hook message: {output:?}"));
     let left = output
         .rfind(LEAVE_ALT)
@@ -412,8 +426,8 @@ fn contained_artwork_and_metadata_panics_keep_the_player_running() {
         two_covered_tracks(&profile, titles);
         let env = [
             NULL_OUTPUT,
-            ("CONTINUO_TEST_HOOK", hook),
-            ("RUST_LOG", "continuo=debug"),
+            ("TENUTO_TEST_HOOK", hook),
+            ("RUST_LOG", "tenuto=debug"),
         ];
         let mut child = PtyChild::spawn(profile.root(), &["tui"], &env, 100, 30).expect("spawn");
         assert!(
@@ -496,7 +510,7 @@ fn an_uncontained_worker_panic_restores_the_terminal_and_fails() {
     let mut child = PtyChild::spawn(
         profile.root(),
         &["tui"],
-        &[("CONTINUO_TEST_HOOK", "worker-panic")],
+        &[("TENUTO_TEST_HOOK", "worker-panic")],
         100,
         30,
     )

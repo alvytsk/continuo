@@ -1,4 +1,4 @@
-//! `continuo tui`: startup, the event loop and teardown around
+//! `tenuto tui`: startup, the event loop and teardown around
 //! [`PlayerRuntime`] (design doc M5 §4, §11).
 //!
 //! Startup runs in the order §11 fixes: cleanup state and the panic hook,
@@ -335,11 +335,11 @@ fn enter_terminal(mouse: MouseMode, cleanup: &FatalCleanup) -> io::Result<Tty> {
 /// can check both reach the session log instead of the terminal.
 fn probe_stderr() {
     let _ = std::process::Command::new("sh")
-        .args(["-c", "printf continuo-stderr-probe >&2"])
+        .args(["-c", "printf tenuto-stderr-probe >&2"])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .status();
-    eprintln!("continuo-stderr-probe-rust");
+    eprintln!("tenuto-stderr-probe-rust");
 }
 
 fn run_loop(

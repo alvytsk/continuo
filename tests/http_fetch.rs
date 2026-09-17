@@ -4,12 +4,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use continuo::http::channel::{ByteChannel, HeaderOutcome, ReadOutcome, SourceInterrupt, WaitHook};
-use continuo::http::error::{Operation, Phase, RangeRejection, RedirectRejection, RemoteFailure};
-use continuo::http::limits::Limits;
-use continuo::http::response::{Accepted, FetchAccepted};
-use continuo::http::service::{FetchRequest, HttpService};
 use support::server::{Script, TestServer};
+use tenuto::http::channel::{ByteChannel, HeaderOutcome, ReadOutcome, SourceInterrupt, WaitHook};
+use tenuto::http::error::{Operation, Phase, RangeRejection, RedirectRejection, RemoteFailure};
+use tenuto::http::limits::Limits;
+use tenuto::http::response::{Accepted, FetchAccepted};
+use tenuto::http::service::{FetchRequest, HttpService};
 use url::Url;
 
 struct NoHook;

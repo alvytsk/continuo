@@ -12,17 +12,17 @@
 
 use std::time::Duration;
 
-use continuo::clock::{Clock, FakeClock};
-use continuo::media::capabilities::{Continuity, MediaCapabilities, SeekSupport};
-use continuo::media::id::MediaId;
-use continuo::media::metadata::MediaMetadata;
-use continuo::persistence::model::PersistedState;
-use continuo::playback::checkpoint::PlaybackCheckpoint;
-use continuo::playback::event::{PlaybackEvent, Progress, StartDisposition};
-use continuo::playback::provenance::PositionProvenance;
-use continuo::playback::state::PlaybackState;
-use continuo::playback::timeline::PositionQuality;
-use continuo::session::{Action, CAPTURE_INTERVAL, LoadTarget, Session};
+use tenuto::clock::{Clock, FakeClock};
+use tenuto::media::capabilities::{Continuity, MediaCapabilities, SeekSupport};
+use tenuto::media::id::MediaId;
+use tenuto::media::metadata::MediaMetadata;
+use tenuto::persistence::model::PersistedState;
+use tenuto::playback::checkpoint::PlaybackCheckpoint;
+use tenuto::playback::event::{PlaybackEvent, Progress, StartDisposition};
+use tenuto::playback::provenance::PositionProvenance;
+use tenuto::playback::state::PlaybackState;
+use tenuto::playback::timeline::PositionQuality;
+use tenuto::session::{Action, CAPTURE_INTERVAL, LoadTarget, Session};
 
 mod support;
 use support::media;

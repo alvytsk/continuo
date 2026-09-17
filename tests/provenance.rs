@@ -1,5 +1,5 @@
-use continuo::playback::provenance::PositionProvenance;
-use continuo::playback::timeline::PositionQuality;
+use tenuto::playback::provenance::PositionProvenance;
+use tenuto::playback::timeline::PositionQuality;
 
 #[test]
 fn provenance_and_quality_are_independent_axes() {

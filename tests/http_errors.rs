@@ -1,4 +1,4 @@
-use continuo::http::error::{Operation, RangeRejection, RemoteFailure, redact_url};
+use tenuto::http::error::{Operation, RangeRejection, RemoteFailure, redact_url};
 
 #[test]
 fn a_signed_query_never_reaches_a_diagnostic() {
@@ -42,10 +42,10 @@ fn every_category_the_spec_names_has_a_distinct_variant() {
             operation: Operation::Open,
         },
         RemoteFailure::Redirect {
-            reason: continuo::http::error::RedirectRejection::TooMany,
+            reason: tenuto::http::error::RedirectRejection::TooMany,
         },
         RemoteFailure::Timeout {
-            phase: continuo::http::error::Phase::Headers,
+            phase: tenuto::http::error::Phase::Headers,
         },
         RemoteFailure::InvalidRange {
             reason: RangeRejection::WrongStart,

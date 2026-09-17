@@ -14,12 +14,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use continuo::artwork::decode::{ArtworkError, MAX_ENCODED_BYTES, decode_limited, read_limited};
-use continuo::artwork::resolve::{ArtworkSource, find_artwork};
-use continuo::artwork::worker::{ArtworkWorker, CoverLoader, CoverSource, default_loader};
-use continuo::lifecycle::hooks::TestHook;
-use continuo::media::id::{AbsolutePath, MediaId};
-use continuo::media::tags::{CoverBytes, MAX_EMBEDDED_COVER_BYTES};
+use tenuto::artwork::decode::{ArtworkError, MAX_ENCODED_BYTES, decode_limited, read_limited};
+use tenuto::artwork::resolve::{ArtworkSource, find_artwork};
+use tenuto::artwork::worker::{ArtworkWorker, CoverLoader, CoverSource, default_loader};
+use tenuto::lifecycle::hooks::TestHook;
+use tenuto::media::id::{AbsolutePath, MediaId};
+use tenuto::media::tags::{CoverBytes, MAX_EMBEDDED_COVER_BYTES};
 
 fn encoded(format: image::ImageFormat, w: u32, h: u32) -> Vec<u8> {
     let mut bytes = Vec::new();
@@ -199,9 +199,9 @@ fn an_oversized_embedded_cover_is_a_placeholder_and_never_falls_back_to_a_siblin
 /// error.
 #[test]
 fn a_remote_cover_is_fetched_and_decoded_and_a_failed_fetch_is_reported() {
-    use continuo::http::limits::Limits;
-    use continuo::http::service::HttpService;
     use support::server::{Script, TestServer};
+    use tenuto::http::limits::Limits;
+    use tenuto::http::service::HttpService;
 
     let http = HttpService::spawn(Limits::brisk()).expect("http service");
     let loader = default_loader(TestHook::None);
@@ -228,13 +228,13 @@ fn a_remote_cover_is_fetched_and_decoded_and_a_failed_fetch_is_reported() {
 /// becomes the active entry's cover source, with no second request.
 #[test]
 fn a_remote_streams_embedded_front_cover_becomes_the_active_cover_source() {
-    use continuo::application::runtime::AppCommand;
-    use continuo::media::id::NormalizedUrl;
-    use continuo::persistence::model::PersistedState;
-    use continuo::queue::{NewQueueEntry, QueueSource};
-    use continuo::session::Session;
     use runtime::{rig_with, row_ids};
     use support::server::{Script, TestServer};
+    use tenuto::application::runtime::AppCommand;
+    use tenuto::media::id::NormalizedUrl;
+    use tenuto::persistence::model::PersistedState;
+    use tenuto::queue::{NewQueueEntry, QueueSource};
+    use tenuto::session::Session;
 
     let dir = tempfile::tempdir().expect("tempdir");
     let track = tagged_flac::tagged_flac(

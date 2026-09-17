@@ -67,7 +67,7 @@ fn usable_enclosure_url(url: &Url) -> bool {
 ///
 /// Items are walked in the parser's document order and never re-sorted.
 /// For each item: the GUID is used verbatim; the enclosure is used only if
-/// it passes [`usable_enclosure_url`], and `None` otherwise, so an
+/// it passes `usable_enclosure_url`, and `None` otherwise, so an
 /// unsupported scheme can never poison resolution past the GUID; the link
 /// is the last resort. An item that resolves to no identity at all is
 /// skipped with [`WarningKind::MissingIdentity`]. An item whose resolved

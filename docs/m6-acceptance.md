@@ -1,6 +1,6 @@
 # M6 acceptance
 
-`docs/superpowers/specs/2026-09-16-continuo-m6-feed-management-design.md` §8 lists the evidence: the automated suites, then one manual run against Radio-T.
+`docs/superpowers/specs/2026-09-16-tenuto-m6-feed-management-design.md` §8 lists the evidence: the automated suites, then one manual run against Radio-T.
 
 ## Automated
 

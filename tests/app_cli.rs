@@ -21,11 +21,11 @@ mod support;
 
 use std::time::{Duration, Instant};
 
-use continuo::app::KeyRouter;
-use continuo::http::limits::Limits;
-use continuo::playback::command::{Admission, PlaybackCommand};
-use continuo::playback::event::PlaybackEvent;
-use continuo::playback::state::PlaybackState;
+use tenuto::app::KeyRouter;
+use tenuto::http::limits::Limits;
+use tenuto::playback::command::{Admission, PlaybackCommand};
+use tenuto::playback::event::PlaybackEvent;
+use tenuto::playback::state::PlaybackState;
 
 use support::TestEngine;
 use support::server::{Script, TestServer};

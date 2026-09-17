@@ -41,7 +41,7 @@ fn next_invocation_acquires_the_profile(profile: &process::Profile) {
     let output = profile
         .command()
         .args(["play", FIXTURE_SHORT])
-        .env("CONTINUO_AUDIO_OUTPUT", "null")
+        .env("TENUTO_AUDIO_OUTPUT", "null")
         .output()
         .expect("next");
     assert!(
@@ -79,7 +79,7 @@ fn every_shutdown_signal_during_playback_flushes_a_checkpoint() {
         let mut child = profile
             .command()
             .args(["play", FIXTURE_5S])
-            .env("CONTINUO_AUDIO_OUTPUT", "null")
+            .env("TENUTO_AUDIO_OUTPUT", "null")
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()
@@ -118,7 +118,7 @@ fn playing_under_a_pty(profile: &process::Profile) -> PtyChild {
     let child = PtyChild::spawn(
         profile.root(),
         &["play", FIXTURE_5S],
-        &[("CONTINUO_AUDIO_OUTPUT", "null")],
+        &[("TENUTO_AUDIO_OUTPUT", "null")],
         100,
         30,
     )
@@ -165,7 +165,7 @@ fn a_silently_closed_pty_ends_play_and_flushes_a_checkpoint() {
 
 #[test]
 fn exit_status_arithmetic() {
-    use continuo::lifecycle::RunOutcome;
+    use tenuto::lifecycle::RunOutcome;
     assert_eq!(RunOutcome::Completed.exit_status(), 0);
     assert_eq!(RunOutcome::Signalled(15).exit_status(), 143);
     assert_eq!(RunOutcome::Signalled(200).exit_status(), 255);

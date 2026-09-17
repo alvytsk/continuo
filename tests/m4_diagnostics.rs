@@ -16,7 +16,7 @@
 //!
 //! * **Transport URLs are secret.** A signed query and embedded userinfo are
 //!   where a bearer token hides, so every URL reaching a message has passed
-//!   through [`continuo::http::error::redact_url`] first — under `Debug` as
+//!   through [`tenuto::http::error::redact_url`] first — under `Debug` as
 //!   much as `Display`, because `main.rs` logs `?error`.
 //! * **File content is never quoted.** A `serde_json::Error`'s own `Display`
 //!   can echo the offending bytes, and a checkpoint key or a cached
@@ -38,7 +38,8 @@ mod support;
 #[path = "support/feeds.rs"]
 mod feeds;
 
-use continuo::{
+use support::server::{Script, TestServer};
+use tenuto::{
     feed::error::FeedError,
     http::{
         document::CacheValidators,
@@ -49,7 +50,6 @@ use continuo::{
     library::{self, RefreshOutcome},
     persistence::PersistenceError,
 };
-use support::server::{Script, TestServer};
 
 type Fallible = Result<(), Box<dyn std::error::Error>>;
 
@@ -351,7 +351,7 @@ fn a_cache_whose_media_id_is_refused_reports_where_not_what() -> Fallible {
         let rendered = text(&error);
         assert!(rendered.contains("corrupt cache"), "{label}: {rendered}");
         assert!(
-            rendered.contains("run continuo refresh radio-t"),
+            rendered.contains("run tenuto refresh radio-t"),
             "{label}: the recovery must be named: {rendered}"
         );
         if from_serde {
@@ -397,7 +397,7 @@ fn state_deserialization_never_quotes_the_checkpoint_key() -> Fallible {
     );
 
     // And once more after `FeedError`'s transparent wrapper, which is how
-    // `continuo episodes` actually surfaces it.
+    // `tenuto episodes` actually surfaces it.
     let wrapped = FeedError::from(error);
     both(&wrapped);
     assert!(text(&wrapped).contains("malformed"), "{}", text(&wrapped));
@@ -736,7 +736,7 @@ fn every_feed_error_variant_has_a_recorded_safe_context() {
 
 // --- Tracing -----------------------------------------------------------
 
-/// `RUST_LOG=continuo=debug` is the level a listener is told to raise when
+/// `RUST_LOG=tenuto=debug` is the level a listener is told to raise when
 /// something goes wrong, so it is also the level a leak would surface at.
 ///
 /// Linux-gated because it drives the real binary through XDG directories;
@@ -776,7 +776,7 @@ fn debug_logging_records_no_document_request_or_validator() -> Fallible {
     let run = |args: &[&str]| -> std::io::Result<std::process::Output> {
         process::command_in(root.path())
             .args(args)
-            .env("RUST_LOG", "continuo=debug")
+            .env("RUST_LOG", "tenuto=debug")
             .output()
     };
 

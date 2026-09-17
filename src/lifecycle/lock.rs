@@ -1,4 +1,4 @@
-//! The exclusive profile lock: two `continuo` players on one state profile
+//! The exclusive profile lock: two `tenuto` players on one state profile
 //! would overwrite each other's listening history, so `play` takes an
 //! OS-level lock on a sibling `state.lock` file before it ever opens
 //! `state.json` (design doc M5 §6).
@@ -23,7 +23,7 @@ pub struct ProfileLock {
 
 #[derive(Debug, thiserror::Error)]
 pub enum LockError {
-    #[error("Another Continuo player is using this state profile")]
+    #[error("Another Tenuto player is using this state profile")]
     Contended,
     #[error("no platform state directory is available")]
     NoStateDirectory,

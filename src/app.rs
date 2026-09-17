@@ -1,4 +1,4 @@
-//! The `continuo play` application: argument-to-source resolution, terminal
+//! The `tenuto play` application: argument-to-source resolution, terminal
 //! setup, and the key-driven status loop around [`EngineHandle`].
 
 use std::io::Write;
@@ -57,7 +57,15 @@ const HELP_LINE: &str =
 /// program prints for a feed command, the one synchronous bridge into the
 /// HTTP runtime, and the exit status a partial failure has to carry.
 pub fn run(cli: cli::Cli) -> Result<RunOutcome, crate::error::AppError> {
-    match cli.command {
+    // A bare `tenuto` opens the player. The defaults are the ones
+    // `tenuto tui` applies when neither flag is given.
+    let Some(command) = cli.command else {
+        return crate::tui::run(crate::tui::TuiOptions {
+            mouse: cli::MouseMode::default(),
+            artwork: cli::ArtworkMode::default(),
+        });
+    };
+    match command {
         CliCommand::Play {
             source,
             index: None,

@@ -13,12 +13,12 @@ mod feeds;
 
 use std::time::Duration;
 
-use continuo::application::podcast::{PodcastResolution, PodcastResolveError, resolve_podcast};
-use continuo::feed::error::FeedError;
-use continuo::library::episode_candidates;
-use continuo::media::id::{EpisodeKey, FeedId, MediaId};
-use continuo::media::source::SourceLocation;
-use continuo::subscription::store::SubscriptionSnapshot;
+use tenuto::application::podcast::{PodcastResolution, PodcastResolveError, resolve_podcast};
+use tenuto::feed::error::FeedError;
+use tenuto::library::episode_candidates;
+use tenuto::media::id::{EpisodeKey, FeedId, MediaId};
+use tenuto::media::source::SourceLocation;
+use tenuto::subscription::store::SubscriptionSnapshot;
 use url::Url;
 
 const FEED_URL: &str = "https://feeds.example/radio-t.xml";
@@ -237,7 +237,7 @@ fn episode_candidates_carry_the_enclosure_and_declared_duration()
 #[test]
 fn podcast_artwork_prefers_the_episode_image_then_the_feed_image()
 -> Result<(), Box<dyn std::error::Error>> {
-    use continuo::application::podcast::podcast_artwork;
+    use tenuto::application::podcast::podcast_artwork;
 
     let rig = feeds::Rig::new()?;
     rig.seed(

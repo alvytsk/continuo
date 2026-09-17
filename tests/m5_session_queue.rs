@@ -3,23 +3,23 @@ mod support;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use continuo::clock::{Clock, FakeClock};
-use continuo::media::capabilities::{Continuity, MediaCapabilities, SeekSupport};
-use continuo::media::id::MediaId;
-use continuo::media::metadata::MediaMetadata;
-use continuo::persistence::PersistenceError;
-use continuo::persistence::model::PersistedState;
-use continuo::persistence::store::StateStore;
-use continuo::persistence::writer::{StateSink, Urgency, WriterHandle};
-use continuo::playback::command::{LoadRequestId, ResumeIntent};
-use continuo::playback::event::{PlaybackEvent, Progress, StartDisposition};
-use continuo::playback::provenance::PositionProvenance;
-use continuo::playback::state::PlaybackState;
-use continuo::playback::timeline::PositionQuality;
-use continuo::queue::{DisplayMetadata, MAX_QUEUE_ENTRIES, NewQueueEntry, QueueError, QueueSource};
-use continuo::resume::ResumeCandidate;
-use continuo::session::{Action, DisplayUpdate, LoadTarget, Session};
 use support::media;
+use tenuto::clock::{Clock, FakeClock};
+use tenuto::media::capabilities::{Continuity, MediaCapabilities, SeekSupport};
+use tenuto::media::id::MediaId;
+use tenuto::media::metadata::MediaMetadata;
+use tenuto::persistence::PersistenceError;
+use tenuto::persistence::model::PersistedState;
+use tenuto::persistence::store::StateStore;
+use tenuto::persistence::writer::{StateSink, Urgency, WriterHandle};
+use tenuto::playback::command::{LoadRequestId, ResumeIntent};
+use tenuto::playback::event::{PlaybackEvent, Progress, StartDisposition};
+use tenuto::playback::provenance::PositionProvenance;
+use tenuto::playback::state::PlaybackState;
+use tenuto::playback::timeline::PositionQuality;
+use tenuto::queue::{DisplayMetadata, MAX_QUEUE_ENTRIES, NewQueueEntry, QueueError, QueueSource};
+use tenuto::resume::ResumeCandidate;
+use tenuto::session::{Action, DisplayUpdate, LoadTarget, Session};
 
 // entry(), loaded(), progress(), playing() helpers: copied from tests/m5_session_adoption.rs.
 
@@ -228,7 +228,7 @@ fn volume_and_display_updates_submit_through_the_session() {
     let mut session = Session::new(PersistedState::default());
     let (ids, _) = session.enqueue(vec![entry("a"), entry("a")]).expect("fits");
     assert!(matches!(
-        session.set_volume(continuo::playback::volume::Volume::new(0.4)),
+        session.set_volume(tenuto::playback::volume::Volume::new(0.4)),
         Action::Submit { .. }
     ));
     let update = DisplayUpdate {
@@ -415,7 +415,7 @@ fn queue_and_checkpoint_writes_interleave_into_one_latest_snapshot() {
     }
     assert!(matches!(
         writer.shutdown(),
-        continuo::persistence::writer::ShutdownOutcome::Written
+        tenuto::persistence::writer::ShutdownOutcome::Written
     ));
 
     let written: serde_json::Value =

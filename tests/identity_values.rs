@@ -1,5 +1,5 @@
-use continuo::media::id::{AbsolutePath, EpisodeKey, FeedId, NormalizedUrl};
 use std::path::PathBuf;
+use tenuto::media::id::{AbsolutePath, EpisodeKey, FeedId, NormalizedUrl};
 use url::Url;
 
 #[test]

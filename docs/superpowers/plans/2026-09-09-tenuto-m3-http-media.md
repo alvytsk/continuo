@@ -1,14 +1,14 @@
-# Continuo M3 — Finite HTTP Media Implementation Plan
+# Tenuto M3 — Finite HTTP Media Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** `continuo play <http-or-https-url>` plays a finite remote recording through the existing Symphonia/CPAL pipeline, with seek, stop/resume and cross-process checkpoint resume on range-capable servers, and honest refusals everywhere else.
+**Goal:** `tenuto play <http-or-https-url>` plays a finite remote recording through the existing Symphonia/CPAL pipeline, with seek, stop/resume and cross-process checkpoint resume on range-capable servers, and honest refusals everywhere else.
 
 **Architecture:** A new `src/http/` module owns an application-owned Tokio runtime, one fetch task per source generation, and a bounded encoded-byte channel. The decode worker sees only a synchronous `MediaSource`; it never calls `block_on`. Three enabling changes inside `src/playback/`: source opening is separated from decoder probing (`prepare.rs`), the transport's span/timeline state moves behind an `Arc<Mutex<TransportCore>>` so a blocked read can keep publishing progress without touching the decoder, and out-of-band interrupts grow from stop/shutdown to also carry seek and a pause *level*.
 
 **Tech Stack:** Rust 2024, `tokio` (rt-multi-thread, net, time, sync), `reqwest` (rustls TLS, streaming bodies, redirects disabled), `symphonia`, `cpal`, `rtrb`, `crossbeam-channel`, `url`. Tests use a hand-rolled `std::net::TcpListener` server — no HTTP mocking crate, because the acceptance evidence needs raw framing, mid-body stalls and barrier releases that no mocking library exposes.
 
-**Spec:** `docs/superpowers/specs/2026-09-09-continuo-finite-http-design.md` — read it alongside this plan. Every `§n` and `Hn` below points into that document.
+**Spec:** `docs/superpowers/specs/2026-09-09-tenuto-finite-http-design.md` — read it alongside this plan. Every `§n` and `Hn` below points into that document.
 
 ## Review decisions settled before this breakdown
 
@@ -165,8 +165,8 @@ Every task's requirements implicitly include this section.
 **Interfaces:**
 - Consumes: nothing.
 - Produces:
-  `continuo::http::limits::Limits { connect, headers, stall, open, probe_bytes, buffer_bytes, chunk_bytes, max_redirects }`, `Limits::default()`.
-  `continuo::http::error::{RemoteFailure, Operation, Phase, RedirectRejection, RangeRejection}`.
+  `tenuto::http::limits::Limits { connect, headers, stall, open, probe_bytes, buffer_bytes, chunk_bytes, max_redirects }`, `Limits::default()`.
+  `tenuto::http::error::{RemoteFailure, Operation, Phase, RedirectRejection, RangeRejection}`.
   `RemoteFailure: Clone + Debug + Eq + PartialEq + std::error::Error`, and `redact_url(&str) -> String`.
 
 - [ ] **Step 1: Add the dependencies**
@@ -199,7 +199,7 @@ Adjust the version requirements in `Cargo.toml` to the resolved majors and re-ru
 Create `tests/http_errors.rs`:
 
 ```rust
-use continuo::http::error::{Operation, RangeRejection, RemoteFailure, redact_url};
+use tenuto::http::error::{Operation, RangeRejection, RemoteFailure, redact_url};
 
 #[test]
 fn a_signed_query_never_reaches_a_diagnostic() {
@@ -236,8 +236,8 @@ fn every_category_the_spec_names_has_a_distinct_variant() {
     let categories = [
         RemoteFailure::InvalidSource { input: redact_url("https://x/y"), reason: "no host" },
         RemoteFailure::Status { status: 503, operation: Operation::Open },
-        RemoteFailure::Redirect { reason: continuo::http::error::RedirectRejection::TooMany },
-        RemoteFailure::Timeout { phase: continuo::http::error::Phase::Headers },
+        RemoteFailure::Redirect { reason: tenuto::http::error::RedirectRejection::TooMany },
+        RemoteFailure::Timeout { phase: tenuto::http::error::Phase::Headers },
         RemoteFailure::InvalidRange { reason: RangeRejection::WrongStart },
         RemoteFailure::ResourceChanged,
         RemoteFailure::TruncatedBody { missing: 17 },
@@ -262,7 +262,7 @@ fn every_category_the_spec_names_has_a_distinct_variant() {
 - [ ] **Step 3: Run it to verify it fails**
 
 Run: `cargo test --test http_errors 2>&1 | tail -20`
-Expected: FAIL — `unresolved import continuo::http`.
+Expected: FAIL — `unresolved import tenuto::http`.
 
 - [ ] **Step 4: Write the module, the limits and the error type**
 
@@ -518,9 +518,9 @@ pub fn is_live(headers: &Headers) -> bool;
 Create `tests/http_response.rs`:
 
 ```rust
-use continuo::http::error::{RangeRejection, RedirectRejection, RemoteFailure};
-use continuo::http::limits::Limits;
-use continuo::http::response::{
+use tenuto::http::error::{RangeRejection, RedirectRejection, RemoteFailure};
+use tenuto::http::limits::Limits;
+use tenuto::http::response::{
     Accepted, ByteRange, Established, Headers, Validator, accept, accept_redirect,
     if_range_value, is_live, parse_content_range,
 };
@@ -804,7 +804,7 @@ fn a_weak_etag_is_never_sent_as_if_range() {
 
 #[test]
 fn a_weak_etag_header_is_not_stored_as_a_strong_one() {
-    let validator = continuo::http::response::validator_from(&headers(&[("etag", "W/\"v1\"")]));
+    let validator = tenuto::http::response::validator_from(&headers(&[("etag", "W/\"v1\"")]));
     assert_eq!(validator.strong_etag, None);
     // Kept, though: it is comparable even when it is not sendable.
     assert_eq!(validator.weak_etag.as_deref(), Some("W/\"v1\""));
@@ -900,7 +900,7 @@ fn an_http_origin_may_redirect_to_http() {
 - [ ] **Step 2: Run to verify they fail**
 
 Run: `cargo test --test http_response 2>&1 | tail -20`
-Expected: FAIL — `unresolved import continuo::http::response`.
+Expected: FAIL — `unresolved import tenuto::http::response`.
 
 - [ ] **Step 3: Implement the acceptance rules**
 
@@ -1315,8 +1315,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
-use continuo::http::channel::{ByteChannel, Outcome, ReadOutcome, SourceInterrupt, WaitHook};
-use continuo::http::error::{Operation, RemoteFailure};
+use tenuto::http::channel::{ByteChannel, Outcome, ReadOutcome, SourceInterrupt, WaitHook};
+use tenuto::http::error::{Operation, RemoteFailure};
 
 const STALL: Duration = Duration::from_secs(5);
 
@@ -1779,7 +1779,7 @@ fn a_stall_deadline_that_elapses_fails_rather_than_returning_eof() {
     let outcome = channel.read(&mut [0u8; 16], &NoHook, Duration::from_millis(100));
     assert_eq!(
         outcome,
-        ReadOutcome::Failed(RemoteFailure::Timeout { phase: continuo::http::error::Phase::Stall })
+        ReadOutcome::Failed(RemoteFailure::Timeout { phase: tenuto::http::error::Phase::Stall })
     );
 }
 ```
@@ -1787,7 +1787,7 @@ fn a_stall_deadline_that_elapses_fails_rather_than_returning_eof() {
 - [ ] **Step 2: Run to verify they fail**
 
 Run: `cargo test --test http_channel 2>&1 | tail -20`
-Expected: FAIL — `unresolved import continuo::http::channel`.
+Expected: FAIL — `unresolved import tenuto::http::channel`.
 
 - [ ] **Step 3: Implement the channel and the interrupt**
 
@@ -2598,12 +2598,12 @@ mod support;
 use std::sync::Arc;
 use std::time::Duration;
 
-use continuo::http::channel::{ByteChannel, ReadOutcome, SourceInterrupt, WaitHook};
-use continuo::http::error::{Phase, RedirectRejection, RemoteFailure};
-use continuo::http::limits::Limits;
-use continuo::http::response::Accepted;
-use continuo::http::service::{FetchRequest, HeaderOutcome, HttpService};
-use continuo::http::error::Operation;
+use tenuto::http::channel::{ByteChannel, ReadOutcome, SourceInterrupt, WaitHook};
+use tenuto::http::error::{Phase, RedirectRejection, RemoteFailure};
+use tenuto::http::limits::Limits;
+use tenuto::http::response::Accepted;
+use tenuto::http::service::{FetchRequest, HeaderOutcome, HttpService};
+use tenuto::http::error::Operation;
 use support::server::{Script, TestServer};
 use url::Url;
 
@@ -2624,7 +2624,7 @@ fn service(limits: Limits) -> Arc<HttpService> {
     }
 }
 
-fn open(service: &HttpService, origin: Url, start: u64) -> (Arc<ByteChannel>, Arc<SourceInterrupt>, Result<continuo::http::service::FetchAccepted, HeaderOutcome>) {
+fn open(service: &HttpService, origin: Url, start: u64) -> (Arc<ByteChannel>, Arc<SourceInterrupt>, Result<tenuto::http::service::FetchAccepted, HeaderOutcome>) {
     let interrupt = SourceInterrupt::new(Limits::default().buffer_bytes);
     let channel = Arc::new(ByteChannel::new(Arc::clone(&interrupt)));
     let generation = channel.generation();
@@ -2863,7 +2863,7 @@ fn a_retirement_during_a_header_wait_wakes_it_without_releasing_the_server() {
 - [ ] **Step 2: Run to verify they fail**
 
 Run: `cargo test --test http_fetch 2>&1 | tail -20`
-Expected: FAIL — `unresolved import continuo::http::service`.
+Expected: FAIL — `unresolved import tenuto::http::service`.
 
 - [ ] **Step 3: Implement the service**
 
@@ -3131,11 +3131,11 @@ use std::io::{Read, Seek, SeekFrom};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use continuo::http::channel::{SourceInterrupt, WaitHook};
-use continuo::http::error::RemoteFailure;
-use continuo::http::limits::Limits;
-use continuo::http::service::HttpService;
-use continuo::http::source::{HttpMediaSource, is_retired, remote_cause};
+use tenuto::http::channel::{SourceInterrupt, WaitHook};
+use tenuto::http::error::RemoteFailure;
+use tenuto::http::limits::Limits;
+use tenuto::http::service::HttpService;
+use tenuto::http::source::{HttpMediaSource, is_retired, remote_cause};
 use support::server::{Script, TestServer};
 use symphonia::core::io::MediaSource;
 use url::Url;
@@ -3176,7 +3176,7 @@ fn a_range_capable_source_reports_its_length_and_is_seekable() {
     assert!(source.is_seekable());
     assert_eq!(
         source.evidence(),
-        continuo::http::source::SourceEvidence { byte_len: Some(8192), byte_seekable: true, live: false }
+        tenuto::http::source::SourceEvidence { byte_len: Some(8192), byte_seekable: true, live: false }
     );
     server.shutdown();
 }
@@ -3255,12 +3255,12 @@ fn a_retired_read_is_recovered_through_symphonias_own_error_type() {
     // source rather than the payload. Both are exercised here by wrapping the
     // error exactly as the decoder does.
     let failure = RemoteFailure::TruncatedBody { missing: 9 };
-    let io = std::io::Error::other(continuo::http::source::RemoteIoError(failure.clone()));
+    let io = std::io::Error::other(tenuto::http::source::RemoteIoError(failure.clone()));
     let wrapped = symphonia::core::errors::Error::IoError(io);
     assert_eq!(remote_cause(&wrapped), Some(failure));
 
     let cancelled = symphonia::core::errors::Error::IoError(std::io::Error::other(
-        continuo::http::source::RemoteIoError(RemoteFailure::Cancelled),
+        tenuto::http::source::RemoteIoError(RemoteFailure::Cancelled),
     ));
     assert!(is_retired(&cancelled), "a wrapped retirement was not recognised");
 
@@ -3400,7 +3400,7 @@ fn the_probe_cap_stops_a_runaway_scan() {
 - [ ] **Step 2: Run to verify they fail**
 
 Run: `cargo test --test http_source 2>&1 | tail -20`
-Expected: FAIL — `unresolved import continuo::http::source`.
+Expected: FAIL — `unresolved import tenuto::http::source`.
 
 - [ ] **Step 3: Implement the source**
 
@@ -3542,14 +3542,14 @@ mod support;
 use std::sync::Arc;
 use std::time::Duration;
 
-use continuo::http::channel::{SourceInterrupt, WaitHook};
-use continuo::http::error::RemoteFailure;
-use continuo::http::limits::Limits;
-use continuo::http::service::HttpService;
-use continuo::media::capabilities::{Continuity, SeekSupport};
-use continuo::media::source::SourceLocation;
-use continuo::playback::error::PlaybackError;
-use continuo::playback::prepare::{PrepareContext, prepare};
+use tenuto::http::channel::{SourceInterrupt, WaitHook};
+use tenuto::http::error::RemoteFailure;
+use tenuto::http::limits::Limits;
+use tenuto::http::service::HttpService;
+use tenuto::media::capabilities::{Continuity, SeekSupport};
+use tenuto::media::source::SourceLocation;
+use tenuto::playback::error::PlaybackError;
+use tenuto::playback::prepare::{PrepareContext, prepare};
 use support::server::{Script, TestServer};
 use url::Url;
 
@@ -3754,7 +3754,7 @@ fn a_slow_trickle_cannot_outlast_the_opening_deadline() {
     assert!(
         matches!(
             error,
-            PlaybackError::Remote(RemoteFailure::Timeout { phase: continuo::http::error::Phase::Open })
+            PlaybackError::Remote(RemoteFailure::Timeout { phase: tenuto::http::error::Phase::Open })
         ),
         "{error}"
     );
@@ -3780,7 +3780,7 @@ fn a_probe_that_outlives_its_deadline_is_refused() {
 - [ ] **Step 2: Run to verify they fail**
 
 Run: `cargo test --test prepare 2>&1 | tail -20`
-Expected: FAIL — `unresolved import continuo::playback::prepare`.
+Expected: FAIL — `unresolved import tenuto::playback::prepare`.
 
 - [ ] **Step 3: Implement preparation**
 
@@ -3954,7 +3954,7 @@ Create `tests/resume_decision.rs` by **moving** the seven `#[cfg(test)] mod test
 ```rust
 use std::time::Duration;
 
-use continuo::resume::{ResumeCandidate, ResumeDecision, decide_resume};
+use tenuto::resume::{ResumeCandidate, ResumeDecision, decide_resume};
 
 fn stored(secs: u64, completed: bool) -> ResumeCandidate {
     ResumeCandidate { position: Duration::from_secs(secs), completed }
@@ -4097,7 +4097,7 @@ fn an_explicit_restart_announces_that_it_established() {
 - [ ] **Step 3: Run to verify they fail**
 
 Run: `cargo test --test resume_decision --test engine_contract 2>&1 | tail -20`
-Expected: FAIL — `unresolved import continuo::resume` and the three new engine tests.
+Expected: FAIL — `unresolved import tenuto::resume` and the three new engine tests.
 
 - [ ] **Step 4: Implement**
 
@@ -4307,18 +4307,18 @@ transport preserves the retained position instead of rewinding it to zero.
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use continuo::http::channel::WaitHook;
-use continuo::playback::engine::TransportCore;
-use continuo::playback::event::Progress;
-use continuo::playback::output::Nanos;
-use continuo::playback::timeline::PositionQuality;
-use continuo::playback::wait::{SessionFacts, WaitService};
+use tenuto::http::channel::WaitHook;
+use tenuto::playback::engine::TransportCore;
+use tenuto::playback::event::Progress;
+use tenuto::playback::output::Nanos;
+use tenuto::playback::timeline::PositionQuality;
+use tenuto::playback::wait::{SessionFacts, WaitService};
 
 /// The four wiring arguments that only the freeze tests care about, in the
 /// inert configuration: nothing frozen, an empty backlog, a channel nobody
 /// reads. A bare helper, so it handles its own error rather than unwrapping.
 fn inert() -> (
-    Arc<continuo::http::channel::SourceInterrupt>,
+    Arc<tenuto::http::channel::SourceInterrupt>,
     crossbeam_channel::Sender<PlaybackEvent>,
     Arc<Mutex<std::collections::VecDeque<PlaybackEvent>>>,
     Arc<std::sync::atomic::AtomicBool>,
@@ -4330,7 +4330,7 @@ fn inert() -> (
     // fails, which `announce` already handles by using the outbox.
     drop(rx);
     (
-        continuo::http::channel::SourceInterrupt::new(1024),
+        tenuto::http::channel::SourceInterrupt::new(1024),
         tx,
         Arc::new(Mutex::new(std::collections::VecDeque::new())),
         Arc::new(std::sync::atomic::AtomicBool::new(true)),
@@ -4519,7 +4519,7 @@ fn servicing_with_no_transport_is_harmless_and_repeatable() {
 - [ ] **Step 2: Run to verify they fail**
 
 Run: `cargo test --test wait_service 2>&1 | tail -20`
-Expected: FAIL — `unresolved import continuo::playback::wait`.
+Expected: FAIL — `unresolved import tenuto::playback::wait`.
 
 - [ ] **Step 3: Perform the refactor**
 
@@ -5314,7 +5314,7 @@ use support::server::{Script, TestServer};
 
 #[allow(clippy::unwrap_used)] // Spawning a fixed test binary.
 fn run(args: &[&str]) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_continuo")).args(args).output().unwrap()
+    Command::new(env!("CARGO_BIN_EXE_tenuto")).args(args).output().unwrap()
 }
 
 #[test]
@@ -5600,9 +5600,9 @@ Needs Task 13. §12's closing instruction: "Update README and architecture to de
 Add HTTP to the usage line, show the two forms:
 
 ```
-continuo play ~/Music/episode.mp3
-continuo play https://example.com/podcast/episode-42.mp3
-continuo play https://example.com/podcast/episode-42.mp3 --probe-only
+tenuto play ~/Music/episode.mp3
+tenuto play https://example.com/podcast/episode-42.mp3
+tenuto play https://example.com/podcast/episode-42.mp3 --probe-only
 ```
 
 State the honest limits in one short list: range-capable servers can seek and resume; range-less servers play through but cannot seek or resume; live streams and sources whose continuity cannot be established are refused; there is no automatic reconnection.
@@ -5629,12 +5629,12 @@ git commit -m "docs: describe the shipped M3 slice"
 
 Not automatable and not a gate for the tasks above, but the milestone is not done without it. On a machine with a real audio device:
 
-1. `continuo play <a real finite episode URL>` — confirm audio, and that the status line shows a duration and a seek capability.
+1. `tenuto play <a real finite episode URL>` — confirm audio, and that the status line shows a duration and a seek capability.
 2. Seek forward and back; confirm the position lands where the seek asked.
 3. Stop with `s`, then Play with `p`; confirm playback resumes at the preserved position rather than at zero.
 4. Quit with `q`, relaunch with the same URL; confirm the position continues.
-5. Check `~/.local/state/continuo/state.json` (or the platform equivalent) for the entry, and confirm the identity is the original URL rather than a redirect target.
-6. With `RUST_LOG=continuo=debug`, confirm no signed query or userinfo appears in any log line.
+5. Check `~/.local/state/tenuto/state.json` (or the platform equivalent) for the entry, and confirm the identity is the original URL rather than a redirect target.
+6. With `RUST_LOG=tenuto=debug`, confirm no signed query or userinfo appears in any log line.
 
 Record the results in the PR description. Feed discovery remains an M4 step.
 

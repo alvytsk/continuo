@@ -1,4 +1,4 @@
-//! The `continuo-spectrum` analysis worker (spec §10, decisions 18 and 25).
+//! The `tenuto-spectrum` analysis worker (spec §10, decisions 18 and 25).
 //!
 //! One thread per [`crate::playback::engine::EngineHandle`]. It owns the
 //! reading side of every transport's output tap, looks each block's label up
@@ -21,7 +21,7 @@
 //! still take the fatal path" (§12). A panic anywhere here - the FFT
 //! included - unwinds and ends this thread, and in the terminal player the
 //! §11 panic hook fails the application. The engine's own shutdown still
-//! completes: [`SpectrumThread::stop`] only sets a flag, sends on a channel
+//! completes: `SpectrumThread::stop` only sets a flag, sends on a channel
 //! whose failure is ignored, and joins a thread that has already exited,
 //! logging the panic rather than propagating it. A dead thread's control
 //! channel is disconnected, so later attaches and wakes are dropped, and its
@@ -504,7 +504,7 @@ pub(crate) fn spawn(
         scratch: Vec::new(),
     };
     let join = std::thread::Builder::new()
-        .name("continuo-spectrum".into())
+        .name("tenuto-spectrum".into())
         .spawn(move || runner.run())
         .ok();
     if join.is_none() {
@@ -711,7 +711,7 @@ mod tests {
         });
         let (control, receiver) = crossbeam_channel::unbounded::<Control>();
         let join = std::thread::Builder::new()
-            .name("continuo-spectrum".into())
+            .name("tenuto-spectrum".into())
             .spawn(move || {
                 let _receiver = receiver;
                 panic!("analysis bug");

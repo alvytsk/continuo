@@ -32,11 +32,11 @@ pub enum FeedError {
         index: usize,
         retained: usize,
     },
-    #[error("no cached episodes for {slug}; run continuo refresh {slug}")]
+    #[error("no cached episodes for {slug}; run tenuto refresh {slug}")]
     CacheMissing { slug: String },
-    #[error("corrupt cache for {slug}: {detail}; run continuo refresh {slug}")]
+    #[error("corrupt cache for {slug}: {detail}; run tenuto refresh {slug}")]
     CacheCorrupt { slug: String, detail: String },
-    #[error("cache parser {found} differs from {expected} for {slug}; run continuo refresh {slug}")]
+    #[error("cache parser {found} differs from {expected} for {slug}; run tenuto refresh {slug}")]
     CacheParserMismatch {
         slug: String,
         found: u32,

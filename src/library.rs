@@ -13,7 +13,7 @@
 //!
 //! Task 12 adds the two mutating functions, [`subscribe`] and
 //! [`unsubscribe`]. Both call [`SubscriptionStore::load`] through the
-//! private [`load_mutating`] helper, which narrows `load`'s outcomes down to
+//! private `load_mutating` helper, which narrows `load`'s outcomes down to
 //! the two safe ones — `Loaded` and `Missing`, both writable — and turns
 //! every other [`crate::persistence::store::LoadReason`] into a visible
 //! [`FeedError::SubscriptionsUnreadable`] rather than mutating on top of a
@@ -63,7 +63,7 @@ use crate::persistence::store::{LoadReason, StateSnapshot};
 use crate::subscription::model::{Subscription, choose_slug, new_feed_id, validate_slug};
 use crate::subscription::store::{SubscriptionLoad, SubscriptionSnapshot, SubscriptionStore};
 
-/// One row of `continuo feeds` (§6.1, §6.6). `episodes` and
+/// One row of `tenuto feeds` (§6.1, §6.6). `episodes` and
 /// `last_refreshed_at` are both `None` for a subscription that has never
 /// been refreshed — the normal state right after `subscribe`, not an error.
 #[derive(Clone, Debug, PartialEq)]
@@ -75,7 +75,7 @@ pub struct FeedSummary {
     pub last_refreshed_at: Option<OffsetDateTime>,
 }
 
-/// One row of `continuo episodes` (§6.1, §6.6). `index` is 1-based and
+/// One row of `tenuto episodes` (§6.1, §6.6). `index` is 1-based and
 /// contiguous over the retained list (§1.2) — the same index
 /// [`resolve_episode`] accepts.
 #[derive(Clone, Debug, PartialEq)]
@@ -151,7 +151,7 @@ fn find_subscription(
         })
 }
 
-/// `continuo feeds` (§6.1, §6.6). Iterates subscription order (never
+/// `tenuto feeds` (§6.1, §6.6). Iterates subscription order (never
 /// re-sorted), uses each subscription's own durable `title` — never the
 /// cache's, which can go stale the moment a feed's title changes upstream
 /// and is only refreshed on the next `refresh` — and reports a missing
@@ -187,7 +187,7 @@ pub fn list_feeds(
         .collect()
 }
 
-/// `continuo episodes <slug> [-n N]` (§6.1, §6.6). Rows are built by
+/// `tenuto episodes <slug> [-n N]` (§6.1, §6.6). Rows are built by
 /// enumerating the cache's episodes in stored order — never re-sorted by
 /// date or title (§1.2) — assigning contiguous 1-based indices before
 /// `limit` ever truncates the list, so `-n N` changes what is displayed,
@@ -266,7 +266,7 @@ pub fn episode_candidates(
         .collect())
 }
 
-/// `continuo play <slug> <index>`'s resolution step (§6.4, §6.5, §6.6): the
+/// `tenuto play <slug> <index>`'s resolution step (§6.4, §6.5, §6.6): the
 /// only thing this function does is decide *which* `(MediaId,
 /// SourceLocation)` pair to play, or that none exists — no `EngineHandle`,
 /// no `AudioOutput` and no `HttpService` are constructed here or by any
@@ -350,7 +350,7 @@ pub enum FollowupStep {
     RemoveCache,
 }
 
-/// `continuo subscribe <url> [--as slug]`'s result (§6.1, §6.6).
+/// `tenuto subscribe <url> [--as slug]`'s result (§6.1, §6.6).
 #[derive(Debug)]
 pub struct SubscribeOutcome {
     pub slug: String,
@@ -361,7 +361,7 @@ pub struct SubscribeOutcome {
     pub followup: Option<FollowupFailure>,
 }
 
-/// `continuo unsubscribe <slug>`'s result (§6.1, §6.6).
+/// `tenuto unsubscribe <slug>`'s result (§6.1, §6.6).
 #[derive(Debug)]
 pub struct UnsubscribeOutcome {
     pub slug: String,
@@ -532,7 +532,7 @@ fn log_bound_warnings(slug: &str, warnings: &[ParseWarning]) {
     }
 }
 
-/// `continuo subscribe <url> [--as slug]` (§6.1, §6.6, §6.7). Fetches
+/// `tenuto subscribe <url> [--as slug]` (§6.1, §6.6, §6.7). Fetches
 /// unconditionally — a subscribe has no cache to revalidate against, so an
 /// `Unchanged` outcome can never legitimately occur here and is reported as
 /// [`RemoteFailure::UnsolicitedNotModified`] rather than fabricating a
@@ -654,7 +654,7 @@ pub async fn subscribe(
     })
 }
 
-/// `continuo unsubscribe <slug>` (§6.1, §6.6). Keeps checkpoints: there is
+/// `tenuto unsubscribe <slug>` (§6.1, §6.6). Keeps checkpoints: there is
 /// no [`crate::persistence::store::StateStore`] argument and this function
 /// never deletes one. Resubscribing later mints a fresh `FeedId` (§1.6), so
 /// any checkpoint keyed to the old one is simply orphaned, never reattached.
@@ -687,7 +687,7 @@ pub fn unsubscribe(
     })
 }
 
-/// `continuo refresh [<slug>]`'s result (§6.1, §6.6).
+/// `tenuto refresh [<slug>]`'s result (§6.1, §6.6).
 #[derive(Debug)]
 pub enum RefreshOutcome {
     /// A 304. The cache was revalidated; a permanent redirect may still
@@ -867,10 +867,10 @@ async fn refresh_one(
     }
 }
 
-/// `continuo refresh <slug>` (§6.1, §6.6). Loads the subscription snapshot
-/// once, resolves `slug` to its index — reusing [`find_subscription`] for
+/// `tenuto refresh <slug>` (§6.1, §6.6). Loads the subscription snapshot
+/// once, resolves `slug` to its index — reusing `find_subscription` for
 /// the same `UnknownSlug` presentation every other single-feed lookup in
-/// this file uses — and returns [`refresh_one`]'s outcome for it.
+/// this file uses — and returns `refresh_one`'s outcome for it.
 pub async fn refresh(
     http: &HttpService,
     subs: &SubscriptionStore,
@@ -890,7 +890,7 @@ pub async fn refresh(
     Ok(refresh_one(http, subs, cache, &mut snapshot, index).await)
 }
 
-/// `continuo refresh` with no slug (§6.1, §6.6). Executes strictly
+/// `tenuto refresh` with no slug (§6.1, §6.6). Executes strictly
 /// sequentially — no background task, no retries on a generic
 /// network failure — for deterministic outcomes and bounded resource use.
 ///

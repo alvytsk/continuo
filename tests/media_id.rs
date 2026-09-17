@@ -1,5 +1,5 @@
-use continuo::media::id::{AbsolutePath, EpisodeKey, FeedId, MediaId, NormalizedUrl};
 use std::{collections::HashMap, path::PathBuf};
+use tenuto::media::id::{AbsolutePath, EpisodeKey, FeedId, MediaId, NormalizedUrl};
 
 #[allow(clippy::unwrap_used)] // Fallible construction of fixed test fixtures.
 fn identities() -> Vec<MediaId> {

@@ -1,14 +1,14 @@
-# Continuo M5 Compact Ratatui Player Implementation Plan
+# Tenuto M5 Compact Ratatui Player Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Ship `continuo tui`: a compact, local-first terminal player with a durable playback queue, token-correlated loads, one shared shutdown/lock lifecycle for `tui` and legacy `play`, on-demand browsing, best-effort cover art and a real post-gain frequency spectrum, while every existing CLI command keeps working.
+**Goal:** Ship `tenuto tui`: a compact, local-first terminal player with a durable playback queue, token-correlated loads, one shared shutdown/lock lifecycle for `tui` and legacy `play`, on-demand browsing, best-effort cover art and a real post-gain frequency spectrum, while every existing CLI command keeps working.
 
 **Architecture:** `Session` stays the only owner of `PersistedState`, which becomes schema 3 with a queue; it also owns a transient table of pending load tokens and adopts a queue occurrence only on `Loaded` for its token. The engine gains caller-supplied `LoadRequestId`s and protected load outcomes. A terminal-free `application::PlayerRuntime` owns engine, session, writer and HTTP service for the TUI; legacy `play` shares the lifecycle module (profile lock, signals) and token correlation but keeps its two loops. The TUI renders immutable `PlayerView` snapshots; metadata, artwork and spectrum work runs on bounded workers that report back to the application thread.
 
 **Tech Stack:** Rust edition 2024 (toolchain 1.98.1), existing symphonia/cpal/rtrb/crossbeam/crossterm 0.29/clap/serde/tokio/reqwest; new direct dependencies `ratatui` 0.30, `ratatui-image` 11, `image` 0.25 (JPEG/PNG only), `rustfft` 6, and on Unix `signal-hook` 0.4 and `gag` 1; dev-dependency `portable-pty` 0.9. Locking uses `std::fs::File::try_lock` (stable since 1.89).
 
-**Spec:** [Continuo M5: compact Ratatui player](../specs/2026-09-14-continuo-ratatui-design.md), all thirteen sections, at commit `9e46ffe`, with the [compact reference](../specs/assets/continuo-compact-reference.html) for palette and layout only. Read the whole spec before starting any task; every task's requirements include this plan's Global Constraints and Implementation Decisions.
+**Spec:** [Tenuto M5: compact Ratatui player](../specs/2026-09-14-tenuto-ratatui-design.md), all thirteen sections, at commit `9e46ffe`, with the [compact reference](../specs/assets/tenuto-compact-reference.html) for palette and layout only. Read the whole spec before starting any task; every task's requirements include this plan's Global Constraints and Implementation Decisions.
 
 ## Global Constraints
 
@@ -28,19 +28,19 @@
 - Artwork: embedded front cover, then sibling `cover.jpg`, `cover.png`, `folder.jpg`, `folder.png`; JPEG and PNG only; **10 MiB** encoded input, **16 million** decoded pixels; modes `auto`, `blocks`, `off`.
 - Spectrum: "**2048-sample Hann window**", 24 nominal logarithmic intervals from **40 Hz** to the lesser of **16 kHz** or Nyquist, every band ≥ 2 FFT bin centers, at most **20 frames per second**, power averaged across **all output channels**.
 - Unix signals: SIGINT, SIGHUP, SIGTERM through the `signal-hook` iterator API; OS-signal exit status is `128 + signal_number` of the first recorded signal; `q` and the Ctrl-C key exit 0.
-- Profile lock file: sibling `state.lock` next to `state.json`, never unlinked. Contention message, verbatim: `Another Continuo player is using this state profile`.
+- Profile lock file: sibling `state.lock` next to `state.json`, never unlinked. Contention message, verbatim: `Another Tenuto player is using this state profile`.
 - TUI log: a new uniquely named append log under `<state dir>/logs/`, keeping the **five** most recent prior logs.
 - Status strings, verbatim: `Play a track before seeking`, `Queue is empty`, `Track ended; press play to replay`, `Still loading`, `Using saved episode source`.
-- Bare `continuo` is a usage error with exit status **2** on stderr; `continuo --help` exits **0**.
+- Bare `tenuto` is a usage error with exit status **2** on stderr; `tenuto --help` exits **0**.
 - Never: IPC, network protocol, server/daemon mode, Tauri code, named playlists, shuffle/repeat/wrap, implicit feed refresh, remote metadata or duration probes outside an explicit load, recursive library indexing, raw terminal control characters or URL credentials in display strings.
-- Every test that launches the `continuo` binary goes through `tests/support/process.rs` with an isolated temporary profile.
+- Every test that launches the `tenuto` binary goes through `tests/support/process.rs` with an isolated temporary profile.
 - Acceptance: `cargo fmt --check`, `cargo clippy --locked --all-targets --all-features -- -D warnings`, `cargo test --locked`.
 
 ---
 
 ## Execution context
 
-The inspected branch is `feat/ratatui-player` at `9e46ffe`. The worktree had one unrelated untracked file (`docs/superpowers/plans/2026-09-11-continuo-feeds-subscriptions.md`); leave it alone. This plan is a planning deliverable. At execution time re-check `git status`, preserve unrelated changes, and follow the chosen execution skill's isolation rules.
+The inspected branch is `feat/ratatui-player` at `9e46ffe`. The worktree had one unrelated untracked file (`docs/superpowers/plans/2026-09-11-tenuto-feeds-subscriptions.md`); leave it alone. This plan is a planning deliverable. At execution time re-check `git status`, preserve unrelated changes, and follow the chosen execution skill's isolation rules.
 
 The spec is one milestone with ordered increments (§12). Tasks below follow that order; each leaves `play`, `play --probe-only`, and every feed command working. Run the focused test first and watch it fail for the intended reason, then implement, then rerun. A task's code listings are binding for public names and behavior; private helper names may vary where no later task consumes them.
 
@@ -50,14 +50,14 @@ All new tests return `Result<(), Box<dyn std::error::Error>>` or use `expect`/`u
 
 These resolve gaps found while reading the code against the spec. They are binding.
 
-1. **Usage exit status is currently wrong.** `src/main.rs` prints every clap error with `eprint!` and returns `ExitCode::FAILURE`; measured on this commit, bare `continuo` and `continuo --help` both exit 1. §4 says bare exits 2 and `--help` succeeds, so Task 2 makes that true with clap's own `Error::print` and `Error::exit_code`.
+1. **Usage exit status is currently wrong.** `src/main.rs` prints every clap error with `eprint!` and returns `ExitCode::FAILURE`; measured on this commit, bare `tenuto` and `tenuto --help` both exit 1. §4 says bare exits 2 and `--help` succeeds, so Task 2 makes that true with clap's own `Error::print` and `Error::exit_code`.
 2. **`Progress` carries the adopted load token.** The worker bumps `session_rev` on load, on stop (`do_stop`) and on device recovery, and `Progress.media` cannot tell duplicate occurrences apart. Neither can therefore implement "progress for an unadopted load cannot update that previous checkpoint". Add `Progress::load: Option<LoadRequestId>`: the worker sets it when it emits `Loaded`, keeps it across stop, pause and recovery, and clears it when the next `load` starts. `Session::tick` ignores progress whose `load` is not the adopted token.
 3. **Completion advancement** is keyed by `(adopted token, session_rev)` and additionally requires that the most recent `Loaded` the session observed carried the adopted token. A `Loaded` for an invalidated target therefore suppresses advancement for any `EndOfTrack` its playback might produce before the stop lands.
 4. **Protected events are never dropped or displaced.** `Loaded`, `LoadCancelled` and `Failed { request: Some(_) }` bypass `PENDING_CAP` and may occupy the reserved tail. The backlog stays bounded while running because admission already closes whenever `pending_events` is nonempty, so one pass dispatches at most one load and emits at most one load outcome. The shutdown drain of undelivered `Load` commands may exceed `PENDING_CAP`; it only extends the returned `Vec`.
 5. **Reserve arithmetic, rechecked.** The load row's terminal-or-protected share becomes 3 (`Loaded`, then `Failed` + `StateChanged{Failed}` when the device does not open). Worst pass: stop 1 + fatal fault 2 + load 3 + end of track 2 = 8 ≤ `RESERVED_EVENT_SLOTS` (9). A cancelled load emits only `LoadCancelled` (1). Update the comment block in `engine.rs` with this table.
 6. **Existing session tests register their loads.** `Loaded` now requires a registered token. Test helpers change shape (Task 8 gives the exact helpers); the policy they assert does not change.
-7. **Virtual real-time audio output for subprocess tests.** CI has no audio device, but §12 requires signal tests "during playback". Add `playback::output::null_output::NullOutput`, a paced thread that runs `CallbackCore::fill` every buffer period and discards samples. `EngineHandle::spawn_for_environment()` selects it when `CONTINUO_AUDIO_OUTPUT=null`, otherwise `spawn_cpal()`. Document it in `docs/architecture.md` as a diagnostic switch.
-8. **Process test hooks.** Panic-at-stage and fd-2 probe tests need a deterministic trigger inside the child. `lifecycle::hooks::TestHook::from_env()` reads `CONTINUO_TEST_HOOK` once at startup; unknown or absent values mean no hook. Values: `panic-before-redirect`, `panic-after-redirect`, `panic-after-terminal`, `stderr-probe`, `artwork-job-panic`, `artwork-encoding-panic`, `metadata-job-panic`, `worker-panic`.
+7. **Virtual real-time audio output for subprocess tests.** CI has no audio device, but §12 requires signal tests "during playback". Add `playback::output::null_output::NullOutput`, a paced thread that runs `CallbackCore::fill` every buffer period and discards samples. `EngineHandle::spawn_for_environment()` selects it when `TENUTO_AUDIO_OUTPUT=null`, otherwise `spawn_cpal()`. Document it in `docs/architecture.md` as a diagnostic switch.
+8. **Process test hooks.** Panic-at-stage and fd-2 probe tests need a deterministic trigger inside the child. `lifecycle::hooks::TestHook::from_env()` reads `TENUTO_TEST_HOOK` once at startup; unknown or absent values mean no hook. Values: `panic-before-redirect`, `panic-after-redirect`, `panic-after-terminal`, `stderr-probe`, `artwork-job-panic`, `artwork-encoding-panic`, `metadata-job-panic`, `worker-panic`.
 9. **No production profile override.** Subprocess suites run on Linux only, with `XDG_STATE_HOME`, `XDG_DATA_HOME`, `XDG_CACHE_HOME`, and `XDG_CONFIG_HOME` set per child. The shared launcher refuses unsupported platforms before spawning. `HOME` does not redirect Windows Known Folders; do not claim cross-platform isolation. Enable subprocess suites on another platform only after verifying its actual profile paths. Production platform support is unchanged.
 10. **Queue decoding.** `PersistedState` loses its derived serde impls. A private `RawState` decodes the envelope and listening history with `queue` and `active_entry` as `Option<serde_json::Value>`; a pure `recover_queue` turns those values into a `Queue` plus an optional `QueueReset`. A wrong JSON type in either field can no longer fail the whole file.
 11. **Local and remote queue sources duplicate their identity on disk** (`path`, `url`) so a source/identity mismatch is detectable, as §6 requires. A podcast source stores only `fallback_url`; its identity is the entry's `MediaId`.
@@ -65,7 +65,7 @@ These resolve gaps found while reading the code against the spec. They are bindi
 13. **Embedded artwork** accepts only a visual whose `usage` is `StandardVisualKey::FrontCover`, as the spec says "front-cover artwork".
 14. **Browser episodes need the enclosure URL**, which `EpisodeRow` does not carry. Add `library::episode_candidates`.
 15. **`resume_intent_for` moves** from `app.rs` to `session.rs` (it reads `PersistedCheckpoint`, so it cannot live in the persistence-free `resume.rs`). `app.rs` imports it, so its tests keep compiling.
-16. **`KeyRouter` and `SeekBurst` move** from `app.rs` to `application::seek`; `app.rs` keeps `pub use crate::application::seek::KeyRouter;` because `tests/app_cli.rs` imports `continuo::app::KeyRouter`.
+16. **`KeyRouter` and `SeekBurst` move** from `app.rs` to `application::seek`; `app.rs` keeps `pub use crate::application::seek::KeyRouter;` because `tests/app_cli.rs` imports `tenuto::app::KeyRouter`.
 17. **The lock-holding process test uses volume** as the newer durable fact: `tui` accepts `+` without an engine and persists volume through `Session`, which is observable without an audio device.
 18. **Spectrum mapping publication.** The callback labels tap blocks with `(transport instance, generation, epoch)`. The worker learns the epoch a `Run` publication will use through a new `Handshake::upcoming_epoch()` and publishes the mapping before calling `start_running` or `release`. The wait hook's thaw path publishes through `TransportCore`, which stores its own `session_rev` and tap instance.
 19. **Adoption snapshots are built last.** Capture outgoing history and change `current_media`, active occurrence and metadata before cloning the single submitted snapshot. The old `on_loaded` submission cannot be reused.
@@ -186,7 +186,7 @@ pub struct PlayerRuntime; pub enum AppCommand; pub enum EnqueueItem; pub struct 
 | D. Session semantics | 8–10 | Token adoption, queue mutations, advancement and podcast resolution are pure and tested |
 | E. Shared lifecycle | 11–12 | `play` locks, flushes on signals and exits `128 + n` |
 | F. Runtime | 13–15 | Terminal-free runtime implements §4's transport table against a virtual device |
-| G. TUI | 16–23 | `continuo tui` starts in the §11 order, renders every tier, handles keys, mouse, browser and metadata |
+| G. TUI | 16–23 | `tenuto tui` starts in the §11 order, renders every tier, handles keys, mouse, browser and metadata |
 | H. Artwork | 24–25 | Bounded decode, contained panics, protocol detection and cleanup |
 | I. Spectrum | 26–28 | Band geometry table, tap ring, mapping, analysis on screen |
 | J. Acceptance | 29 | Process/PTY suite, docs, manual terminal checklist, final gates |
@@ -201,7 +201,7 @@ pub struct PlayerRuntime; pub enum AppCommand; pub enum EnqueueItem; pub struct 
 - Modify: `tests/cli.rs`, `tests/cli_playback.rs`, `tests/http_cli.rs`, `tests/m4_cli.rs:250-275`, `tests/m4_diagnostics.rs:769-778`
 
 **Interfaces:**
-- Produces: `process::Profile::new() -> io::Result<Profile>`, `Profile::root(&self) -> &Path`, `Profile::state_dir(&self) -> PathBuf` (`<root>/state/continuo`), `Profile::state_file(&self) -> PathBuf`, `Profile::command(&self) -> Command`, `process::command_in(root: &Path) -> Command`, `process::binary() -> &'static str`. Include with `#[path = "support/process.rs"] mod process;`.
+- Produces: `process::Profile::new() -> io::Result<Profile>`, `Profile::root(&self) -> &Path`, `Profile::state_dir(&self) -> PathBuf` (`<root>/state/tenuto`), `Profile::state_file(&self) -> PathBuf`, `Profile::command(&self) -> Command`, `process::command_in(root: &Path) -> Command`, `process::binary() -> &'static str`. Include with `#[path = "support/process.rs"] mod process;`.
 
 The audit found seven launch sites in five files. `a_stalled_remote_open_is_quittable_before_anything_loads` currently uses the developer's real `XDG_STATE_HOME`; it is the case §12 names explicitly. Add `#![cfg(target_os = "linux")]` to these five subprocess suites and every later suite using `process` or `pty`. Pure library tests remain portable. The launcher also fails closed on unsupported platforms so a missing suite gate cannot launch against a real profile.
 
@@ -229,7 +229,7 @@ fn rust_files(dir: &Path, found: &mut Vec<PathBuf>) -> std::io::Result<()> {
 #[test]
 fn only_the_process_helper_names_the_binary() -> Result<(), Box<dyn std::error::Error>> {
     // Built with concat! so this file does not match its own search.
-    let needle = concat!("CARGO_BIN_EXE_", "continuo");
+    let needle = concat!("CARGO_BIN_EXE_", "tenuto");
     let mut files = Vec::new();
     rust_files(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests"), &mut files)?;
     let offenders: Vec<_> = files
@@ -248,7 +248,7 @@ fn only_the_process_helper_names_the_binary() -> Result<(), Box<dyn std::error::
 
 ```rust
 // tests/support/process.rs
-//! The one way a test launches `continuo` (M5 §12). Every child gets its own
+//! The one way a test launches `tenuto` (M5 §12). Every child gets its own
 //! state, data, cache and config directories, so no test can read, lock or
 //! write the developer's playback profile. Keep the `Profile` alive until the
 //! child has exited: dropping it deletes the directories under the child.
@@ -260,10 +260,10 @@ use std::process::Command;
 
 pub fn binary() -> &'static str {
     assert!(cfg!(target_os = "linux"), "subprocess profile isolation is verified only on Linux");
-    env!("CARGO_BIN_EXE_continuo")
+    env!("CARGO_BIN_EXE_tenuto")
 }
 
-/// A command for `continuo` whose profile lives under `root`, laid out the
+/// A command for `tenuto` whose profile lives under `root`, laid out the
 /// way the M4 CLI tests already seed it: `root/{state,data,cache,config}`.
 pub fn command_in(root: &Path) -> Command {
     let mut command = Command::new(binary());
@@ -272,8 +272,8 @@ pub fn command_in(root: &Path) -> Command {
         .env("XDG_DATA_HOME", root.join("data"))
         .env("XDG_CACHE_HOME", root.join("cache"))
         .env("XDG_CONFIG_HOME", root.join("config"))
-        .env_remove("CONTINUO_TEST_HOOK")
-        .env_remove("CONTINUO_AUDIO_OUTPUT");
+        .env_remove("TENUTO_TEST_HOOK")
+        .env_remove("TENUTO_AUDIO_OUTPUT");
     command
 }
 
@@ -292,7 +292,7 @@ impl Profile {
 
     /// Where `StateStore::platform_path` resolves on Linux under this profile.
     pub fn state_dir(&self) -> PathBuf {
-        self.root().join("state").join("continuo")
+        self.root().join("state").join("tenuto")
     }
 
     pub fn state_file(&self) -> PathBuf {
@@ -305,7 +305,7 @@ impl Profile {
 }
 ```
 
-- [ ] **Step 4: Migrate each launch site.** Replace `Command::new(env!("CARGO_BIN_EXE_continuo"))` as follows, keeping every assertion unchanged:
+- [ ] **Step 4: Migrate each launch site.** Replace `Command::new(env!("CARGO_BIN_EXE_tenuto"))` as follows, keeping every assertion unchanged:
   - `tests/cli.rs`, `tests/cli_playback.rs`, `tests/http_cli.rs`: add `#[path = "support/process.rs"] mod process;`. Their `run(args)` helpers become:
 
 ```rust
@@ -318,8 +318,8 @@ fn run(args: &[&str]) -> std::process::Output {
 ```
 
   - Inline launches in `tests/cli.rs` (`bare`, `failure`) and `a_relative_path_is_accepted_and_canonicalized` use a local `let profile = process::Profile::new().unwrap();` and `profile.command()`, then keep their `.env`/`.current_dir` calls.
-  - `tests/m4_cli.rs:252`: `fn command(root: &Path, args: &[&str]) -> Command { let mut command = process::command_in(root); command.args(args).env("RUST_LOG", "continuo=warn"); command }`.
-  - `tests/m4_diagnostics.rs:769`: `process::command_in(root.path()).args(args).env("RUST_LOG", "continuo=debug").output()`.
+  - `tests/m4_cli.rs:252`: `fn command(root: &Path, args: &[&str]) -> Command { let mut command = process::command_in(root); command.args(args).env("RUST_LOG", "tenuto=warn"); command }`.
+  - `tests/m4_diagnostics.rs:769`: `process::command_in(root.path()).args(args).env("RUST_LOG", "tenuto=debug").output()`.
 
 - [ ] **Step 5: Run the audit and the migrated suites.**
 Extend `launch_audit` with `subprocess_suites_are_gated_to_verified_platforms`: every top-level test file importing `mod process;` or `mod pty;` must contain `#![cfg(target_os = "linux")]` (build those search strings with `concat!` to avoid self-matches). In the ungated `launch_audit.rs`, import the helper as `unsupported_process` only under `cfg(not(target_os = "linux"))`; a non-Linux test catches the panic from `unsupported_process::binary()` and verifies refusal before constructing any child. This test must not live inside a Linux-gated suite. On Linux, launch a child with inherited `HOME` and a temporary XDG profile; verify the actual `state.json` is under `Profile::state_dir()` and not the inherited home. Later PTY launches must use the same guarded `binary()` and environment construction.
@@ -341,7 +341,7 @@ git commit -m "test: launch the binary only through an isolated profile"
 
 **Interfaces:**
 - Consumes: `process::Profile` (Task 1).
-- Produces: bare `continuo` exits 2 with usage on stderr; `--help` exits 0 with help on stdout. No library API change.
+- Produces: bare `tenuto` exits 2 with usage on stderr; `--help` exits 0 with help on stdout. No library API change.
 
 - [ ] **Step 1: Write failing tests** in `tests/cli.rs`.
 
@@ -415,8 +415,8 @@ Semantics that later tasks rely on:
 
 ```rust
 // tests/m5_queue.rs
-use continuo::media::id::{AbsolutePath, MediaId};
-use continuo::queue::{
+use tenuto::media::id::{AbsolutePath, MediaId};
+use tenuto::queue::{
     Direction, DisplayMetadata, MAX_QUEUE_ENTRIES, NewQueueEntry, Queue, QueueError, QueueSource,
 };
 
@@ -473,13 +473,13 @@ fn reordering_keeps_ids_and_stops_at_the_edges() {
     assert_eq!(queue.entries().iter().map(|e| e.id()).collect::<Vec<_>>(), [ids[0], ids[2], ids[1]]);
     assert!(!queue.move_entry(ids[0], Direction::Up).expect("known"));
     assert!(matches!(
-        queue.move_entry(continuo_unknown_id(&mut queue), Direction::Down),
+        queue.move_entry(tenuto_unknown_id(&mut queue), Direction::Down),
         Err(QueueError::UnknownEntry(_))
     ));
 }
 
 /// An ID that no longer exists: enqueue then remove it.
-fn continuo_unknown_id(queue: &mut Queue) -> continuo::queue::QueueEntryId {
+fn tenuto_unknown_id(queue: &mut Queue) -> tenuto::queue::QueueEntryId {
     let id = queue.enqueue(vec![local("gone")]).expect("fits")[0];
     queue.remove(id).expect("known");
     id
@@ -513,7 +513,7 @@ fn neighbors_do_not_wrap() {
 }
 ```
 
-- [ ] **Step 2: Run `cargo test --locked --test m5_queue`.** Expected: FAIL, unresolved module `continuo::queue`.
+- [ ] **Step 2: Run `cargo test --locked --test m5_queue`.** Expected: FAIL, unresolved module `tenuto::queue`.
 
 - [ ] **Step 3: Implement `src/queue.rs`.** Core shape (write doc comments in the repository's explanatory style):
 
@@ -788,8 +788,8 @@ Never infer an active entry from a `MediaId`.
 
 ```rust
 // tests/m5_state_schema.rs
-use continuo::persistence::model::{PersistedState, SCHEMA_VERSION};
-use continuo::persistence::queue_codec::{ActiveProblem, QueueProblem, QueueReset, recover_queue};
+use tenuto::persistence::model::{PersistedState, SCHEMA_VERSION};
+use tenuto::persistence::queue_codec::{ActiveProblem, QueueProblem, QueueReset, recover_queue};
 use serde_json::json;
 
 mod support;
@@ -897,8 +897,8 @@ Add a schema-boundary regression using the existing `entry` helper:
 ```rust
 #[test]
 fn a_valid_maximum_id_is_preserved_but_cannot_be_reallocated() {
-    use continuo::queue::{DisplayMetadata, NewQueueEntry, QueueError, QueueSource};
-    use continuo::media::id::MediaId;
+    use tenuto::queue::{DisplayMetadata, NewQueueEntry, QueueError, QueueSource};
+    use tenuto::media::id::MediaId;
     let file = json!({ "schema_version": 3, "queue": [entry(u64::MAX, "a")] });
     let state: PersistedState = serde_json::from_value(file).expect("valid maximum ID");
     let mut queue = state.queue().clone();
@@ -1094,9 +1094,9 @@ Behavior: when `decode_state` yields a reset, `load` copies the **exact original
 ```rust
 // tests/m5_state_recovery.rs
 use std::sync::Arc;
-use continuo::clock::FakeClock;
-use continuo::persistence::queue_codec::{QueueProblem, QueueReset};
-use continuo::persistence::store::{LoadReason, QueueBackup, StateStore};
+use tenuto::clock::FakeClock;
+use tenuto::persistence::queue_codec::{QueueProblem, QueueReset};
+use tenuto::persistence::store::{LoadReason, QueueBackup, StateStore};
 use serde_json::json;
 
 mod support;
@@ -1276,7 +1276,7 @@ Worker rules:
 - [ ] **Step 1: Write failing tests** in `tests/engine_contract.rs`.
 
 ```rust
-use continuo::playback::command::LoadRequestId;
+use tenuto::playback::command::LoadRequestId;
 
 fn local_load(request: u64, name: &str) -> PlaybackCommand {
     let path = support::fixture(name);
@@ -1307,10 +1307,10 @@ fn a_load_echoes_its_request_on_loading_loaded_and_progress() {
 #[test]
 fn an_open_failure_is_the_load_outcome_for_its_request() {
     let mut engine = TestEngine::start_idle();
-    let missing = std::env::temp_dir().join("continuo-m5-definitely-missing.flac");
+    let missing = std::env::temp_dir().join("tenuto-m5-definitely-missing.flac");
     engine.send(PlaybackCommand::Load {
         request: LoadRequestId::from_raw(42),
-        media: MediaId::LocalFile(continuo::media::id::AbsolutePath::new(missing.clone()).expect("absolute")),
+        media: MediaId::LocalFile(tenuto::media::id::AbsolutePath::new(missing.clone()).expect("absolute")),
         source: SourceLocation::LocalPath(missing),
         resume: ResumeIntent::StartAt(Duration::ZERO),
     });
@@ -1409,12 +1409,12 @@ mod support;
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use continuo::http::limits::Limits;
-use continuo::http::service::HttpService;
-use continuo::media::id::{MediaId, NormalizedUrl};
-use continuo::media::source::SourceLocation;
-use continuo::playback::command::{LoadRequestId, PlaybackCommand, ResumeIntent};
-use continuo::playback::event::PlaybackEvent;
+use tenuto::http::limits::Limits;
+use tenuto::http::service::HttpService;
+use tenuto::media::id::{MediaId, NormalizedUrl};
+use tenuto::media::source::SourceLocation;
+use tenuto::playback::command::{LoadRequestId, PlaybackCommand, ResumeIntent};
+use tenuto::playback::event::PlaybackEvent;
 use support::TestEngine;
 use support::server::{Script, TestServer};
 
@@ -1465,7 +1465,7 @@ fn every_accepted_load_has_exactly_one_ordered_outcome_under_saturation() {
     for (index, event) in report.events.iter().enumerate() {
         if let PlaybackEvent::Loaded { session_rev, .. } = event {
             assert!(!report.events[..index].iter().any(|earlier| matches!(earlier,
-                PlaybackEvent::StateChanged { session_rev: rev, state: continuo::playback::state::PlaybackState::Paused, .. } if rev == session_rev)));
+                PlaybackEvent::StateChanged { session_rev: rev, state: tenuto::playback::state::PlaybackState::Paused, .. } if rev == session_rev)));
         }
     }
 }
@@ -1519,7 +1519,7 @@ Add the guarded-start regression using this file's `remote_load` helper. A queue
 ```rust
 #[test]
 fn automatic_start_does_not_reopen_a_failed_remote_load() {
-    use continuo::playback::volume::Volume;
+    use tenuto::playback::volume::Volume;
     let server = TestServer::start(Script::serving(Vec::new()).status(404));
     let mut engine = TestEngine::start_idle();
     engine.handle().set_http(Some(HttpService::spawn(Limits::brisk()).expect("http")));
@@ -1534,8 +1534,8 @@ fn automatic_start_does_not_reopen_a_failed_remote_load() {
 
 #[test]
 fn an_older_automatic_start_cannot_play_a_newer_load() {
-    use continuo::playback::state::PlaybackState;
-    use continuo::playback::volume::Volume;
+    use tenuto::playback::state::PlaybackState;
+    use tenuto::playback::volume::Volume;
     let mut engine = TestEngine::start_idle();
     engine.send(local_load(81));
     engine.send(local_load(82));
@@ -1697,18 +1697,18 @@ mod support;
 
 use std::time::Duration;
 
-use continuo::clock::{Clock, FakeClock};
-use continuo::media::capabilities::{Continuity, MediaCapabilities, SeekSupport};
-use continuo::media::id::MediaId;
-use continuo::media::metadata::MediaMetadata;
-use continuo::persistence::model::PersistedState;
-use continuo::playback::command::LoadRequestId;
-use continuo::playback::event::{PlaybackEvent, Progress, StartDisposition};
-use continuo::playback::provenance::PositionProvenance;
-use continuo::playback::state::PlaybackState;
-use continuo::playback::timeline::PositionQuality;
-use continuo::queue::{Direction, DisplayMetadata, NewQueueEntry, QueueEntryId, QueueSource};
-use continuo::session::{Advance, LoadTarget, MAX_PENDING_LOADS, RegisterLoadError, Session};
+use tenuto::clock::{Clock, FakeClock};
+use tenuto::media::capabilities::{Continuity, MediaCapabilities, SeekSupport};
+use tenuto::media::id::MediaId;
+use tenuto::media::metadata::MediaMetadata;
+use tenuto::persistence::model::PersistedState;
+use tenuto::playback::command::LoadRequestId;
+use tenuto::playback::event::{PlaybackEvent, Progress, StartDisposition};
+use tenuto::playback::provenance::PositionProvenance;
+use tenuto::playback::state::PlaybackState;
+use tenuto::playback::timeline::PositionQuality;
+use tenuto::queue::{Direction, DisplayMetadata, NewQueueEntry, QueueEntryId, QueueSource};
+use tenuto::session::{Advance, LoadTarget, MAX_PENDING_LOADS, RegisterLoadError, Session};
 use support::media;
 
 fn entry(name: &str) -> NewQueueEntry {
@@ -1828,7 +1828,7 @@ fn device_recovery_keeps_the_adopted_load_while_another_is_pending() {
     session.observe(&PlaybackEvent::DeviceRecovered { session_rev: 2 }, clock.sample());
     clock.advance(Duration::from_secs(6));
     let action = session.tick(&progress(2, "a", 12, Some(first)), clock.sample());
-    assert!(matches!(action, continuo::session::Action::Submit { .. }));
+    assert!(matches!(action, tenuto::session::Action::Submit { .. }));
     assert_eq!(session.adopted().map(|a| a.request), Some(first));
 }
 
@@ -1892,7 +1892,7 @@ Add these regressions using this file's helpers:
 ```rust
 #[test]
 fn an_adoption_snapshot_contains_the_new_media_active_entry_and_metadata() {
-    use continuo::session::Action;
+    use tenuto::session::Action;
     let clock = FakeClock::new();
     let (mut session, ids) = queued(&["a", "b"]);
     let a = session.register_load(LoadTarget::Queue(ids[0]), &media("a")).expect("register");
@@ -1912,7 +1912,7 @@ fn an_adoption_snapshot_contains_the_new_media_active_entry_and_metadata() {
 
 #[test]
 fn completion_for_a_removed_pending_load_cannot_write_the_previous_history() {
-    use continuo::session::Action;
+    use tenuto::session::Action;
     for provenance in [PositionProvenance::Established, PositionProvenance::Estimated] {
         let clock = FakeClock::new();
         let (mut session, ids) = queued(&["a", "b"]);
@@ -2006,15 +2006,15 @@ mod support;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use continuo::clock::{Clock, FakeClock};
-use continuo::persistence::model::PersistedState;
-use continuo::persistence::store::StateStore;
-use continuo::persistence::writer::{StateSink, Urgency, WriterHandle};
-use continuo::persistence::PersistenceError;
-use continuo::playback::command::ResumeIntent;
-use continuo::queue::{DisplayMetadata, MAX_QUEUE_ENTRIES, NewQueueEntry, QueueError, QueueSource};
-use continuo::resume::ResumeCandidate;
-use continuo::session::{Action, DisplayUpdate, LoadTarget, Session};
+use tenuto::clock::{Clock, FakeClock};
+use tenuto::persistence::model::PersistedState;
+use tenuto::persistence::store::StateStore;
+use tenuto::persistence::writer::{StateSink, Urgency, WriterHandle};
+use tenuto::persistence::PersistenceError;
+use tenuto::playback::command::ResumeIntent;
+use tenuto::queue::{DisplayMetadata, MAX_QUEUE_ENTRIES, NewQueueEntry, QueueError, QueueSource};
+use tenuto::resume::ResumeCandidate;
+use tenuto::session::{Action, DisplayUpdate, LoadTarget, Session};
 use support::media;
 
 // entry(), loaded(), progress(), playing() helpers: copy from tests/m5_session_adoption.rs.
@@ -2114,7 +2114,7 @@ fn a_queued_track_can_lose_its_history_to_eviction_and_stays_queued() {
 fn volume_and_display_updates_submit_through_the_session() {
     let mut session = Session::new(PersistedState::default());
     let (ids, _) = session.enqueue(vec![entry("a"), entry("a")]).expect("fits");
-    assert!(matches!(session.set_volume(continuo::playback::volume::Volume::new(0.4)), Action::Submit { .. }));
+    assert!(matches!(session.set_volume(tenuto::playback::volume::Volume::new(0.4)), Action::Submit { .. }));
     let update = DisplayUpdate { title: Some("Title".into()), artist: Some("Artist".into()), album: None, duration: None };
     assert!(matches!(session.update_display(&media("a"), update), Action::Submit { .. }));
     for id in ids {
@@ -2151,7 +2151,7 @@ fn queue_and_checkpoint_writes_interleave_into_one_latest_snapshot() {
     if let Action::Submit { state, urgency } = session.tick(&progress(1, "a", 17, Some(request)), clock.sample()) { writer.submit(state, urgency); }
     let (_, action) = session.enqueue(vec![entry("c")]).expect("fits");
     if let Action::Submit { state, .. } = action { writer.submit(state, Urgency::Forced); }
-    assert!(matches!(writer.shutdown(), continuo::persistence::writer::ShutdownOutcome::Written));
+    assert!(matches!(writer.shutdown(), tenuto::persistence::writer::ShutdownOutcome::Written));
 
     let written: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.path().join("state.json")).expect("read")).expect("json");
     assert_eq!(written["queue"].as_array().map(Vec::len), Some(3), "latest queue");
@@ -2216,8 +2216,8 @@ fn item(guid: &str, enclosure: Option<&str>) -> String {
 }
 fn episode_media(guid: &str) -> MediaId {
     MediaId::PodcastEpisode {
-        feed: continuo::media::id::FeedId::new(feeds::FEED_ID.into()).expect("feed"),
-        episode: continuo::media::id::EpisodeKey::resolve(Some(guid), None, None).expect("key"),
+        feed: tenuto::media::id::FeedId::new(feeds::FEED_ID.into()).expect("feed"),
+        episode: tenuto::media::id::EpisodeKey::resolve(Some(guid), None, None).expect("key"),
     }
 }
 const FEED_URL: &str = "https://feeds.example/radio-t.xml";
@@ -2233,7 +2233,7 @@ Test cases, each asserting the exact variant:
 7. `a_corrupt_cache_is_a_resolution_error_not_absence`: overwrite the cache file with `b"{"` → `Err(Library(FeedError::CacheCorrupt { .. }))`.
 8. `episode_candidates_carry_the_enclosure_and_declared_duration`: seed with `<itunes:duration>61</itunes:duration>` (declare the itunes namespace on `<rss>`) → one candidate, enclosure present, `declared_duration == Some(61 s)`.
 
-- [ ] **Step 2: Run `cargo test --locked --test m5_podcast_resolve`.** Expected: FAIL, unresolved `continuo::application`.
+- [ ] **Step 2: Run `cargo test --locked --test m5_podcast_resolve`.** Expected: FAIL, unresolved `tenuto::application`.
 - [ ] **Step 3: Implement** `resolve_podcast` and `episode_candidates` per the rules. `application/mod.rs` declares `pub mod podcast;` only.
 - [ ] **Step 4: Run `cargo test --locked --test m5_podcast_resolve --test m4_library_reads`.** Expected: PASS.
 - [ ] **Step 5: Commit.**
@@ -2260,7 +2260,7 @@ git commit -m "feat: resolve queued podcast episodes from the local cache"
 pub struct ProfileLock { file: std::fs::File, path: PathBuf }
 #[derive(Debug, thiserror::Error)]
 pub enum LockError {
-    #[error("Another Continuo player is using this state profile")]
+    #[error("Another Tenuto player is using this state profile")]
     Contended,
     #[error("no platform state directory is available")]
     NoStateDirectory,
@@ -2296,12 +2296,12 @@ Rules (§6):
 
 ```rust
 // tests/m5_profile_lock.rs
-use continuo::lifecycle::lock::{LockError, ProfileLock};
+use tenuto::lifecycle::lock::{LockError, ProfileLock};
 
 #[test]
 fn a_second_acquisition_is_contended_until_the_first_is_dropped() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let state = dir.path().join("continuo").join("state.json");
+    let state = dir.path().join("tenuto").join("state.json");
     let first = ProfileLock::acquire(&state).expect("first");
     assert!(first.path().ends_with("state.lock"));
     assert!(matches!(ProfileLock::acquire(&state), Err(LockError::Contended)));
@@ -2325,7 +2325,7 @@ fn a_failed_initialization_after_acquisition_releases_the_profile() {
 
 #[test]
 fn the_contention_message_is_exact() {
-    assert_eq!(LockError::Contended.to_string(), "Another Continuo player is using this state profile");
+    assert_eq!(LockError::Contended.to_string(), "Another Tenuto player is using this state profile");
 }
 ```
 
@@ -2341,7 +2341,7 @@ use std::process::Stdio;
 use std::time::{Duration, Instant};
 use support::server::{Script, TestServer};
 
-const CONTENDED: &str = "Another Continuo player is using this state profile";
+const CONTENDED: &str = "Another Tenuto player is using this state profile";
 
 fn wait_exit(child: &mut std::process::Child, patience: Duration) -> Option<std::process::ExitStatus> {
     let deadline = Instant::now() + patience;
@@ -2364,7 +2364,7 @@ fn a_second_play_refuses_while_the_first_holds_the_profile() {
 
     let second = profile.command()
         .args(["play", concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/sine.flac")])
-        .env("CONTINUO_AUDIO_OUTPUT", "null").output().expect("second");
+        .env("TENUTO_AUDIO_OUTPUT", "null").output().expect("second");
     assert!(!second.status.success());
     assert!(String::from_utf8_lossy(&second.stderr).contains(CONTENDED));
 
@@ -2376,7 +2376,7 @@ fn a_second_play_refuses_while_the_first_holds_the_profile() {
 #[test]
 fn source_errors_are_reported_before_profile_contention() {
     let profile = process::Profile::new().expect("profile");
-    let _held = continuo::lifecycle::lock::ProfileLock::acquire(&profile.state_file()).expect("hold");
+    let _held = tenuto::lifecycle::lock::ProfileLock::acquire(&profile.state_file()).expect("hold");
     let absent = profile.command().args(["play", "/nonexistent/definitely-not-here.flac"]).output().expect("run");
     let text = String::from_utf8_lossy(&absent.stderr);
     assert!(text.contains("definitely-not-here.flac") && !text.contains(CONTENDED), "{text}");
@@ -2388,7 +2388,7 @@ fn source_errors_are_reported_before_profile_contention() {
 #[test]
 fn probe_only_and_feed_listing_ignore_a_held_profile() {
     let profile = process::Profile::new().expect("profile");
-    let _held = continuo::lifecycle::lock::ProfileLock::acquire(&profile.state_file()).expect("hold");
+    let _held = tenuto::lifecycle::lock::ProfileLock::acquire(&profile.state_file()).expect("hold");
     let probe = profile.command()
         .args(["play", concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/sine.flac"), "--probe-only"])
         .output().expect("run");
@@ -2397,7 +2397,7 @@ fn probe_only_and_feed_listing_ignore_a_held_profile() {
 }
 ```
 
-`CONTINUO_AUDIO_OUTPUT=null` has no effect until Task 12; the second process is refused before it would open any output, so this test does not depend on it.
+`TENUTO_AUDIO_OUTPUT=null` has no effect until Task 12; the second process is refused before it would open any output, so this test does not depend on it.
 
 - [ ] **Step 3: Run `cargo test --locked --test m5_profile_lock --test m5_lock_process`.** Expected: FAIL (module missing; second process not refused).
 - [ ] **Step 4: Implement** `lifecycle::lock` and the `app.rs` changes described above. `lifecycle/mod.rs` declares `pub mod lock;`.
@@ -2440,7 +2440,7 @@ impl ShutdownSignals {
 // playback/output/null_output.rs
 pub struct NullOutput;   // NullOutput::new()
 // playback/engine.rs
-pub fn spawn_for_environment() -> EngineHandle;  // CONTINUO_AUDIO_OUTPUT=null → NullOutput, else spawn_cpal
+pub fn spawn_for_environment() -> EngineHandle;  // TENUTO_AUDIO_OUTPUT=null → NullOutput, else spawn_cpal
 // app.rs
 pub fn run(cli: cli::Cli) -> Result<RunOutcome, AppError>;
 ```
@@ -2450,7 +2450,7 @@ Rules (§4):
 - Legacy `play` order: resolve source → `ShutdownSignals::install()` (failure is a startup error) → lock → load state → writer/engine → loops. Both loops check `signals.requested()` at the top of each pass and break into `finish`. After `finish`, close the signals and return `signals.outcome()` when a signal was recorded, even if the loop's outcome was a playback error (the signal exit status wins); otherwise `Completed` or the error.
 - `main.rs`: `Ok(outcome) => ExitCode::from(outcome.exit_status())`.
 - `run_resolved` creates its engine with `EngineHandle::spawn_for_environment()`.
-- `NullOutput::negotiate` returns the preferred rate (clamped to 8 000–192 000) and channels (clamped to 1–2), 480 buffer frames, F32. `open` spawns `continuo-null-output`, which calls `core.fill(&mut buffer, now, now + 20 ms)` once per buffer period against an `Instant` captured at open, sleeping to the next deadline; `now()` reads the last published instant; `close` stops and joins. It allocates its buffer once in `open`.
+- `NullOutput::negotiate` returns the preferred rate (clamped to 8 000–192 000) and channels (clamped to 1–2), 480 buffer frames, F32. `open` spawns `tenuto-null-output`, which calls `core.fill(&mut buffer, now, now + 20 ms)` once per buffer period against an `Instant` captured at open, sleeping to the next deadline; `now()` reads the last published instant; `close` stops and joins. It allocates its buffer once in `open`.
 
 - [ ] **Step 1: Add the dependency** under `[target.'cfg(unix)'.dependencies]`: `signal-hook = "0.4.4"`. Run `cargo check --locked` after `cargo update -p signal-hook --precise 0.4.4` if the lock file needs the new entry; commit the lock change with this task. Confirm the iterator API (`signal_hook::iterator::Signals::new`, `Signals::handle`, `Handle::close`, `Signals::forever`) in the 0.4.4 docs before writing the listener.
 
@@ -2486,7 +2486,7 @@ fn wait_exit(child: &mut Child, patience: Duration) -> ExitStatus {
 }
 
 fn next_invocation_acquires_the_profile(profile: &process::Profile) {
-    let output = profile.command().args(["play", FIXTURE_SHORT]).env("CONTINUO_AUDIO_OUTPUT", "null")
+    let output = profile.command().args(["play", FIXTURE_SHORT]).env("TENUTO_AUDIO_OUTPUT", "null")
         .output().expect("next");
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
 }
@@ -2511,7 +2511,7 @@ fn every_shutdown_signal_during_stalled_preparation_exits_128_plus_n() {
 fn every_shutdown_signal_during_playback_flushes_a_checkpoint() {
     for (name, number) in SIGNALS {
         let profile = process::Profile::new().expect("profile");
-        let mut child = profile.command().args(["play", FIXTURE_5S]).env("CONTINUO_AUDIO_OUTPUT", "null")
+        let mut child = profile.command().args(["play", FIXTURE_5S]).env("TENUTO_AUDIO_OUTPUT", "null")
             .stdout(Stdio::null()).stderr(Stdio::piped()).spawn().expect("spawn");
         std::thread::sleep(Duration::from_millis(1_500));
         send_signal(&child, name);
@@ -2528,7 +2528,7 @@ fn every_shutdown_signal_during_playback_flushes_a_checkpoint() {
 
 #[test]
 fn exit_status_arithmetic() {
-    use continuo::lifecycle::RunOutcome;
+    use tenuto::lifecycle::RunOutcome;
     assert_eq!(RunOutcome::Completed.exit_status(), 0);
     assert_eq!(RunOutcome::Signalled(15).exit_status(), 143);
     assert_eq!(RunOutcome::Signalled(200).exit_status(), 255);
@@ -2630,11 +2630,11 @@ Previous/Next return `Load(neighbor)` or `Nothing` when the anchor has no neighb
 mod support;
 
 use std::time::Duration;
-use continuo::application::transport::*;
-use continuo::media::id::MediaId;
-use continuo::persistence::model::PersistedState;
-use continuo::queue::{DisplayMetadata, NewQueueEntry, Queue, QueueEntryId, QueueSource};
-use continuo::session::{LoadTarget, Session};
+use tenuto::application::transport::*;
+use tenuto::media::id::MediaId;
+use tenuto::persistence::model::PersistedState;
+use tenuto::queue::{DisplayMetadata, NewQueueEntry, Queue, QueueEntryId, QueueSource};
+use tenuto::session::{LoadTarget, Session};
 use support::media;
 
 fn entry(name: &str) -> NewQueueEntry {
@@ -2645,9 +2645,9 @@ fn entry(name: &str) -> NewQueueEntry {
 /// A queue of three with the second entry active, built through Session so
 /// the active entry is set the only legal way.
 fn with_active() -> (Queue, Vec<QueueEntryId>) {
-    use continuo::clock::{Clock, FakeClock};
-    use continuo::media::capabilities::{Continuity, MediaCapabilities, SeekSupport};
-    use continuo::playback::event::{PlaybackEvent, StartDisposition};
+    use tenuto::clock::{Clock, FakeClock};
+    use tenuto::media::capabilities::{Continuity, MediaCapabilities, SeekSupport};
+    use tenuto::playback::event::{PlaybackEvent, StartDisposition};
     let mut session = Session::new(PersistedState::default());
     let (ids, _) = session.enqueue(vec![entry("a"), entry("b"), entry("c")]).expect("fits");
     let request = session.register_load(LoadTarget::Queue(ids[1]), &media("b")).expect("registered");
@@ -2836,16 +2836,16 @@ mod support;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use continuo::application::runtime::{AppCommand, EnqueueItem, FlushReport, PlayerRuntime, RuntimeParts};
-use continuo::application::transport::PlaybackPhase;
-use continuo::clock::SystemClock;
-use continuo::http::limits::Limits;
-use continuo::persistence::model::PersistedState;
-use continuo::persistence::store::StateStore;
-use continuo::persistence::writer::WriterHandle;
-use continuo::playback::engine::EngineHandle;
-use continuo::playback::output::null_output::NullOutput;
-use continuo::session::Session;
+use tenuto::application::runtime::{AppCommand, EnqueueItem, FlushReport, PlayerRuntime, RuntimeParts};
+use tenuto::application::transport::PlaybackPhase;
+use tenuto::clock::SystemClock;
+use tenuto::http::limits::Limits;
+use tenuto::persistence::model::PersistedState;
+use tenuto::persistence::store::StateStore;
+use tenuto::persistence::writer::WriterHandle;
+use tenuto::playback::engine::EngineHandle;
+use tenuto::playback::output::null_output::NullOutput;
+use tenuto::session::Session;
 
 const SHORT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/sine.flac");
 const MISSING: &str = "/nonexistent/m5-missing.flac";
@@ -2854,7 +2854,7 @@ struct Rig { _dir: tempfile::TempDir, runtime: PlayerRuntime, state_path: std::p
 
 fn rig_with(state: PersistedState) -> Rig {
     let dir = tempfile::tempdir().expect("tempdir");
-    let clock: Arc<dyn continuo::clock::Clock> = Arc::new(SystemClock);
+    let clock: Arc<dyn tenuto::clock::Clock> = Arc::new(SystemClock);
     let state_path = dir.path().join("state.json");
     let writer = WriterHandle::spawn(Box::new(StateStore::new(state_path.clone(), clock.clone())), clock.clone());
     let runtime = PlayerRuntime::new(RuntimeParts {
@@ -2866,7 +2866,7 @@ fn rig_with(state: PersistedState) -> Rig {
     Rig { _dir: dir, runtime, state_path }
 }
 
-fn pump_until(runtime: &mut PlayerRuntime, what: &str, done: impl Fn(&continuo::application::view::PlayerView) -> bool) {
+fn pump_until(runtime: &mut PlayerRuntime, what: &str, done: impl Fn(&tenuto::application::view::PlayerView) -> bool) {
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
         runtime.pump();
@@ -2900,10 +2900,10 @@ fn completion_advances_once_and_the_last_entry_stays_ended() {
 #[test]
 fn a_failed_load_keeps_the_queue_and_does_not_skip() {
     let mut state = Session::new(PersistedState::default());
-    let missing = continuo::media::id::AbsolutePath::new(MISSING.into()).expect("absolute");
+    let missing = tenuto::media::id::AbsolutePath::new(MISSING.into()).expect("absolute");
     let (_ids, _) = state.enqueue(vec![
-        continuo::queue::NewQueueEntry::new(continuo::media::id::MediaId::LocalFile(missing.clone()),
-            continuo::queue::QueueSource::LocalFile(missing), Default::default()).expect("entry"),
+        tenuto::queue::NewQueueEntry::new(tenuto::media::id::MediaId::LocalFile(missing.clone()),
+            tenuto::queue::QueueSource::LocalFile(missing), Default::default()).expect("entry"),
     ]).expect("fits");
     let mut rig = rig_with(state.state().clone());
     rig.runtime.handle(AppCommand::Enqueue(vec![EnqueueItem::Path(SHORT.into())]));
@@ -2981,15 +2981,15 @@ fn two_loads_of_one_media_submitted_together_end_on_the_later_row() {
 }
 
 struct FailingSink;
-impl continuo::persistence::writer::StateSink for FailingSink {
-    fn write(&self, _: &PersistedState) -> Result<(), continuo::persistence::PersistenceError> {
-        Err(continuo::persistence::PersistenceError::NoStateDirectory)
+impl tenuto::persistence::writer::StateSink for FailingSink {
+    fn write(&self, _: &PersistedState) -> Result<(), tenuto::persistence::PersistenceError> {
+        Err(tenuto::persistence::PersistenceError::NoStateDirectory)
     }
 }
 
 #[test]
 fn a_failed_final_flush_is_reported_not_claimed_as_saved() {
-    let clock: Arc<dyn continuo::clock::Clock> = Arc::new(SystemClock);
+    let clock: Arc<dyn tenuto::clock::Clock> = Arc::new(SystemClock);
     let mut runtime = PlayerRuntime::new(RuntimeParts {
         session: Session::new(PersistedState::default()),
         writer: WriterHandle::spawn(Box::new(FailingSink), clock.clone()), persisting: true, clock,
@@ -3039,8 +3039,8 @@ git commit -m "feat: add the terminal-free player runtime"
 pub enum TestHook { None, PanicBeforeRedirect, PanicAfterRedirect, PanicAfterTerminal, StderrProbe, ArtworkJobPanic, ArtworkEncodingPanic, MetadataJobPanic, WorkerPanic }
 impl TestHook {
     pub fn parse(value: Option<&str>) -> Self;   // exact kebab-case names from decision 8; anything else → None
-    pub fn from_env() -> Self;                   // reads CONTINUO_TEST_HOOK once
-    pub fn panic_at(self, stage: TestHook);      // panics with "continuo test hook: <name>" when self == stage
+    pub fn from_env() -> Self;                   // reads TENUTO_TEST_HOOK once
+    pub fn panic_at(self, stage: TestHook);      // panics with "tenuto test hook: <name>" when self == stage
 }
 
 // panic.rs
@@ -3091,9 +3091,9 @@ Rules (§11):
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier};
 
-use continuo::lifecycle::hooks::TestHook;
-use continuo::lifecycle::panic::{TakeOnceSlot, TakeResult, in_contained_job, run_contained};
-use continuo::lifecycle::terminal::TerminalCleanup;
+use tenuto::lifecycle::hooks::TestHook;
+use tenuto::lifecycle::panic::{TakeOnceSlot, TakeResult, in_contained_job, run_contained};
+use tenuto::lifecycle::terminal::TerminalCleanup;
 
 #[test]
 fn a_contained_panic_becomes_a_failed_job_and_the_flag_resets() {
@@ -3203,26 +3203,26 @@ git commit -m "feat: contain background job panics and make terminal cleanup ide
 ```rust
 pub const KEPT_PRIOR_LOGS: usize = 5;
 pub fn log_dir(state_file: &Path) -> PathBuf;                                  // <state dir>/logs
-pub fn retain_recent_logs(dir: &Path, keep: usize) -> std::io::Result<Vec<PathBuf>>;  // removes older continuo-tui-*.log, returns removed
+pub fn retain_recent_logs(dir: &Path, keep: usize) -> std::io::Result<Vec<PathBuf>>;  // removes older tenuto-tui-*.log, returns removed
 pub fn open_session_log(state_file: &Path, wall: OffsetDateTime) -> std::io::Result<(std::fs::File, PathBuf)>;
 #[cfg(unix)] pub struct StderrRedirect(gag::Redirect<std::fs::File>);
 #[cfg(unix)] pub fn redirect_stderr(file: std::fs::File) -> std::io::Result<StderrRedirect>;
 ```
 
-Rules (§11): `open_session_log` creates `logs/` with the private directory policy, calls `retain_recent_logs(dir, KEPT_PRIOR_LOGS)` **before** creating the new file, then creates `continuo-tui-<stamp>-<pid>.log` (stamp as in `store::stamp`) with `append(true).create_new(true)` and mode 0600, trying `-<pid>-2` … `-<pid>-100` on `AlreadyExists`. Retention sorts matching names ascending (stamps sort chronologically) and deletes all but the last `keep`; other files are never touched. The redirect is exercised only in subprocess tests (Task 29) because it would capture the test runner's fd 2.
+Rules (§11): `open_session_log` creates `logs/` with the private directory policy, calls `retain_recent_logs(dir, KEPT_PRIOR_LOGS)` **before** creating the new file, then creates `tenuto-tui-<stamp>-<pid>.log` (stamp as in `store::stamp`) with `append(true).create_new(true)` and mode 0600, trying `-<pid>-2` … `-<pid>-100` on `AlreadyExists`. Retention sorts matching names ascending (stamps sort chronologically) and deletes all but the last `keep`; other files are never touched. The redirect is exercised only in subprocess tests (Task 29) because it would capture the test runner's fd 2.
 
 - [ ] **Step 1: Write failing tests.**
 
 ```rust
 // tests/m5_session_log.rs
-use continuo::lifecycle::stderr::{KEPT_PRIOR_LOGS, log_dir, open_session_log, retain_recent_logs};
+use tenuto::lifecycle::stderr::{KEPT_PRIOR_LOGS, log_dir, open_session_log, retain_recent_logs};
 use time::macros::datetime;
 
 #[test]
 fn retention_keeps_the_five_most_recent_prior_logs_and_ignores_other_files() {
     let dir = tempfile::tempdir().expect("tempdir");
     for day in 1..=8 {
-        std::fs::write(dir.path().join(format!("continuo-tui-2026090{day}T000000Z-1.log")), b"x").expect("seed");
+        std::fs::write(dir.path().join(format!("tenuto-tui-2026090{day}T000000Z-1.log")), b"x").expect("seed");
     }
     std::fs::write(dir.path().join("notes.txt"), b"keep").expect("seed");
     let removed = retain_recent_logs(dir.path(), KEPT_PRIOR_LOGS).expect("retain");
@@ -3231,14 +3231,14 @@ fn retention_keeps_the_five_most_recent_prior_logs_and_ignores_other_files() {
     left.sort();
     assert_eq!(left.len(), 6);
     assert!(left.contains(&"notes.txt".to_string()));
-    assert!(left.contains(&"continuo-tui-20260908T000000Z-1.log".to_string()));
-    assert!(!left.contains(&"continuo-tui-20260903T000000Z-1.log".to_string()));
+    assert!(left.contains(&"tenuto-tui-20260908T000000Z-1.log".to_string()));
+    assert!(!left.contains(&"tenuto-tui-20260903T000000Z-1.log".to_string()));
 }
 
 #[test]
 fn each_session_gets_a_new_unique_log_under_the_profile() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let state = dir.path().join("continuo").join("state.json");
+    let state = dir.path().join("tenuto").join("state.json");
     let wall = datetime!(2026-09-14 12:00:00 UTC);
     let (_a, first) = open_session_log(&state, wall).expect("first");
     let (_b, second) = open_session_log(&state, wall).expect("second");
@@ -3264,7 +3264,7 @@ git add Cargo.toml Cargo.lock src/lifecycle tests/m5_session_log.rs
 git commit -m "feat: per-session log files with retention and stderr redirection"
 ```
 
-### Task 18: `continuo tui` startup, loop and teardown
+### Task 18: `tenuto tui` startup, loop and teardown
 
 **Files:**
 - Create: `src/tui/mod.rs`, `tests/support/pty.rs`, `tests/m5_tui_process.rs`
@@ -3307,15 +3307,15 @@ Startup order, exactly (§11); check `signals.requested()` between stages and ju
 4. `StateStore::load()`; remember `queue_repair` and `writable`.
 5. `open_session_log` → `cleanup.set_diagnostic_log(file.try_clone())` → `redirect_stderr(file)` → `cleanup.stderr_slot().publish(Box::new(redirect))` with no fallible step between the redirect and the publish. `hook.panic_at(PanicAfterRedirect)`.
 6. Writer (`DisabledSink` when not writable, reusing `app.rs`'s type moved to `persistence::writer` as `pub struct DisabledSink`), library stores from `commands::platform_subscription_stores()` (`None` on error), `PlayerRuntime::new` with `engine_factory = Box::new(EngineHandle::spawn_for_environment)`. Status for a queue repair: `Queue data was reset (<fields>); backup at <path>` or `Queue data was reset (<fields>); this session is not saved`; unwritable state: `This session is not saved`.
-7. Terminal: `enable_raw_mode` → `mark_raw`; `EnterAlternateScreen` → `mark_alternate`; `Hide` → `mark_cursor_hidden`; `EnableMouseCapture` when `mouse == On` → `set_mouse(true)`; build `Terminal<CrosstermBackend<Stdout>>`. Failure → `LifecycleError::Terminal` after teardown. `hook.panic_at(PanicAfterTerminal)`; `StderrProbe` spawns `sh -c 'printf continuo-stderr-probe >&2'` (inheriting fd 2) and `eprintln!("continuo-stderr-probe-rust")`.
+7. Terminal: `enable_raw_mode` → `mark_raw`; `EnterAlternateScreen` → `mark_alternate`; `Hide` → `mark_cursor_hidden`; `EnableMouseCapture` when `mouse == On` → `set_mouse(true)`; build `Terminal<CrosstermBackend<Stdout>>`. Failure → `LifecycleError::Terminal` after teardown. `hook.panic_at(PanicAfterTerminal)`; `StderrProbe` spawns `sh -c 'printf tenuto-stderr-probe >&2'` (inheriting fd 2) and `eprintln!("tenuto-stderr-probe-rust")`.
 
-Loop, wrapped in `catch_unwind(AssertUnwindSafe(..))`: poll crossterm events for up to 50 ms; `q` or Ctrl-C → `signals.request()`; `runtime.pump()`; `if signals.requested() || cleanup.fatal_requested() { break }`; draw unless `cleanup.rendering_disabled()`. This task draws only a status row (`continuo`), the queue titles and `Queue is empty` when empty; Task 19 replaces the drawing.
+Loop, wrapped in `catch_unwind(AssertUnwindSafe(..))`: poll crossterm events for up to 50 ms; `q` or Ctrl-C → `signals.request()`; `runtime.pump()`; `if signals.requested() || cleanup.fatal_requested() { break }`; draw unless `cleanup.rendering_disabled()`. This task draws only a status row (`tenuto`), the queue titles and `Queue is empty` when empty; Task 19 replaces the drawing.
 
 Teardown (normal, signal, fatal-worker, or after a caught app-thread panic): `runtime.shutdown()` (engine and writer) → `cleanup.restore_now()` (terminal, then fd 2 via the slot) → `signals.close()` → drop the lock → print a final error or `State was not saved: <reason>` for `FlushReport::Failed`/`Unconfirmed` → for a caught app-thread panic, `resume_unwind(payload)`; for a worker fatal, return `AppError` with message `a background worker panicked`. Return `signals.outcome()` otherwise.
 
 - [ ] **Step 1: Add dependencies.** `ratatui = { version = "0.30.2", default-features = false, features = ["crossterm_0_29", "layout-cache"] }`; dev `portable-pty = "0.9.0"`. Run `cargo tree -i crossterm --locked` after updating the lock file and confirm exactly one `crossterm 0.29` in the graph.
 
-- [ ] **Step 2: Write the PTY helper** over `portable_pty::native_pty_system().openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })`, `CommandBuilder::new(process::binary())` with `profile_env(root)` applied and `CONTINUO_TEST_HOOK`/`CONTINUO_AUDIO_OUTPUT` removed unless given in `env`, a reader thread appending to `Arc<Mutex<Vec<u8>>>`, `take_writer()` for `send`, and `Child::wait`/`try_wait` for exit codes. `close_master` drops the master and writer.
+- [ ] **Step 2: Write the PTY helper** over `portable_pty::native_pty_system().openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })`, `CommandBuilder::new(process::binary())` with `profile_env(root)` applied and `TENUTO_TEST_HOOK`/`TENUTO_AUDIO_OUTPUT` removed unless given in `env`, a reader thread appending to `Arc<Mutex<Vec<u8>>>`, `take_writer()` for `send`, and `Child::wait`/`try_wait` for exit codes. `close_master` drops the master and writer.
 
 - [ ] **Step 3: Write failing process tests.**
 
@@ -3329,7 +3329,7 @@ mod support;
 use std::time::Duration;
 use pty::PtyChild;
 
-const CONTENDED: &str = "Another Continuo player is using this state profile";
+const CONTENDED: &str = "Another Tenuto player is using this state profile";
 const LEAVE_ALT: &str = "\x1b[?1049l";
 
 #[test]
@@ -3345,7 +3345,7 @@ fn tui_opens_idle_on_an_empty_queue_and_q_restores_the_terminal() {
 #[test]
 fn tui_refuses_a_held_profile_before_entering_raw_mode() {
     let profile = process::Profile::new().expect("profile");
-    let _held = continuo::lifecycle::lock::ProfileLock::acquire(&profile.state_file()).expect("hold");
+    let _held = tenuto::lifecycle::lock::ProfileLock::acquire(&profile.state_file()).expect("hold");
     let mut child = PtyChild::spawn(profile.root(), &["tui"], &[], 100, 30).expect("spawn");
     let code = child.wait_exit(Duration::from_secs(10));
     assert!(matches!(code, Some(c) if c != 0));
@@ -3362,7 +3362,7 @@ fn play_refuses_while_tui_holds_the_profile_and_tui_keeps_its_volume() {
     tui.send(b"-");
     let play = profile.command()
         .args(["play", concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/sine.flac")])
-        .env("CONTINUO_AUDIO_OUTPUT", "null").output().expect("play");
+        .env("TENUTO_AUDIO_OUTPUT", "null").output().expect("play");
     assert!(String::from_utf8_lossy(&play.stderr).contains(CONTENDED));
     tui.send(b"q");
     assert_eq!(tui.wait_exit(Duration::from_secs(10)), Some(0));
@@ -3391,7 +3391,7 @@ In this task, `-` maps directly to `AppCommand::AdjustVolume(-0.05)` inside the 
 
 ```bash
 git add Cargo.toml Cargo.lock src tests/support/process.rs tests/support/pty.rs tests/m5_tui_process.rs
-git commit -m "feat: start continuo tui in the specified lifecycle order"
+git commit -m "feat: start tenuto tui in the specified lifecycle order"
 ```
 
 ### Task 19: Layout tiers and rendering
@@ -3441,7 +3441,7 @@ Rendering rules:
 - **Compact**: player 6 rows; cover 4 rows × 8 columns; spectrum 1 row; no artist/album line; single-line queue rows.
 - **Minimal**: no cover, no spectrum; player 3 rows (title; state + progress; transport); queue; footer.
 - **Resize**: a centered `Terminal too small (need 30×8)` and a last line `space play · q quit`.
-- Status row: `continuo` in green on the left; right side `vol NN%`, `mouse on|off`, and `unsaved` when `persistence == Unsaved`.
+- Status row: `tenuto` in green on the left; right side `vol NN%`, `mouse on|off`, and `unsaved` when `persistence == Unsaved`.
 - Progress: `mm:ss / mm:ss` via `format_hms` trimmed to `mm:ss` under one hour; unknown duration shows `--:--` and a bar without a filled ratio; an estimated position prefixes `~`; a `Declared` duration is shown in parentheses and never fills the bar; `buffering` appends ` buffering` to the state label; before loading, the progress row shows the saved label (`format_saved`) instead of a position.
 - Queue: a playing marker column (`▶` for the active entry, blank otherwise) separate from the selected-row highlight (reversed green background); columns title, duration, saved label. Empty queue: `Queue is empty — press b to browse or a to add`.
 - Footer: status message when present, else `space play · enter play selected · b browse · a add · ? help · q quit`.
@@ -3455,14 +3455,14 @@ Rendering rules:
 // tests/m5_tui_render.rs
 use std::time::Duration;
 
-use continuo::application::transport::PlaybackPhase;
-use continuo::application::view::{NowPlaying, PersistenceStatus, PlayerView, QueueRow, SavedHistory};
-use continuo::playback::state::PlaybackState;
-use continuo::playback::volume::Volume;
-use continuo::queue::{DisplayDuration, DurationSource};
-use continuo::tui::layout::{Tier, regions, tier_for};
-use continuo::tui::render::{Visuals, draw};
-use continuo::tui::state::UiState;
+use tenuto::application::transport::PlaybackPhase;
+use tenuto::application::view::{NowPlaying, PersistenceStatus, PlayerView, QueueRow, SavedHistory};
+use tenuto::playback::state::PlaybackState;
+use tenuto::playback::volume::Volume;
+use tenuto::queue::{DisplayDuration, DurationSource};
+use tenuto::tui::layout::{Tier, regions, tier_for};
+use tenuto::tui::render::{Visuals, draw};
+use tenuto::tui::state::UiState;
 use ratatui::{Terminal, backend::TestBackend, layout::Rect};
 
 fn text(view: &PlayerView, ui: &UiState, w: u16, h: u16) -> String {
@@ -3472,12 +3472,12 @@ fn text(view: &PlayerView, ui: &UiState, w: u16, h: u16) -> String {
     buffer.content().chunks(usize::from(w.max(1))).map(|row| row.iter().map(|c| c.symbol()).collect::<String>()).collect::<Vec<_>>().join("\n")
 }
 
-fn ids() -> Vec<continuo::queue::QueueEntryId> {
-    let mut queue = continuo::queue::Queue::default();
+fn ids() -> Vec<tenuto::queue::QueueEntryId> {
+    let mut queue = tenuto::queue::Queue::default();
     let entries = ["a", "b", "c"].iter().map(|n| {
-        let path = continuo::media::id::AbsolutePath::new(format!("/music/{n}.flac").into()).expect("abs");
-        continuo::queue::NewQueueEntry::new(continuo::media::id::MediaId::LocalFile(path.clone()),
-            continuo::queue::QueueSource::LocalFile(path), Default::default()).expect("entry")
+        let path = tenuto::media::id::AbsolutePath::new(format!("/music/{n}.flac").into()).expect("abs");
+        tenuto::queue::NewQueueEntry::new(tenuto::media::id::MediaId::LocalFile(path.clone()),
+            tenuto::queue::QueueSource::LocalFile(path), Default::default()).expect("entry")
     }).collect();
     queue.enqueue(entries).expect("fits")
 }
@@ -3495,7 +3495,7 @@ fn view(phase: PlaybackPhase, now: Option<NowPlaying>) -> PlayerView {
     }
 }
 
-fn playing(entry: continuo::queue::QueueEntryId, loaded: bool, duration: Option<DisplayDuration>, estimated: bool) -> NowPlaying {
+fn playing(entry: tenuto::queue::QueueEntryId, loaded: bool, duration: Option<DisplayDuration>, estimated: bool) -> NowPlaying {
     NowPlaying { entry: Some(entry), title: "Morning Tide".into(), artist: Some("Harbor".into()), album: Some("Coast".into()),
         loaded, state: if loaded { PlaybackState::Playing } else { PlaybackState::Idle }, position: Duration::from_secs(62),
         duration, estimated_position: estimated, degraded: false, buffering: false, seek: None,
@@ -3631,9 +3631,9 @@ Rules (§7 table), for `KeyEventKind::Press` only:
 ```rust
 // tests/m5_tui_input.rs
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
-use continuo::application::runtime::{AppCommand, EnqueueItem};
-use continuo::tui::input::{Effect, handle_key};
-use continuo::tui::state::{Overlay, UiState};
+use tenuto::application::runtime::{AppCommand, EnqueueItem};
+use tenuto::tui::input::{Effect, handle_key};
+use tenuto::tui::state::{Overlay, UiState};
 
 // `sample_view()` builds a PlayerView with three rows exactly as in tests/m5_tui_render.rs.
 
@@ -3669,7 +3669,7 @@ fn transport_keys_carry_the_selection_as_an_argument() {
     assert!(matches!(app(&handle_key(key(KeyCode::Left), &mut ui, &view))[..], [AppCommand::SeekBy(-10)]));
     assert!(matches!(app(&handle_key(key(KeyCode::Home), &mut ui, &view))[..], [AppCommand::Restart]));
     assert!(matches!(app(&handle_key(key(KeyCode::Char(']')), &mut ui, &view))[..], [AppCommand::Next { .. }]));
-    assert!(matches!(app(&handle_key(key(KeyCode::Char('J')), &mut ui, &view))[..], [AppCommand::Move(_, continuo::queue::Direction::Down)]));
+    assert!(matches!(app(&handle_key(key(KeyCode::Char('J')), &mut ui, &view))[..], [AppCommand::Move(_, tenuto::queue::Direction::Down)]));
 }
 
 #[test]
@@ -3859,7 +3859,7 @@ pub fn default_probe(hook: TestHook) -> TagProbe;   // probe_local_tags, panicki
 
 Rules (§8, §9, §11):
 - `probe_local_tags` opens the file and runs symphonia's probe only (no decoder, no audio device), reads `metadata().current()`: `StandardTag::TrackTitle`, `Artist`, `Album`; duration and provenance exactly as `DecodedSource::from_media_source` computes them (share a helper); the first visual with `usage == Some(StandardVisualKey::FrontCover)` becomes `front_cover` if its data is at most `MAX_EMBEDDED_COVER_BYTES`, else `cover_oversized = true`.
-- `MetadataWorkers::spawn(2, probe, hook)` starts exactly `workers` threads named `continuo-metadata-N` reading a bounded channel (capacity 256). Each job runs inside `run_contained("metadata", ..)`; a panic yields `Panicked` and the worker keeps serving. After a job returns normally the worker logs `tracing::debug!("metadata job completed")`. Before its first job, **outside** the contained boundary, the worker calls `hook.panic_at(TestHook::WorkerPanic)` — the uncontained worker panic Task 29 exercises. Tests below pass `TestHook::None`. `cancel_all` increments a shared generation and drains the channel; results from an older generation are discarded by `try_result`.
+- `MetadataWorkers::spawn(2, probe, hook)` starts exactly `workers` threads named `tenuto-metadata-N` reading a bounded channel (capacity 256). Each job runs inside `run_contained("metadata", ..)`; a panic yields `Panicked` and the worker keeps serving. After a job returns normally the worker logs `tracing::debug!("metadata job completed")`. Before its first job, **outside** the contained boundary, the worker calls `hook.panic_at(TestHook::WorkerPanic)` — the uncontained worker panic Task 29 exercises. Tests below pass `TestHook::None`. `cancel_all` increments a shared generation and drains the channel; results from an older generation are discarded by `try_result`.
 - The runtime requests enrichment for `LocalFile` entries whose display title is `None`, after `Enqueue` and once at construction for restored entries; results call `Session::update_display` (title/artist/album only when `Some`; duration as `Decoded(provenance)`). `URL` and podcast entries are never probed. Enrichment for a removed media is harmless because `update_display` finds no entry.
 - `tests/support/tagged_flac.rs`: `pub fn tagged_flac(dir: &Path, title: &str, artist: &str, album: &str, cover_png: Option<&[u8]>) -> PathBuf` copies `tests/fixtures/sine.flac`, walks its metadata blocks (4-byte header: last-flag bit + 7-bit type, 24-bit big-endian length), clears the last flag on the final block, and appends a `VORBIS_COMMENT` block (type 4: little-endian vendor length + vendor, count, `TITLE=`, `ARTIST=`, `ALBUM=` entries) and, when given, a `PICTURE` block (type 6: big-endian picture type 3, MIME `image/png`, empty description, width, height, depth 32, colors 0, data length, data), marking the new final block as last.
 
@@ -3875,9 +3875,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use continuo::application::enrich::{EnrichOutcome, MetadataWorkers, TagProbe};
-use continuo::media::id::{AbsolutePath, MediaId};
-use continuo::media::tags::{LocalTags, probe_local_tags};
+use tenuto::application::enrich::{EnrichOutcome, MetadataWorkers, TagProbe};
+use tenuto::media::id::{AbsolutePath, MediaId};
+use tenuto::media::tags::{LocalTags, probe_local_tags};
 
 fn png_2x2() -> Vec<u8> {
     let mut bytes = Vec::new();
@@ -3904,7 +3904,7 @@ fn an_untagged_file_has_no_names_but_a_duration() {
     assert_eq!(tags.duration, Some(Duration::from_millis(500)));
 }
 
-fn next_result(workers: &MetadataWorkers) -> continuo::application::enrich::EnrichResult {
+fn next_result(workers: &MetadataWorkers) -> tenuto::application::enrich::EnrichResult {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         if let Some(result) = workers.try_result() { return result; }
@@ -3919,10 +3919,10 @@ fn a_panicking_probe_is_contained_and_the_worker_serves_the_next_job() {
     let flag = panicked_once.clone();
     let probe: TagProbe = Arc::new(move |_path| {
         if !flag.swap(true, Ordering::SeqCst) { panic!("injected decoder panic"); }
-        assert!(continuo::lifecycle::panic::in_contained_job());
+        assert!(tenuto::lifecycle::panic::in_contained_job());
         Ok(LocalTags { title: Some("ok".into()), ..LocalTags::default() })
     });
-    let workers = MetadataWorkers::spawn(1, probe, continuo::lifecycle::hooks::TestHook::None);
+    let workers = MetadataWorkers::spawn(1, probe, tenuto::lifecycle::hooks::TestHook::None);
     let path = AbsolutePath::new("/music/a.flac".into()).expect("abs");
     workers.request(MediaId::LocalFile(path.clone()), path.clone());
     assert!(matches!(next_result(&workers).outcome, EnrichOutcome::Panicked));
@@ -3933,7 +3933,7 @@ fn a_panicking_probe_is_contained_and_the_worker_serves_the_next_job() {
 #[test]
 fn cancelled_results_are_discarded() {
     let probe: TagProbe = Arc::new(|_path| { std::thread::sleep(Duration::from_millis(200)); Ok(LocalTags::default()) });
-    let workers = MetadataWorkers::spawn(2, probe, continuo::lifecycle::hooks::TestHook::None);
+    let workers = MetadataWorkers::spawn(2, probe, tenuto::lifecycle::hooks::TestHook::None);
     let path = AbsolutePath::new("/music/a.flac".into()).expect("abs");
     workers.request(MediaId::LocalFile(path.clone()), path);
     workers.cancel_all();
@@ -4007,11 +4007,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use continuo::artwork::decode::{ArtworkError, MAX_ENCODED_BYTES, decode_limited, read_limited};
-use continuo::artwork::resolve::{ArtworkSource, find_artwork};
-use continuo::artwork::worker::{ArtworkWorker, CoverLoader};
-use continuo::media::id::{AbsolutePath, MediaId};
-use continuo::media::tags::CoverBytes;
+use tenuto::artwork::decode::{ArtworkError, MAX_ENCODED_BYTES, decode_limited, read_limited};
+use tenuto::artwork::resolve::{ArtworkSource, find_artwork};
+use tenuto::artwork::worker::{ArtworkWorker, CoverLoader};
+use tenuto::media::id::{AbsolutePath, MediaId};
+use tenuto::media::tags::CoverBytes;
 
 fn encoded(format: image::ImageFormat, w: u32, h: u32) -> Vec<u8> {
     let mut bytes = Vec::new();
@@ -4169,9 +4169,9 @@ pub fn prepare_contained<T>(job: impl FnOnce() -> Result<T, ArtworkError>) -> Re
 ```rust
 // tests/m5_tui_images.rs
 use std::sync::Arc;
-use continuo::cli::ArtworkMode;
-use continuo::media::id::{AbsolutePath, MediaId};
-use continuo::tui::images::{CoverCache, picker_for};
+use tenuto::cli::ArtworkMode;
+use tenuto::media::id::{AbsolutePath, MediaId};
+use tenuto::tui::images::{CoverCache, picker_for};
 use ratatui::layout::Rect;
 use ratatui_image::picker::Picker;
 
@@ -4187,7 +4187,7 @@ fn off_disables_images_blocks_never_queries_and_auto_falls_back() {
 #[test]
 fn a_prepared_cover_is_reused_until_media_mode_or_area_changes() {
     let picker = Picker::halfblocks();
-    let mut cache = CoverCache::new(continuo::lifecycle::hooks::TestHook::None);
+    let mut cache = CoverCache::new(tenuto::lifecycle::hooks::TestHook::None);
     let area = Some(Rect::new(0, 0, 14, 7));
     cache.set_image(media("a"), Some(Arc::new(image::DynamicImage::new_rgb8(8, 8))));
     assert!(cache.prepare(Some(&picker), ArtworkMode::Blocks, area));
@@ -4206,7 +4206,7 @@ fn a_prepared_cover_is_reused_until_media_mode_or_area_changes() {
 #[test]
 fn no_image_or_no_area_renders_the_placeholder() {
     let picker = Picker::halfblocks();
-    let mut cache = CoverCache::new(continuo::lifecycle::hooks::TestHook::None);
+    let mut cache = CoverCache::new(tenuto::lifecycle::hooks::TestHook::None);
     cache.set_image(media("a"), None);
     assert!(!cache.prepare(Some(&picker), ArtworkMode::Blocks, Some(Rect::new(0, 0, 14, 7))));
     assert!(cache.widget().is_none());
@@ -4221,9 +4221,9 @@ Add this test and a cache unit test using an injected encoder in the same prepar
 ```rust
 #[test]
 fn an_encoding_panic_is_contained_and_a_later_preparation_succeeds() {
-    use continuo::artwork::decode::ArtworkError;
-    use continuo::lifecycle::panic::in_contained_job;
-    use continuo::tui::images::prepare_contained;
+    use tenuto::artwork::decode::ArtworkError;
+    use tenuto::lifecycle::panic::in_contained_job;
+    use tenuto::tui::images::prepare_contained;
     let failed = prepare_contained(|| -> Result<(), ArtworkError> {
         assert!(in_contained_job());
         panic!("encoding panic");
@@ -4288,8 +4288,8 @@ Analyzer: per channel, a `WINDOW`-sample Hann window (`0.5 − 0.5·cos(2πn/(N�
 
 ```rust
 // tests/m5_spectrum_bands.rs
-use continuo::playback::spectrum::analyzer::SpectrumAnalyzer;
-use continuo::playback::spectrum::bands::{WINDOW, layout_bands};
+use tenuto::playback::spectrum::analyzer::SpectrumAnalyzer;
+use tenuto::playback::spectrum::bands::{WINDOW, layout_bands};
 
 #[test]
 fn the_band_table_matches_the_spec_at_ordinary_and_high_rates() {
@@ -4421,10 +4421,10 @@ The PCM ring holds half a second rounded down to whole frames (`rate / 2 × chan
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Instant;
-use continuo::playback::output::Nanos;
-use continuo::playback::spectrum::tap::tap_pair;
+use tenuto::playback::output::Nanos;
+use tenuto::playback::spectrum::tap::tap_pair;
 
-fn pair(enabled: bool) -> (continuo::playback::spectrum::tap::TapWriter, continuo::playback::spectrum::tap::TapReader) {
+fn pair(enabled: bool) -> (tenuto::playback::spectrum::tap::TapWriter, tenuto::playback::spectrum::tap::TapReader) {
     tap_pair(7, 2, 48_000, Arc::new(AtomicBool::new(enabled)))
 }
 
@@ -4548,7 +4548,7 @@ impl EngineHandle { pub fn spectrum(&self) -> SpectrumHandle }
 ```
 
 Rules (§10):
-- `EngineHandle::assemble` creates a `TapRegistry`, an `enabled` flag (initially `false`), a latest-frame slot, an attach channel and one `continuo-spectrum` thread; the worker owns the receiving side and the device clock `Arc<AtomicU64>` the engine already shares.
+- `EngineHandle::assemble` creates a `TapRegistry`, an `enabled` flag (initially `false`), a latest-frame slot, an attach channel and one `tenuto-spectrum` thread; the worker owns the receiving side and the device clock `Arc<AtomicU64>` the engine already shares.
 - `open_transport` assigns `instance = next_tap_instance` (monotonic `u64`, never reused), builds `tap_pair`, sends the reader over the attach channel, attaches the writer with `CallbackCore::with_tap`, and stores `instance` and `session_rev` in `TransportCore`.
 - **Before** every `Run` publication — `prime_and_run`'s `start_running`, `play`'s `release`, and `TransportCore::release` on the hook's thaw path — publish `TapMapping { instance, generation, epoch: handshake.upcoming_epoch(), session_rev, sample_rate, channels }`.
 - `teardown` retires the instance. A load, stop or shutdown therefore invalidates every mapping of the old transport; a seek's reinstall publishes a newer generation, which retires the older one.
@@ -4568,7 +4568,7 @@ pub fn frame_is_fresh(frame: &SpectrumFrame, now: Instant) -> bool {
 mod support;
 
 use std::time::{Duration, Instant};
-use continuo::playback::spectrum::registry::{TapMapping, TapRegistry};
+use tenuto::playback::spectrum::registry::{TapMapping, TapRegistry};
 use support::TestEngine;
 
 fn mapping(instance: u64, generation: u16, epoch: u32, rev: u64) -> TapMapping {
@@ -4606,7 +4606,7 @@ fn playback_publishes_frames_labelled_with_the_current_revision_only() {
     assert!(!frame.levels.is_empty() && frame.levels.len() <= 24);
 
     engine.interrupt_stop();
-    engine.await_state(continuo::playback::state::PlaybackState::Stopped);
+    engine.await_state(tenuto::playback::state::PlaybackState::Stopped);
     let deadline = Instant::now() + Duration::from_secs(5);
     while spectrum.latest().is_some() {
         assert!(Instant::now() < deadline, "a retired transport's frame must be cleared");
@@ -4643,8 +4643,8 @@ Add the deterministic freshness test below. Also exercise `pause_without_transpo
 ```rust
 #[test]
 fn an_unchanged_frame_expires_even_when_its_revision_still_matches() {
-    use continuo::playback::output::Nanos;
-    use continuo::playback::spectrum::worker::{SpectrumFrame, FRAME_MAX_AGE, frame_is_fresh};
+    use tenuto::playback::output::Nanos;
+    use tenuto::playback::spectrum::worker::{SpectrumFrame, FRAME_MAX_AGE, frame_is_fresh};
     let now = Instant::now();
     let frame = SpectrumFrame { session_rev: 1, bands: vec![(40.0, 85.0)],
         levels: vec![1.0], at: Nanos(0), published_at: now };
@@ -4677,26 +4677,26 @@ git commit -m "feat: analyze the output tap per transport and draw the spectrum"
 - Create: `docs/m5-acceptance.md`
 
 **Interfaces:**
-- Consumes: everything above; `TestHook` values; `CONTINUO_AUDIO_OUTPUT=null`.
+- Consumes: everything above; `TestHook` values; `TENUTO_AUDIO_OUTPUT=null`.
 
 Each case below is its own subprocess, with its own `Profile`, so a panic, a signal or a redirect cannot affect the test runner. Seed queues by writing a schema-3 `state.json` into `profile.state_dir()` before spawning.
 
 - [ ] **Step 1: Write the failing process tests** in `tests/m5_tui_process.rs`.
-  1. `tui_signals_during_playback_flush_and_exit_128_plus_n` — for INT, HUP, TERM: queue `[sine-5s.flac]` active; spawn with `CONTINUO_AUDIO_OUTPUT=null`; send `" "`; wait 1.5 s; `kill -<SIG>`; exit code `128 + n`; `state.json` has a checkpoint ≥ 1 s for the fixture; a fresh `tui` in a PTY starts and exits 0 on `q` (lock released).
+  1. `tui_signals_during_playback_flush_and_exit_128_plus_n` — for INT, HUP, TERM: queue `[sine-5s.flac]` active; spawn with `TENUTO_AUDIO_OUTPUT=null`; send `" "`; wait 1.5 s; `kill -<SIG>`; exit code `128 + n`; `state.json` has a checkpoint ≥ 1 s for the fixture; a fresh `tui` in a PTY starts and exits 0 on `q` (lock released).
   2. `tui_signals_during_stalled_http_preparation_exit_128_plus_n` — queue a remote entry pointing at a `stall_headers` server; send `" "`; `server.wait_until_stalled`; for each signal the exit code is `128 + n` and a fresh invocation acquires the profile.
-  3. `a_direct_fd2_write_reaches_the_log_not_the_pty` — hook `stderr-probe`; wait for the idle screen; `q`; the newest file in `profile.state_dir().join("logs")` contains `continuo-stderr-probe` and `continuo-stderr-probe-rust`; PTY output contains neither.
+  3. `a_direct_fd2_write_reaches_the_log_not_the_pty` — hook `stderr-probe`; wait for the idle screen; `q`; the newest file in `profile.state_dir().join("logs")` contains `tenuto-stderr-probe` and `tenuto-stderr-probe-rust`; PTY output contains neither.
   4. `a_hung_up_pty_still_flushes_and_releases_the_profile` — press `-`, then `close_master()`; the child exits (SIGHUP path: code 129, or 0 if it read EOF first — accept either, but it must exit within 10 s); `state.json` volume is `0.95`; a fresh `tui` acquires the profile.
-  5. `a_panic_before_redirection_reaches_the_terminal` — hook `panic-before-redirect`; exit code 101; PTY output contains `continuo test hook: panic-before-redirect`; no `logs/` file contains it.
+  5. `a_panic_before_redirection_reaches_the_terminal` — hook `panic-before-redirect`; exit code 101; PTY output contains `tenuto test hook: panic-before-redirect`; no `logs/` file contains it.
   6. `a_panic_right_after_redirection_is_printed_on_restored_stderr` — hook `panic-after-redirect`; exit code 101; PTY output contains the hook message.
   7. `a_panic_after_terminal_entry_leaves_the_alternate_screen_first` — hook `panic-after-terminal`; exit 101; in PTY output the last `\x1b[?1049l` appears before the hook message.
-  8. `contained_artwork_and_metadata_panics_keep_the_player_running` — for hooks `artwork-job-panic`, `artwork-encoding-panic` and `metadata-job-panic`, `RUST_LOG=continuo=debug`: queue two tagged FLACs with covers (Task 23 helper), restore the first active entry and wait for its contained failure; press Down then Enter to activate the second entry and wait for its successful job; send `q`; exit 0; the log contains `contained panic in background job` and a later successful-job debug line (`artwork job completed` / `artwork encoding completed` / `metadata job completed`, emitted at debug level by the corresponding successful job); PTY output does not contain the hook message.
+  8. `contained_artwork_and_metadata_panics_keep_the_player_running` — for hooks `artwork-job-panic`, `artwork-encoding-panic` and `metadata-job-panic`, `RUST_LOG=tenuto=debug`: queue two tagged FLACs with covers (Task 23 helper), restore the first active entry and wait for its contained failure; press Down then Enter to activate the second entry and wait for its successful job; send `q`; exit 0; the log contains `contained panic in background job` and a later successful-job debug line (`artwork job completed` / `artwork encoding completed` / `metadata job completed`, emitted at debug level by the corresponding successful job); PTY output does not contain the hook message.
   9. `an_uncontained_worker_panic_restores_the_terminal_and_fails` — hook `worker-panic` (the metadata worker panics outside `run_contained` on its first job); exit code nonzero; `\x1b[?1049l` precedes `a background worker panicked` in PTY output.
   10. `a_play_without_a_terminal_still_honours_signals` is already covered by Task 12; do not duplicate it.
 - [ ] **Step 2: Run `cargo test --locked --test m5_tui_process`.** Expected: the new cases FAIL only where wiring is missing (for example the `worker-panic` hook site or the job-completed debug lines). Implement those missing pieces in the owning modules, keeping each one's own tests green.
 - [ ] **Step 3: Update the docs.**
-  - `README.md`: new `## Terminal player` section — `continuo tui [--mouse on|off] [--artwork auto|blocks|off]`, the §7 key table, queue persistence and its 256-entry limit, the `saved`/`~`/`played`/`position unknown` labels, the lock message, logs under `$XDG_STATE_HOME/continuo/logs/`, manual feed refresh. Replace "One process at a time" with the lock behavior for `play`/`tui` (feed commands still do not lock). Add `state.lock` and `logs/` to "Where the files live".
-  - `docs/architecture.md`: add execution contexts (TUI application thread, signal listener, metadata workers ×2, artwork worker, spectrum worker, browse worker) with ownership/"must not" columns; the token correlation contract and protected outcomes (§6 of the spec, decisions 2–5); schema 3 and queue-only recovery; the lock, startup order and panic containment; `CONTINUO_AUDIO_OUTPUT=null` and `CONTINUO_TEST_HOOK` as diagnostic switches.
-- [ ] **Step 4: Manual terminal checks.** Build `cargo build --release --locked` and run `continuo tui` with a local album that has embedded art and a folder with `cover.jpg`, one podcast episode, and one direct URL, in: Ghostty directly; Ghostty with Zellij; Ghostty with Herdr. In each, check and record in `docs/m5-acceptance.md` (a table: environment × check → pass/fail + note): image protocol used or half-block fallback; `--artwork blocks` and `off`; resize through all four tiers; pane switch and return; keyboard map; mouse selection/scroll/transport and `m` toggle with text selection working while off; Ctrl-L; `q`, Ctrl-C, closing the pane; terminal state after exit (cursor, raw mode, no stray images). Browser checks do not count. Record failures honestly; do not mark a row passed without doing it.
+  - `README.md`: new `## Terminal player` section — `tenuto tui [--mouse on|off] [--artwork auto|blocks|off]`, the §7 key table, queue persistence and its 256-entry limit, the `saved`/`~`/`played`/`position unknown` labels, the lock message, logs under `$XDG_STATE_HOME/tenuto/logs/`, manual feed refresh. Replace "One process at a time" with the lock behavior for `play`/`tui` (feed commands still do not lock). Add `state.lock` and `logs/` to "Where the files live".
+  - `docs/architecture.md`: add execution contexts (TUI application thread, signal listener, metadata workers ×2, artwork worker, spectrum worker, browse worker) with ownership/"must not" columns; the token correlation contract and protected outcomes (§6 of the spec, decisions 2–5); schema 3 and queue-only recovery; the lock, startup order and panic containment; `TENUTO_AUDIO_OUTPUT=null` and `TENUTO_TEST_HOOK` as diagnostic switches.
+- [ ] **Step 4: Manual terminal checks.** Build `cargo build --release --locked` and run `tenuto tui` with a local album that has embedded art and a folder with `cover.jpg`, one podcast episode, and one direct URL, in: Ghostty directly; Ghostty with Zellij; Ghostty with Herdr. In each, check and record in `docs/m5-acceptance.md` (a table: environment × check → pass/fail + note): image protocol used or half-block fallback; `--artwork blocks` and `off`; resize through all four tiers; pane switch and return; keyboard map; mouse selection/scroll/transport and `m` toggle with text selection working while off; Ctrl-L; `q`, Ctrl-C, closing the pane; terminal state after exit (cursor, raw mode, no stray images). Browser checks do not count. Record failures honestly; do not mark a row passed without doing it.
 - [ ] **Step 5: Final gates.**
 
 ```bash

@@ -185,7 +185,7 @@ impl WriterHandle {
             let shared = Arc::clone(&shared);
             let clock = Arc::clone(&clock);
             match std::thread::Builder::new()
-                .name("continuo-state".into())
+                .name("tenuto-state".into())
                 .spawn(move || run(shared, sink, clock, ack_tx))
             {
                 Ok(thread) => Some(thread),

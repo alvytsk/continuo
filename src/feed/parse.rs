@@ -16,7 +16,7 @@
 //!
 //! RSS 2.0 and Atom 1.0 are two mappings over **one** walker (§4.3). The
 //! document element picks the mapping once, and from there the format lives in
-//! the [`Context`] the open path resolves to: an RSS arm wants an RSS context
+//! the `Context` the open path resolves to: an RSS arm wants an RSS context
 //! and the empty namespace, an Atom arm wants an Atom context and the Atom
 //! namespace URI. Prefixes never enter into it, and no element can be mistaken
 //! for a field of the other format.

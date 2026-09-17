@@ -1,12 +1,12 @@
 # Milestone 5 acceptance record
 
-`docs/superpowers/specs/2026-09-14-continuo-ratatui-design.md` §12 lists the evidence M5's terminal player must produce: automated suites for the queue, durable state, the load contract, the Ratatui screens, podcast resolution, artwork, the spectrum and the process lifecycle, then manual runs in three real terminal environments, then the repository gates. This page records both halves: which tests discharge each automated bullet, and — where discharge is partial — exactly why; and the manual terminal checks, **none of which has been performed yet**.
+`docs/superpowers/specs/2026-09-14-tenuto-ratatui-design.md` §12 lists the evidence M5's terminal player must produce: automated suites for the queue, durable state, the load contract, the Ratatui screens, podcast resolution, artwork, the spectrum and the process lifecycle, then manual runs in three real terminal environments, then the repository gates. This page records both halves: which tests discharge each automated bullet, and — where discharge is partial — exactly why; and the manual terminal checks, **none of which has been performed yet**.
 
 ## Honesty statement
 
 The manual rows below were written by an automated implementation agent that has no terminal emulator, no multiplexer and no display. It could not run Ghostty, Zellij or Herdr, and it did not. **Every manual row is marked "not run — requires a human at the terminal"**; none is marked passed, and nothing on this page should be read as evidence that images, mouse input, pane switching or exit restoration work in those environments. Browser-rendered checks were not substituted: §12 says they do not count. A person has to perform each row and replace its result.
 
-What *was* done without a terminal: `cargo build --release --locked` succeeded, again after the final pre-merge fix wave (Linux, `target/release/continuo`, `continuo tui --help` prints the `--mouse on|off` and `--artwork auto|blocks|off` options), and the automated suites below ran under pseudo-terminals, which exercise raw mode, the alternate screen, signals and fd-2 redirection but not a real emulator's image protocols, mouse reporting or multiplexer behavior.
+What *was* done without a terminal: `cargo build --release --locked` succeeded, again after the final pre-merge fix wave (Linux, `target/release/tenuto`, `tenuto tui --help` prints the `--mouse on|off` and `--artwork auto|blocks|off` options), and the automated suites below ran under pseudo-terminals, which exercise raw mode, the alternate screen, signals and fd-2 redirection but not a real emulator's image protocols, mouse reporting or multiplexer behavior.
 
 ## Automated evidence (§12)
 
@@ -29,9 +29,9 @@ Five bullets are only partly discharged; each is marked **Partial** with the rea
 
 ## Manual terminal checks
 
-**Media to prepare.** A local album whose tracks carry embedded front-cover art; a folder of tracks without embedded art that has a `cover.jpg`; one podcast episode enqueued from a subscribed feed through the browser's Podcasts tab; and one direct `https://` URL enqueued with `a`. Build with `cargo build --release --locked` and run `target/release/continuo tui` from a shell in each environment.
+**Media to prepare.** A local album whose tracks carry embedded front-cover art; a folder of tracks without embedded art that has a `cover.jpg`; one podcast episode enqueued from a subscribed feed through the browser's Podcasts tab; and one direct `https://` URL enqueued with `a`. Build with `cargo build --release --locked` and run `target/release/tenuto tui` from a shell in each environment.
 
-**Environments.** *Ghostty* — Ghostty directly, no multiplexer. *Ghostty + Zellij* — `continuo tui` in a Zellij pane inside Ghostty. *Ghostty + Herdr* — `continuo tui` in a Herdr pane inside Ghostty.
+**Environments.** *Ghostty* — Ghostty directly, no multiplexer. *Ghostty + Zellij* — `tenuto tui` in a Zellij pane inside Ghostty. *Ghostty + Herdr* — `tenuto tui` in a Herdr pane inside Ghostty.
 
 **What each check means.**
 

@@ -5,11 +5,11 @@
 //! (`tests/m4_feed_parse.rs`) and a real `FeedId`: it is what turns a
 //! `ParsedItem` into a `MediaId::PodcastEpisode` and a `media::Episode`.
 
-use continuo::feed::episode::bind_feed;
-use continuo::feed::model::{Enclosure, ParsedFeed, ParsedItem};
-use continuo::feed::parse::{ParseReport, WarningKind, parse_feed};
-use continuo::media::id::{FeedId, MediaId};
-use continuo::subscription::model::validate_feed_id;
+use tenuto::feed::episode::bind_feed;
+use tenuto::feed::model::{Enclosure, ParsedFeed, ParsedItem};
+use tenuto::feed::parse::{ParseReport, WarningKind, parse_feed};
+use tenuto::media::id::{FeedId, MediaId};
+use tenuto::subscription::model::validate_feed_id;
 use url::Url;
 
 const GUID_ABSENT_USES_ENCLOSURE: &[u8] =
@@ -75,7 +75,7 @@ fn empty_guid_is_treated_as_absent_not_as_a_duplicate_identity()
     let enclosure_url: Url = "https://example.org/a.mp3".parse()?;
     let expected = MediaId::PodcastEpisode {
         feed: feed_id()?,
-        episode: continuo::media::id::EpisodeKey::resolve(None, Some(&enclosure_url), None)?,
+        episode: tenuto::media::id::EpisodeKey::resolve(None, Some(&enclosure_url), None)?,
     };
     assert_eq!(kept.id, expected);
     Ok(())
@@ -117,7 +117,7 @@ fn absent_guid_uses_enclosure() -> Result<(), Box<dyn std::error::Error>> {
     let enclosure_url: Url = "https://example.org/only.mp3".parse()?;
     let expected = MediaId::PodcastEpisode {
         feed: feed_id()?,
-        episode: continuo::media::id::EpisodeKey::resolve(None, Some(&enclosure_url), None)?,
+        episode: tenuto::media::id::EpisodeKey::resolve(None, Some(&enclosure_url), None)?,
     };
     assert_eq!(bound.items[0].episode.id, expected);
     Ok(())
@@ -161,7 +161,7 @@ fn invalid_enclosure_scheme_built_directly_falls_back_to_link()
     assert!(bound.items[0].episode.source.is_none());
     let expected = MediaId::PodcastEpisode {
         feed: feed_id()?,
-        episode: continuo::media::id::EpisodeKey::resolve(None, None, Some(&link))?,
+        episode: tenuto::media::id::EpisodeKey::resolve(None, None, Some(&link))?,
     };
     assert_eq!(bound.items[0].episode.id, expected);
     Ok(())
@@ -241,8 +241,8 @@ fn parse_stage_and_binding_stage_skips_both_count_exactly_once()
 
 #[test]
 fn local_file_and_remote_url_accessors_return_none() -> Result<(), Box<dyn std::error::Error>> {
-    use continuo::media::id::{AbsolutePath, NormalizedUrl};
     use std::path::PathBuf;
+    use tenuto::media::id::{AbsolutePath, NormalizedUrl};
 
     let path = if cfg!(windows) {
         "C:/audio/a.mp3"

@@ -3,11 +3,6 @@ mod views;
 
 use std::time::Duration;
 
-use continuo::application::runtime::{AppCommand, EnqueueItem};
-use continuo::application::transport::PlaybackPhase;
-use continuo::tui::input::{Effect, handle_key, handle_mouse, routes_to_browser};
-use continuo::tui::render::{HitMap, TransportButton, Visuals, draw};
-use continuo::tui::state::{Overlay, UiState};
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers, MouseButton, MouseEvent,
     MouseEventKind,
@@ -15,6 +10,11 @@ use crossterm::event::{
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::layout::Rect;
+use tenuto::application::runtime::{AppCommand, EnqueueItem};
+use tenuto::application::transport::PlaybackPhase;
+use tenuto::tui::input::{Effect, handle_key, handle_mouse, routes_to_browser};
+use tenuto::tui::render::{HitMap, TransportButton, Visuals, draw};
+use tenuto::tui::state::{Overlay, UiState};
 use views::{decoded, ids, playing, sample_view, view};
 
 fn key(code: KeyCode) -> KeyEvent {
@@ -92,7 +92,7 @@ fn transport_keys_carry_the_selection_as_an_argument() {
     ));
     assert!(matches!(
         app(&handle_key(key(KeyCode::Char('J')), &mut ui, &view))[..],
-        [AppCommand::Move(_, continuo::queue::Direction::Down)]
+        [AppCommand::Move(_, tenuto::queue::Direction::Down)]
     ));
 }
 
@@ -188,7 +188,7 @@ fn enter_on_an_empty_queue_is_a_notice_not_a_command() {
     let effects = handle_key(key(KeyCode::Enter), &mut ui, &view);
     match &effects[..] {
         [Effect::Notice(message)] => {
-            assert_eq!(*message, continuo::application::transport::QUEUE_EMPTY);
+            assert_eq!(*message, tenuto::application::transport::QUEUE_EMPTY);
         }
         other => panic!("expected a single Notice effect, got {other:?}"),
     }
@@ -224,11 +224,11 @@ fn shift_still_reaches_bindings_that_need_an_uppercase_or_symbol_key() {
     ui.selected = Some(view.rows[1].id);
     assert!(matches!(
         app(&handle_key(shift('K'), &mut ui, &view))[..],
-        [AppCommand::Move(_, continuo::queue::Direction::Up)]
+        [AppCommand::Move(_, tenuto::queue::Direction::Up)]
     ));
 }
 
-fn draw_hits(view: &continuo::application::view::PlayerView, ui: &UiState) -> HitMap {
+fn draw_hits(view: &tenuto::application::view::PlayerView, ui: &UiState) -> HitMap {
     let mut terminal = Terminal::new(TestBackend::new(100, 30)).expect("backend");
     let mut hits = HitMap::default();
     terminal

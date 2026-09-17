@@ -1,5 +1,5 @@
-use continuo::playback::spectrum::analyzer::SpectrumAnalyzer;
-use continuo::playback::spectrum::bands::{WINDOW, layout_bands};
+use tenuto::playback::spectrum::analyzer::SpectrumAnalyzer;
+use tenuto::playback::spectrum::bands::{WINDOW, layout_bands};
 
 #[test]
 fn the_band_table_matches_the_spec_at_ordinary_and_high_rates() {

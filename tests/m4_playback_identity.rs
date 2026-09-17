@@ -24,7 +24,8 @@ mod feeds;
 
 use std::time::Duration;
 
-use continuo::{
+use support::server::{Script, TestServer};
+use tenuto::{
     clock::Clock,
     http::{limits::Limits, service::HttpService},
     library,
@@ -36,7 +37,6 @@ use continuo::{
     },
     session::{LoadTarget, Session},
 };
-use support::server::{Script, TestServer};
 
 type Fallible = Result<(), Box<dyn std::error::Error>>;
 
@@ -44,7 +44,7 @@ type Fallible = Result<(), Box<dyn std::error::Error>>;
 ///
 /// The checkpoint written at shutdown is keyed on the podcast episode the
 /// cache resolved, and the enclosure URL that was actually fetched — the one
-/// a direct `continuo play <url>` session would have checkpointed — is
+/// a direct `tenuto play <url>` session would have checkpointed — is
 /// absent from the same file.
 #[test]
 fn playback_persists_the_podcast_id_not_the_enclosure_url() -> Fallible {
@@ -90,10 +90,7 @@ fn playback_persists_the_podcast_id_not_the_enclosure_url() -> Fallible {
     // queued here and is handed to `observe` rather than fabricated.
     let mut saw_loaded = false;
     while let Some(event) = engine.try_event() {
-        saw_loaded |= matches!(
-            event,
-            continuo::playback::event::PlaybackEvent::Loaded { .. }
-        );
+        saw_loaded |= matches!(event, tenuto::playback::event::PlaybackEvent::Loaded { .. });
         let _ = session.observe(&event, rig.clock.sample());
     }
     assert!(saw_loaded, "the session never observed the load");

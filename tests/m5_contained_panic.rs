@@ -1,9 +1,9 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier};
 
-use continuo::lifecycle::hooks::TestHook;
-use continuo::lifecycle::panic::{TakeOnceSlot, TakeResult, in_contained_job, run_contained};
-use continuo::lifecycle::terminal::TerminalCleanup;
+use tenuto::lifecycle::hooks::TestHook;
+use tenuto::lifecycle::panic::{TakeOnceSlot, TakeResult, in_contained_job, run_contained};
+use tenuto::lifecycle::terminal::TerminalCleanup;
 
 #[test]
 fn a_contained_panic_becomes_a_failed_job_and_the_flag_resets() {

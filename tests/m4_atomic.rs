@@ -2,7 +2,7 @@
 //! routine extracted from `StateStore::write` so the subscription and cache
 //! stores call it rather than copy it (design doc §1.3 item 1).
 
-use continuo::persistence::atomic::replace_bytes;
+use tenuto::persistence::atomic::replace_bytes;
 
 #[test]
 fn independent_destinations_replace_whole_snapshots() -> Result<(), Box<dyn std::error::Error>> {
@@ -64,7 +64,7 @@ fn the_destination_file_and_a_new_parent_directory_are_private()
     use std::os::unix::fs::PermissionsExt;
 
     let root = tempfile::tempdir()?;
-    let nested = root.path().join("continuo");
+    let nested = root.path().join("tenuto");
     let destination = nested.join("subscriptions.json");
     replace_bytes(&destination, br#"{"subscriptions":[]}"#)?;
 

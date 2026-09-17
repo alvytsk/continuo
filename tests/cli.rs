@@ -3,46 +3,53 @@
 #[path = "support/process.rs"]
 mod process;
 
+use clap::Parser;
+use tenuto::cli::{Cli, CliCommand};
+
+/// A bare `tenuto` is no longer a usage error: it resolves to no
+/// subcommand, which `app::run` dispatches to the player.
 #[test]
-fn bare_invocation_prints_help_and_reports_filter_errors() {
-    // A bare invocation now prints help and exits nonzero rather than running
-    // the old M0 startup message: `continuo` requires the `play` subcommand.
-    let profile = process::Profile::new().unwrap();
-    let bare = profile
-        .command()
-        .env("RUST_LOG", "continuo=info")
-        .output()
-        .unwrap();
-    assert!(!bare.status.success());
-    assert!(bare.stdout.is_empty());
-    let stderr = String::from_utf8_lossy(&bare.stderr);
+fn a_bare_invocation_parses_to_no_subcommand() -> Result<(), Box<dyn std::error::Error>> {
+    let parsed = Cli::try_parse_from(["tenuto"])?;
     assert!(
-        stderr.contains("play"),
-        "help must mention the play subcommand: {stderr}"
+        parsed.command.is_none(),
+        "bare invocation carries no subcommand"
     );
 
-    // The RUST_LOG filter-error path predates the CLI and still applies: it
-    // fires during `telemetry::init`, before argument parsing runs.
+    // Every existing subcommand still parses as it did.
+    let tui = Cli::try_parse_from(["tenuto", "tui"])?;
+    assert!(matches!(tui.command, Some(CliCommand::Tui { .. })));
+    let feeds = Cli::try_parse_from(["tenuto", "feeds"])?;
+    assert!(matches!(feeds.command, Some(CliCommand::Feeds)));
+    Ok(())
+}
+
+/// The `RUST_LOG` filter-error path predates the CLI and still applies: it
+/// fires during `telemetry::init`, before argument parsing runs, so it is
+/// independent of whether a subcommand was given.
+#[test]
+fn an_invalid_rust_log_filter_fails_before_argument_parsing() {
     let profile = process::Profile::new().unwrap();
     let failure = profile
         .command()
-        .env("RUST_LOG", "continuo=not-a-level")
+        .env("RUST_LOG", "tenuto=not-a-level")
         .output()
         .unwrap();
     assert!(!failure.status.success());
     let stderr = String::from_utf8_lossy(&failure.stderr);
-    assert!(stderr.contains("continuo: invalid tracing filter"));
+    assert!(stderr.contains("tenuto: invalid tracing filter"));
     assert!(stderr.contains("application startup failed"));
     assert!(stderr.contains("error parsing level filter"));
 }
 
+/// §4: usage errors exit 2. `play` with no source is still one; a bare
+/// invocation is not, because it now opens the player.
 #[test]
-fn a_bare_invocation_is_a_usage_error_with_status_two() -> Result<(), Box<dyn std::error::Error>> {
+fn a_usage_error_still_exits_two() -> Result<(), Box<dyn std::error::Error>> {
     let profile = process::Profile::new()?;
-    let output = profile.command().output()?;
+    let output = profile.command().arg("play").output()?;
     assert_eq!(output.status.code(), Some(2), "§4: usage errors exit 2");
     assert!(output.stdout.is_empty());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("play"));
     Ok(())
 }
 

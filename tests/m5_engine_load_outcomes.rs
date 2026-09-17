@@ -3,14 +3,14 @@ mod support;
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use continuo::http::limits::Limits;
-use continuo::http::service::HttpService;
-use continuo::media::id::{MediaId, NormalizedUrl};
-use continuo::media::source::SourceLocation;
-use continuo::playback::command::{LoadRequestId, PlaybackCommand, ResumeIntent};
-use continuo::playback::event::PlaybackEvent;
 use support::TestEngine;
 use support::server::{Script, TestServer};
+use tenuto::http::limits::Limits;
+use tenuto::http::service::HttpService;
+use tenuto::media::id::{MediaId, NormalizedUrl};
+use tenuto::media::source::SourceLocation;
+use tenuto::playback::command::{LoadRequestId, PlaybackCommand, ResumeIntent};
+use tenuto::playback::event::PlaybackEvent;
 
 fn local_load(request: u64) -> PlaybackCommand {
     let path = support::fixture("sine.flac");
@@ -90,7 +90,7 @@ fn every_accepted_load_has_exactly_one_ordered_outcome_under_saturation() {
     for (index, event) in report.events.iter().enumerate() {
         if let PlaybackEvent::Loaded { session_rev, .. } = event {
             assert!(!report.events[..index].iter().any(|earlier| matches!(earlier,
-                PlaybackEvent::StateChanged { session_rev: rev, state: continuo::playback::state::PlaybackState::Paused, .. } if rev == session_rev)));
+                PlaybackEvent::StateChanged { session_rev: rev, state: tenuto::playback::state::PlaybackState::Paused, .. } if rev == session_rev)));
         }
     }
 }
@@ -138,7 +138,7 @@ fn shutdown_during_a_stalled_open_reports_the_cancellation() {
 
 #[test]
 fn automatic_start_does_not_reopen_a_failed_remote_load() {
-    use continuo::playback::volume::Volume;
+    use tenuto::playback::volume::Volume;
     let server = TestServer::start(Script::serving(Vec::new()).status(404));
     let mut engine = TestEngine::start_idle();
     engine
@@ -163,8 +163,8 @@ fn automatic_start_does_not_reopen_a_failed_remote_load() {
 
 #[test]
 fn an_older_automatic_start_cannot_play_a_newer_load() {
-    use continuo::playback::state::PlaybackState;
-    use continuo::playback::volume::Volume;
+    use tenuto::playback::state::PlaybackState;
+    use tenuto::playback::volume::Volume;
     let mut engine = TestEngine::start_idle();
     engine.send(local_load(81));
     engine.send(local_load(82));
@@ -209,7 +209,7 @@ fn a_same_token_device_failure_survives_play_loaded_with_no_second_open() {
         !events.iter().any(|e| matches!(
             e,
             PlaybackEvent::StateChanged {
-                state: continuo::playback::state::PlaybackState::Playing,
+                state: tenuto::playback::state::PlaybackState::Playing,
                 ..
             }
         )),

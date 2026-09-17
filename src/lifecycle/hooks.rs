@@ -1,7 +1,7 @@
-//! Deterministic test triggers for the `continuo` binary (design doc M5,
+//! Deterministic test triggers for the `tenuto` binary (design doc M5,
 //! implementation decision 8): process tests that need a panic at an exact
 //! stage, or a probe on fd 2, cannot arrange that from outside the child
-//! process. Instead the child reads `CONTINUO_TEST_HOOK` once at startup and
+//! process. Instead the child reads `TENUTO_TEST_HOOK` once at startup and
 //! a handful of call sites ask whether *they* are the requested stage.
 //!
 //! Absent or unrecognised values are indistinguishable from `None`: a typo
@@ -42,20 +42,20 @@ impl TestHook {
         }
     }
 
-    /// Reads `CONTINUO_TEST_HOOK` the first time this is called in the
+    /// Reads `TENUTO_TEST_HOOK` the first time this is called in the
     /// process and caches the result, so later calls (there may be many,
     /// scattered across call sites) never touch the environment again.
     pub fn from_env() -> Self {
         static HOOK: OnceLock<TestHook> = OnceLock::new();
-        *HOOK.get_or_init(|| Self::parse(std::env::var("CONTINUO_TEST_HOOK").ok().as_deref()))
+        *HOOK.get_or_init(|| Self::parse(std::env::var("TENUTO_TEST_HOOK").ok().as_deref()))
     }
 
-    /// Panics with `continuo test hook: <name>` when this value is the
+    /// Panics with `tenuto test hook: <name>` when this value is the
     /// requested `stage`; a no-op otherwise. Call sites pass their own
     /// stage as `self` after reading it once via [`Self::from_env`].
     pub fn panic_at(self, stage: Self) {
         if self == stage {
-            panic!("continuo test hook: {}", stage.name());
+            panic!("tenuto test hook: {}", stage.name());
         }
     }
 

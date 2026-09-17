@@ -2,13 +2,13 @@ mod support;
 
 use std::time::Duration;
 
-use continuo::http::{
+use support::server::{DocumentReply, Script, TestServer};
+use tenuto::http::{
     document::{CacheValidators, DocumentOutcome, DocumentRequest},
     error::{Phase, RedirectRejection, RemoteFailure},
     limits::Limits,
     service::HttpService,
 };
-use support::server::{DocumentReply, Script, TestServer};
 
 fn reply(path: &str, status: u16, headers: Vec<(&str, &str)>, body: &[u8]) -> DocumentReply {
     DocumentReply {

@@ -4,13 +4,13 @@ use std::io::{Read, Seek, SeekFrom};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use continuo::http::channel::{SourceInterrupt, WaitHook};
-use continuo::http::error::RemoteFailure;
-use continuo::http::limits::Limits;
-use continuo::http::service::HttpService;
-use continuo::http::source::{HttpMediaSource, OpeningDeadline, is_retired, remote_cause};
 use support::server::{Script, TestServer};
 use symphonia::core::io::MediaSource;
+use tenuto::http::channel::{SourceInterrupt, WaitHook};
+use tenuto::http::error::RemoteFailure;
+use tenuto::http::limits::Limits;
+use tenuto::http::service::HttpService;
+use tenuto::http::source::{HttpMediaSource, OpeningDeadline, is_retired, remote_cause};
 use url::Url;
 
 struct NoHook;
@@ -74,11 +74,11 @@ fn a_range_capable_source_reports_its_length_and_is_seekable() {
     assert!(source.is_seekable());
     assert_eq!(
         source.evidence(),
-        continuo::media::capabilities::SourceEvidence {
+        tenuto::media::capabilities::SourceEvidence {
             byte_len: Some(8192),
             byte_seekable: true,
             live: false,
-            demuxer: continuo::media::capabilities::DemuxerSeek::Unproven,
+            demuxer: tenuto::media::capabilities::DemuxerSeek::Unproven,
         }
     );
     server.shutdown();
@@ -180,12 +180,12 @@ fn a_retired_read_is_recovered_through_symphonias_own_error_type() {
     // source rather than the payload. Both are exercised here by wrapping the
     // error exactly as the decoder does.
     let failure = RemoteFailure::TruncatedBody { missing: 9 };
-    let io = std::io::Error::other(continuo::http::source::RemoteIoError(failure.clone()));
+    let io = std::io::Error::other(tenuto::http::source::RemoteIoError(failure.clone()));
     let wrapped = symphonia::core::errors::Error::IoError(io);
     assert_eq!(remote_cause(&wrapped), Some(failure));
 
     let cancelled = symphonia::core::errors::Error::IoError(std::io::Error::other(
-        continuo::http::source::RemoteIoError(RemoteFailure::Cancelled),
+        tenuto::http::source::RemoteIoError(RemoteFailure::Cancelled),
     ));
     assert!(
         is_retired(&cancelled),

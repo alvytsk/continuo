@@ -4,21 +4,21 @@
 //!
 //! Every test here binds `127.0.0.1`, against `TestServer` and `TestOutput`,
 //! exactly like `engine_remote.rs`. See
-//! `docs/superpowers/specs/2026-09-10-continuo-estimated-seek-design.md`
+//! `docs/superpowers/specs/2026-09-10-tenuto-estimated-seek-design.md`
 //! §5 for the mechanism and the measurements these tests pin.
 
 mod support;
 
 use std::time::{Duration, Instant};
 
-use continuo::http::limits::Limits;
-use continuo::http::service::HttpService;
-use continuo::media::id::{MediaId, NormalizedUrl};
-use continuo::media::source::SourceLocation;
-use continuo::playback::command::{Admission, PlaybackCommand, ResumeIntent};
-use continuo::playback::event::PlaybackEvent;
-use continuo::playback::provenance::PositionProvenance;
-use continuo::playback::state::PlaybackState;
+use tenuto::http::limits::Limits;
+use tenuto::http::service::HttpService;
+use tenuto::media::id::{MediaId, NormalizedUrl};
+use tenuto::media::source::SourceLocation;
+use tenuto::playback::command::{Admission, PlaybackCommand, ResumeIntent};
+use tenuto::playback::event::PlaybackEvent;
+use tenuto::playback::provenance::PositionProvenance;
+use tenuto::playback::state::PlaybackState;
 use url::Url;
 
 use support::server::{Script, TestServer};
