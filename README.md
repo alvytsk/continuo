@@ -10,8 +10,6 @@ A keyboard-first terminal audio player for local files, finite HTTP media, and p
 
 ![The terminal player: cover art, track information, spectrum, transport and the queue](https://raw.githubusercontent.com/alvytsk/tenuto/main/docs/images/tui.webp)
 
-Milestones 0 through 6 are implemented. The automated suites pass. The manual terminal checks for the player and for feed management have not been run yet. [docs/m5-acceptance.md](https://github.com/alvytsk/tenuto/blob/main/docs/m5-acceptance.md) and [docs/m6-acceptance.md](https://github.com/alvytsk/tenuto/blob/main/docs/m6-acceptance.md) record them.
-
 ## Install
 
 ```sh
@@ -296,7 +294,7 @@ An item with a GUID keeps its position when the show moves its audio to another 
 | `$XDG_DATA_HOME/tenuto/subscriptions.lock` | The subscription writer lock |
 | `$XDG_CACHE_HOME/tenuto/feeds/<feed-id>.json` | Cached episodes. Refetchable |
 
-On macOS and Windows these resolve to the platform's own data, cache and local-data directories. The cache and the logs are disposable. Subscriptions and checkpoints are not.
+On macOS these resolve to the platform's own data, cache and local-data directories. The cache and the logs are disposable. Subscriptions and checkpoints are not.
 
 ### Playback state
 
@@ -325,7 +323,13 @@ RUST_LOG=tenuto=debug cargo run --locked -- play <path-or-url>
 cargo fmt --check
 cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo test --locked
+RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps
+cargo publish --dry-run --locked
 ```
+
+CI runs every gate above on each pull request. The tests run on Linux, and on macOS as a non-blocking leg. Releases are listed in the [changelog](https://github.com/alvytsk/tenuto/blob/main/CHANGELOG.md).
+
+Milestones 0 through 6 are implemented and the automated suites pass. The manual terminal checks for the player and for feed management have not been run yet. [docs/m5-acceptance.md](https://github.com/alvytsk/tenuto/blob/main/docs/m5-acceptance.md) and [docs/m6-acceptance.md](https://github.com/alvytsk/tenuto/blob/main/docs/m6-acceptance.md) record them.
 
 Dependency versions are recorded in the committed `Cargo.lock`. Runtime code forbids unsafe code and denies `unwrap` and `expect`. Tests may use them for assertions and fixtures. `TENUTO_AUDIO_OUTPUT=null` runs the player against a paced virtual output on a machine with no sound device. It is a test switch, not user configuration.
 
