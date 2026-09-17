@@ -38,7 +38,9 @@ Renames the package for crates.io, adds every field publishing requires, and mak
 
 - [ ] **Step 1: Run the packaging check to see the package blow the size cap**
 
-Run: `cargo publish --dry-run --locked && ls -l target/package/*.crate`
+Run: `cargo package --locked && ls -l target/package/*.crate`
+
+Use `cargo package`, not `cargo publish --dry-run`: both run the same packaging and verification build, but the dry run discards its tarball, so nothing lands in `target/package/` for you to measure.
 
 Expected: the command **exits 0** — missing metadata is only a warning in this cargo version, not an error — but two things are wrong, and the size is the one that fails a check:
 
@@ -50,9 +52,11 @@ warning: manifest has no description, license, license-file, documentation, home
 
 The `.crate` file is about 13.9 MiB against the crates.io cap of 10 MB. Confirm the failing assertion directly:
 
-Run: `test "$(stat -c%s target/package/continuo-0.1.0.crate)" -lt 10485760; echo "under cap: $?"`
+Run: `test -f target/package/continuo-0.1.0.crate && test "$(stat -c%s target/package/continuo-0.1.0.crate)" -lt 10485760; echo "under cap: $?"`
 
 Expected: prints `under cap: 1` — the check fails. That is this task's red state. Step 6 turns it green.
+
+The `test -f` guard is not decoration. Under zsh, `test "" -lt 10485760` treats the empty string as 0 and reports success, so a missing `.crate` file silently becomes a passing size check. Always confirm the file exists before measuring it.
 
 Do not expect an error about the missing fields; you will not get one. The metadata still has to be added, because crates.io rejects an upload without `description` and `license` even though the local dry run tolerates their absence.
 
@@ -123,7 +127,9 @@ Expected: succeeds, and `git diff --stat Cargo.lock` shows the `continuo` root p
 
 - [ ] **Step 5: Run the packaging check to verify it passes**
 
-Run: `cargo publish --dry-run --locked --allow-dirty`
+Run: `cargo publish --dry-run --locked --allow-dirty && cargo package --locked --allow-dirty --no-verify`
+
+The dry run is the real publish rehearsal and validates the metadata for upload; `cargo package` is what actually writes the `.crate` that Step 6 measures.
 
 `--allow-dirty` is required: `cargo publish` refuses a working tree with uncommitted changes, and yours has them until Step 9. The CI job added in Task 3 runs on a clean checkout and deliberately does **not** pass this flag.
 
@@ -131,9 +137,9 @@ Expected: PASS, ending with `Packaged N files, X MiB`, and the metadata warning 
 
 - [ ] **Step 6: Verify the package now clears the 10 MB cap**
 
-Run: `test "$(stat -c%s target/package/continuo-player-0.1.0.crate)" -lt 10485760; echo "under cap: $?"`
+Run: `test -f target/package/continuo-player-0.1.0.crate && test "$(stat -c%s target/package/continuo-player-0.1.0.crate)" -lt 10485760; echo "under cap: $?"`
 
-Expected: prints `under cap: 0` — the assertion that failed in Step 1 now passes. Run `ls -lh target/package/continuo-player-0.1.0.crate` to see the figure; it should be roughly 1-2 MB, down from 13.9 MiB.
+Expected: prints `under cap: 0` — the assertion that failed in Step 1 now passes. Keep the `test -f` guard for the reason given in Step 1. Run `ls -lh target/package/continuo-player-0.1.0.crate` to see the figure; it should be roughly 1-2 MB, down from 13.9 MiB.
 
 If it is still over, `exclude` is wrong — confirm `/tests` and `/docs` are both listed.
 
@@ -452,7 +458,12 @@ jobs:
       - run: cargo publish --dry-run --locked
       - name: Check the package clears the 10 MB crates.io cap
         run: |
-          crate=$(ls target/package/*.crate)
+          # cargo publish --dry-run does NOT leave a .crate behind; only
+          # cargo package writes one. --no-verify skips a second
+          # verification build, which the dry run above already did.
+          cargo package --locked --no-verify
+          crate=target/package/continuo-player-0.1.0.crate
+          test -f "$crate" || { echo "no .crate at $crate"; exit 1; }
           size=$(stat -c%s "$crate")
           echo "$crate is $size bytes"
           test "$size" -lt 10485760
@@ -818,11 +829,15 @@ Expected: prints `none remain`.
 Run:
 
 ```bash
-cargo publish --dry-run --locked --allow-dirty
+cargo package --locked --allow-dirty --no-verify
 tar -xzOf target/package/continuo-player-0.1.0.crate continuo-player-0.1.0/README.md | head -20
 ```
 
-`--allow-dirty` is needed because the README edits are not committed until Step 8.
+Use `cargo package`, not `cargo publish --dry-run`: the dry run discards its
+tarball, so `target/package/*.crate` would be missing or stale and you would be
+reading an older README than the one you just edited. `--allow-dirty` is needed
+because the README edits are not committed until Step 8, and `--no-verify`
+skips a compile this step does not need.
 
 Expected: the extracted README shows the new install section and the absolute image URL.
 
