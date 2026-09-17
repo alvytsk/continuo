@@ -318,15 +318,13 @@ fn a_changed_strong_validator_on_a_seek_fails_as_resource_changed() {
 
 #[test]
 fn a_live_source_is_flagged_as_live_evidence() {
-    // `HttpService::fetch` always sends a `Range` header, even on the opening
-    // request (Task 5), so a script that still advertises ranges gets
-    // answered 206 — and only the 200 path emits the icy headers `accept`
-    // classifies as live. `.without_ranges()` is what makes this scenario
-    // actually exercise a live response, matching how a real icecast origin
-    // usually has no range support to begin with. `.icy_station()`, not
-    // `.live()`, because `.live()` also sends `icy-metaint`, which `accept`
-    // now refuses as unsupported framing rather than accepting as live.
-    let server = TestServer::start(Script::serving(body()).icy_station().without_ranges());
+    // `.icy_station()`, not `.live()`, because `.live()` also sends
+    // `icy-metaint`, which `accept` refuses as unsupported framing rather
+    // than accepting as live. `icy_station()` turns ranges off itself (it
+    // models a real Icecast mount, which answers `Range: bytes=0-` — always
+    // sent, even on the opening request — with a plain 200), so this needs
+    // no `.without_ranges()` of its own.
+    let server = TestServer::start(Script::serving(body()).icy_station());
     let source = open(
         &server,
         SourceInterrupt::new(Limits::default().buffer_bytes),

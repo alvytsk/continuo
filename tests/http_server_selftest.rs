@@ -170,6 +170,21 @@ fn an_icy_station_sends_name_and_bitrate_but_no_metaint() {
 }
 
 #[test]
+fn an_icy_station_answers_a_range_request_with_a_plain_200() {
+    // `HttpService::fetch` always sends `Range: bytes=0-`, even on the
+    // opening request — a real Icecast mount answers that the same way it
+    // answers a plain GET, with a 200 and no `Content-Range`. `icy_station()`
+    // must model that itself rather than making every caller remember
+    // `.without_ranges()`.
+    let server = TestServer::start(Script::from_fixture("sine-noxing.mp3").icy_station());
+    let response = raw_get(&server, "/radio", &[("Range", "bytes=0-")]);
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    let head = response.to_ascii_lowercase();
+    assert!(head.contains("icy-name: test radio"), "{head}");
+    server.shutdown();
+}
+
+#[test]
 fn a_script_chain_serves_each_connection_its_own_script_and_repeats_the_last() {
     let server = TestServer::start(
         Script::serving(b"first".to_vec())

@@ -282,8 +282,14 @@ impl Script {
         self
     }
 
+    /// A real Icecast mount answers `Range: bytes=0-` — which
+    /// `HttpService::fetch` always sends, even on the opening request — the
+    /// same way it answers a plain GET: a 200, no `Content-Range`. Turning
+    /// ranges off here is what makes that true of the script, so a caller
+    /// never has to remember `.without_ranges()` alongside it.
     pub fn icy_station(mut self) -> Self {
         self.icy_station = true;
+        self.ranges = false;
         self
     }
 

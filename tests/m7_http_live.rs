@@ -41,11 +41,7 @@ fn open(server: &TestServer) -> HttpMediaSource {
 
 #[test]
 fn a_station_is_live_unsized_unseekable_and_named() {
-    let server = TestServer::start(
-        Script::from_fixture("sine-noxing.mp3")
-            .icy_station()
-            .without_ranges(),
-    );
+    let server = TestServer::start(Script::from_fixture("sine-noxing.mp3").icy_station());
     let source = open(&server);
     let evidence = source.evidence();
     assert!(evidence.live);
@@ -61,7 +57,6 @@ fn a_live_body_that_ends_is_a_failure_never_eof() {
     let server = TestServer::start(
         Script::from_fixture("sine-noxing.mp3")
             .icy_station()
-            .without_ranges()
             .truncate_body_after(8 * 1024),
     );
     let mut source = open(&server);
