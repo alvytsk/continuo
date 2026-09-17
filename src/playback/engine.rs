@@ -40,6 +40,7 @@ use super::output::null_output::NullOutput;
 use super::output::{AudioOutput, Nanos, NegotiatedOutput, OutputRequest, SpanRecord};
 use super::prepare::{PrepareContext, prepare};
 use super::provenance::PositionProvenance;
+use super::reconnect::{Next, Outage, ReconnectPolicy};
 use super::resample::Converter;
 use super::spectrum::registry::{TapMapping, TapRegistry};
 use super::spectrum::worker::{
@@ -207,6 +208,9 @@ pub struct EngineHandle {
     /// `Worker::load` can build a `PrepareContext` from whatever is
     /// installed at the moment it runs.
     http: Arc<Mutex<Option<Arc<HttpService>>>>,
+    /// Shared with the worker, so a policy installed after the worker was
+    /// spawned governs the very next outage (M7 §7).
+    reconnect_policy: Arc<Mutex<ReconnectPolicy>>,
     /// The analysis worker's application side (§10), handed out by
     /// [`Self::spectrum`].
     spectrum: SpectrumHandle,
@@ -275,6 +279,7 @@ impl EngineHandle {
         let source_interrupt = SourceInterrupt::new(Limits::default().buffer_bytes);
         let traits = Arc::new(SourceTraits::default());
         let http = Arc::new(Mutex::new(None));
+        let reconnect_policy = Arc::new(Mutex::new(ReconnectPolicy::default()));
         // Shared by the callback (writer), the decode worker, `WaitService`
         // and the spectrum worker, which schedules frames against it.
         let device_clock = Arc::new(AtomicU64::new(0));
@@ -292,6 +297,7 @@ impl EngineHandle {
             Arc::clone(&source_interrupt),
             Arc::clone(&traits),
             Arc::clone(&http),
+            Arc::clone(&reconnect_policy),
             device_clock,
             spectrum_port,
         );
@@ -312,6 +318,7 @@ impl EngineHandle {
             source_interrupt,
             traits,
             http,
+            reconnect_policy,
             spectrum,
             spectrum_thread,
         }
@@ -494,6 +501,13 @@ impl EngineHandle {
     /// documents.
     pub fn set_http(&self, service: Option<Arc<HttpService>>) {
         *lock(&self.http) = service;
+    }
+
+    /// Install the reconnect timing every later outage is judged against
+    /// (M7 §7). The default is `ReconnectPolicy::default()`; a test installs
+    /// a brisk one so a whole outage fits inside a test's patience.
+    pub fn set_reconnect_policy(&self, policy: ReconnectPolicy) {
+        *lock(&self.reconnect_policy) = policy;
     }
 
     pub fn is_finished(&self) -> bool {
@@ -782,6 +796,15 @@ struct Worker {
     /// this worker was spawned is visible the next time `load` builds a
     /// `PrepareContext`.
     http: Arc<Mutex<Option<Arc<HttpService>>>>,
+    /// Shared with `EngineHandle::set_reconnect_policy`. Read fresh at every
+    /// decision point, never cached, so an installed policy takes effect at
+    /// once (M7 §7).
+    reconnect_policy: Arc<Mutex<ReconnectPolicy>>,
+    /// The outage in progress: `Some` from the first retryable failure of an
+    /// established live connection until either sustained playback ends it,
+    /// the budget gives up, or the listener ends the request (pause, stop,
+    /// a replacing load, shutdown). `None` at every other moment.
+    outage: Option<Outage>,
     /// A `Send + Sync` mirror of the device's current instant, so
     /// `WaitService` — reachable from inside a decoder read that already
     /// holds `&mut self.source` and so cannot see the rest of `Worker`, let
@@ -818,6 +841,7 @@ impl Worker {
         source_interrupt: Arc<SourceInterrupt>,
         traits: Arc<SourceTraits>,
         http: Arc<Mutex<Option<Arc<HttpService>>>>,
+        reconnect_policy: Arc<Mutex<ReconnectPolicy>>,
         device_clock: Arc<AtomicU64>,
         spectrum: SpectrumPort,
     ) -> Self {
@@ -906,6 +930,8 @@ impl Worker {
             source_interrupt,
             traits,
             http,
+            reconnect_policy,
+            outage: None,
             device_clock,
             backlog_empty,
             spectrum,
@@ -998,7 +1024,10 @@ impl Worker {
                 return Vec::from(self.pending_events);
             }
 
-            // 7. Decode -> convert -> ring, with interruptible backpressure.
+            // 7. Reconnect timing first - it is what turns `Reconnecting`
+            //    back into `Playing` - then decode -> convert -> ring, with
+            //    interruptible backpressure.
+            self.service_reconnect();
             if self.state == PlaybackState::Playing {
                 self.pump_audio();
             }
@@ -1323,7 +1352,13 @@ impl Worker {
             // latency after the park and only then settles. Freezing the
             // number at the instant of the park would report a position
             // slightly behind what the listener actually heard.
-            facts.playing = matches!(self.state, PlaybackState::Playing | PlaybackState::Paused);
+            // `Reconnecting` too (M7 §7): the transport is left running so
+            // the ring plays out after a disconnect, and that audio is heard,
+            // so it must be counted.
+            facts.playing = matches!(
+                self.state,
+                PlaybackState::Playing | PlaybackState::Paused | PlaybackState::Reconnecting
+            );
             // `frozen_by_hook` is deliberately left untouched here: it is the
             // hook's own bookkeeping (Ruling 1's `SessionFacts` lives in
             // `wait.rs`), and this pass has nothing new to tell it.
@@ -1597,10 +1632,14 @@ impl Worker {
     /// established station. Never seeks; never reports a seek or a restart.
     ///
     /// `Ok` means `Playing` was announced. On `Err` nothing of the new source
-    /// remains adopted, and no transport it opened is left behind — a refusal
-    /// in step 1 returns before the previous generation's transport is torn
-    /// down, so what the listener already has in the ring keeps playing while
-    /// the caller decides what the failure means.
+    /// remains adopted and no transport this call opened is left behind.
+    ///
+    /// What survives an `Err` is narrower than it looks. Step 0 closes the
+    /// old source before anything else, so by the time a refusal in step 1
+    /// returns, the connection is already gone; what is still standing is the
+    /// previous generation's *transport*, holding the frames already staged
+    /// in its ring, which go on playing out while the caller decides what the
+    /// failure means. A failure from step 3 onward has torn even that down.
     fn fresh_open(&mut self) -> Result<(), PlaybackError> {
         let Some(location) = self.descriptor.clone() else {
             return Err(PlaybackError::UnsupportedInput {
@@ -1897,6 +1936,7 @@ impl Worker {
         // (neither calls `self.emit` directly), so nothing between here and
         // `publish_progress` can reorder ahead of what was just drained.
         self.drain_outbox();
+        self.outage = None;
         // Accepted but never dispatched: each still owes its caller an
         // outcome. Every other undelivered command is simply discarded -
         // nothing else in `PlaybackCommand` promises one.
@@ -2080,7 +2120,100 @@ impl Worker {
             self.source = None;
             return;
         }
-        self.fail_with(format!("{failure}"), Some(failure));
+        if failure.is_retryable() {
+            self.enter_reconnecting(failure);
+        } else {
+            self.outage = None;
+            self.fail_with(format!("{failure}"), Some(failure));
+        }
+    }
+
+    /// M7 §7. A playing connection, or an attempt, failed retryably.
+    ///
+    /// The outage is the thing that spans attempts: it is begun by the first
+    /// such failure and outlives every attempt until sustained playback ends
+    /// it, the budget gives up, or the listener ends the request.
+    fn enter_reconnecting(&mut self, failure: RemoteFailure) {
+        let now = Instant::now();
+        let policy = *lock(&self.reconnect_policy);
+        let outage = self.outage.get_or_insert_with(|| Outage::begin(now));
+        match outage.failed(now, &policy) {
+            Next::GiveUp => {
+                self.outage = None;
+                self.fail_with(format!("{failure}"), Some(failure));
+            }
+            Next::AttemptAt(_) => {
+                tracing::info!(reason = %failure, "live source lost; reconnecting");
+                // The output transport stays up so the ring plays out; only
+                // the source goes.
+                self.source_interrupt.retire();
+                self.retire_remote_source();
+                self.set_state(PlaybackState::Reconnecting);
+            }
+        }
+    }
+
+    /// Run from the loop, never from a sleep: commands stay serviced through
+    /// every backoff, so a pause, a stop, a replacing load or a shutdown ends
+    /// the attempts at once rather than after the current one.
+    fn service_reconnect(&mut self) {
+        match self.state {
+            PlaybackState::Playing => {
+                let policy = *lock(&self.reconnect_policy);
+                if self
+                    .outage
+                    .as_ref()
+                    .is_some_and(|outage| outage.is_over(self.position, &policy))
+                {
+                    self.outage = None;
+                }
+            }
+            PlaybackState::Reconnecting => {
+                if !self
+                    .outage
+                    .as_ref()
+                    .is_some_and(|outage| outage.due(Instant::now()))
+                {
+                    return;
+                }
+                match self.fresh_open() {
+                    Ok(()) => {
+                        let position = self.position;
+                        if let Some(outage) = self.outage.as_mut() {
+                            outage.playing_from(position);
+                        }
+                    }
+                    // The command that cancelled it decides what happens next.
+                    Err(error) if is_cancelled(&error) => {}
+                    Err(error) => {
+                        let failure = match error {
+                            PlaybackError::Remote(failure) => failure,
+                            other => match remote_cause(&other) {
+                                Some(failure) => failure,
+                                // Not the station's fault: a device that will
+                                // not open is never retried against a remote
+                                // budget.
+                                None => {
+                                    self.outage = None;
+                                    self.fail_from(other);
+                                    return;
+                                }
+                            },
+                        };
+                        // `fresh_open` may have torn the old transport down
+                        // and announced nothing; stay in Reconnecting.
+                        self.state = PlaybackState::Reconnecting;
+                        if failure.is_retryable() {
+                            self.enter_reconnecting(failure);
+                        } else {
+                            self.outage = None;
+                            self.fail_with(format!("{failure}"), Some(failure));
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 
     /// End of track fires only once every pushed frame has been played, which
@@ -2264,6 +2397,8 @@ impl Worker {
         source: SourceLocation,
         resume: ResumeIntent,
     ) {
+        // Whatever this replaces, its outage goes with it.
+        self.outage = None;
         self.capture_and_teardown();
         // The source the handle was reasoning about is gone and the incoming
         // one is not known yet, so the handle gets the conservative answer
@@ -2734,6 +2869,11 @@ impl Worker {
         ) {
             return;
         }
+        // §6.2 step 4: a pause cancels any pending reconnect attempt and
+        // clears the outage. Cancelling it is the state change alone - the
+        // loop only attempts while `Reconnecting` - and clearing it is what
+        // gives the next Play a fresh budget rather than a spent one.
+        self.outage = None;
         // No transport will remain for a thaw to release, and
         // `WaitService::park` answers `true` with none — so both the flag and
         // the level go, or the next thaw announces `Playing` over nothing.
@@ -2776,6 +2916,7 @@ impl Worker {
         ) {
             return;
         }
+        self.outage = None;
         self.capture_and_teardown();
         // §9: "retire fetch, wake reads, discard transport and remote
         // decoder; keep identity/source/position". `capture_and_teardown`

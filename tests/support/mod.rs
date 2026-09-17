@@ -897,6 +897,35 @@ impl TestEngine {
         }
     }
 
+    /// `await_event` with the device clock running, for an event that only
+    /// arrives once buffered audio has been played out.
+    ///
+    /// A disconnect reaches the decoder only when it next reads, and with the
+    /// clock frozen the ring stays full so it never does - the same reason
+    /// `play_until_terminal` above drives the clock rather than leaving it
+    /// frozen. Anything a *disconnect* causes is awaited through here;
+    /// anything a *command* causes is awaited with plain `await_event`.
+    ///
+    /// Closes behind the same command round trip `play_for` does, and for the
+    /// same reason. This mode does not pace the clock against the playback it
+    /// drives: while the consumer keeps up, `pump_audio` never sees a full
+    /// ring and so never returns, and the worker publishes no new position
+    /// for as long as that lasts. An event emitted the moment it finally does
+    /// return therefore arrives *before* the pass that accounts for
+    /// everything played since - so a test reading the position straight off
+    /// this event would read one from seconds of playback ago. The barrier
+    /// makes the position this returns behind the event that caused it.
+    pub fn play_until_event(
+        &mut self,
+        predicate: impl Fn(&PlaybackEvent) -> bool,
+    ) -> PlaybackEvent {
+        self.set_mode(ADVANCING);
+        let event = self.await_event(predicate);
+        self.set_mode(FROZEN);
+        self.settle();
+        event
+    }
+
     pub fn stop_draining_events(&mut self) {
         self.draining.store(false, Ordering::Relaxed);
     }
