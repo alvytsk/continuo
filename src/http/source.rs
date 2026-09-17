@@ -90,9 +90,53 @@ impl OpeningLimits {
     }
 }
 
+/// Which of the two bounds a wait's budget was clipped to.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Bound {
+    /// `limits.stall`: the wait's own phase is the one to report.
+    Stall,
+    /// The remainder of the opening deadline, which was shorter than
+    /// `limits.stall`: a wait that exhausts it hit the *opening* deadline,
+    /// whatever phase the wait itself measures.
+    Opening,
+}
+
+/// The wait budget for one blocking operation, and the bound it came from.
+#[derive(Clone, Copy, Debug)]
+struct WaitBudget {
+    budget: Duration,
+    bound: Bound,
+}
+
+impl WaitBudget {
+    /// The failure a wait that ran out of this budget actually reports.
+    ///
+    /// A wait only knows its own phase - `wait_for_headers` reports
+    /// `Headers`, `ByteChannel::read` reports `Stall` - and reports it
+    /// whenever the budget it was handed runs out. When that budget was the
+    /// opening deadline's remainder, the bound that expired was the opening
+    /// deadline, and `Open` is the phase that names it. Before this, which
+    /// phase a trickling server's probe reported depended on where the
+    /// deadline fell inside a byte gap: a read with more of the remainder
+    /// left than its next slice check saw the next byte first, and the
+    /// *following* read's `wait_budget` reported `Open`; one with less
+    /// reported `Stall` from inside the clipped wait (the macOS leg, and
+    /// Linux under load, 2026-09-17). Only the wait's own timeout phase is
+    /// reclassified: a published `Connect` timeout, say, is a fact about
+    /// the fetch, not about this budget.
+    fn exhausted(self, failure: RemoteFailure, own: Phase) -> RemoteFailure {
+        match (self.bound, failure) {
+            (Bound::Opening, RemoteFailure::Timeout { phase }) if phase == own => {
+                RemoteFailure::Timeout { phase: Phase::Open }
+            }
+            (_, failure) => failure,
+        }
+    }
+}
+
 /// The wait budget for one blocking operation: `limits.stall` once opening is
 /// over, or the smaller of `limits.stall` and however much of the opening
-/// deadline remains while it is not.
+/// deadline remains while it is not - tagged with which of the two it was.
 ///
 /// Used identically by the header wait in `open`, every `Read::read` a probe
 /// takes, and every seek's header wait — the three places Ruling 1 names.
@@ -100,12 +144,22 @@ fn wait_budget(
     opening_limits: &OpeningLimits,
     opening_deadline: OpeningDeadline,
     limits: &Limits,
-) -> Result<Duration, RemoteFailure> {
+) -> Result<WaitBudget, RemoteFailure> {
     if !opening_limits.is_opening() {
-        return Ok(limits.stall);
+        return Ok(WaitBudget {
+            budget: limits.stall,
+            bound: Bound::Stall,
+        });
     }
     match opening_deadline.remaining() {
-        Some(remaining) => Ok(remaining.min(limits.stall)),
+        Some(remaining) if remaining < limits.stall => Ok(WaitBudget {
+            budget: remaining,
+            bound: Bound::Opening,
+        }),
+        Some(_) => Ok(WaitBudget {
+            budget: limits.stall,
+            bound: Bound::Stall,
+        }),
         None => Err(RemoteFailure::Timeout { phase: Phase::Open }),
     }
 }
@@ -170,7 +224,11 @@ impl HttpMediaSource {
 
         let outcome = wait_budget(&opening_limits, opening, &limits)
             .map_err(HeaderOutcome::Failed)
-            .and_then(|budget| header_wait.wait(hook.as_ref(), budget));
+            .and_then(|budget| {
+                header_wait
+                    .wait(hook.as_ref(), budget.budget)
+                    .map_err(|outcome| exhausted_headers(budget, outcome))
+            });
 
         let accepted = match outcome {
             Ok(accepted) => accepted,
@@ -308,7 +366,7 @@ impl HttpMediaSource {
         self.consumed
     }
 
-    fn wait_budget(&self) -> Result<Duration, RemoteFailure> {
+    fn wait_budget(&self) -> Result<WaitBudget, RemoteFailure> {
         wait_budget(&self.opening_limits, self.opening_deadline, &self.limits)
     }
 }
@@ -337,7 +395,7 @@ impl std::io::Read for HttpMediaSource {
         let budget = self
             .wait_budget()
             .map_err(|failure| io::Error::other(RemoteIoError(failure)))?;
-        match self.channel.read(out, self.hook.as_ref(), budget) {
+        match self.channel.read(out, self.hook.as_ref(), budget.budget) {
             ReadOutcome::Bytes(n) => {
                 self.consumed = self.consumed.saturating_add(n as u64);
                 self.pos = self.pos.saturating_add(n as u64);
@@ -354,8 +412,22 @@ impl std::io::Read for HttpMediaSource {
                 self.retired = true;
                 Err(io::Error::other(RemoteIoError(RemoteFailure::Cancelled)))
             }
-            ReadOutcome::Failed(failure) => Err(io::Error::other(RemoteIoError(failure))),
+            ReadOutcome::Failed(failure) => Err(io::Error::other(RemoteIoError(
+                budget.exhausted(failure, Phase::Stall),
+            ))),
         }
+    }
+}
+
+/// `WaitBudget::exhausted` for a header wait's outcome: only a `Failed`
+/// timeout of the wait's own `Headers` phase is reclassified; `Retired` and
+/// every other failure pass through untouched.
+fn exhausted_headers(budget: WaitBudget, outcome: HeaderOutcome) -> HeaderOutcome {
+    match outcome {
+        HeaderOutcome::Failed(failure) => {
+            HeaderOutcome::Failed(budget.exhausted(failure, Phase::Headers))
+        }
+        other => other,
     }
 }
 
@@ -429,7 +501,11 @@ impl std::io::Seek for HttpMediaSource {
         let outcome = self
             .wait_budget()
             .map_err(HeaderOutcome::Failed)
-            .and_then(|budget| header_wait.wait(self.hook.as_ref(), budget));
+            .and_then(|budget| {
+                header_wait
+                    .wait(self.hook.as_ref(), budget.budget)
+                    .map_err(|outcome| exhausted_headers(budget, outcome))
+            });
 
         if let Err(failure) = outcome {
             // Every non-success path out of `seek` retires the generation it

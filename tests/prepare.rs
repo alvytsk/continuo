@@ -274,8 +274,18 @@ fn a_slow_trickle_cannot_outlast_the_opening_deadline() {
     // Every individual read stays inside `stall`, so a deadline checked only
     // after probing returns never fires and opening runs indefinitely. The
     // deadline has to be inside each wait, not around all of them.
+    //
+    // A 300 ms gap, not 50: the deadline then always expires *inside* a
+    // read's wait, with the next byte still far off, which is the case that
+    // has to be reported as `Open` rather than as the stall budget the wait
+    // was clipped to. With a 50 ms gap the outcome depended on where the
+    // deadline fell within the gap - a read with more than 40 ms left saw
+    // the next byte before its own budget check and the *following* read
+    // reported `Open`, one with less reported `Stall` - and which of the two
+    // happened was decided by scheduling (the macOS leg, and Linux under
+    // load, 2026-09-17).
     let server = TestServer::start(
-        Script::from_fixture("sine-5s.flac").trickle(1, Duration::from_millis(50)),
+        Script::from_fixture("sine-5s.flac").trickle(1, Duration::from_millis(300)),
     );
     let mut context = context();
     context.limits.open = Duration::from_secs(1);
