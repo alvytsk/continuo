@@ -801,9 +801,11 @@ struct Worker {
     /// once (M7 §7).
     reconnect_policy: Arc<Mutex<ReconnectPolicy>>,
     /// The outage in progress: `Some` from the first retryable failure of an
-    /// established live connection until either sustained playback ends it,
-    /// the budget gives up, or the listener ends the request (pause, stop,
-    /// a replacing load, shutdown). `None` at every other moment.
+    /// established live connection until sustained playback ends it, a
+    /// failure ends the session (every one of them, through `fail_with`), or
+    /// the listener ends the request (pause, stop, a replacing load,
+    /// shutdown). `None` at every other moment - which is what lets each
+    /// outage be judged against a budget of its own.
     outage: Option<Outage>,
     /// A `Send + Sync` mirror of the device's current instant, so
     /// `WaitService` — reachable from inside a decoder read that already
@@ -1246,6 +1248,23 @@ impl Worker {
             // every iteration.
             return;
         }
+        // M7 §7, and the single funnel every failure in this file passes
+        // through (`fail` and `fail_from` both delegate here): a failed
+        // session keeps no outage. Left standing, one would outlive the
+        // session that opened it and be charged against the *next* one - and
+        // since `Outage::failed` judges the budget from `started` before
+        // anything else, a `started` minutes old makes the next disconnect
+        // give up instantly instead of reconnecting. §9's one explicit reopen
+        // out of `Failed` is exactly the path that would inherit it.
+        //
+        // After the guard above rather than before it: nothing can open an
+        // outage on an already-`Failed` session (`source_ended` runs only from
+        // `pump_audio`, which runs only while `Playing`, and
+        // `service_reconnect` acts only in `Playing`/`Reconnecting`), so the
+        // first `fail_with` has already cleared it and a repeat has nothing
+        // left to do. The guard stays a pure early return, which is what its
+        // own comment says it is.
+        self.outage = None;
         self.teardown();
         // §9: the decoder over a remote source is unusable once its fetch is
         // dead - its `MediaSourceStream` sits over a channel nothing will
@@ -2123,7 +2142,6 @@ impl Worker {
         if failure.is_retryable() {
             self.enter_reconnecting(failure);
         } else {
-            self.outage = None;
             self.fail_with(format!("{failure}"), Some(failure));
         }
     }
@@ -2138,10 +2156,7 @@ impl Worker {
         let policy = *lock(&self.reconnect_policy);
         let outage = self.outage.get_or_insert_with(|| Outage::begin(now));
         match outage.failed(now, &policy) {
-            Next::GiveUp => {
-                self.outage = None;
-                self.fail_with(format!("{failure}"), Some(failure));
-            }
+            Next::GiveUp => self.fail_with(format!("{failure}"), Some(failure)),
             Next::AttemptAt(_) => {
                 tracing::info!(reason = %failure, "live source lost; reconnecting");
                 // The output transport stays up so the ring plays out; only
@@ -2194,7 +2209,6 @@ impl Worker {
                                 // not open is never retried against a remote
                                 // budget.
                                 None => {
-                                    self.outage = None;
                                     self.fail_from(other);
                                     return;
                                 }
@@ -2206,7 +2220,6 @@ impl Worker {
                         if failure.is_retryable() {
                             self.enter_reconnecting(failure);
                         } else {
-                            self.outage = None;
                             self.fail_with(format!("{failure}"), Some(failure));
                         }
                     }

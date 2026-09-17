@@ -348,3 +348,52 @@ fn sustained_playback_ends_the_outage_so_a_later_drop_gets_a_fresh_budget() {
     engine.finish();
     server.shutdown();
 }
+
+#[test]
+fn a_failure_during_an_outage_leaves_no_budget_behind_for_the_next_one() {
+    // Connections 1 and 2 are cut; 3 plays on. Connection 2 is the one an
+    // explicit Play opens out of `Failed`.
+    let server = TestServer::start(
+        station()
+            .truncate_body_after(8 * 1024)
+            .then(station().truncate_body_after(8 * 1024))
+            .then(station()),
+    );
+    // A backoff long enough that the engine is still sitting in `Reconnecting`
+    // when the device fault lands, rather than already back on connection 2.
+    let patient = ReconnectPolicy {
+        backoff: [Duration::from_secs(3); 5],
+        budget: Duration::from_millis(300),
+        stable_after: Duration::from_secs(10),
+    };
+    let mut engine = start_with(&server, patient);
+    engine.play_until_event(state(PlaybackState::Reconnecting));
+
+    // A fatal device fault: a failure that is none of the four paths which end
+    // the listener's request, landing while the outage is open.
+    engine.force_fatal_device_fault();
+    engine.await_event(failed);
+
+    // Deliberate wall time, with the clock frozen, past the budget - so an
+    // outage carried over from before would already be spent.
+    std::thread::sleep(Duration::from_millis(400));
+
+    // Brisk again, so the reconnect the second drop deserves does not have to
+    // wait out the patient backoff above.
+    engine.handle().set_reconnect_policy(ReconnectPolicy {
+        backoff: [Duration::from_millis(20); 5],
+        ..patient
+    });
+    // §9's one explicit reopen: connection 2, which then drops in its turn.
+    engine.send(PlaybackCommand::Play);
+    engine.await_event(state(PlaybackState::Playing));
+    engine.play_until_event(state(PlaybackState::Reconnecting));
+    engine.play_until_event(state(PlaybackState::Playing));
+    assert_eq!(
+        engine.count_events(failed),
+        0,
+        "the new outage was judged against a budget the failed session left behind"
+    );
+    engine.finish();
+    server.shutdown();
+}
