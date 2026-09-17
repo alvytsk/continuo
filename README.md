@@ -329,8 +329,6 @@ cargo publish --dry-run --locked
 
 CI runs every gate above on each pull request. The tests run on Linux, and on macOS as a non-blocking leg. Releases are listed in the [changelog](https://github.com/alvytsk/tenuto/blob/main/CHANGELOG.md).
 
-Milestones 0 through 6 are implemented and the automated suites pass. The manual terminal checks for the player and for feed management have not been run yet. [docs/m5-acceptance.md](https://github.com/alvytsk/tenuto/blob/main/docs/m5-acceptance.md) and [docs/m6-acceptance.md](https://github.com/alvytsk/tenuto/blob/main/docs/m6-acceptance.md) record them.
-
 Dependency versions are recorded in the committed `Cargo.lock`. Runtime code forbids unsafe code and denies `unwrap` and `expect`. Tests may use them for assertions and fixtures. `TENUTO_AUDIO_OUTPUT=null` runs the player against a paced virtual output on a machine with no sound device. It is a test switch, not user configuration.
 
-Read the [architecture](https://github.com/alvytsk/tenuto/blob/main/docs/architecture.md) for the C4 views, the execution contexts and the contracts. The design specs live under [docs/superpowers/specs/](https://github.com/alvytsk/tenuto/tree/main/docs/superpowers/specs), starting with the [foundation spec](https://github.com/alvytsk/tenuto/blob/main/docs/superpowers/specs/2026-09-07-tenuto-foundation-design.md). Known limitations: non-UTF-8 local paths are unsupported, position is an estimate when device latency is unavailable, and seek support may stay unknown until probed.
+Read the [architecture](https://github.com/alvytsk/tenuto/blob/main/docs/architecture.md) for the C4 views, the execution contexts and the contracts. Known limitations: non-UTF-8 local paths are unsupported, position is an estimate when device latency is unavailable, and seek support may stay unknown until probed.
