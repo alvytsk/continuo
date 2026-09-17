@@ -21,7 +21,7 @@
 //! still take the fatal path" (§12). A panic anywhere here - the FFT
 //! included - unwinds and ends this thread, and in the terminal player the
 //! §11 panic hook fails the application. The engine's own shutdown still
-//! completes: [`SpectrumThread::stop`] only sets a flag, sends on a channel
+//! completes: `SpectrumThread::stop` only sets a flag, sends on a channel
 //! whose failure is ignored, and joins a thread that has already exited,
 //! logging the panic rather than propagating it. A dead thread's control
 //! channel is disconnected, so later attaches and wakes are dropped, and its

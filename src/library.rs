@@ -13,7 +13,7 @@
 //!
 //! Task 12 adds the two mutating functions, [`subscribe`] and
 //! [`unsubscribe`]. Both call [`SubscriptionStore::load`] through the
-//! private [`load_mutating`] helper, which narrows `load`'s outcomes down to
+//! private `load_mutating` helper, which narrows `load`'s outcomes down to
 //! the two safe ones — `Loaded` and `Missing`, both writable — and turns
 //! every other [`crate::persistence::store::LoadReason`] into a visible
 //! [`FeedError::SubscriptionsUnreadable`] rather than mutating on top of a
@@ -868,9 +868,9 @@ async fn refresh_one(
 }
 
 /// `continuo refresh <slug>` (§6.1, §6.6). Loads the subscription snapshot
-/// once, resolves `slug` to its index — reusing [`find_subscription`] for
+/// once, resolves `slug` to its index — reusing `find_subscription` for
 /// the same `UnknownSlug` presentation every other single-feed lookup in
-/// this file uses — and returns [`refresh_one`]'s outcome for it.
+/// this file uses — and returns `refresh_one`'s outcome for it.
 pub async fn refresh(
     http: &HttpService,
     subs: &SubscriptionStore,

@@ -50,7 +50,7 @@ pub struct PersistedCheckpoint {
 /// The accessors below are the whole surface.
 ///
 /// `next_seq` is derived, never stored (§10). Deserialization goes through
-/// [`RawState`] so that deriving it is the only way to build one from a file:
+/// `RawState` so that deriving it is the only way to build one from a file:
 /// a `#[serde(skip)]` field would arrive as `0` and hand every caller a
 /// sequence that regresses.
 #[derive(Clone, Debug)]
@@ -174,7 +174,7 @@ impl PersistedState {
     }
 
     /// Read-only from outside `persistence`: the only path that can change the
-    /// version a snapshot carries is [`Self::migrate_to_current_schema`],
+    /// version a snapshot carries is `Self::migrate_to_current_schema`,
     /// visible solely to the store's own load path, and the store asserts
     /// [`SCHEMA_VERSION`] again before it writes.
     pub fn schema_version(&self) -> u32 {

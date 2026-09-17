@@ -1,7 +1,7 @@
 //! The browser overlay (design doc M5 §8): tabs, where the list is, the list
 //! itself and a key hint, in one bordered box over the player. Every name
 //! read from the filesystem or a feed goes through
-//! [`displayable`](crate::commands::displayable) before it is drawn.
+//! [`displayable`] before it is drawn.
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Rect};

@@ -2,7 +2,7 @@
 //! the clickable parts landed (design doc M5 §7). Every string it prints was
 //! already made safe by the view; the renderer only adds fixed labels and
 //! formatted times, except the browser overlay, which makes its own
-//! filesystem and feed names safe (see [`browser`]).
+//! filesystem and feed names safe (see `browser`).
 
 mod browser;
 

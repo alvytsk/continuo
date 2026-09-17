@@ -63,7 +63,7 @@ const ANSWERED_QUERY_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Asks the terminal on stdio which image protocol it supports. A terminal
 /// that answers nothing within `timeout` gets `None` at once; one that
-/// answered has [`ANSWERED_QUERY_TIMEOUT`] to answer the full query. `None`
+/// answered has `ANSWERED_QUERY_TIMEOUT` to answer the full query. `None`
 /// too when the query failed; a picker built without any reported
 /// capability is a guess, not a detection, and counts as no answer.
 ///
@@ -74,10 +74,10 @@ const ANSWERED_QUERY_TIMEOUT: Duration = Duration::from_secs(2);
 /// report, the thread would swallow every later key for the rest of the run,
 /// and a thread that did finish after teardown would restore its raw-mode
 /// terminal settings. So the query goes only to a terminal that has just
-/// answered a status report ([`terminal_answers`]), and it gets a timeout far
+/// answered a status report (`terminal_answers`), and it gets a timeout far
 /// beyond that answer's delay, so its thread has read the final report
 /// before this returns. The remaining risk is a terminal that answers the
-/// probe but then takes longer than [`ANSWERED_QUERY_TIMEOUT`] between two
+/// probe but then takes longer than `ANSWERED_QUERY_TIMEOUT` between two
 /// chunks of the query's answer, or drops the query's own status report.
 pub fn query_terminal(timeout: Duration) -> Option<Picker> {
     if !terminal_answers(timeout) {
