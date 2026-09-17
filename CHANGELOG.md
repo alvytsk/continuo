@@ -7,7 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-09-17
+
+### Fixed
+
+- Opening a slow remote source could report "the server went quiet" as a
+  stall when it was the opening deadline that had run out: a wait whose
+  budget had been clipped to the remaining opening time reported its own
+  phase on expiry. Such a timeout now reports the opening phase.
+
+### Internal
+
+- Three playback tests no longer depend on how fast the machine runs them:
+  the retry against a truncated server drives its virtual clock until the
+  engine settles rather than for a fixed span, the opening-deadline test
+  makes the deadline expire mid-read every time, and the seek-servicing
+  test no longer lets its throttled server starve the open.
+- CI runs every test binary even after one fails, so a red job shows all
+  of its failures rather than the first binary's only.
+
 ## [0.1.1] - 2026-09-17
+
+Not published to crates.io; its fix ships in 0.1.2.
 
 ### Fixed
 
@@ -33,6 +54,7 @@ First release. Published to crates.io as `tenuto`.
 - Feed management from the player: subscribe, refresh and unsubscribe.
 - A bare `tenuto` opens the player.
 
-[Unreleased]: https://github.com/alvytsk/tenuto/compare/v0.1.1...HEAD
-[0.1.1]: https://github.com/alvytsk/tenuto/compare/2167690b3e89979eb61b05b3b3b9af6f69057eb2...v0.1.1
+[Unreleased]: https://github.com/alvytsk/tenuto/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/alvytsk/tenuto/compare/29da62c...v0.1.2
+[0.1.1]: https://github.com/alvytsk/tenuto/compare/2167690b3e89979eb61b05b3b3b9af6f69057eb2...29da62c
 [0.1.0]: https://github.com/alvytsk/tenuto/commit/2167690b3e89979eb61b05b3b3b9af6f69057eb2
