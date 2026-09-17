@@ -588,6 +588,7 @@ impl PlayerRuntime {
                     | PlaybackState::Loading
                     | PlaybackState::Playing
                     | PlaybackState::Paused
+                    | PlaybackState::Reconnecting
                     | PlaybackState::Stopped
             )
         );
@@ -598,7 +599,9 @@ impl PlayerRuntime {
             None => PlaybackPhase::Unloaded,
             Some(PlaybackState::Ended) => PlaybackPhase::Ended,
             Some(PlaybackState::Paused) => PlaybackPhase::Paused,
-            Some(PlaybackState::Playing) => PlaybackPhase::Playing,
+            // A reconnecting station is still the playing transport as far as
+            // the transport rules are concerned (M7 §5); Task 11 refines it.
+            Some(PlaybackState::Playing | PlaybackState::Reconnecting) => PlaybackPhase::Playing,
             Some(PlaybackState::Stopped | PlaybackState::Failed) => PlaybackPhase::Stopped,
             Some(PlaybackState::Idle | PlaybackState::Loading) => PlaybackPhase::Loading,
         }

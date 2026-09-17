@@ -1931,6 +1931,10 @@ impl Worker {
         // this call is about to emit must not land ahead of a `Paused` the
         // hook announced earlier in the very same pass.
         self.drain_outbox();
+        // M7 §3.3: a station has no end.
+        if self.is_indefinite() {
+            return;
+        }
         if self.state != PlaybackState::Playing || !self.decoder_drained {
             return;
         }
@@ -2058,7 +2062,7 @@ impl Worker {
             }
             PlaybackCommand::Pause => self.pause(),
             PlaybackCommand::TogglePause => match self.state {
-                PlaybackState::Playing => self.pause(),
+                PlaybackState::Playing | PlaybackState::Reconnecting => self.pause(),
                 _ => self.play(),
             },
             PlaybackCommand::SeekTo(target) => self.seek_to(target),
@@ -2158,6 +2162,18 @@ impl Worker {
         };
         let mut decoded = prepared.source;
         self.set_capabilities(prepared.capabilities);
+
+        // M7 §5: a station starts where its connection joined, which is zero
+        // by definition. Decided before the match below rather than inside
+        // it, so a stale candidate carried into a station load can never be
+        // announced as `ResumeUnavailable` - there is no position it was
+        // denied, only one that never applied.
+        let resume = if self.is_indefinite() {
+            self.position = Duration::ZERO;
+            ResumeIntent::StartAt(Duration::ZERO)
+        } else {
+            resume
+        };
 
         // A `Candidate` is decided now, against the duration this decoder just
         // reported - the same rule `decide_resume` applies wherever a
@@ -2304,7 +2320,10 @@ impl Worker {
 
     fn play(&mut self) {
         match self.state {
-            PlaybackState::Playing => {}
+            // `Reconnecting` alongside `Playing`: playback is already what
+            // the listener asked for, the transport is simply waiting on the
+            // station (M7 §5).
+            PlaybackState::Playing | PlaybackState::Reconnecting => {}
             // Play from Ended never restarts implicitly: the application has
             // to say `Restart`, so that "play" cannot silently lose the fact
             // that the track finished.
@@ -2775,6 +2794,12 @@ impl Worker {
     }
 
     fn restart(&mut self) {
+        // M7 §5.1: before `ensure_source_open`. The reopened-source branch
+        // below would zero listening time and report a restart.
+        if self.is_indefinite() {
+            self.reject_seek("a live stream cannot restart".into());
+            return;
+        }
         let reopened = match self.ensure_source_open() {
             Ok(reopened) => reopened,
             // IMPORTANT 1 (final review): same rule as `restore`'s arm above
@@ -2987,7 +3012,6 @@ impl Worker {
         );
     }
 
-    #[allow(dead_code)] // used from Task 6 (M7)
     fn is_indefinite(&self) -> bool {
         self.capabilities.continuity == Continuity::Indefinite
     }

@@ -34,6 +34,7 @@ use url::Url;
 
 use tenuto::http::limits::Limits;
 use tenuto::http::service::HttpService;
+use tenuto::media::capabilities::MediaCapabilities;
 use tenuto::media::id::{AbsolutePath, MediaId, NormalizedUrl};
 use tenuto::media::source::SourceLocation;
 use tenuto::playback::callback::CallbackCore;
@@ -211,6 +212,7 @@ impl Driver {
 pub struct Loaded {
     pub position: Duration,
     pub disposition: StartDisposition,
+    pub capabilities: MediaCapabilities,
 }
 
 /// Where a `SeekCompleted` landed, and its provenance (§3), from
@@ -934,6 +936,7 @@ impl TestEngine {
         let PlaybackEvent::Loaded {
             position,
             disposition,
+            capabilities,
             ..
         } = event
         else {
@@ -942,6 +945,7 @@ impl TestEngine {
         Loaded {
             position,
             disposition,
+            capabilities,
         }
     }
 
