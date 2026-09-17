@@ -16,3 +16,6 @@
 
 # Local visual brainstorming sessions
 .superpowers/
+
+# Claude Code worktrees
+.claude/worktrees/
