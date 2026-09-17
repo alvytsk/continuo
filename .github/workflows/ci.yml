@@ -90,7 +90,9 @@ jobs:
           # cargo package writes one. --no-verify skips a second
           # verification build, which the dry run above already did.
           cargo package --locked --no-verify
-          crate=target/package/tenuto-0.1.0.crate
+          version=$(cargo metadata --no-deps --format-version 1 \
+            | python3 -c "import json,sys; print(next(p['version'] for p in json.load(sys.stdin)['packages'] if p['name'] == 'tenuto'))")
+          crate=target/package/tenuto-$version.crate
           test -f "$crate" || { echo "no .crate at $crate"; exit 1; }
           size=$(stat -c%s "$crate")
           echo "$crate is $size bytes"
