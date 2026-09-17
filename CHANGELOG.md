@@ -16,6 +16,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   budget had been clipped to the remaining opening time reported its own
   phase on expiry. Such a timeout now reports the opening phase.
 
+### Internal
+
+- Three playback tests no longer depend on how fast the machine runs them:
+  the retry against a truncated server drives its virtual clock until the
+  engine settles rather than for a fixed span, the opening-deadline test
+  makes the deadline expire mid-read every time, and the seek-servicing
+  test no longer lets its throttled server starve the open.
+- CI runs every test binary even after one fails, so a red job shows all
+  of its failures rather than the first binary's only.
+
 ## [0.1.1] - 2026-09-17
 
 Not published to crates.io; its fix ships in 0.1.2.
