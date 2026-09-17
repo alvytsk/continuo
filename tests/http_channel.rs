@@ -630,3 +630,53 @@ fn a_header_wait_deadline_that_elapses_fails_rather_than_hanging() {
         }))
     );
 }
+
+#[test]
+fn a_targeted_retirement_ignores_a_generation_begin_has_moved_past() {
+    // `EngineHandle::submit_seek` retires the fetch that was live when it
+    // enqueued the seek, so a worker blocked in a read wakes to service the
+    // command. It reads that generation *before* the send and the worker may
+    // dispatch the seek - and `begin()` the seek's own generation - before
+    // the retirement lands. Aimed at the generation it observed, a late
+    // retirement is a no-op; aimed at "whatever is current" it cancels the
+    // very seek it was published for.
+    let interrupt = SourceInterrupt::new(CAPACITY);
+    let observed = interrupt.begin();
+    let seeks_own = interrupt.begin();
+
+    assert!(
+        !interrupt.retire_generation(observed),
+        "a retirement aimed at a superseded generation must report doing nothing"
+    );
+    assert!(interrupt.is_current(seeks_own));
+    assert!(!interrupt.is_retired());
+    assert_eq!(interrupt.generation(), seeks_own);
+}
+
+#[test]
+fn a_targeted_retirement_of_the_live_generation_wakes_a_blocked_read() {
+    // The case the targeting must not weaken: the observed generation is
+    // still the live one, so the retirement has to land exactly as an
+    // untargeted `retire` would, and reach a reader blocked inside it.
+    let interrupt = SourceInterrupt::new(CAPACITY);
+    let channel = ByteChannel::new(Arc::clone(&interrupt));
+    let live = interrupt.begin();
+
+    let reader = {
+        let channel = channel.clone();
+        std::thread::spawn(move || channel.read(&mut [0u8; 16], &NoHook, STALL))
+    };
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(interrupt.retire_generation(live));
+    assert!(interrupt.is_retired());
+    assert!(!interrupt.is_current(live));
+
+    match reader.join() {
+        Ok(outcome) => assert_eq!(outcome, ReadOutcome::Retired),
+        Err(_) => panic!("the reader thread panicked"),
+    }
+    assert!(
+        !interrupt.retire_generation(live),
+        "an already-retired generation is not retired twice"
+    );
+}

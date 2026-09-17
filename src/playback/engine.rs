@@ -380,12 +380,25 @@ impl EngineHandle {
     /// `SeekTo(target)`, published to the source interrupt only after the
     /// queue accepts it (§8): a seek refused admission must not retire a
     /// fetch it never got to replace.
+    ///
+    /// The retirement is aimed at the generation that was live *before* the
+    /// send, never at whatever is current afterwards. Between the send and
+    /// the retirement this thread can be preempted, and the worker - woken
+    /// by the send itself - can dispatch the seek and `begin()` the seek's
+    /// own generation in that gap; an unaimed retirement landing then kills
+    /// the reopen or trial the seek just opened and misreports the seek as
+    /// cancelled (CI on main, 2026-09-17, three different tests, all
+    /// `SeekCancelled` with no stop in sight). A superseded generation means
+    /// the worker is no longer blocked in anything this had to wake, so the
+    /// aimed retirement doing nothing is the correct outcome, not a missed
+    /// one.
     pub fn submit_seek(&self, target: Duration) -> Admission {
+        let generation = self.source_interrupt.generation();
         let admission = self.try_send(PlaybackCommand::SeekTo(target));
         if admission != Admission::Accepted {
             return admission;
         }
-        self.source_interrupt.retire();
+        self.source_interrupt.retire_generation(generation);
         self.interrupt.fetch_or(SEEK, Ordering::Release);
         let _ = self.wake.try_send(());
         admission

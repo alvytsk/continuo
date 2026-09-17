@@ -8,7 +8,7 @@ mod support;
 use std::time::{Duration, Instant};
 
 use tenuto::media::capabilities::SeekSupport;
-use tenuto::playback::command::Admission;
+use tenuto::playback::command::{Admission, PlaybackCommand};
 use tenuto::playback::event::PlaybackEvent;
 use tenuto::playback::state::PlaybackState;
 
@@ -1063,6 +1063,63 @@ fn a_short_forward_seek_on_a_no_index_mp3_lands_quickly_without_rescanning() {
         landed.is_some(),
         "a 300ms forward seek from byte {seek_byte} (near byte \
          {proportional_estimate} expected) did not land within 2s. {diagnosis}"
+    );
+
+    engine.finish();
+    server.shutdown();
+}
+
+#[test]
+fn a_seek_submitters_late_retirement_does_not_cancel_the_seek_it_enqueued() {
+    // CI on main, 2026-09-17: `a_capability_change_carries_the_current_
+    // session_rev` and two `estimated_seek.rs` tests failed on the shared
+    // runner with a `SeekCancelled` nothing had asked for. `submit_seek`
+    // enqueues `SeekTo` and then retires the source interrupt so a worker
+    // blocked in a remote read wakes to service it. Preempted for a
+    // millisecond between the two, the submitter's retirement landed after
+    // the worker had already dispatched the seek and `begin()`-ed its own
+    // fetch generation for it - killing the reopen or trial in flight and
+    // misreporting the seek as cancelled.
+    //
+    // The two halves of `submit_seek` are replayed here by hand with the
+    // preemption made total: the queue half goes first, the worker is given
+    // until it has opened a generation of its own, and only then does the
+    // retirement half land. Aimed at the generation that was live at the
+    // send, it must find nothing to retire.
+    let server = TestServer::start(Script::from_fixture("sine-5s.flac"));
+    let mut engine = TestEngine::start_idle();
+    engine.load_remote(&server.url("/audio.flac"));
+    assert_eq!(engine.handle().submit_play(), Admission::Accepted);
+    engine.await_state(PlaybackState::Playing);
+    engine.play_for(Duration::from_millis(100));
+    engine.handle().submit_stop();
+    engine.await_state(PlaybackState::Stopped);
+
+    let interrupt = engine.handle().source_interrupt();
+    let observed = interrupt.generation();
+    engine.send(PlaybackCommand::SeekTo(Duration::from_secs(2)));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while interrupt.generation() == observed {
+        assert!(
+            Instant::now() < deadline,
+            "the worker never opened a generation of its own for the seek"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(
+        !interrupt.retire_generation(observed),
+        "a retirement aimed at the pre-seek generation must not touch the seek's own"
+    );
+
+    let event = engine.await_event(|e| {
+        matches!(
+            e,
+            PlaybackEvent::SeekTargetStored { .. } | PlaybackEvent::SeekCancelled { .. }
+        )
+    });
+    assert!(
+        matches!(event, PlaybackEvent::SeekTargetStored { .. }),
+        "the seek was cancelled by its own submitter's retirement: {event:?}"
     );
 
     engine.finish();

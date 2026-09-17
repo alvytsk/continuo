@@ -146,13 +146,44 @@ impl SourceInterrupt {
     pub fn retire(&self) {
         {
             let mut state = lock(&self.state);
-            state.bytes.clear();
-            state.outcome = None;
-            state.headers = None;
-            state.retired = true;
-            state.generation += 1;
+            Self::retire_locked(&mut state);
         }
         self.wake_all();
+    }
+
+    /// `retire`, aimed at one generation: ends `generation` only if it is
+    /// still the live one, and reports whether it did.
+    ///
+    /// For a caller that publishes a retirement out of band from the command
+    /// queue and cannot know what the worker has done since - `EngineHandle::
+    /// submit_seek` reads the live generation, enqueues `SeekTo`, and only
+    /// then retires, so a worker blocked in a remote read wakes to service
+    /// the command. Preempted between the send and the retirement, it can
+    /// land after the worker has already dispatched the seek and `begin`-ed
+    /// the seek's own generation; an unaimed `retire` there cancels the very
+    /// seek it was published for (CI on main, 2026-09-17: `SeekCancelled`
+    /// nothing had asked for). Aimed at the generation observed before the
+    /// send, the late retirement finds it superseded and does nothing, which
+    /// is exactly right: the worker is no longer blocked in anything that
+    /// needs waking.
+    pub fn retire_generation(&self, generation: u64) -> bool {
+        {
+            let mut state = lock(&self.state);
+            if state.generation != generation || state.retired {
+                return false;
+            }
+            Self::retire_locked(&mut state);
+        }
+        self.wake_all();
+        true
+    }
+
+    fn retire_locked(state: &mut State) {
+        state.bytes.clear();
+        state.outcome = None;
+        state.headers = None;
+        state.retired = true;
+        state.generation += 1;
     }
 
     /// Open a new generation: bump the counter, clear the retirement, and
