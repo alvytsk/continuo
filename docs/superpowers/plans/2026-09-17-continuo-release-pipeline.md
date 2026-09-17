@@ -36,17 +36,25 @@ Renames the package for crates.io, adds every field publishing requires, and mak
 - Consumes: nothing.
 - Produces: a packageable crate named `continuo-player` whose lib and bin targets are both `continuo`. Task 3's `package` job and Task 5's release job both run `cargo publish` against this.
 
-- [ ] **Step 1: Run the packaging check to see it fail**
+- [ ] **Step 1: Run the packaging check to see the package blow the size cap**
 
-Run: `cargo publish --dry-run --locked`
+Run: `cargo publish --dry-run --locked && ls -l target/package/*.crate`
 
-Expected: FAIL. Cargo reports the missing manifest fields, along the lines of:
+Expected: the command **exits 0** — missing metadata is only a warning in this cargo version, not an error — but two things are wrong, and the size is the one that fails a check:
 
 ```
-error: failed to verify package tarball
-Caused by: missing or empty metadata fields: description, license.
-Please fill in the fields or disable publishing by setting `publish = false`.
+warning: crate continuo@0.1.0 already exists on crates.io index
+warning: manifest has no description, license, license-file, documentation, homepage or repository
+    Packaged 257 files, 20.2MiB (13.9MiB compressed)
 ```
+
+The `.crate` file is about 13.9 MiB against the crates.io cap of 10 MB. Confirm the failing assertion directly:
+
+Run: `test "$(stat -c%s target/package/continuo-0.1.0.crate)" -lt 10485760; echo "under cap: $?"`
+
+Expected: prints `under cap: 1` — the check fails. That is this task's red state. Step 6 turns it green.
+
+Do not expect an error about the missing fields; you will not get one. The metadata still has to be added, because crates.io rejects an upload without `description` and `license` even though the local dry run tolerates their absence.
 
 - [ ] **Step 2: Rewrite the `[package]` block and add the target names**
 
@@ -115,15 +123,19 @@ Expected: succeeds, and `git diff --stat Cargo.lock` shows the `continuo` root p
 
 - [ ] **Step 5: Run the packaging check to verify it passes**
 
-Run: `cargo publish --dry-run --locked`
+Run: `cargo publish --dry-run --locked --allow-dirty`
 
-Expected: PASS, ending with `Packaged N files, X MiB`.
+`--allow-dirty` is required: `cargo publish` refuses a working tree with uncommitted changes, and yours has them until Step 9. The CI job added in Task 3 runs on a clean checkout and deliberately does **not** pass this flag.
 
-- [ ] **Step 6: Verify the package clears the 10 MB cap**
+Expected: PASS, ending with `Packaged N files, X MiB`, and the metadata warning from Step 1 is gone.
 
-Run: `ls -lh target/package/continuo-player-0.1.0.crate`
+- [ ] **Step 6: Verify the package now clears the 10 MB cap**
 
-Expected: well under 10 MB (roughly 1-2 MB). If it is over, `exclude` is wrong — confirm `/tests` and `/docs` are both listed.
+Run: `test "$(stat -c%s target/package/continuo-player-0.1.0.crate)" -lt 10485760; echo "under cap: $?"`
+
+Expected: prints `under cap: 0` — the assertion that failed in Step 1 now passes. Run `ls -lh target/package/continuo-player-0.1.0.crate` to see the figure; it should be roughly 1-2 MB, down from 13.9 MiB.
+
+If it is still over, `exclude` is wrong — confirm `/tests` and `/docs` are both listed.
 
 - [ ] **Step 7: Verify the binary is still named `continuo`**
 
@@ -457,8 +469,10 @@ cargo fmt --check
 cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo test --locked
 RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps
-cargo publish --dry-run --locked
+cargo publish --dry-run --locked --allow-dirty
 ```
+
+The last one needs `--allow-dirty` only because `ci.yml` is uncommitted while you run it locally. The job in the workflow runs on a clean checkout and must not carry the flag.
 
 Expected: all five PASS. `cargo doc` with `-D warnings` is the one most likely to fail first, on a broken intra-doc link; fix any it reports.
 
@@ -485,10 +499,12 @@ costs a version number that can never be reused. Adds rust-cache."
 - [ ] **Step 5: Push and read the macOS result**
 
 ```bash
-git push -u origin feat/release-pipeline
+git push -u origin feat/release-pipeline-impl
 ```
 
-Then watch the run: `gh run watch` (or `gh run list --branch feat/release-pipeline`).
+Then watch the run: `gh run watch` (or `gh run list --branch feat/release-pipeline-impl`).
+
+If the push is refused by a permission gate, stop and report it — do not try to work around it. Pushing is the controller's call, not yours.
 
 Expected: all jobs pass. **If the macOS leg fails, stop and report it rather than working around it.** Nothing in the dependency set is known to be Linux-only, but no macOS build has ever been attempted, so a failure here is new information. Note that `tests/cli.rs`, `tests/m4_cli.rs` and `tests/m5_tui_process.rs` all carry `#![cfg(target_os = "linux")]`, so a macOS failure is a compile or a runtime failure elsewhere, most likely in the CPAL or CoreAudio path. Per the spec's §11, the fallback if it cannot be fixed cheaply is to drop macOS from the matrix and say so in the README — that is a decision to bring back, not to take alone.
 
@@ -802,9 +818,11 @@ Expected: prints `none remain`.
 Run:
 
 ```bash
-cargo publish --dry-run --locked
+cargo publish --dry-run --locked --allow-dirty
 tar -xzOf target/package/continuo-player-0.1.0.crate continuo-player-0.1.0/README.md | head -20
 ```
+
+`--allow-dirty` is needed because the README edits are not committed until Step 8.
 
 Expected: the extracted README shows the new install section and the absolute image URL.
 
@@ -826,7 +844,7 @@ broken on crates.io. Adds a changelog with the 0.1.0 entry."
 
 These steps are the maintainer's, not an implementer's, and are deliberately manual. They follow the spec's §7.
 
-1. Merge `feat/release-pipeline`; confirm the `package` job is green on `main`.
+1. Merge `feat/release-pipeline-impl` (it contains the spec and plan commits too); confirm the `package` job is green on `main`.
 2. `cargo publish --locked` from a local checkout of `main`, using a personal crates.io token. This is the first publish and is irreversible — a version can be yanked but never reused, and never re-uploaded.
 3. Configure the trusted publisher on crates.io for `continuo-player`: repository `alvytsk/continuo`, workflow `release.yml`.
 4. Run `release.yml` once through `workflow_dispatch` to prove the token-minting path against a dry run.
