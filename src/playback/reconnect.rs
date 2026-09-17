@@ -113,6 +113,15 @@ mod tests {
     }
 
     #[test]
+    fn an_attempt_is_due_at_its_scheduled_instant_and_not_a_moment_before() {
+        let t0 = Instant::now();
+        let mut outage = Outage::begin(t0);
+        outage.failed(t0, &policy());
+        assert!(!outage.due(t0 + Duration::from_millis(999)));
+        assert!(outage.due(t0 + Duration::from_secs(1)));
+    }
+
+    #[test]
     fn short_connections_stay_one_outage_and_thirty_played_seconds_end_it() {
         let t0 = Instant::now();
         let mut outage = Outage::begin(t0);
