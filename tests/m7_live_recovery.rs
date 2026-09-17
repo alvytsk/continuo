@@ -149,6 +149,71 @@ fn pause_wakes_a_stalled_live_read_and_thaw_announces_nothing() {
 }
 
 #[test]
+fn a_stop_during_a_fresh_opens_priming_is_a_cancellation_not_a_lost_stream() {
+    // The second connection probes fine and then stops feeding, so the fresh
+    // open parks inside `pump_audio`'s priming read rather than racing through
+    // it. That is the one window in which a Stop lands on a source that is
+    // opened but not yet adopted.
+    let server = TestServer::start(station().then(station().stall_body_after(2 * 1024)));
+    let mut engine = TestEngine::start_idle();
+    // Long enough that the stall timer is never what ends the priming read:
+    // what is being proven is how a Stop is classified, not a timeout.
+    let request = engine.load_remote_with_limits(
+        &server.url("/radio"),
+        Limits {
+            stall: Duration::from_secs(5),
+            ..Limits::brisk()
+        },
+    );
+    engine.await_event(paused);
+    engine.send(PlaybackCommand::PlayLoaded { request });
+    engine.await_event(playing);
+    engine.play_for(Duration::from_millis(300));
+
+    engine.handle().submit_pause();
+    engine.await_event(paused);
+    let kept = engine.handle().progress().position;
+
+    engine.handle().submit_play();
+    assert!(
+        server.wait_until_stalled(Duration::from_secs(2)),
+        "the second connection never stopped feeding"
+    );
+    // Real time for the worker to finish probing and reach the priming read it
+    // cannot complete. Nothing is asked of the worker here, because it is
+    // exactly the thing that is meant to be stuck.
+    engine.let_time_pass_while_unresponsive(Duration::from_secs(1));
+
+    // The window this test exists for: the fresh open must still be inside
+    // priming. If it ever completes here, the `Playing` it announces makes the
+    // assertions below vacuous, so the window is asserted rather than assumed.
+    assert_eq!(
+        engine.count_events(playing),
+        0,
+        "the fresh open finished; the stop no longer lands during priming"
+    );
+    engine.interrupt_stop();
+    engine.await_event(|event| {
+        matches!(
+            event,
+            PlaybackEvent::StateChanged {
+                state: PlaybackState::Stopped,
+                ..
+            }
+        )
+    });
+    assert_eq!(
+        engine.count_events(|event| matches!(event, PlaybackEvent::Failed { .. })),
+        0,
+        "a stop during priming was reported as a dead stream"
+    );
+    assert_eq!(engine.handle().progress().position, kept);
+    engine.finish();
+    server.release();
+    server.shutdown();
+}
+
+#[test]
 fn stop_then_play_reopens_without_a_seek() {
     let server = TestServer::start(station());
     let mut engine = start(&server);

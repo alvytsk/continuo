@@ -1640,6 +1640,24 @@ impl Worker {
         self.attempt_failure = None;
         let opened = self.open_transport(false);
         self.attempting = false;
+        // 7, hoisted ahead of every other classification: a stop or a
+        // shutdown retires the priming read, and `pump_audio` answers that
+        // through its `is_retired_read` arm - which drops the source and
+        // returns *quietly*, leaving no `attempt_failure` and a `primed` that
+        // reads false precisely because the source is gone. Classified as
+        // anything but a cancellation, that becomes a fabricated
+        // `Failed{LiveEnded}`, and `do_stop`'s own early return on `Failed`
+        // then swallows the stop the listener actually asked for - the same
+        // rule `restore` and `restart` already state at their own cancellation
+        // arms. This subsumes the check that used to sit after the
+        // classification: nothing between here and `announce_playing` blocks,
+        // so one check covers both points, and it also catches a cancelled
+        // `opened` without having to guess which `PlaybackError` shape a
+        // cancelled device open would take.
+        if self.source_interrupt.is_retired() || self.interrupted() {
+            self.abandon_attempt();
+            return Err(PlaybackError::Cancelled);
+        }
         let primed = self.source.is_some() && (self.pushed_total > 0 || !self.staging.is_empty());
         let failure = self.attempt_failure.take();
         if let Err(error) = opened {
@@ -1653,11 +1671,6 @@ impl Worker {
         if !primed {
             self.abandon_attempt();
             return Err(RemoteFailure::LiveEnded.into());
-        }
-        // 7.
-        if self.source_interrupt.is_retired() || self.interrupted() {
-            self.abandon_attempt();
-            return Err(PlaybackError::Cancelled);
         }
         self.start_running();
         self.announce_playing();
