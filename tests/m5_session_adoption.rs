@@ -2,19 +2,19 @@ mod support;
 
 use std::time::Duration;
 
-use continuo::clock::{Clock, FakeClock};
-use continuo::media::capabilities::{Continuity, MediaCapabilities, SeekSupport};
-use continuo::media::id::MediaId;
-use continuo::media::metadata::MediaMetadata;
-use continuo::persistence::model::PersistedState;
-use continuo::playback::command::LoadRequestId;
-use continuo::playback::event::{PlaybackEvent, Progress, StartDisposition};
-use continuo::playback::provenance::PositionProvenance;
-use continuo::playback::state::PlaybackState;
-use continuo::playback::timeline::PositionQuality;
-use continuo::queue::{Direction, DisplayMetadata, NewQueueEntry, QueueEntryId, QueueSource};
-use continuo::session::{Advance, LoadTarget, MAX_PENDING_LOADS, RegisterLoadError, Session};
 use support::media;
+use tenuto::clock::{Clock, FakeClock};
+use tenuto::media::capabilities::{Continuity, MediaCapabilities, SeekSupport};
+use tenuto::media::id::MediaId;
+use tenuto::media::metadata::MediaMetadata;
+use tenuto::persistence::model::PersistedState;
+use tenuto::playback::command::LoadRequestId;
+use tenuto::playback::event::{PlaybackEvent, Progress, StartDisposition};
+use tenuto::playback::provenance::PositionProvenance;
+use tenuto::playback::state::PlaybackState;
+use tenuto::playback::timeline::PositionQuality;
+use tenuto::queue::{Direction, DisplayMetadata, NewQueueEntry, QueueEntryId, QueueSource};
+use tenuto::session::{Advance, LoadTarget, MAX_PENDING_LOADS, RegisterLoadError, Session};
 
 fn entry(name: &str) -> NewQueueEntry {
     let MediaId::LocalFile(path) = media(name) else {
@@ -222,7 +222,7 @@ fn device_recovery_keeps_the_adopted_load_while_another_is_pending() {
     );
     clock.advance(Duration::from_secs(6));
     let action = session.tick(&progress(2, "a", 12, Some(first)), clock.sample());
-    assert!(matches!(action, continuo::session::Action::Submit { .. }));
+    assert!(matches!(action, tenuto::session::Action::Submit { .. }));
     assert_eq!(session.adopted().map(|a| a.request), Some(first));
 }
 
@@ -313,7 +313,7 @@ fn unknown_and_duplicate_outcomes_select_nothing() {
 
 #[test]
 fn an_adoption_snapshot_contains_the_new_media_active_entry_and_metadata() {
-    use continuo::session::Action;
+    use tenuto::session::Action;
     let clock = FakeClock::new();
     let (mut session, ids) = queued(&["a", "b"]);
     let a = session
@@ -352,7 +352,7 @@ fn an_adoption_snapshot_contains_the_new_media_active_entry_and_metadata() {
 
 #[test]
 fn completion_for_a_removed_pending_load_cannot_write_the_previous_history() {
-    use continuo::session::Action;
+    use tenuto::session::Action;
     for provenance in [
         PositionProvenance::Established,
         PositionProvenance::Estimated,
@@ -396,7 +396,7 @@ fn completion_for_a_removed_pending_load_cannot_write_the_previous_history() {
 /// checkpoint appears at all.
 #[test]
 fn reconcile_shutdown_replays_an_invalidated_load_sequence_without_writing_its_history() {
-    use continuo::playback::event::ShutdownReport;
+    use tenuto::playback::event::ShutdownReport;
     for provenance in [
         PositionProvenance::Established,
         PositionProvenance::Estimated,
@@ -438,7 +438,7 @@ fn reconcile_shutdown_replays_an_invalidated_load_sequence_without_writing_its_h
 /// ownership check existed.
 #[test]
 fn a_seek_target_stored_from_a_rejected_revision_writes_nothing() {
-    use continuo::session::Action;
+    use tenuto::session::Action;
     let clock = FakeClock::new();
     let (mut session, ids) = queued(&["a", "b"]);
     let a = session
@@ -535,7 +535,7 @@ fn a_restart_after_completion_lets_the_second_playthrough_complete_and_advance()
 /// `session_policy.rs`.
 #[test]
 fn a_loading_announcement_for_a_registered_load_does_not_raise_a_spurious_pause_force() {
-    use continuo::session::Action;
+    use tenuto::session::Action;
     let clock = FakeClock::new();
     let (mut session, ids) = queued(&["a", "b"]);
     let a = session
@@ -594,7 +594,7 @@ fn a_loading_announcement_for_a_registered_load_does_not_raise_a_spurious_pause_
 /// media must survive it untouched.
 #[test]
 fn a_loading_announcement_for_an_unregistered_token_does_not_break_ownership() {
-    use continuo::session::Action;
+    use tenuto::session::Action;
     let clock = FakeClock::new();
     let (mut session, ids) = queued(&["a"]);
     let first = session

@@ -29,7 +29,7 @@ pub const KEPT_PRIOR_LOGS: usize = 5;
 /// in `persistence::store`.
 const MAX_LOG_CANDIDATES: u32 = 100;
 
-const LOG_PREFIX: &str = "continuo-tui-";
+const LOG_PREFIX: &str = "tenuto-tui-";
 const LOG_SUFFIX: &str = ".log";
 
 /// `<state dir>/logs`, sibling to wherever `state_file` (i.e. `state.json`)
@@ -41,9 +41,9 @@ pub fn log_dir(state_file: &Path) -> PathBuf {
         .join("logs")
 }
 
-/// Deletes the oldest `continuo-tui-*.log` files in `dir` beyond the most
+/// Deletes the oldest `tenuto-tui-*.log` files in `dir` beyond the most
 /// recent `keep`, returning the paths removed. Files that do not match the
-/// `continuo-tui-*.log` pattern (a stray `notes.txt`, say) are never touched.
+/// `tenuto-tui-*.log` pattern (a stray `notes.txt`, say) are never touched.
 ///
 /// Matching names sort ascending by their embedded stamp, which sorts
 /// chronologically since the stamp is a fixed-width `YYYYMMDDTHHMMSSZ`.
@@ -81,7 +81,7 @@ pub fn retain_recent_logs(dir: &Path, keep: usize) -> io::Result<Vec<PathBuf>> {
 
 /// Creates `<state dir>/logs/` under the private-directory policy (0700,
 /// created if missing, tightened if not), retains the five most recent
-/// prior logs, then creates a new `continuo-tui-<stamp>-<pid>.log` opened
+/// prior logs, then creates a new `tenuto-tui-<stamp>-<pid>.log` opened
 /// with `append(true).create_new(true)` at mode 0600. A same-second,
 /// same-pid collision (two sessions started within the same wall-clock
 /// second) retries `-<pid>-2` through `-<pid>-100`.

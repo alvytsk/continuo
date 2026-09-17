@@ -1,6 +1,6 @@
 # Milestone 3 acceptance coverage
 
-`docs/superpowers/specs/2026-09-09-continuo-finite-http-design.md` §12 lists eighteen acceptance items, H1 through H18, that M3's implementation must demonstrate. This page is the coverage map: for each item, which test(s) discharge it, and — where discharge is partial or absent — exactly why.
+`docs/superpowers/specs/2026-09-09-tenuto-finite-http-design.md` §12 lists eighteen acceptance items, H1 through H18, that M3's implementation must demonstrate. This page is the coverage map: for each item, which test(s) discharge it, and — where discharge is partial or absent — exactly why.
 
 Two rows are not fully discharged, and are carried as known debt (`docs/m1-known-debt.md`, "Milestone 3 — carried debt") rather than closed silently:
 
@@ -34,7 +34,7 @@ Total after M3: **377 tests passed, 0 failed, 1 ignored** (`device_smoke`, needs
 
 ## Milestone 3.1 — estimated seeking and position provenance
 
-`docs/superpowers/specs/2026-09-10-continuo-estimated-seek-design.md` §6 lists
+`docs/superpowers/specs/2026-09-10-tenuto-estimated-seek-design.md` §6 lists
 the acceptance items for the estimated-seek amendment. Most of them were
 already discharged by Tasks 4, 5, 6 and 9 before this row was ever written;
 this task's own contribution is the four cross-process rows at the bottom

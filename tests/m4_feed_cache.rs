@@ -8,11 +8,11 @@
 #[path = "support/feeds.rs"]
 mod feeds;
 
-use continuo::feed::cache::PARSER_VERSION;
-use continuo::feed::error::FeedError;
-use continuo::media::id::{EpisodeKey, FeedId, MediaId};
-use continuo::subscription::model::Subscription;
 use serde_json::json;
+use tenuto::feed::cache::PARSER_VERSION;
+use tenuto::feed::error::FeedError;
+use tenuto::media::id::{EpisodeKey, FeedId, MediaId};
+use tenuto::subscription::model::Subscription;
 
 const RSS_ONE_ITEM: &[u8] = br#"<rss><channel><item><guid>id</guid></item></channel></rss>"#;
 const RSS_TWO_ITEMS: &[u8] = br#"<rss><channel>
@@ -292,7 +292,7 @@ fn a_failed_save_leaves_the_previous_cache_untouched() -> Result<(), Box<dyn std
 /// never echo the offending id back: `slug` is the one field every
 /// `FeedError` `Display` treats as a safe, bare identifier, and
 /// `CacheCorrupt` prints it straight into a suggested command
-/// (`run continuo refresh {slug}`). A traversal-shaped id is exactly the
+/// (`run tenuto refresh {slug}`). A traversal-shaped id is exactly the
 /// case where that would be most dangerous, so neither the traversal text
 /// nor any path separator may appear in either rendering — under `Debug` as
 /// much as `Display` (§7.2).

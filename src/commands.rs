@@ -116,7 +116,7 @@ pub fn run(command: CliCommand) -> Result<(), FeedError> {
 /// that a command with no progress column to join against never opens
 /// `state.json` at all.
 pub(crate) fn platform_subscription_stores() -> Result<(SubscriptionStore, CacheStore), FeedError> {
-    let dirs = directories::ProjectDirs::from("", "", "continuo").ok_or_else(|| {
+    let dirs = directories::ProjectDirs::from("", "", "tenuto").ok_or_else(|| {
         FeedError::SubscriptionsUnreadable {
             reason: "no platform data directory is available".to_string(),
         }
@@ -342,7 +342,7 @@ fn column(label: &str, values: impl Iterator<Item = usize>) -> usize {
     values.fold(width(label), usize::max)
 }
 
-/// `continuo feeds` (§6.1). A subscription that has never been refreshed
+/// `tenuto feeds` (§6.1). A subscription that has never been refreshed
 /// shows `—` episodes and `never`, which is the normal state directly after
 /// `subscribe` rather than a failure.
 fn write_feeds(out: &mut dyn Write, feeds: &[FeedSummary]) -> Result<(), FeedError> {
@@ -395,7 +395,7 @@ fn write_feeds(out: &mut dyn Write, feeds: &[FeedSummary]) -> Result<(), FeedErr
     Ok(())
 }
 
-/// `continuo episodes <slug>` (§6.1, §6.2). `AUDIO` is a column of its own
+/// `tenuto episodes <slug>` (§6.1, §6.2). `AUDIO` is a column of its own
 /// so that a removed enclosure never hides existing progress.
 fn write_episodes(out: &mut dyn Write, episodes: &[EpisodeRow]) -> Result<(), FeedError> {
     let progress: Vec<String> = episodes
@@ -521,7 +521,7 @@ fn write_refresh(out: &mut dyn Write, outcome: &RefreshOutcome) -> Result<(), Fe
     Ok(())
 }
 
-/// `continuo refresh` with no slug (§6.4): every feed is printed, and only
+/// `tenuto refresh` with no slug (§6.4): every feed is printed, and only
 /// then does the count of feeds that did not complete decide the exit
 /// status. One bad feed neither hides the others nor exits zero.
 pub(crate) fn finish_refresh_batch(
@@ -546,7 +546,7 @@ pub(crate) fn finish_refresh_batch(
     }
 }
 
-/// `continuo refresh <slug>` (§6.4): the concrete error, after printing what
+/// `tenuto refresh <slug>` (§6.4): the concrete error, after printing what
 /// did commit. A batch count would tell a single-feed caller nothing it did
 /// not already know.
 pub(crate) fn finish_refresh_one(
@@ -562,11 +562,11 @@ pub(crate) fn finish_refresh_one(
     }
 }
 
-/// `continuo subscribe` (§5.3, §6.4). The commit order is cache first,
+/// `tenuto subscribe` (§5.3, §6.4). The commit order is cache first,
 /// subscription second, so the only step that can fail after something
 /// landed is the subscription — and when it does, the cache file is left
 /// behind unreferenced and *nothing is subscribed*. Reporting that as a
-/// subscription would send the listener looking for a feed that `continuo
+/// subscription would send the listener looking for a feed that `tenuto
 /// feeds` will not show.
 pub(crate) fn finish_subscribe(
     out: &mut dyn Write,
@@ -596,7 +596,7 @@ pub(crate) fn finish_subscribe(
     Err(failure.error)
 }
 
-/// `continuo unsubscribe` (§5.3, §6.4). The subscription is removed first,
+/// `tenuto unsubscribe` (§5.3, §6.4). The subscription is removed first,
 /// so a followup failure means the subscription is genuinely gone and only
 /// its cache file remains — recoverable, and reported rather than silently
 /// left behind.

@@ -1,8 +1,8 @@
-# Continuo local playback (Milestone 1)
+# Tenuto local playback (Milestone 1)
 
 **Date:** 2026-09-08
 **Status:** Proposed for review; implementation has not started.
-**Predecessor:** [Approved foundation design](2026-09-07-continuo-foundation-design.md).
+**Predecessor:** [Approved foundation design](2026-09-07-tenuto-foundation-design.md).
 
 ## 1. Scope and starting point
 
@@ -14,7 +14,7 @@ The binding constraint from M0 is unchanged and governs this entire document:
 >
 > Position is the session's logical resume point. It advances from estimated playback of media frames. Stop and transport recreation preserve it; restoration, media selection, explicit restart, and successful seeks establish a new position.
 
-**Surface.** `continuo play <path>` starts playback immediately and enters crossterm raw mode:
+**Surface.** `tenuto play <path>` starts playback immediately and enters crossterm raw mode:
 
 ```
 ep.flac [playing] 00:04:12 / 01:02:30  vol 80%

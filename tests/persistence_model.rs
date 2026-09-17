@@ -4,10 +4,10 @@ mod support;
 
 use std::time::Duration;
 
-use continuo::persistence::model::{MAX_ENTRIES, PersistedState, SCHEMA_VERSION};
-use continuo::playback::checkpoint::PlaybackCheckpoint;
-use continuo::playback::volume::Volume;
 use support::media;
+use tenuto::persistence::model::{MAX_ENTRIES, PersistedState, SCHEMA_VERSION};
+use tenuto::playback::checkpoint::PlaybackCheckpoint;
+use tenuto::playback::volume::Volume;
 use time::OffsetDateTime;
 
 fn checkpoint(name: &str, secs: u64) -> PlaybackCheckpoint {

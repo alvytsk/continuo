@@ -4,22 +4,22 @@
 mod process;
 
 use clap::Parser;
-use continuo::cli::{Cli, CliCommand};
+use tenuto::cli::{Cli, CliCommand};
 
-/// A bare `continuo` is no longer a usage error: it resolves to no
+/// A bare `tenuto` is no longer a usage error: it resolves to no
 /// subcommand, which `app::run` dispatches to the player.
 #[test]
 fn a_bare_invocation_parses_to_no_subcommand() -> Result<(), Box<dyn std::error::Error>> {
-    let parsed = Cli::try_parse_from(["continuo"])?;
+    let parsed = Cli::try_parse_from(["tenuto"])?;
     assert!(
         parsed.command.is_none(),
         "bare invocation carries no subcommand"
     );
 
     // Every existing subcommand still parses as it did.
-    let tui = Cli::try_parse_from(["continuo", "tui"])?;
+    let tui = Cli::try_parse_from(["tenuto", "tui"])?;
     assert!(matches!(tui.command, Some(CliCommand::Tui { .. })));
-    let feeds = Cli::try_parse_from(["continuo", "feeds"])?;
+    let feeds = Cli::try_parse_from(["tenuto", "feeds"])?;
     assert!(matches!(feeds.command, Some(CliCommand::Feeds)));
     Ok(())
 }
@@ -32,12 +32,12 @@ fn an_invalid_rust_log_filter_fails_before_argument_parsing() {
     let profile = process::Profile::new().unwrap();
     let failure = profile
         .command()
-        .env("RUST_LOG", "continuo=not-a-level")
+        .env("RUST_LOG", "tenuto=not-a-level")
         .output()
         .unwrap();
     assert!(!failure.status.success());
     let stderr = String::from_utf8_lossy(&failure.stderr);
-    assert!(stderr.contains("continuo: invalid tracing filter"));
+    assert!(stderr.contains("tenuto: invalid tracing filter"));
     assert!(stderr.contains("application startup failed"));
     assert!(stderr.contains("error parsing level filter"));
 }

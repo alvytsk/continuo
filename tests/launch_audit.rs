@@ -22,7 +22,7 @@ fn rust_files(dir: &Path, found: &mut Vec<PathBuf>) -> std::io::Result<()> {
 #[test]
 fn only_the_process_helper_names_the_binary() -> Result<(), Box<dyn std::error::Error>> {
     // Built with concat! so this file does not match its own search.
-    let needle = concat!("CARGO_BIN_EXE_", "continuo");
+    let needle = concat!("CARGO_BIN_EXE_", "tenuto");
     let mut files = Vec::new();
     rust_files(
         &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests"),
@@ -121,10 +121,7 @@ fn subprocess_suites_are_gated_to_verified_platforms() -> Result<(), Box<dyn std
 
         // Verify that subscriptions.json was written to the isolated profile's
         // data directory, not to the inherited HOME.
-        let subscriptions_file = root
-            .join("data")
-            .join("continuo")
-            .join("subscriptions.json");
+        let subscriptions_file = root.join("data").join("tenuto").join("subscriptions.json");
 
         assert!(
             subscriptions_file.exists(),

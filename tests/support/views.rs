@@ -7,14 +7,14 @@
 
 use std::time::Duration;
 
-use continuo::application::transport::PlaybackPhase;
-use continuo::application::view::{
+use tenuto::application::transport::PlaybackPhase;
+use tenuto::application::view::{
     NowPlaying, PersistenceStatus, PlayerView, QueueRow, SavedHistory,
 };
-use continuo::media::id::{AbsolutePath, MediaId};
-use continuo::playback::state::PlaybackState;
-use continuo::playback::volume::Volume;
-use continuo::queue::{
+use tenuto::media::id::{AbsolutePath, MediaId};
+use tenuto::playback::state::PlaybackState;
+use tenuto::playback::volume::Volume;
+use tenuto::queue::{
     DisplayDuration, DurationSource, NewQueueEntry, Queue, QueueEntryId, QueueSource,
 };
 

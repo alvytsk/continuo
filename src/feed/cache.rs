@@ -1,5 +1,5 @@
 //! The per-feed episode cache (design doc §5.2): `$XDG_CACHE_HOME` (or
-//! platform equivalent) `/continuo/feeds/<feed_id>.json`, one file per feed,
+//! platform equivalent) `/tenuto/feeds/<feed_id>.json`, one file per feed,
 //! keyed by [`FeedId`] and never by slug — a rename cannot orphan it.
 //!
 //! It stores the **parsed** result, not raw XML, so `episodes` never
@@ -336,7 +336,7 @@ impl CacheStore {
     /// id that already failed validation is precisely the id least safe to
     /// echo back — `slug` is the one field every `FeedError` `Display`
     /// prints as a bare, trusted identifier (`CacheCorrupt`'s message
-    /// suggests `run continuo refresh {slug}`), so a traversal-shaped or
+    /// suggests `run tenuto refresh {slug}`), so a traversal-shaped or
     /// otherwise malformed id must never reach it, under `Debug` as much as
     /// `Display` (§7.2).
     pub fn path_for(&self, id: &FeedId) -> Result<PathBuf, FeedError> {

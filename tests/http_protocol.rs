@@ -11,20 +11,20 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use continuo::clock::{Clock, FakeClock};
-use continuo::http::channel::SourceInterrupt;
-use continuo::http::error::{RedirectRejection, RemoteFailure};
-use continuo::http::limits::Limits;
-use continuo::media::id::{MediaId, NormalizedUrl};
-use continuo::media::source::SourceLocation;
-use continuo::persistence::model::PersistedState;
-use continuo::persistence::store::StateStore;
-use continuo::playback::command::{Admission, ResumeIntent};
-use continuo::playback::error::PlaybackError;
-use continuo::playback::event::PlaybackEvent;
-use continuo::playback::prepare::{PrepareContext, prepare};
-use continuo::playback::state::PlaybackState;
-use continuo::session::{Action, LoadTarget, Session};
+use tenuto::clock::{Clock, FakeClock};
+use tenuto::http::channel::SourceInterrupt;
+use tenuto::http::error::{RedirectRejection, RemoteFailure};
+use tenuto::http::limits::Limits;
+use tenuto::media::id::{MediaId, NormalizedUrl};
+use tenuto::media::source::SourceLocation;
+use tenuto::persistence::model::PersistedState;
+use tenuto::persistence::store::StateStore;
+use tenuto::playback::command::{Admission, ResumeIntent};
+use tenuto::playback::error::PlaybackError;
+use tenuto::playback::event::PlaybackEvent;
+use tenuto::playback::prepare::{PrepareContext, prepare};
+use tenuto::playback::state::PlaybackState;
+use tenuto::session::{Action, LoadTarget, Session};
 
 use support::TestEngine;
 use support::server::{Script, TestServer};
@@ -41,14 +41,14 @@ fn url(text: &str) -> url::Url {
 }
 
 struct NoHook;
-impl continuo::http::channel::WaitHook for NoHook {
+impl tenuto::http::channel::WaitHook for NoHook {
     fn service(&self) {}
 }
 
 /// A `PrepareContext` for the `prepare()`-level cases (H6's three failure
 /// modes), which need no engine — `prepare.rs` uses the identical shape.
 fn context() -> PrepareContext {
-    let http = match continuo::http::service::HttpService::spawn(Limits::default()) {
+    let http = match tenuto::http::service::HttpService::spawn(Limits::default()) {
         Ok(service) => service,
         Err(error) => panic!("the HTTP service must start: {error}"),
     };
@@ -464,19 +464,18 @@ fn no_broken_transfer_can_become_a_completed_track() {
 }
 
 struct NoOpHook;
-impl continuo::http::channel::WaitHook for NoOpHook {
+impl tenuto::http::channel::WaitHook for NoOpHook {
     fn service(&self) {}
 }
 
-fn open_source(server: &TestServer) -> continuo::http::source::HttpMediaSource {
-    let service = match continuo::http::service::HttpService::spawn(Limits::default()) {
+fn open_source(server: &TestServer) -> tenuto::http::source::HttpMediaSource {
+    let service = match tenuto::http::service::HttpService::spawn(Limits::default()) {
         Ok(service) => service,
         Err(error) => panic!("the HTTP service must start: {error}"),
     };
-    let deadline = continuo::http::source::OpeningDeadline(
-        std::time::Instant::now() + Duration::from_secs(60),
-    );
-    match continuo::http::source::HttpMediaSource::open(
+    let deadline =
+        tenuto::http::source::OpeningDeadline(std::time::Instant::now() + Duration::from_secs(60));
+    match tenuto::http::source::HttpMediaSource::open(
         service,
         url(&server.url("/audio")),
         SourceInterrupt::new(Limits::default().buffer_bytes),
@@ -512,7 +511,7 @@ fn validators_follow_the_documented_policy() {
         matches!(
             outcome
                 .err()
-                .and_then(|e| continuo::http::source::remote_cause(&e)),
+                .and_then(|e| tenuto::http::source::remote_cause(&e)),
             Some(RemoteFailure::ResourceChanged)
         ),
         "a changed strong validator must fail the seek as ResourceChanged"

@@ -30,7 +30,7 @@ fn an_absent_file_exits_nonzero_with_a_concise_message() {
     assert!(!output.status.success());
     let text = String::from_utf8_lossy(&output.stderr);
     assert!(
-        text.contains("continuo:"),
+        text.contains("tenuto:"),
         "expected a prefixed message: {text}"
     );
     assert!(

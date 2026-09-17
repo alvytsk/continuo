@@ -407,43 +407,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "continuo-player"
-version = "0.1.0"
-dependencies = [
- "clap",
- "cpal",
- "crossbeam-channel",
- "crossterm",
- "directories",
- "gag",
- "getrandom 0.4.3",
- "http",
- "image",
- "percent-encoding",
- "portable-pty",
- "quick-xml",
- "ratatui",
- "ratatui-image",
- "reqwest",
- "rtrb",
- "rubato",
- "rustfft",
- "serde",
- "serde_json",
- "signal-hook 0.4.4",
- "socket2",
- "symphonia",
- "tempfile",
- "thiserror 2.0.20",
- "time",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "unicode-width",
- "url",
-]
-
-[[package]]
 name = "convert_case"
 version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3024,6 +2987,43 @@ dependencies = [
  "once_cell",
  "rustix 1.1.4",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "tenuto"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "cpal",
+ "crossbeam-channel",
+ "crossterm",
+ "directories",
+ "gag",
+ "getrandom 0.4.3",
+ "http",
+ "image",
+ "percent-encoding",
+ "portable-pty",
+ "quick-xml",
+ "ratatui",
+ "ratatui-image",
+ "reqwest",
+ "rtrb",
+ "rubato",
+ "rustfft",
+ "serde",
+ "serde_json",
+ "signal-hook 0.4.4",
+ "socket2",
+ "symphonia",
+ "tempfile",
+ "thiserror 2.0.20",
+ "time",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "unicode-width",
+ "url",
 ]
 
 [[package]]

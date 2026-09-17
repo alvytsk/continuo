@@ -13,25 +13,25 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use continuo::application::enrich::default_probe;
-use continuo::application::runtime::{
-    AppCommand, EnqueueItem, FlushReport, LibraryStores, PlayerRuntime,
-};
-use continuo::application::transport::PlaybackPhase;
-use continuo::application::view::{NowPlaying, PersistenceStatus, PlayerView};
-use continuo::clock::SystemClock;
-use continuo::feed::cache::CacheStore;
-use continuo::lifecycle::hooks::TestHook;
-use continuo::media::id::{AbsolutePath, EpisodeKey, FeedId, MediaId};
-use continuo::persistence::model::PersistedState;
-use continuo::persistence::writer::WriterHandle;
-use continuo::queue::{NewQueueEntry, QueueEntryId, QueueSource};
-use continuo::session::Session;
-use continuo::subscription::store::SubscriptionStore;
 use runtime::{
     null_engine, parts, pump_for, pump_until, rig_with, rig_with_parts, rig_with_probe, row_ids,
 };
 use support::server::{DocumentReply, Script, TestServer};
+use tenuto::application::enrich::default_probe;
+use tenuto::application::runtime::{
+    AppCommand, EnqueueItem, FlushReport, LibraryStores, PlayerRuntime,
+};
+use tenuto::application::transport::PlaybackPhase;
+use tenuto::application::view::{NowPlaying, PersistenceStatus, PlayerView};
+use tenuto::clock::SystemClock;
+use tenuto::feed::cache::CacheStore;
+use tenuto::lifecycle::hooks::TestHook;
+use tenuto::media::id::{AbsolutePath, EpisodeKey, FeedId, MediaId};
+use tenuto::persistence::model::PersistedState;
+use tenuto::persistence::writer::WriterHandle;
+use tenuto::queue::{NewQueueEntry, QueueEntryId, QueueSource};
+use tenuto::session::Session;
+use tenuto::subscription::store::SubscriptionStore;
 
 const SHORT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/sine.flac");
 const FIVE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/sine-5s.flac");
@@ -310,15 +310,15 @@ fn two_loads_of_one_media_submitted_together_end_on_the_later_row() {
 }
 
 struct FailingSink;
-impl continuo::persistence::writer::StateSink for FailingSink {
-    fn write(&self, _: &PersistedState) -> Result<(), continuo::persistence::PersistenceError> {
-        Err(continuo::persistence::PersistenceError::NoStateDirectory)
+impl tenuto::persistence::writer::StateSink for FailingSink {
+    fn write(&self, _: &PersistedState) -> Result<(), tenuto::persistence::PersistenceError> {
+        Err(tenuto::persistence::PersistenceError::NoStateDirectory)
     }
 }
 
 #[test]
 fn a_failed_final_flush_is_reported_not_claimed_as_saved() {
-    let clock: Arc<dyn continuo::clock::Clock> = Arc::new(SystemClock);
+    let clock: Arc<dyn tenuto::clock::Clock> = Arc::new(SystemClock);
     let writer = WriterHandle::spawn(Box::new(FailingSink), clock.clone());
     let mut runtime = PlayerRuntime::new(parts(
         PersistedState::default(),
@@ -333,7 +333,7 @@ fn a_failed_final_flush_is_reported_not_claimed_as_saved() {
 
 #[test]
 fn a_failing_writer_is_shown_while_the_session_runs() {
-    let clock: Arc<dyn continuo::clock::Clock> = Arc::new(SystemClock);
+    let clock: Arc<dyn tenuto::clock::Clock> = Arc::new(SystemClock);
     let writer = WriterHandle::spawn(Box::new(FailingSink), clock.clone());
     let mut runtime = PlayerRuntime::new(parts(
         PersistedState::default(),
@@ -700,13 +700,13 @@ fn corrupt_podcast(enclosure: &str) -> (feeds::Rig, NewQueueEntry, LibraryStores
         Default::default(),
     )
     .unwrap_or_else(|error| panic!("podcast entry: {error}"));
-    let clock: Arc<dyn continuo::clock::Clock> = Arc::new(SystemClock);
+    let clock: Arc<dyn tenuto::clock::Clock> = Arc::new(SystemClock);
     let stores = LibraryStores {
         subscriptions: SubscriptionStore::new(
-            library.root.path().join("data/continuo/subscriptions.json"),
+            library.root.path().join("data/tenuto/subscriptions.json"),
             clock,
         ),
-        cache: CacheStore::new(library.root.path().join("cache/continuo/feeds")),
+        cache: CacheStore::new(library.root.path().join("cache/tenuto/feeds")),
     };
     (library, podcast, stores)
 }

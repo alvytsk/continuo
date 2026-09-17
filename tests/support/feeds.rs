@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use continuo::{
+use tenuto::{
     clock::FakeClock,
     feed::{cache::CacheStore, episode::bind_feed, parse::parse_feed},
     persistence::store::StateStore,
@@ -33,11 +33,11 @@ impl Rig {
         let root = tempfile::tempdir()?;
         let clock = Arc::new(FakeClock::new());
         let subs = SubscriptionStore::new(
-            root.path().join("data/continuo/subscriptions.json"),
+            root.path().join("data/tenuto/subscriptions.json"),
             clock.clone(),
         );
-        let cache = CacheStore::new(root.path().join("cache/continuo/feeds"));
-        let state = StateStore::new(root.path().join("state/continuo/state.json"), clock.clone());
+        let cache = CacheStore::new(root.path().join("cache/tenuto/feeds"));
+        let state = StateStore::new(root.path().join("state/tenuto/state.json"), clock.clone());
         Ok(Self {
             root,
             clock,
@@ -48,7 +48,7 @@ impl Rig {
     }
 
     pub fn seed(&self, xml: &[u8], url: &str) -> Result<Subscription, Box<dyn std::error::Error>> {
-        use continuo::{clock::Clock, feed::cache::CachedFeed, http::document::CacheValidators};
+        use tenuto::{clock::Clock, feed::cache::CachedFeed, http::document::CacheValidators};
 
         let id = validate_feed_id(FEED_ID)?;
         let url: url::Url = url.parse()?;

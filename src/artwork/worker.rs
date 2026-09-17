@@ -66,7 +66,7 @@ pub struct ArtworkWorker {
 }
 
 impl ArtworkWorker {
-    /// Starts the `continuo-artwork` thread. The thread is detached, never
+    /// Starts the `tenuto-artwork` thread. The thread is detached, never
     /// joined: dropping this handle drops the request sender, which ends
     /// the worker's loop once whatever job it holds (if any) returns.
     pub fn spawn(loader: CoverLoader) -> Self {
@@ -74,7 +74,7 @@ impl ArtworkWorker {
         let (results_tx, results_rx) = crossbeam_channel::bounded::<ArtworkResult>(1);
         let worker_requests = requests_rx.clone();
         let spawned = thread::Builder::new()
-            .name("continuo-artwork".to_string())
+            .name("tenuto-artwork".to_string())
             .spawn(move || {
                 for job in &worker_requests {
                     let outcome = match run_contained("artwork", || (loader)(&job.source)) {

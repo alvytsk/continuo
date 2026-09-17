@@ -1,9 +1,9 @@
-use continuo::telemetry;
+use tenuto::telemetry;
 
 #[test]
 fn validates_filter_without_installing_global_state() {
-    assert!(telemetry::subscriber("continuo=debug,warn").is_ok());
-    let error = match telemetry::subscriber("continuo=not-a-level") {
+    assert!(telemetry::subscriber("tenuto=debug,warn").is_ok());
+    let error = match telemetry::subscriber("tenuto=not-a-level") {
         Ok(_) => panic!("invalid filter accepted"),
         Err(error) => error,
     };

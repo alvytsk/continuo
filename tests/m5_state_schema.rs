@@ -1,9 +1,9 @@
 //! Schema 3's queue fields, decoded apart from listening history (task
 //! brief: "Schema 3 with independently decoded queue fields").
 
-use continuo::persistence::model::{PersistedState, SCHEMA_VERSION};
-use continuo::persistence::queue_codec::{ActiveProblem, QueueProblem, QueueReset, recover_queue};
 use serde_json::json;
+use tenuto::persistence::model::{PersistedState, SCHEMA_VERSION};
+use tenuto::persistence::queue_codec::{ActiveProblem, QueueProblem, QueueReset, recover_queue};
 
 mod support;
 use support::media;
@@ -122,8 +122,8 @@ fn a_duplicate_occurrence_is_never_inferred_active_from_media() {
 
 #[test]
 fn a_valid_maximum_id_is_preserved_but_cannot_be_reallocated() {
-    use continuo::media::id::MediaId;
-    use continuo::queue::{DisplayMetadata, NewQueueEntry, QueueError, QueueSource};
+    use tenuto::media::id::MediaId;
+    use tenuto::queue::{DisplayMetadata, NewQueueEntry, QueueError, QueueSource};
     let file = json!({ "schema_version": 3, "queue": [entry(u64::MAX, "a")] });
     let state: PersistedState = serde_json::from_value(file).expect("valid maximum ID");
     let mut queue = state.queue().clone();

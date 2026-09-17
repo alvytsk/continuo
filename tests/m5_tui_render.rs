@@ -4,16 +4,16 @@ mod views;
 use std::cell::Cell;
 use std::time::Duration;
 
-use continuo::application::transport::PlaybackPhase;
-use continuo::application::view::{PersistenceStatus, PlayerView, SavedHistory};
-use continuo::playback::provenance::PositionProvenance;
-use continuo::queue::{DisplayDuration, DurationSource};
-use continuo::tui::layout::{Regions, Tier, regions, tier_for};
-use continuo::tui::render::{CoverView, CoverWidget, HitMap, TransportButton, Visuals, draw};
-use continuo::tui::state::UiState;
-use continuo::tui::theme::Theme;
 use ratatui::buffer::Buffer;
 use ratatui::{Terminal, backend::TestBackend, layout::Rect};
+use tenuto::application::transport::PlaybackPhase;
+use tenuto::application::view::{PersistenceStatus, PlayerView, SavedHistory};
+use tenuto::playback::provenance::PositionProvenance;
+use tenuto::queue::{DisplayDuration, DurationSource};
+use tenuto::tui::layout::{Regions, Tier, regions, tier_for};
+use tenuto::tui::render::{CoverView, CoverWidget, HitMap, TransportButton, Visuals, draw};
+use tenuto::tui::state::UiState;
+use tenuto::tui::theme::Theme;
 use views::{decoded, ids, playing, view};
 
 fn render(
@@ -353,7 +353,7 @@ fn buffering_and_unsaved_are_labelled() {
     assert!(screen.contains("playing buffering"), "{screen}");
     let status = screen.lines().nth(1).expect("status row");
     assert!(
-        status.contains("CONTINUO") && status.contains("mouse on") && status.contains("unsaved"),
+        status.contains("TENUTO") && status.contains("mouse on") && status.contains("unsaved"),
         "{status}"
     );
     assert!(screen.contains("VOL ━━━━━━━━──   80%"), "{screen}");
@@ -472,14 +472,14 @@ fn the_spectrum_row_draws_levels_and_nothing_in_minimal() {
 mod spectrum_display {
     use std::time::{Duration, Instant};
 
-    use continuo::application::transport::PlaybackPhase;
-    use continuo::application::view::NowPlaying;
-    use continuo::playback::command::LoadRequestId;
-    use continuo::playback::output::Nanos;
-    use continuo::playback::spectrum::worker::SpectrumFrame;
-    use continuo::tui::layout::{Tier, regions};
-    use continuo::tui::spectrum::{DrawSource, SpectrumDisplay, wants_analysis};
     use ratatui::layout::Rect;
+    use tenuto::application::transport::PlaybackPhase;
+    use tenuto::application::view::NowPlaying;
+    use tenuto::playback::command::LoadRequestId;
+    use tenuto::playback::output::Nanos;
+    use tenuto::playback::spectrum::worker::SpectrumFrame;
+    use tenuto::tui::layout::{Tier, regions};
+    use tenuto::tui::spectrum::{DrawSource, SpectrumDisplay, wants_analysis};
 
     use super::views::{ids, playing};
 

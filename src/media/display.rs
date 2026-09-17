@@ -18,7 +18,7 @@ use crate::media::id::MediaId;
 /// path segment, and a podcast episode fell through to the canonical id —
 /// `podcast:<feed>/guid:https:%2F%2F…`, about 110 characters of identifier and
 /// nothing a listener recognises. The decoder's title is the same name
-/// `--probe-only` prints and the one `continuo episodes` lists, so `play
+/// `--probe-only` prints and the one `tenuto episodes` lists, so `play
 /// radio-t 1` now reads the way the listing that chose it did. Untitled audio
 /// gets the `(untitled)` spelling the probe and the listing already use.
 pub fn episode_name(title: Option<&str>) -> String {

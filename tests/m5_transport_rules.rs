@@ -2,12 +2,12 @@ mod support;
 
 use std::time::Duration;
 
-use continuo::application::transport::*;
-use continuo::media::id::MediaId;
-use continuo::persistence::model::PersistedState;
-use continuo::queue::{DisplayMetadata, NewQueueEntry, Queue, QueueEntryId, QueueSource};
-use continuo::session::{LoadTarget, Session};
 use support::media;
+use tenuto::application::transport::*;
+use tenuto::media::id::MediaId;
+use tenuto::persistence::model::PersistedState;
+use tenuto::queue::{DisplayMetadata, NewQueueEntry, Queue, QueueEntryId, QueueSource};
+use tenuto::session::{LoadTarget, Session};
 
 fn entry(name: &str) -> NewQueueEntry {
     let MediaId::LocalFile(path) = media(name) else {
@@ -24,9 +24,9 @@ fn entry(name: &str) -> NewQueueEntry {
 /// A queue of three with the second entry active, built through Session so
 /// the active entry is set the only legal way.
 fn with_active() -> (Queue, Vec<QueueEntryId>) {
-    use continuo::clock::{Clock, FakeClock};
-    use continuo::media::capabilities::{Continuity, MediaCapabilities, SeekSupport};
-    use continuo::playback::event::{PlaybackEvent, StartDisposition};
+    use tenuto::clock::{Clock, FakeClock};
+    use tenuto::media::capabilities::{Continuity, MediaCapabilities, SeekSupport};
+    use tenuto::playback::event::{PlaybackEvent, StartDisposition};
     let mut session = Session::new(PersistedState::default());
     let (ids, _) = session
         .enqueue(vec![entry("a"), entry("b"), entry("c")])

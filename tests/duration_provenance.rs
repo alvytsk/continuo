@@ -13,10 +13,10 @@
 use std::path::Path;
 use std::time::Duration;
 
-use continuo::media::id::AbsolutePath;
-use continuo::playback::decode::DecodedSource;
-use continuo::playback::provenance::PositionProvenance;
-use continuo::resume::{KnownDuration, ResumeCandidate, ResumeDecision, decide_resume};
+use tenuto::media::id::AbsolutePath;
+use tenuto::playback::decode::DecodedSource;
+use tenuto::playback::provenance::PositionProvenance;
+use tenuto::resume::{KnownDuration, ResumeCandidate, ResumeDecision, decide_resume};
 
 #[allow(clippy::unwrap_used)]
 fn fixture(name: &str) -> AbsolutePath {

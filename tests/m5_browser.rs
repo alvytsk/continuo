@@ -3,21 +3,21 @@
 
 use std::path::{Path, PathBuf};
 
-use continuo::application::browse::{
-    BrowseRequest, BrowseResult, BrowseWorker, DirEntry, EntryKind, list_directory,
-};
-use continuo::application::runtime::EnqueueItem;
-use continuo::application::view::QueueRow;
-use continuo::library::{EpisodeCandidate, FeedSummary};
-use continuo::media::id::{AbsolutePath, EpisodeKey, FeedId, MediaId};
-use continuo::queue::QueueEntryId;
-use continuo::tui::browser::{BrowserEffect, BrowserState, BrowserTab, NoticeKind};
-use continuo::tui::render::{Visuals, draw};
-use continuo::tui::state::{Overlay, UiState};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::style::Modifier;
+use tenuto::application::browse::{
+    BrowseRequest, BrowseResult, BrowseWorker, DirEntry, EntryKind, list_directory,
+};
+use tenuto::application::runtime::EnqueueItem;
+use tenuto::application::view::QueueRow;
+use tenuto::library::{EpisodeCandidate, FeedSummary};
+use tenuto::media::id::{AbsolutePath, EpisodeKey, FeedId, MediaId};
+use tenuto::queue::QueueEntryId;
+use tenuto::tui::browser::{BrowserEffect, BrowserState, BrowserTab, NoticeKind};
+use tenuto::tui::render::{Visuals, draw};
+use tenuto::tui::state::{Overlay, UiState};
 use time::OffsetDateTime;
 
 #[path = "support/views.rs"]

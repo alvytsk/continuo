@@ -12,7 +12,7 @@ pub fn subscriber(filter: &str) -> Result<impl tracing::Subscriber + Send + Sync
 pub fn init() -> Result<(), TelemetryError> {
     let filter = match std::env::var("RUST_LOG") {
         Ok(value) => value,
-        Err(std::env::VarError::NotPresent) => "continuo=info".into(),
+        Err(std::env::VarError::NotPresent) => "tenuto=info".into(),
         Err(error) => return Err(TelemetryError::Environment(error)),
     };
     tracing::subscriber::set_global_default(subscriber(&filter)?)?;

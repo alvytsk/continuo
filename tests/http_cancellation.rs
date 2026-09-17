@@ -16,9 +16,9 @@ mod support;
 
 use std::time::{Duration, Instant};
 
-use continuo::playback::command::Admission;
-use continuo::playback::event::PlaybackEvent;
-use continuo::playback::state::PlaybackState;
+use tenuto::playback::command::Admission;
+use tenuto::playback::event::PlaybackEvent;
+use tenuto::playback::state::PlaybackState;
 
 use support::TestEngine;
 use support::server::{Script, TestServer};

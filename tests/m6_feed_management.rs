@@ -8,13 +8,13 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use continuo::application::browse::{BrowseRequest, BrowseResult, BrowseWorker};
-use continuo::application::runtime::LibraryStores;
-use continuo::clock::SystemClock;
-use continuo::feed::cache::CacheStore;
-use continuo::library::list_feeds;
-use continuo::subscription::store::SubscriptionStore;
 use support::server::{DocumentReply, Script, TestServer};
+use tenuto::application::browse::{BrowseRequest, BrowseResult, BrowseWorker};
+use tenuto::application::runtime::LibraryStores;
+use tenuto::clock::SystemClock;
+use tenuto::feed::cache::CacheStore;
+use tenuto::library::list_feeds;
+use tenuto::subscription::store::SubscriptionStore;
 
 fn rss(title: &str) -> Vec<u8> {
     format!(
@@ -39,10 +39,10 @@ fn reply(path: &str, status: u16, body: Vec<u8>) -> DocumentReply {
 fn stores(root: &Path) -> LibraryStores {
     LibraryStores {
         subscriptions: SubscriptionStore::new(
-            root.join("data/continuo/subscriptions.json"),
+            root.join("data/tenuto/subscriptions.json"),
             Arc::new(SystemClock),
         ),
-        cache: CacheStore::new(root.join("cache/continuo/feeds")),
+        cache: CacheStore::new(root.join("cache/tenuto/feeds")),
     }
 }
 

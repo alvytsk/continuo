@@ -8,11 +8,11 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use continuo::clock::FakeClock;
-use continuo::persistence::store::{LoadReason, MAX_QUARANTINE_CANDIDATES};
-use continuo::subscription::model::Subscription;
-use continuo::subscription::store::{SubscriptionSnapshot, SubscriptionStore};
 use serde_json::{Value, json};
+use tenuto::clock::FakeClock;
+use tenuto::persistence::store::{LoadReason, MAX_QUARANTINE_CANDIDATES};
+use tenuto::subscription::model::Subscription;
+use tenuto::subscription::store::{SubscriptionSnapshot, SubscriptionStore};
 use time::OffsetDateTime;
 
 /// The stamp a `FakeClock` produces, which starts at the epoch.
@@ -93,9 +93,7 @@ fn a_valid_subscription_survives_save_and_load() -> Result<(), Box<dyn std::erro
     let store = store(path.clone());
 
     let subscription = Subscription {
-        feed_id: continuo::subscription::model::validate_feed_id(
-            "9f3c1a7e42b58d0c6f19ab3e5d72c840",
-        )?,
+        feed_id: tenuto::subscription::model::validate_feed_id("9f3c1a7e42b58d0c6f19ab3e5d72c840")?,
         slug: "radio-t".to_string(),
         title: Some("Радио-Т".to_string()),
         fetch_url: url::Url::parse("https://radio-t.com/rss/")?,
@@ -121,7 +119,7 @@ fn a_valid_subscription_survives_save_and_load() -> Result<(), Box<dyn std::erro
 #[test]
 fn a_missing_read_creates_no_parent_directory() -> Result<(), Box<dyn std::error::Error>> {
     let root = tempfile::tempdir()?;
-    let nested = root.path().join("continuo");
+    let nested = root.path().join("tenuto");
     let path = nested.join("subscriptions.json");
     let store = store(path.clone());
 
@@ -275,7 +273,7 @@ fn saving_513_distinct_subscriptions_all_survive() -> Result<(), Box<dyn std::er
     const COUNT: usize = 513;
     let mut subscriptions = Vec::with_capacity(COUNT);
     for index in 0..COUNT {
-        let feed_id = continuo::subscription::model::validate_feed_id(&format!("{index:032x}"))?;
+        let feed_id = tenuto::subscription::model::validate_feed_id(&format!("{index:032x}"))?;
         subscriptions.push(Subscription {
             feed_id,
             slug: format!("feed-{index}"),

@@ -67,7 +67,7 @@ pub enum TransportButton {
 }
 
 const EMPTY_QUEUE: &str = "Queue is empty — press b to browse or a to add";
-const BRAND: &str = "CONTINUO";
+const BRAND: &str = "TENUTO";
 /// Key, then what it does; drawn as bold key and muted label.
 const KEY_HINTS: [(&str, &str); 6] = [
     ("Space", "Play/Pause"),

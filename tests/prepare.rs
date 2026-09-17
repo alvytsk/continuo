@@ -3,15 +3,15 @@ mod support;
 use std::sync::Arc;
 use std::time::Duration;
 
-use continuo::http::channel::{SourceInterrupt, WaitHook};
-use continuo::http::error::RemoteFailure;
-use continuo::http::limits::Limits;
-use continuo::http::service::HttpService;
-use continuo::media::capabilities::{Continuity, SeekSupport};
-use continuo::media::source::SourceLocation;
-use continuo::playback::error::PlaybackError;
-use continuo::playback::prepare::{PrepareContext, prepare};
 use support::server::{Script, TestServer};
+use tenuto::http::channel::{SourceInterrupt, WaitHook};
+use tenuto::http::error::RemoteFailure;
+use tenuto::http::limits::Limits;
+use tenuto::http::service::HttpService;
+use tenuto::media::capabilities::{Continuity, SeekSupport};
+use tenuto::media::source::SourceLocation;
+use tenuto::playback::error::PlaybackError;
+use tenuto::playback::prepare::{PrepareContext, prepare};
 use url::Url;
 
 struct NoHook;
@@ -294,7 +294,7 @@ fn a_slow_trickle_cannot_outlast_the_opening_deadline() {
         matches!(
             error,
             PlaybackError::Remote(RemoteFailure::Timeout {
-                phase: continuo::http::error::Phase::Open
+                phase: tenuto::http::error::Phase::Open
             })
         ),
         "{error}"

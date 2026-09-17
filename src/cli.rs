@@ -1,20 +1,20 @@
-//! The `continuo` command-line surface.
+//! The `tenuto` command-line surface.
 
 use std::num::NonZeroUsize;
 
 use clap::{Parser, Subcommand};
 
 #[derive(Debug, Parser)]
-#[command(name = "continuo", about = "A keyboard-first terminal audio player")]
+#[command(name = "tenuto", about = "A keyboard-first terminal audio player")]
 pub struct Cli {
-    /// The subcommand to run. Absent means a bare `continuo`, which opens
+    /// The subcommand to run. Absent means a bare `tenuto`, which opens
     /// the full-screen player on the saved queue with the same defaults
-    /// `continuo tui` uses when its flags are omitted.
+    /// `tenuto tui` uses when its flags are omitted.
     #[command(subcommand)]
     pub command: Option<CliCommand>,
 }
 
-/// Whether `continuo tui` captures the mouse. Off leaves the terminal's own
+/// Whether `tenuto tui` captures the mouse. Off leaves the terminal's own
 /// selection and scrolling alone.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, clap::ValueEnum)]
 pub enum MouseMode {
@@ -23,7 +23,7 @@ pub enum MouseMode {
     Off,
 }
 
-/// How `continuo tui` draws cover art: `auto` asks the terminal which image
+/// How `tenuto tui` draws cover art: `auto` asks the terminal which image
 /// protocol it supports and falls back to colored half-blocks, `blocks`
 /// always uses half-blocks without asking, and `off` shows only the
 /// placeholder and never loads artwork.
@@ -44,7 +44,7 @@ pub enum CliCommand {
         /// with an index after it — a subscribed feed's slug.
         source: String,
         /// The 1-based episode index within `source`'s cached episode list,
-        /// as `continuo episodes <slug>` displays it (§6.3).
+        /// as `tenuto episodes <slug>` displays it (§6.3).
         #[arg(value_parser = positive_index)]
         index: Option<NonZeroUsize>,
         /// Open the source, print what was found, and exit without using a
@@ -63,7 +63,7 @@ pub enum CliCommand {
     },
     /// Remove a subscription and its cached episodes. Checkpoints are kept.
     Unsubscribe {
-        /// The slug `continuo feeds` displays.
+        /// The slug `tenuto feeds` displays.
         slug: String,
     },
     /// Open the terminal player on the saved queue.
@@ -84,7 +84,7 @@ pub enum CliCommand {
     },
     /// List a subscription's cached episodes and their playback progress.
     Episodes {
-        /// The slug `continuo feeds` displays.
+        /// The slug `tenuto feeds` displays.
         slug: String,
         /// Display only the first N episodes. Indices never change (§6.3).
         #[arg(short = 'n', value_parser = positive_count)]

@@ -1,6 +1,6 @@
-use continuo::http::error::{RangeRejection, RedirectRejection, RemoteFailure};
-use continuo::http::limits::Limits;
-use continuo::http::response::{
+use tenuto::http::error::{RangeRejection, RedirectRejection, RemoteFailure};
+use tenuto::http::limits::Limits;
+use tenuto::http::response::{
     Accepted, ByteRange, Established, Headers, Validator, accept, accept_redirect, if_range_value,
     is_live, parse_content_range,
 };
@@ -370,7 +370,7 @@ fn a_weak_etag_is_never_sent_as_if_range() {
 
 #[test]
 fn a_weak_etag_header_is_not_stored_as_a_strong_one() {
-    let validator = continuo::http::response::validator_from(&headers(&[("etag", "W/\"v1\"")]));
+    let validator = tenuto::http::response::validator_from(&headers(&[("etag", "W/\"v1\"")]));
     assert_eq!(validator.strong_etag, None);
     // Kept, though: it is comparable even when it is not sendable.
     assert_eq!(validator.weak_etag.as_deref(), Some("W/\"v1\""));

@@ -2,11 +2,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
-use continuo::http::channel::{
+use tenuto::http::channel::{
     ByteChannel, HeaderOutcome, Outcome, ReadOutcome, SourceInterrupt, WaitHook,
 };
-use continuo::http::error::{Operation, RemoteFailure};
-use continuo::http::response::{Accepted, FetchAccepted, Headers, Validator};
+use tenuto::http::error::{Operation, RemoteFailure};
+use tenuto::http::response::{Accepted, FetchAccepted, Headers, Validator};
 
 const STALL: Duration = Duration::from_secs(5);
 
@@ -515,7 +515,7 @@ fn a_stall_deadline_that_elapses_fails_rather_than_returning_eof() {
     assert_eq!(
         outcome,
         ReadOutcome::Failed(RemoteFailure::Timeout {
-            phase: continuo::http::error::Phase::Stall
+            phase: tenuto::http::error::Phase::Stall
         })
     );
 }
@@ -626,7 +626,7 @@ fn a_header_wait_deadline_that_elapses_fails_rather_than_hanging() {
     assert_eq!(
         outcome,
         Err(HeaderOutcome::Failed(RemoteFailure::Timeout {
-            phase: continuo::http::error::Phase::Headers
+            phase: tenuto::http::error::Phase::Headers
         }))
     );
 }

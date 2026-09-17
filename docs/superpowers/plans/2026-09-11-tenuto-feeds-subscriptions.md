@@ -1,4 +1,4 @@
-# Continuo M4 Feeds and Subscriptions Implementation Plan
+# Tenuto M4 Feeds and Subscriptions Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust edition 2024, existing Tokio/reqwest, serde/serde_json, time, url, clap, directories, tracing; direct quick-xml 0.42 with `encoding` and direct getrandom 0.4. Existing tempfile, socket2 and virtual audio output provide tests.
 
-**Spec:** [Continuo M4 design](../specs/2026-09-11-continuo-feeds-design.md), all nine sections, at commit `0a0793b`. The user's `:318` locator identifies a line in this document, not a request to implement only encoding. Read the complete spec and this plan.
+**Spec:** [Tenuto M4 design](../specs/2026-09-11-tenuto-feeds-design.md), all nine sections, at commit `0a0793b`. The user's `:318` locator identifies a line in this document, not a request to implement only encoding. Read the complete spec and this plan.
 
 ## Global Constraints
 
@@ -26,7 +26,7 @@
 - "Validators and the per-check timestamps live here", in the same atomic cache file as episodes.
 - Subscribe/refresh commit cache before subscription; unsubscribe commits subscription before cache deletion. Every partial failure exits nonzero.
 - "`episodes` and `feeds` **never touch the network and never delete a file.**" Their subscription/checkpoint reads never quarantine or create directories either.
-- Durable subscriptions: `$XDG_DATA_HOME/continuo/subscriptions.json`; cache: `$XDG_CACHE_HOME/continuo/feeds/<feed_id>.json`. Preserve StateStore's existing platform checkpoint path.
+- Durable subscriptions: `$XDG_DATA_HOME/tenuto/subscriptions.json`; cache: `$XDG_CACHE_HOME/tenuto/feeds/<feed_id>.json`. Preserve StateStore's existing platform checkpoint path.
 - Subscription/cache schema version and initial parser version are **1**. PersistedState remains at its existing schema **2**, with no new fields.
 - "All displayed timestamps are **UTC** and labeled as such in the header."
 - Progress precedence: completed, then estimated, then established, then unknown-position entry, then no entry. Feed duration is advisory and parenthesized; estimated position alone uses `~`.
@@ -94,7 +94,7 @@ All tests use `Result<(), Box<dyn std::error::Error>>` with `?`, or a narrowly s
 - [ ] **Step 1: Add a failing regression for two destination names.**
 
 ```rust
-use continuo::persistence::atomic::replace_bytes;
+use tenuto::persistence::atomic::replace_bytes;
 
 #[test]
 fn independent_destinations_replace_whole_snapshots() -> Result<(), Box<dyn std::error::Error>> {
@@ -153,8 +153,8 @@ git commit -m "refactor: share atomic snapshot replacement"
 
 ```rust
 use std::sync::Arc;
-use continuo::clock::FakeClock;
-use continuo::persistence::store::StateStore;
+use tenuto::clock::FakeClock;
+use tenuto::persistence::store::StateStore;
 
 #[test]
 fn snapshot_read_does_not_quarantine() -> Result<(), Box<dyn std::error::Error>> {
@@ -208,7 +208,7 @@ git commit -m "feat: expose read-only checkpoint snapshots"
 
 ```rust
 use std::collections::BTreeSet;
-use continuo::subscription::model::{choose_slug, validate_feed_id, validate_slug};
+use tenuto::subscription::model::{choose_slug, validate_feed_id, validate_slug};
 
 #[test]
 fn cyrillic_title_uses_host_and_suffix_stays_bounded() -> Result<(), Box<dyn std::error::Error>> {
@@ -241,10 +241,10 @@ pub enum FeedError {
     #[error("unknown feed: {slug}")] UnknownSlug { slug: String },
     #[error("episode index {index} is outside 1..={retained} for {slug}")]
     IndexOutOfRange { slug: String, index: usize, retained: usize },
-    #[error("no cached episodes for {slug}; run continuo refresh {slug}")] CacheMissing { slug: String },
-    #[error("corrupt cache for {slug}: {detail}; run continuo refresh {slug}")]
+    #[error("no cached episodes for {slug}; run tenuto refresh {slug}")] CacheMissing { slug: String },
+    #[error("corrupt cache for {slug}: {detail}; run tenuto refresh {slug}")]
     CacheCorrupt { slug: String, detail: String },
-    #[error("cache parser {found} differs from {expected} for {slug}; run continuo refresh {slug}")]
+    #[error("cache parser {found} differs from {expected} for {slug}; run tenuto refresh {slug}")]
     CacheParserMismatch { slug: String, found: u32, expected: u32 },
     #[error("cannot use subscriptions: {reason}")] SubscriptionsUnreadable { reason: String },
     #[error("invalid slug {slug:?}; expected 1-32 ASCII lowercase letters, digits or hyphens")]
@@ -314,9 +314,9 @@ impl SubscriptionStore {
 #[test]
 fn only_mutating_load_quarantines() -> Result<(), Box<dyn std::error::Error>> {
     use std::sync::Arc;
-    use continuo::clock::FakeClock;
-    use continuo::subscription::store::SubscriptionStore;
-    use continuo::persistence::store::LoadReason;
+    use tenuto::clock::FakeClock;
+    use tenuto::subscription::store::SubscriptionStore;
+    use tenuto::persistence::store::LoadReason;
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("subscriptions.json");
     std::fs::write(&path, b"broken")?;
@@ -371,7 +371,7 @@ git commit -m "feat: persist subscriptions with non-mutating reads"
 
 ```rust
 mod support;
-use continuo::http::{document::{DocumentRequest, DocumentOutcome}, limits::Limits, service::HttpService};
+use tenuto::http::{document::{DocumentRequest, DocumentOutcome}, limits::Limits, service::HttpService};
 use support::server::{Script, TestServer};
 
 #[test]
@@ -480,7 +480,7 @@ Matching uses request path. Route lookup failure returns 404. `conditional: true
 #[test]
 fn permanent_prefix_stops_before_temporary_redirect() -> Result<(), Box<dyn std::error::Error>> {
     use std::time::Duration;
-    use continuo::http::{document::{DocumentRequest, DocumentOutcome}, limits::Limits, service::HttpService};
+    use tenuto::http::{document::{DocumentRequest, DocumentOutcome}, limits::Limits, service::HttpService};
     use support::server::{DocumentReply, Script, TestServer};
     let replies = vec![
         DocumentReply { path: "/a".into(), status: 301, headers: vec![("Location".into(), "/b".into())],
@@ -573,7 +573,7 @@ Identityless/duplicate skipping is Task 9's binding responsibility. `ParseReport
 ```rust
 #[test]
 fn rss_keeps_decoded_guid_whitespace() -> Result<(), Box<dyn std::error::Error>> {
-    use continuo::feed::parse::parse_feed;
+    use tenuto::feed::parse::parse_feed;
     let report = parse_feed(include_bytes!("fixtures/feeds/rss2-minimal.xml"),
         &url::Url::parse("https://example.org/feed.xml")?)?;
     assert_eq!(report.feed.title.as_deref(), Some("Radio & Friends"));
@@ -625,7 +625,7 @@ Initialize ParsedItem fields to None. RSS selects direct channel/item children. 
 ```rust
 #[test]
 fn utf16_bom_is_decoded_strictly() -> Result<(), Box<dyn std::error::Error>> {
-    use continuo::feed::parse::parse_feed;
+    use tenuto::feed::parse::parse_feed;
     let xml = "<?xml version=\"1.0\"?><rss><channel><title>Радио</title></channel></rss>";
     let mut bytes = vec![0xff, 0xfe];
     for unit in xml.encode_utf16() { bytes.extend_from_slice(&unit.to_le_bytes()); }
@@ -667,7 +667,7 @@ git commit -m "feat: parse RSS feeds with strict XML decoding"
 ```rust
 #[test]
 fn atom_uses_nested_base_and_exact_id() -> Result<(), Box<dyn std::error::Error>> {
-    use continuo::feed::parse::parse_feed;
+    use tenuto::feed::parse::parse_feed;
     let report = parse_feed(include_bytes!("fixtures/feeds/atom-minimal.xml"),
         &"https://example.org/feeds/show.xml".parse()?)?;
     let item = &report.feed.items[0];
@@ -742,8 +742,8 @@ git commit -m "feat: interpret Atom feeds and podcast XML extensions"
 fn duplicate_guid_keeps_first_and_nonplayable_identity_survives()
     -> Result<(), Box<dyn std::error::Error>>
 {
-    use continuo::feed::{parse::parse_feed, episode::bind_feed};
-    use continuo::subscription::model::validate_feed_id;
+    use tenuto::feed::{parse::parse_feed, episode::bind_feed};
+    use tenuto::subscription::model::validate_feed_id;
     let xml = br#"<rss><channel>
       <item><guid>same</guid><title>first</title></item>
       <item><guid>same</guid><title>second</title><enclosure url="https://example.org/b.mp3"/></item>
@@ -863,7 +863,7 @@ Validate both reads and writes, so a public DTO cannot bypass invariants. New ca
 
 ```rust
 use std::sync::Arc;
-use continuo::{clock::FakeClock, feed::{cache::CacheStore, episode::bind_feed, parse::parse_feed},
+use tenuto::{clock::FakeClock, feed::{cache::CacheStore, episode::bind_feed, parse::parse_feed},
     persistence::store::StateStore, subscription::{model::{Subscription, validate_feed_id},
     store::{SubscriptionStore, SubscriptionSnapshot}}};
 
@@ -879,13 +879,13 @@ impl Rig {
     pub fn new() -> Result<Self, Box<dyn std::error::Error>> {
         let root = tempfile::tempdir()?;
         let clock = Arc::new(FakeClock::new());
-        let subs = SubscriptionStore::new(root.path().join("data/continuo/subscriptions.json"), clock.clone());
-        let cache = CacheStore::new(root.path().join("cache/continuo/feeds"));
-        let state = StateStore::new(root.path().join("state/continuo/state.json"), clock.clone());
+        let subs = SubscriptionStore::new(root.path().join("data/tenuto/subscriptions.json"), clock.clone());
+        let cache = CacheStore::new(root.path().join("cache/tenuto/feeds"));
+        let state = StateStore::new(root.path().join("state/tenuto/state.json"), clock.clone());
         Ok(Self { root, clock, subs, cache, state })
     }
     pub fn seed(&self, xml: &[u8], url: &str) -> Result<Subscription, Box<dyn std::error::Error>> {
-        use continuo::{clock::Clock, feed::cache::CachedFeed, http::document::CacheValidators};
+        use tenuto::{clock::Clock, feed::cache::CachedFeed, http::document::CacheValidators};
         let id = validate_feed_id(FEED_ID)?;
         let url: url::Url = url.parse()?;
         let bound = bind_feed(&id, parse_feed(xml, &url)?);
@@ -950,7 +950,7 @@ Derive Debug/Clone/PartialEq for row and Progress types. Keep private `progress_
 #[path = "support/feeds.rs"] mod feeds;
 #[test]
 fn latest_estimate_and_missing_audio_are_independent() -> Result<(), Box<dyn std::error::Error>> {
-    use continuo::{library::{list_episodes, Progress}, persistence::model::PersistedState};
+    use tenuto::{library::{list_episodes, Progress}, persistence::model::PersistedState};
     let rig = feeds::Rig::new()?;
     let sub = rig.seed(br#"<rss><channel><item><guid>id</guid><title>Outtakes</title></item></channel></rss>"#,
         "https://example.org/feed")?;
@@ -1027,7 +1027,7 @@ mod support;
 
 #[test]
 fn subscription_roundtrip_does_not_touch_checkpoints() -> Result<(), Box<dyn std::error::Error>> {
-    use continuo::{http::{limits::Limits, service::HttpService}, library};
+    use tenuto::{http::{limits::Limits, service::HttpService}, library};
     use support::server::{Script, TestServer};
     let rig = feeds::Rig::new()?;
     let server = TestServer::start(Script::serving(
@@ -1091,9 +1091,9 @@ let path = rig.cache.path_for(&sub.feed_id)?;
 std::fs::remove_file(&path)?;
 std::fs::create_dir(&path)?;
 std::fs::write(path.join("sentinel"), b"keep")?;
-let result = continuo::library::unsubscribe(&rig.subs, &rig.cache, &sub.slug)?;
+let result = tenuto::library::unsubscribe(&rig.subs, &rig.cache, &sub.slug)?;
 assert!(matches!(result.followup.as_ref().map(|f| &f.step),
-    Some(continuo::library::FollowupStep::RemoveCache)));
+    Some(tenuto::library::FollowupStep::RemoveCache)));
 assert!(rig.subs.read_snapshot()?.subscriptions.is_empty());
 assert_eq!(std::fs::read(path.join("sentinel"))?, b"keep");
 ```
@@ -1135,7 +1135,7 @@ mod support;
 #[test]
 fn unchanged_preserves_representation_and_advances_check_time() -> Result<(), Box<dyn std::error::Error>> {
     use std::time::Duration;
-    use continuo::{http::{limits::Limits, service::HttpService}, library::{self, RefreshOutcome}};
+    use tenuto::{http::{limits::Limits, service::HttpService}, library::{self, RefreshOutcome}};
     use support::server::{DocumentReply, Script, TestServer};
     let rig = feeds::Rig::new()?;
     let server = TestServer::start(Script::documents(vec![DocumentReply {
@@ -1236,16 +1236,16 @@ Inside commands.rs define private formatting functions `duration_text(Duration) 
 
 ```rust
 use clap::Parser;
-use continuo::cli::{Cli, CliCommand};
+use tenuto::cli::{Cli, CliCommand};
 
 #[test]
 fn play_selectors_are_positive_and_single_source_still_parses() -> Result<(), Box<dyn std::error::Error>> {
-    assert!(Cli::try_parse_from(["continuo", "play", "file.mp3"]).is_ok());
-    assert!(Cli::try_parse_from(["continuo", "play", "radio-t", "3", "--probe-only"]).is_ok());
-    assert!(Cli::try_parse_from(["continuo", "play", "radio-t", "0"]).is_err());
-    assert!(Cli::try_parse_from(["continuo", "play", "radio-t", "newest"]).is_err());
-    assert!(Cli::try_parse_from(["continuo", "episodes", "radio-t", "-n", "0"]).is_err());
-    let parsed = Cli::try_parse_from(["continuo", "refresh"])?;
+    assert!(Cli::try_parse_from(["tenuto", "play", "file.mp3"]).is_ok());
+    assert!(Cli::try_parse_from(["tenuto", "play", "radio-t", "3", "--probe-only"]).is_ok());
+    assert!(Cli::try_parse_from(["tenuto", "play", "radio-t", "0"]).is_err());
+    assert!(Cli::try_parse_from(["tenuto", "play", "radio-t", "newest"]).is_err());
+    assert!(Cli::try_parse_from(["tenuto", "episodes", "radio-t", "-n", "0"]).is_err());
+    let parsed = Cli::try_parse_from(["tenuto", "refresh"])?;
     assert!(matches!(parsed.command, CliCommand::Refresh { slug: None }));
     Ok(())
 }
@@ -1385,13 +1385,13 @@ fn finish_refresh_batch(out: &mut dyn std::io::Write, outcomes: Vec<RefreshOutco
 
 ```rust
 fn run_cli(root: &std::path::Path, args: &[&str]) -> std::io::Result<std::process::Output> {
-    std::process::Command::new(env!("CARGO_BIN_EXE_continuo"))
+    std::process::Command::new(env!("CARGO_BIN_EXE_tenuto"))
         .args(args)
         .env("XDG_DATA_HOME", root.join("data"))
         .env("XDG_CACHE_HOME", root.join("cache"))
         .env("XDG_STATE_HOME", root.join("state"))
         .env("XDG_CONFIG_HOME", root.join("config"))
-        .env("RUST_LOG", "continuo=warn")
+        .env("RUST_LOG", "tenuto=warn")
         .output()
 }
 ```
@@ -1420,7 +1420,7 @@ mod support;
 
 #[test]
 fn playback_persists_the_podcast_id_not_the_enclosure_url() -> Result<(), Box<dyn std::error::Error>> {
-    use continuo::{clock::Clock, http::{limits::Limits, service::HttpService}, library,
+    use tenuto::{clock::Clock, http::{limits::Limits, service::HttpService}, library,
         media::id::{MediaId, NormalizedUrl}, persistence::model::PersistedState,
         playback::{command::{PlaybackCommand, ResumeIntent}, state::PlaybackState}, session::Session};
     use support::server::{Script, TestServer};
@@ -1468,19 +1468,19 @@ fn assert_no_transport_secret(error: &(impl std::fmt::Display + std::fmt::Debug)
 }
 ```
 
-For each FeedError variant, document which constructor supplies safe context. Test nested Remote/Persistence sources as well as top-level Display; do not blindly preserve a raw serde DomainError message. Titles and explicit aliases are user-visible content, so keep their formatting policy distinct from transport URL secrecy. Check tracing output at `RUST_LOG=continuo=debug`; never log a full ParsedItem, CachedFeed, request or validator record.
+For each FeedError variant, document which constructor supplies safe context. Test nested Remote/Persistence sources as well as top-level Display; do not blindly preserve a raw serde DomainError message. Titles and explicit aliases are user-visible content, so keep their formatting policy distinct from transport URL secrecy. Check tracing output at `RUST_LOG=tenuto=debug`; never log a full ParsedItem, CachedFeed, request or validator record.
 
 - [ ] **Step 5: Add README command examples with the actual implemented contract.**
 
 ```text
-continuo subscribe https://radio-t.com/rss/ --as radio-t
-continuo feeds
-continuo episodes radio-t -n 5
-continuo play radio-t 3
-continuo play radio-t 3 --probe-only
-continuo refresh radio-t
-continuo refresh
-continuo unsubscribe radio-t
+tenuto subscribe https://radio-t.com/rss/ --as radio-t
+tenuto feeds
+tenuto episodes radio-t -n 5
+tenuto play radio-t 3
+tenuto play radio-t 3 --probe-only
+tenuto refresh radio-t
+tenuto refresh
+tenuto unsubscribe radio-t
 ```
 
 Document explicit refresh/offline listings, feed-order indices and renumbering only after cache replacement, one-positional compatibility, `--as`/ASCII host fallback and suffixes, unknown/unplayed/played/estimated progress and advisory duration, no-audio column, UTC, cache recovery messages, partial-success nonzero exits, single-process limitation, orphan checkpoints after resubscribe, distinct direct-URL/podcast identities, XML/Atom/HTML-title limitations, RSS1 refusal, data/cache paths and no offline audio. Do not recommend editing state.json to mark progress or deleting a shared directory to reset feeds.

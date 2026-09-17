@@ -120,7 +120,7 @@ impl Platform {
         let handle = signals.handle();
         let shared = Arc::clone(shared);
         let listener = std::thread::Builder::new()
-            .name("continuo-signal-listener".to_string())
+            .name("tenuto-signal-listener".to_string())
             .spawn(move || {
                 // `forever()` blocks until a signal arrives or `handle.close()`
                 // is called; the latter is exactly how this loop ends.

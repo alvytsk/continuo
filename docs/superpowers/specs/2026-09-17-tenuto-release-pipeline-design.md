@@ -1,4 +1,4 @@
-# Continuo: release pipeline and crates.io publishing
+# Tenuto: release pipeline and crates.io publishing
 
 Status: approved in conversation on 2026-09-17; ready for an implementation plan. The behavior below is the proposed contract, not an assertion that it already exists.
 
@@ -6,13 +6,11 @@ Branch: `feat/release-pipeline`.
 
 ## 1. Product decision
 
-Continuo builds from source and has never been released. This work makes it installable with one command — `cargo install continuo-player` — and gives the repository the checks that a published crate needs.
+Tenuto builds from source and has never been released. This work makes it installable with one command — `cargo install tenuto` — and gives the repository the checks that a published crate needs.
 
 The deliverable is a binary. The library target stays an implementation detail of that binary: no stable public API is promised, no semver discipline is claimed over the 90 modules `src/lib.rs` currently exports, and no crate is split out. If a reusable library is ever wanted, that is a separate decision taken later.
 
-Three constraints shape everything below.
-
-- **The name `continuo` is taken on crates.io.** It belongs to `continuo` v0.8.0, "Runtime service composition for multi-service Rust applications", last published 2026-09-12. It is maintained and unrelated, so the name will not be released.
+Two constraints shape everything below.
 - **The package exceeds the crates.io size cap.** `tests/fixtures` is 17 MB of audio and `docs` is 1.7 MB; the limit is 10 MB.
 - **Only Linux is verified.** CI runs on `ubuntu-latest` alone, yet a crates.io listing offers the crate to every platform.
 
@@ -28,32 +26,25 @@ Three constraints shape everything below.
 
 ## 3. Package identity
 
-`Cargo.toml` gains the publishing metadata and separates the package name from the binary and library names.
+`Cargo.toml` gains the publishing metadata. The package name carries the library and binary target names, so neither needs an explicit block.
 
 ```toml
 [package]
-name         = "continuo-player"
+name         = "tenuto"
 version      = "0.1.0"
 edition      = "2024"
 rust-version = "1.98.1"
 description  = "A keyboard-first terminal audio player for local files, HTTP media and podcasts"
 license      = "MIT"
-repository   = "https://github.com/alvytsk/continuo"
+repository   = "https://github.com/alvytsk/tenuto"
 readme       = "README.md"
 keywords     = ["audio", "player", "podcast", "tui", "terminal"]
 categories   = ["multimedia::audio", "command-line-utilities"]
 authors      = ["Alexey Vymyatnin <alvy.tsk@gmail.com>"]
 exclude      = ["/tests", "/docs", "/.github", "/.claude", "/rust-toolchain.toml"]
-
-[lib]
-name = "continuo"
-
-[[bin]]
-name = "continuo"
-path = "src/main.rs"
 ```
 
-The package is `continuo-player` on crates.io. The installed binary and the library are both `continuo`, so `continuo tui` still runs and the `use continuo::...` imports in the integration tests are untouched. This is the only place the new name appears in code.
+The package, the installed binary and the library are all `tenuto`, so `tenuto tui` still runs and the `use tenuto::...` imports in the integration tests are untouched.
 
 `exclude` takes the package from roughly 20 MB to under 2 MB.
 
@@ -62,14 +53,14 @@ The package is `continuo-player` on crates.io. The installed binary and the libr
 
 Excluding `/docs` breaks the README's relative links once the README is rendered on crates.io. Section 8 covers the fix.
 
-## 4. Bare `continuo` opens the player
+## 4. Bare `tenuto` opens the player
 
-`continuo` with no arguments is currently a clap usage error on exit code 2. It becomes the full-screen player, so the first thing a new installer types does something useful.
+`tenuto` with no arguments is currently a clap usage error on exit code 2. It becomes the full-screen player, so the first thing a new installer types does something useful.
 
 - `src/cli.rs`: `Cli::command` becomes `Option<CliCommand>`.
-- `src/app.rs`: a `None` arm calls `crate::tui::run` with `TuiOptions` built from `MouseMode::default()` and `ArtworkMode::default()` — the same values `continuo tui` uses when its flags are omitted.
+- `src/app.rs`: a `None` arm calls `crate::tui::run` with `TuiOptions` built from `MouseMode::default()` and `ArtworkMode::default()` — the same values `tenuto tui` uses when its flags are omitted.
 
-Every existing subcommand keeps its spelling and behavior, `continuo tui` included. `continuo --help` and `continuo --version` are clap's and are unaffected, because clap handles them before the subcommand is resolved.
+Every existing subcommand keeps its spelling and behavior, `tenuto tui` included. `tenuto --help` and `tenuto --version` are clap's and are unaffected, because clap handles them before the subcommand is resolved.
 
 The test asserts that no arguments parse to the TUI path. It does not launch a terminal: `tests/m5_tui_process.rs` already covers the process-level behavior, and repeating it here would buy nothing.
 
@@ -119,8 +110,8 @@ Permissions are `contents: read` and `id-token: write`.
 **The first publish is manual and is not performed by this workflow.** It runs from the maintainer's machine with a personal crates.io token. Two reasons: a trusted publisher is configured against a crate that already exists on crates.io, and the first publish is irreversible, so it deserves a deliberate human act. The order is therefore:
 
 1. Land everything in this spec; confirm `cargo publish --dry-run --locked` passes in CI.
-2. `cargo publish --locked` locally, publishing `continuo-player` 0.1.0.
-3. Configure the trusted publisher on crates.io for `alvytsk/continuo`, workflow `release.yml`.
+2. `cargo publish --locked` locally, publishing `tenuto` 0.1.0.
+3. Configure the trusted publisher on crates.io for `alvytsk/tenuto`, workflow `release.yml`.
 4. Run `release.yml` once through `workflow_dispatch` to prove the trusted-publishing path end to end against a dry run.
 
 **No `v0.1.0` tag is pushed.** The tag trigger fires however a tag is created, so a `v0.1.0` tag would start a run whose publish step must fail — 0.1.0 is already on crates.io by then, and a version can never be uploaded twice. The commit that publishes 0.1.0 is the record of it. The first tag ever pushed is `v0.1.1`.
@@ -133,8 +124,8 @@ Version numbers are bumped by hand in `Cargo.toml` with a matching `CHANGELOG.md
 
 - `LICENSE` — MIT, copyright Alexey Vymyatnin, matching the `license` field and the sibling r3sizer repository.
 - `CHANGELOG.md` — Keep a Changelog format, with a `0.1.0` entry describing the first release.
-- `README.md` — the install section leads with `cargo install continuo-player` and keeps the build-from-source instructions below it, including the ALSA note. The section that says which milestones are implemented stays accurate.
-- **Absolute links in `README.md`.** Because `/docs` is excluded from the package, the screenshot and the acceptance-document links must become absolute `https://github.com/alvytsk/continuo/...` URLs, or they render broken on crates.io. They keep working on GitHub.
+- `README.md` — the install section leads with `cargo install tenuto` and keeps the build-from-source instructions below it, including the ALSA note. The section that says which milestones are implemented stays accurate.
+- **Absolute links in `README.md`.** Because `/docs` is excluded from the package, the screenshot and the acceptance-document links must become absolute `https://github.com/alvytsk/tenuto/...` URLs, or they render broken on crates.io. They keep working on GitHub.
 - `docs/architecture.md` — the deployment section gains the crates.io path alongside building from source.
 
 No `CONTRIBUTING.md` and no `SECURITY.md`. This is a single-maintainer project and neither file would say anything the README does not.
@@ -159,10 +150,10 @@ Automated, and all of it in CI:
 
 By hand, before the first publish:
 
-- `cargo install --path .` then `continuo` with no arguments opens the player; `continuo play`, `continuo feeds` and `continuo tui` are unchanged.
+- `cargo install --path .` then `tenuto` with no arguments opens the player; `tenuto play`, `tenuto feeds` and `tenuto tui` are unchanged.
 - The README renders correctly on crates.io, screenshot included, after the dry run's packaged README is inspected.
 
 ## 11. Risks
 
 - **macOS may not build.** Nothing in the dependency set is known to be Linux-only, but nothing has been tried. If it fails and cannot be fixed cheaply, the fallback is to drop macOS from the matrix and say so in the README rather than ship an untested claim.
-- **`continuo-player` could be taken between now and the first publish.** It was free on 2026-09-17. The manual first publish should follow shortly after this work lands.
+- **`tenuto` could be taken between now and the first publish.** It was free on 2026-09-17. The manual first publish should follow shortly after this work lands.

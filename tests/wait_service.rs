@@ -10,16 +10,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use continuo::http::channel::{SourceInterrupt, WaitHook};
-use continuo::playback::engine::TransportCore;
-use continuo::playback::event::{PlaybackEvent, Progress};
-use continuo::playback::handshake::Handshake;
-use continuo::playback::link::OutputLink;
-use continuo::playback::output::{Nanos, SpanRecord};
-use continuo::playback::provenance::PositionProvenance;
-use continuo::playback::state::PlaybackState;
-use continuo::playback::timeline::{PositionQuality, Timeline};
-use continuo::playback::wait::{SessionFacts, WaitService};
+use tenuto::http::channel::{SourceInterrupt, WaitHook};
+use tenuto::playback::engine::TransportCore;
+use tenuto::playback::event::{PlaybackEvent, Progress};
+use tenuto::playback::handshake::Handshake;
+use tenuto::playback::link::OutputLink;
+use tenuto::playback::output::{Nanos, SpanRecord};
+use tenuto::playback::provenance::PositionProvenance;
+use tenuto::playback::state::PlaybackState;
+use tenuto::playback::timeline::{PositionQuality, Timeline};
+use tenuto::playback::wait::{SessionFacts, WaitService};
 
 /// The four wiring arguments that only the freeze tests care about, in the
 /// inert configuration: nothing frozen, an empty backlog, a channel nobody

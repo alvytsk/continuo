@@ -1,14 +1,14 @@
-# Continuo — Estimated Seeking and Position Provenance (M3.1)
+# Tenuto — Estimated Seeking and Position Provenance (M3.1)
 
 Date: 2026-09-10.
 Status: draft for review; not approved for implementation.
-Amends `2026-09-09-continuo-finite-http-design.md` §§4, 6, 8–10 and the M1
+Amends `2026-09-09-tenuto-finite-http-design.md` §§4, 6, 8–10 and the M1
 position contract published in `docs/architecture.md` §§1, 4.
 Occasioned by a defect found in M3's manual acceptance.
 
 ## 1. The defect this amends
 
-`continuo play <2h15m podcast>`, two presses of `→`, and playback wedges: the
+`tenuto play <2h15m podcast>`, two presses of `→`, and playback wedges: the
 status line freezes, position quality degrades, and pause/resume do nothing.
 Only `s` recovers it. Reproduced deterministically; the reproduction is
 `tests/engine_remote.rs::a_short_forward_seek_on_a_no_index_mp3_rescans_the_whole_file_instead_of_landing_quickly`,

@@ -1,23 +1,16 @@
 [package]
-name         = "continuo-player"
+name         = "tenuto"
 version      = "0.1.0"
 edition      = "2024"
 rust-version = "1.98.1"
 description  = "A keyboard-first terminal audio player for local files, HTTP media and podcasts"
 license      = "MIT"
-repository   = "https://github.com/alvytsk/continuo"
+repository   = "https://github.com/alvytsk/tenuto"
 readme       = "README.md"
 keywords     = ["audio", "player", "podcast", "tui", "terminal"]
 categories   = ["multimedia::audio", "command-line-utilities"]
 authors      = ["Alexey Vymyatnin <alvy.tsk@gmail.com>"]
 exclude      = ["/tests", "/docs", "/.github", "/.claude", "/rust-toolchain.toml"]
-
-[lib]
-name = "continuo"
-
-[[bin]]
-name = "continuo"
-path = "src/main.rs"
 
 [dependencies]
 thiserror = "2"

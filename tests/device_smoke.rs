@@ -3,8 +3,8 @@
 
 use std::time::Duration;
 
-use continuo::playback::output::cpal_output::CpalOutput;
-use continuo::playback::output::{AudioOutput, OutputRequest};
+use tenuto::playback::output::cpal_output::CpalOutput;
+use tenuto::playback::output::{AudioOutput, OutputRequest};
 
 #[test]
 #[ignore = "requires a real audio device"]

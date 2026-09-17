@@ -1,19 +1,19 @@
-# Continuo Release Pipeline Implementation Plan
+# Tenuto Release Pipeline Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Make continuo installable with `cargo install continuo-player`, backed by a CI pipeline that verifies formatting, lints, tests on Linux and macOS, docs, and packaging, plus a tag-triggered release workflow.
+**Goal:** Make tenuto installable with `cargo install tenuto`, backed by a CI pipeline that verifies formatting, lints, tests on Linux and macOS, docs, and packaging, plus a tag-triggered release workflow.
 
-**Architecture:** One crate, no workspace split and no cargo features. The package is renamed to `continuo-player` on crates.io while `[lib]` and `[[bin]]` keep the name `continuo`, so no import and no command spelling changes. `exclude` drops the 17 MB of test fixtures and the docs directory to clear the 10 MB package cap. The single CI job becomes five, one of which runs the real packaging path on every pull request. Releases publish from a `v*` tag through crates.io Trusted Publishing.
+**Architecture:** One crate, no workspace split and no cargo features. The package, the library and the binary are all `tenuto`, so no import and no command spelling changes. `exclude` drops the 17 MB of test fixtures and the docs directory to clear the 10 MB package cap. The single CI job becomes five, one of which runs the real packaging path on every pull request. Releases publish from a `v*` tag through crates.io Trusted Publishing.
 
 **Tech Stack:** Rust 1.98.1 (pinned in `rust-toolchain.toml`), edition 2024, clap 4, GitHub Actions, crates.io Trusted Publishing.
 
-**Spec:** `docs/superpowers/specs/2026-09-17-continuo-release-pipeline-design.md`
+**Spec:** `docs/superpowers/specs/2026-09-17-tenuto-release-pipeline-design.md`
 
 ## Global Constraints
 
 - Rust is pinned to **1.98.1** by `rust-toolchain.toml`; every workflow installs that exact toolchain, never `stable`.
-- Package name on crates.io is **`continuo-player`**. The binary and the library are both **`continuo`** and must stay that way.
+- Package name on crates.io is **`tenuto`**, and so are the library and the binary.
 - `Cargo.lock` is committed. Every cargo command in CI uses `--locked`.
 - License is **MIT**, copyright **Alexey Vymyatnin**.
 - `[lints]` in `Cargo.toml` forbids `unsafe_code` and denies `unwrap_used` and `expect_used`. Do not relax them. `clippy.toml` already exempts tests.
@@ -34,7 +34,7 @@ Renames the package for crates.io, adds every field publishing requires, and mak
 
 **Interfaces:**
 - Consumes: nothing.
-- Produces: a packageable crate named `continuo-player` whose lib and bin targets are both `continuo`. Task 3's `package` job and Task 5's release job both run `cargo publish` against this.
+- Produces: a packageable crate named `tenuto`. Task 3's `package` job and Task 5's release job both run `cargo publish` against this.
 
 - [ ] **Step 1: Run the packaging check to see the package blow the size cap**
 
@@ -45,14 +45,14 @@ Use `cargo package`, not `cargo publish --dry-run`: both run the same packaging 
 Expected: the command **exits 0** — missing metadata is only a warning in this cargo version, not an error — but two things are wrong, and the size is the one that fails a check:
 
 ```
-warning: crate continuo@0.1.0 already exists on crates.io index
+warning: crate tenuto@0.1.0 already exists on crates.io index
 warning: manifest has no description, license, license-file, documentation, homepage or repository
     Packaged 257 files, 20.2MiB (13.9MiB compressed)
 ```
 
 The `.crate` file is about 13.9 MiB against the crates.io cap of 10 MB. Confirm the failing assertion directly:
 
-Run: `test -f target/package/continuo-0.1.0.crate && test "$(stat -c%s target/package/continuo-0.1.0.crate)" -lt 10485760; echo "under cap: $?"`
+Run: `test -f target/package/tenuto-0.1.0.crate && test "$(stat -c%s target/package/tenuto-0.1.0.crate)" -lt 10485760; echo "under cap: $?"`
 
 Expected: prints `under cap: 1` — the check fails. That is this task's red state. Step 6 turns it green.
 
@@ -60,34 +60,27 @@ The `test -f` guard is not decoration. Under zsh, `test "" -lt 10485760` treats 
 
 Do not expect an error about the missing fields; you will not get one. The metadata still has to be added, because crates.io rejects an upload without `description` and `license` even though the local dry run tolerates their absence.
 
-- [ ] **Step 2: Rewrite the `[package]` block and add the target names**
+- [ ] **Step 2: Rewrite the `[package]` block**
 
 Replace lines 1-5 of `Cargo.toml` (everything from `[package]` down to the `rust-version` line, leaving the blank line and `[dependencies]` that follow) with:
 
 ```toml
 [package]
-name         = "continuo-player"
+name         = "tenuto"
 version      = "0.1.0"
 edition      = "2024"
 rust-version = "1.98.1"
 description  = "A keyboard-first terminal audio player for local files, HTTP media and podcasts"
 license      = "MIT"
-repository   = "https://github.com/alvytsk/continuo"
+repository   = "https://github.com/alvytsk/tenuto"
 readme       = "README.md"
 keywords     = ["audio", "player", "podcast", "tui", "terminal"]
 categories   = ["multimedia::audio", "command-line-utilities"]
 authors      = ["Alexey Vymyatnin <alvy.tsk@gmail.com>"]
 exclude      = ["/tests", "/docs", "/.github", "/.claude", "/rust-toolchain.toml"]
-
-[lib]
-name = "continuo"
-
-[[bin]]
-name = "continuo"
-path = "src/main.rs"
 ```
 
-The package is `continuo-player`; the lib and bin stay `continuo`, which is why no `use continuo::...` import in `tests/` and no command spelling changes.
+The package name carries the lib and bin target names, so the `use tenuto::...` imports in `tests/` and the command spelling need no change.
 
 - [ ] **Step 3: Create the LICENSE file**
 
@@ -123,7 +116,7 @@ The package rename changes the root entry in `Cargo.lock`, so `--locked` command
 
 Run: `cargo check`
 
-Expected: succeeds, and `git diff --stat Cargo.lock` shows the `continuo` root package entry replaced by `continuo-player`. Do not edit `Cargo.lock` by hand.
+Expected: succeeds, and `git diff --stat Cargo.lock` shows the root package entry gaining the new metadata. Do not edit `Cargo.lock` by hand.
 
 - [ ] **Step 5: Run the packaging check to verify it passes**
 
@@ -137,40 +130,39 @@ Expected: PASS, ending with `Packaged N files, X MiB`, and the metadata warning 
 
 - [ ] **Step 6: Verify the package now clears the 10 MB cap**
 
-Run: `test -f target/package/continuo-player-0.1.0.crate && test "$(stat -c%s target/package/continuo-player-0.1.0.crate)" -lt 10485760; echo "under cap: $?"`
+Run: `test -f target/package/tenuto-0.1.0.crate && test "$(stat -c%s target/package/tenuto-0.1.0.crate)" -lt 10485760; echo "under cap: $?"`
 
-Expected: prints `under cap: 0` — the assertion that failed in Step 1 now passes. Keep the `test -f` guard for the reason given in Step 1. Run `ls -lh target/package/continuo-player-0.1.0.crate` to see the figure; it should be roughly 1-2 MB, down from 13.9 MiB.
+Expected: prints `under cap: 0` — the assertion that failed in Step 1 now passes. Keep the `test -f` guard for the reason given in Step 1. Run `ls -lh target/package/tenuto-0.1.0.crate` to see the figure; it should be roughly 1-2 MB, down from 13.9 MiB.
 
 If it is still over, `exclude` is wrong — confirm `/tests` and `/docs` are both listed.
 
-- [ ] **Step 7: Verify the binary is still named `continuo`**
+- [ ] **Step 7: Verify the binary is still named `tenuto`**
 
-Run: `cargo build --locked && ls target/debug/continuo`
+Run: `cargo build --locked && ls target/debug/tenuto`
 
-Expected: the file exists. A binary named `continuo-player` means `[[bin]] name` was not applied.
+Expected: the file exists.
 
 - [ ] **Step 8: Run the full suite to confirm the rename broke no imports**
 
 Run: `cargo test --locked`
 
-Expected: PASS. The `use continuo::...` imports across `tests/` resolve through `[lib] name`.
+Expected: PASS. The `use tenuto::...` imports across `tests/` resolve through `[lib] name`.
 
 - [ ] **Step 9: Commit**
 
 ```bash
 git add Cargo.toml Cargo.lock LICENSE
-git commit -m "feat: package as continuo-player for crates.io
+git commit -m "feat: package as tenuto for crates.io
 
-The name continuo is taken on crates.io by an unrelated maintained
-crate, so the package is continuo-player while [lib] and [[bin]] keep
-the name continuo: imports and command spellings are unchanged. exclude
+The package, the library and the binary are all named tenuto, so
+imports and command spellings are unchanged. exclude
 drops the 17 MB of test fixtures and the docs directory to clear the
 10 MB package cap. Adds the MIT license the manifest now declares."
 ```
 
 ---
 
-### Task 2: Bare `continuo` opens the player
+### Task 2: Bare `tenuto` opens the player
 
 Running the binary with no arguments currently exits 2 with a clap usage error. It becomes the full-screen player, so the first command a new installer types does something useful.
 
@@ -182,7 +174,7 @@ Running the binary with no arguments currently exits 2 with a clap usage error. 
 
 **Interfaces:**
 - Consumes: `crate::tui::run(TuiOptions) -> Result<RunOutcome, AppError>` and `TuiOptions { mouse: MouseMode, artwork: ArtworkMode }`, both unchanged.
-- Produces: `continuo::cli::Cli.command` becomes `Option<CliCommand>`. Any later code matching on it must handle `None`.
+- Produces: `tenuto::cli::Cli.command` becomes `Option<CliCommand>`. Any later code matching on it must handle `None`.
 
 - [ ] **Step 1: Write the failing parse test**
 
@@ -190,23 +182,23 @@ In `tests/cli.rs`, add these imports below the existing `mod process;` declarati
 
 ```rust
 use clap::Parser;
-use continuo::cli::{Cli, CliCommand};
+use tenuto::cli::{Cli, CliCommand};
 ```
 
 Then add this test:
 
 ```rust
-/// A bare `continuo` is no longer a usage error: it resolves to no
+/// A bare `tenuto` is no longer a usage error: it resolves to no
 /// subcommand, which `app::run` dispatches to the player.
 #[test]
 fn a_bare_invocation_parses_to_no_subcommand() -> Result<(), Box<dyn std::error::Error>> {
-    let parsed = Cli::try_parse_from(["continuo"])?;
+    let parsed = Cli::try_parse_from(["tenuto"])?;
     assert!(parsed.command.is_none(), "bare invocation carries no subcommand");
 
     // Every existing subcommand still parses as it did.
-    let tui = Cli::try_parse_from(["continuo", "tui"])?;
+    let tui = Cli::try_parse_from(["tenuto", "tui"])?;
     assert!(matches!(tui.command, Some(CliCommand::Tui { .. })));
-    let feeds = Cli::try_parse_from(["continuo", "feeds"])?;
+    let feeds = Cli::try_parse_from(["tenuto", "feeds"])?;
     assert!(matches!(feeds.command, Some(CliCommand::Feeds)));
     Ok(())
 }
@@ -224,9 +216,9 @@ In `src/cli.rs`, replace the `Cli` struct (lines 9-12) with:
 
 ```rust
 pub struct Cli {
-    /// The subcommand to run. Absent means a bare `continuo`, which opens
+    /// The subcommand to run. Absent means a bare `tenuto`, which opens
     /// the full-screen player on the saved queue with the same defaults
-    /// `continuo tui` uses when its flags are omitted.
+    /// `tenuto tui` uses when its flags are omitted.
     #[command(subcommand)]
     pub command: Option<CliCommand>,
 }
@@ -245,8 +237,8 @@ with:
 
 ```rust
 pub fn run(cli: cli::Cli) -> Result<RunOutcome, crate::error::AppError> {
-    // A bare `continuo` opens the player. The defaults are the ones
-    // `continuo tui` applies when neither flag is given.
+    // A bare `tenuto` opens the player. The defaults are the ones
+    // `tenuto tui` applies when neither flag is given.
     let Some(command) = cli.command else {
         return crate::tui::run(crate::tui::TuiOptions {
             mouse: cli::MouseMode::default(),
@@ -279,12 +271,12 @@ fn an_invalid_rust_log_filter_fails_before_argument_parsing() {
     let profile = process::Profile::new().unwrap();
     let failure = profile
         .command()
-        .env("RUST_LOG", "continuo=not-a-level")
+        .env("RUST_LOG", "tenuto=not-a-level")
         .output()
         .unwrap();
     assert!(!failure.status.success());
     let stderr = String::from_utf8_lossy(&failure.stderr);
-    assert!(stderr.contains("continuo: invalid tracing filter"));
+    assert!(stderr.contains("tenuto: invalid tracing filter"));
     assert!(stderr.contains("application startup failed"));
     assert!(stderr.contains("error parsing level filter"));
 }
@@ -350,11 +342,11 @@ Expected: PASS. Any other test spawning the binary with no arguments and expecti
 
 ```bash
 git add src/cli.rs src/app.rs tests/cli.rs tests/m5_tui_process.rs
-git commit -m "feat: a bare continuo opens the player
+git commit -m "feat: a bare tenuto opens the player
 
 Running the binary with no arguments was a clap usage error on exit
 code 2. It now opens the full-screen player on the saved queue with the
-defaults continuo tui applies when its flags are omitted, so the first
+defaults tenuto tui applies when its flags are omitted, so the first
 command after cargo install does something useful. Every subcommand
 keeps its spelling, and --help is unaffected. The two tests asserting
 the old usage error are replaced: one keeps the RUST_LOG path it also
@@ -462,7 +454,7 @@ jobs:
           # cargo package writes one. --no-verify skips a second
           # verification build, which the dry run above already did.
           cargo package --locked --no-verify
-          crate=target/package/continuo-player-0.1.0.crate
+          crate=target/package/tenuto-0.1.0.crate
           test -f "$crate" || { echo "no .crate at $crate"; exit 1; }
           size=$(stat -c%s "$crate")
           echo "$crate is $size bytes"
@@ -595,7 +587,7 @@ Publishes on a `v*` tag through crates.io Trusted Publishing, so no long-lived r
 - Create: `.github/workflows/release.yml`
 
 **Interfaces:**
-- Consumes: the packageable manifest from Task 1. The version check reads `version` from `cargo metadata` for the package `continuo-player`.
+- Consumes: the packageable manifest from Task 1. The version check reads `version` from `cargo metadata` for the package `tenuto`.
 - Produces: nothing other tasks consume.
 
 - [ ] **Step 1: Create the workflow**
@@ -636,7 +628,7 @@ jobs:
         if: github.event_name == 'push'
         run: |
           manifest=$(cargo metadata --no-deps --format-version 1 \
-            | python3 -c "import json,sys; print(next(p['version'] for p in json.load(sys.stdin)['packages'] if p['name'] == 'continuo-player'))")
+            | python3 -c "import json,sys; print(next(p['version'] for p in json.load(sys.stdin)['packages'] if p['name'] == 'tenuto'))")
           tag="${GITHUB_REF_NAME#v}"
           echo "manifest=$manifest tag=$tag"
           test "$manifest" = "$tag"
@@ -672,7 +664,7 @@ Run:
 
 ```bash
 cargo metadata --no-deps --format-version 1 \
-  | python3 -c "import json,sys; print(next(p['version'] for p in json.load(sys.stdin)['packages'] if p['name'] == 'continuo-player'))"
+  | python3 -c "import json,sys; print(next(p['version'] for p in json.load(sys.stdin)['packages'] if p['name'] == 'tenuto'))"
 ```
 
 Expected: prints `0.1.0`. If it raises `StopIteration`, the package name in Task 1 does not match the one queried here.
@@ -701,7 +693,7 @@ Brings the README, changelog and architecture document in line with a published 
 - Modify: `docs/architecture.md` (the deployment section)
 
 **Interfaces:**
-- Consumes: the package name `continuo-player` from Task 1.
+- Consumes: the package name `tenuto` from Task 1.
 - Produces: nothing other tasks consume.
 
 - [ ] **Step 1: Create the changelog**
@@ -720,8 +712,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.1.0] - 2026-09-17
 
-First release. Published to crates.io as `continuo-player`; the installed
-binary is `continuo`.
+First release. Published to crates.io as `tenuto`.
 
 ### Added
 
@@ -733,10 +724,10 @@ binary is `continuo`.
 - A full-screen terminal player with a persistent queue, a file and podcast
   browser, cover art and a spectrum display.
 - Feed management from the player: subscribe, refresh and unsubscribe.
-- A bare `continuo` opens the player.
+- A bare `tenuto` opens the player.
 
-[Unreleased]: https://github.com/alvytsk/continuo/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/alvytsk/continuo/releases/tag/v0.1.0
+[Unreleased]: https://github.com/alvytsk/tenuto/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/alvytsk/tenuto/releases/tag/v0.1.0
 ```
 
 - [ ] **Step 2: Rewrite the README install section**
@@ -747,11 +738,8 @@ In `README.md`, replace the whole `## Install` section (from the `## Install` he
 ## Install
 
 ```sh
-cargo install continuo-player
+cargo install tenuto
 ```
-
-The crate is published as `continuo-player` because the name `continuo` was
-already taken on crates.io. The installed binary is `continuo`.
 
 On Linux, install `libasound2-dev` first. CPAL needs the ALSA headers, and
 the runtime `libasound.so.2` alone is not enough.
@@ -767,7 +755,7 @@ the runtime `libasound.so.2` alone is not enough.
 cargo build --release --locked
 ```
 
-The binary is `target/release/continuo`. The examples below assume it is on
+The binary is `target/release/tenuto`. The examples below assume it is on
 your `PATH`.
 ````
 
@@ -780,13 +768,13 @@ Run this to find them: `grep -n 'docs/' README.md`
 Rewrite each hit to an absolute URL. The screenshot becomes a raw URL so the image itself loads:
 
 ```markdown
-![The terminal player: cover art, track information, spectrum, transport and the queue](https://raw.githubusercontent.com/alvytsk/continuo/main/docs/images/tui.webp)
+![The terminal player: cover art, track information, spectrum, transport and the queue](https://raw.githubusercontent.com/alvytsk/tenuto/main/docs/images/tui.webp)
 ```
 
 and each document link becomes a blob URL, for example:
 
 ```markdown
-[docs/m5-acceptance.md](https://github.com/alvytsk/continuo/blob/main/docs/m5-acceptance.md)
+[docs/m5-acceptance.md](https://github.com/alvytsk/tenuto/blob/main/docs/m5-acceptance.md)
 ```
 
 - [ ] **Step 4: Document the bare invocation in the commands table**
@@ -797,10 +785,10 @@ and each document link becomes a blob URL, for example:
 | _(no arguments)_ | Open the full-screen player on the saved queue |
 ```
 
-And add this as the last line of the quick-start code block, after `continuo tui`:
+And add this as the last line of the quick-start code block, after `tenuto tui`:
 
 ```sh
-continuo            # same as `continuo tui`
+tenuto            # same as `tenuto tui`
 ```
 
 - [ ] **Step 5: Note the install path in the architecture document**
@@ -808,10 +796,8 @@ continuo            # same as `continuo tui`
 `docs/architecture.md` has the deployment section at `## 11. Deployment` (line 409). Append this paragraph to the end of that section, before whatever heading follows it:
 
 ```markdown
-The crate ships to crates.io as `continuo-player`, because `continuo` was
-already taken there by an unrelated crate. The published binary and the
-library target are both named `continuo`, so neither the command nor the
-`use continuo::...` imports are affected by the package name. A release is
+The crate ships to crates.io as `tenuto`, the same name as the published
+binary and the library target. A release is
 cut by pushing a `v*` tag, which triggers `.github/workflows/release.yml`:
 it verifies the tag matches the manifest version, runs the suite, and
 publishes through crates.io Trusted Publishing. The package excludes
@@ -830,7 +816,7 @@ Run:
 
 ```bash
 cargo package --locked --allow-dirty --no-verify
-tar -xzOf target/package/continuo-player-0.1.0.crate continuo-player-0.1.0/README.md | head -20
+tar -xzOf target/package/tenuto-0.1.0.crate tenuto-0.1.0/README.md | head -20
 ```
 
 Use `cargo package`, not `cargo publish --dry-run`: the dry run discards its
@@ -847,7 +833,7 @@ Expected: the extracted README shows the new install section and the absolute im
 git add CHANGELOG.md README.md docs/architecture.md
 git commit -m "docs: document installing from crates.io
 
-The README leads with cargo install continuo-player and keeps building
+The README leads with cargo install tenuto and keeps building
 from source below it. Every link into docs/ becomes absolute, because
 exclude drops that directory from the package and relative links render
 broken on crates.io. Adds a changelog with the 0.1.0 entry."
@@ -861,7 +847,7 @@ These steps are the maintainer's, not an implementer's, and are deliberately man
 
 1. Merge `feat/release-pipeline-impl` (it contains the spec and plan commits too); confirm the `package` job is green on `main`.
 2. `cargo publish --locked` from a local checkout of `main`, using a personal crates.io token. This is the first publish and is irreversible — a version can be yanked but never reused, and never re-uploaded.
-3. Configure the trusted publisher on crates.io for `continuo-player`: repository `alvytsk/continuo`, workflow `release.yml`.
+3. Configure the trusted publisher on crates.io for `tenuto`: repository `alvytsk/tenuto`, workflow `release.yml`.
 4. Run `release.yml` once through `workflow_dispatch` to prove the token-minting path against a dry run.
 
 **No `v0.1.0` tag is pushed.** The tag trigger fires however a tag is created, so a `v0.1.0` tag would start a run whose publish step must fail — 0.1.0 is already on crates.io by then. The first tag ever pushed is `v0.1.1`.

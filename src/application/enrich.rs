@@ -66,7 +66,7 @@ pub struct MetadataWorkers {
 }
 
 impl MetadataWorkers {
-    /// Starts `workers` threads named `continuo-metadata-1` onwards.
+    /// Starts `workers` threads named `tenuto-metadata-1` onwards.
     ///
     /// The threads are detached, never joined: a probe stuck on a slow or
     /// hung mount must not hold up whoever drops this handle, least of all
@@ -86,7 +86,7 @@ impl MetadataWorkers {
                 hook,
             };
             let spawned = thread::Builder::new()
-                .name(format!("continuo-metadata-{index}"))
+                .name(format!("tenuto-metadata-{index}"))
                 .spawn(move || worker.serve());
             if let Err(error) = spawned {
                 tracing::warn!(%error, "cannot start a metadata worker");

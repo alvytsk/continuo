@@ -100,7 +100,7 @@ pub enum EnqueueItem {
 
 impl EnqueueItem {
     /// An explicit http/https spelling is a URL; anything else is a path,
-    /// with the same disambiguation `continuo play` applies.
+    /// with the same disambiguation `tenuto play` applies.
     pub fn from_input(text: &str) -> Self {
         if is_url_spelling(text) {
             Self::Url(text.to_owned())

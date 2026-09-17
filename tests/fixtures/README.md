@@ -119,7 +119,7 @@ at all, which a sequential source cannot do.
 
 `sine-noxing.mp3`'s sibling, at a length long enough for the cost of a
 demuxer rescan to actually be measurable. Its whole existence is the M3.1
-spike (`2026-09-10-continuo-estimated-seek-design.md` §5.2): reproducing the
+spike (`2026-09-10-tenuto-estimated-seek-design.md` §5.2): reproducing the
 seek wedge needs a forward-scan expensive enough to time, and `sine-noxing.
 mp3`'s 5 s gives a rescan nothing to walk across. `-write_xing 0` is
 load-bearing for the same reason it is on `sine-noxing.mp3` — regenerating
@@ -157,5 +157,5 @@ for: it demonstrates that `MpaReader::seek`'s bounds check rejects any
 target past the (wrong) estimated duration for *every* seek mode, not only
 `Coarse`, and that ordinary forward playback is unaffected (`next_packet_ts`
 advances from real frame durations, never clamped to `num_frames`). See
-`docs/superpowers/specs/2026-09-10-continuo-estimated-seek-design.md` §5.2
+`docs/superpowers/specs/2026-09-10-tenuto-estimated-seek-design.md` §5.2
 for the measurements this fixture produced.

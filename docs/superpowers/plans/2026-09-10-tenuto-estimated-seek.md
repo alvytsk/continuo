@@ -1,4 +1,4 @@
-# Continuo M3.1 — Estimated Seeking and Position Provenance Implementation Plan
+# Tenuto M3.1 — Estimated Seeking and Position Provenance Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust 2024, `symphonia` (mp3/aac/isomp4/alac), `tokio` + `reqwest` for the HTTP source, `serde`/`serde_json` for persistence, `crossbeam-channel`, `rtrb`, `cpal`.
 
-**Spec:** `docs/superpowers/specs/2026-09-10-continuo-estimated-seek-design.md` — read it alongside this plan. It amends `docs/superpowers/specs/2026-09-09-continuo-finite-http-design.md`, which remains in force for everything it does not touch. Every `§n` below points into the amendment unless it says M3.
+**Spec:** `docs/superpowers/specs/2026-09-10-tenuto-estimated-seek-design.md` — read it alongside this plan. It amends `docs/superpowers/specs/2026-09-09-tenuto-finite-http-design.md`, which remains in force for everything it does not touch. Every `§n` below points into the amendment unless it says M3.
 
 ## Context an implementer needs
 
@@ -148,7 +148,7 @@ Byte-seek beneath the live reader and observe what `next_packet_ts` does. You ar
 
 - [ ] **Step 5: Decide and record**
 
-Write the decision, the measurements behind it, and the rejected shape's failure mode to `docs/superpowers/specs/2026-09-10-continuo-estimated-seek-design.md` as a new `### 5.2 Resolution` subsection. State the timestamp-base answer explicitly — Task 2 and Task 4 both depend on it.
+Write the decision, the measurements behind it, and the rejected shape's failure mode to `docs/superpowers/specs/2026-09-10-tenuto-estimated-seek-design.md` as a new `### 5.2 Resolution` subsection. State the timestamp-base answer explicitly — Task 2 and Task 4 both depend on it.
 
 **If neither shape works,** say so and stop. That is a real outcome and it changes the plan: the fallback is §5.3's partial bound plus honest refusal, and that is the human's decision, not yours.
 
@@ -157,7 +157,7 @@ Write the decision, the measurements behind it, and the rejected shape's failure
 Delete the experiment. Commit only the fixture, its README entry, and the spec resolution.
 
 ```bash
-git add tests/fixtures/sine-long-noxing.mp3 tests/fixtures/README.md docs/superpowers/specs/2026-09-10-continuo-estimated-seek-design.md
+git add tests/fixtures/sine-long-noxing.mp3 tests/fixtures/README.md docs/superpowers/specs/2026-09-10-tenuto-estimated-seek-design.md
 git commit -m "spike: settle how an estimated byte seek reaches the demuxer"
 ```
 
@@ -228,8 +228,8 @@ Second, **removing the clamp does not make the tail seekable.** Symphonia's own 
 ```rust
 use std::time::Duration;
 
-use continuo::playback::provenance::PositionProvenance;
-use continuo::playback::timeline::PositionQuality;
+use tenuto::playback::provenance::PositionProvenance;
+use tenuto::playback::timeline::PositionQuality;
 
 #[test]
 fn provenance_and_quality_are_independent_axes() {

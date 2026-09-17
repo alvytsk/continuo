@@ -5,7 +5,7 @@
 //! Only an explicit `Subscribe` or `Refresh` request touches the network.
 //! The worker owns its own [`LibraryStores`] and builds an `HttpService`
 //! lazily, on the first request that needs one; the feed listings are the
-//! same read-only snapshot reads `continuo feeds` uses, so opening the
+//! same read-only snapshot reads `tenuto feeds` uses, so opening the
 //! browser or listing episodes never refreshes a feed. A listing is a
 //! directory read and a `stat` per entry — no recursion and no media
 //! metadata probing. Mutations run one at a time, in order with the
@@ -116,15 +116,15 @@ pub enum BrowseRequest {
     Episodes {
         slug: String,
     },
-    /// `continuo subscribe <url>`, slug derived.
+    /// `tenuto subscribe <url>`, slug derived.
     Subscribe {
         url: String,
     },
-    /// `continuo refresh [slug]`: one feed, or every feed for `None`.
+    /// `tenuto refresh [slug]`: one feed, or every feed for `None`.
     Refresh {
         slug: Option<String>,
     },
-    /// `continuo unsubscribe <slug>`.
+    /// `tenuto unsubscribe <slug>`.
     Unsubscribe {
         slug: String,
     },
@@ -166,12 +166,10 @@ impl BrowseWorker {
         let (result_tx, results) = crossbeam_channel::unbounded();
         // Detached: a directory read stuck on a slow mount must not hold up
         // whoever drops the handle.
-        let _detached = thread::Builder::new()
-            .name("continuo-browse".into())
-            .spawn({
-                let result_tx = result_tx.clone();
-                move || serve(library.as_ref(), &request_rx, &result_tx)
-            });
+        let _detached = thread::Builder::new().name("tenuto-browse".into()).spawn({
+            let result_tx = result_tx.clone();
+            move || serve(library.as_ref(), &request_rx, &result_tx)
+        });
         Self {
             requests,
             results,

@@ -1,4 +1,4 @@
-//! The `continuo-spectrum` analysis worker (spec §10, decisions 18 and 25).
+//! The `tenuto-spectrum` analysis worker (spec §10, decisions 18 and 25).
 //!
 //! One thread per [`crate::playback::engine::EngineHandle`]. It owns the
 //! reading side of every transport's output tap, looks each block's label up
@@ -504,7 +504,7 @@ pub(crate) fn spawn(
         scratch: Vec::new(),
     };
     let join = std::thread::Builder::new()
-        .name("continuo-spectrum".into())
+        .name("tenuto-spectrum".into())
         .spawn(move || runner.run())
         .ok();
     if join.is_none() {
@@ -711,7 +711,7 @@ mod tests {
         });
         let (control, receiver) = crossbeam_channel::unbounded::<Control>();
         let join = std::thread::Builder::new()
-            .name("continuo-spectrum".into())
+            .name("tenuto-spectrum".into())
             .spawn(move || {
                 let _receiver = receiver;
                 panic!("analysis bug");

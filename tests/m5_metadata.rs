@@ -9,9 +9,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use continuo::application::enrich::{EnrichOutcome, MetadataWorkers, TagProbe};
-use continuo::media::id::{AbsolutePath, MediaId};
-use continuo::media::tags::{CoverBytes, LocalTags, probe_local_tags};
+use tenuto::application::enrich::{EnrichOutcome, MetadataWorkers, TagProbe};
+use tenuto::media::id::{AbsolutePath, MediaId};
+use tenuto::media::tags::{CoverBytes, LocalTags, probe_local_tags};
 
 fn png_2x2() -> Vec<u8> {
     let mut bytes = Vec::new();
@@ -66,7 +66,7 @@ fn an_untagged_file_has_no_names_but_a_duration() {
     assert_eq!(tags.duration, Some(Duration::from_millis(500)));
 }
 
-fn next_result(workers: &MetadataWorkers) -> continuo::application::enrich::EnrichResult {
+fn next_result(workers: &MetadataWorkers) -> tenuto::application::enrich::EnrichResult {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         if let Some(result) = workers.try_result() {
@@ -85,13 +85,13 @@ fn a_panicking_probe_is_contained_and_the_worker_serves_the_next_job() {
         if !flag.swap(true, Ordering::SeqCst) {
             panic!("injected decoder panic");
         }
-        assert!(continuo::lifecycle::panic::in_contained_job());
+        assert!(tenuto::lifecycle::panic::in_contained_job());
         Ok(LocalTags {
             title: Some("ok".into()),
             ..LocalTags::default()
         })
     });
-    let workers = MetadataWorkers::spawn(1, probe, continuo::lifecycle::hooks::TestHook::None);
+    let workers = MetadataWorkers::spawn(1, probe, tenuto::lifecycle::hooks::TestHook::None);
     let path = AbsolutePath::new("/music/a.flac".into()).expect("abs");
     workers.request(MediaId::LocalFile(path.clone()), path.clone());
     assert!(matches!(
@@ -116,7 +116,7 @@ fn enrichment_results_do_not_carry_the_cover_bytes() {
             ..LocalTags::default()
         })
     });
-    let workers = MetadataWorkers::spawn(1, probe, continuo::lifecycle::hooks::TestHook::None);
+    let workers = MetadataWorkers::spawn(1, probe, tenuto::lifecycle::hooks::TestHook::None);
     let path = AbsolutePath::new("/music/a.flac".into()).expect("abs");
     workers.request(MediaId::LocalFile(path.clone()), path);
     match next_result(&workers).outcome {
@@ -137,7 +137,7 @@ fn cancelled_results_are_discarded() {
             ..LocalTags::default()
         })
     });
-    let workers = MetadataWorkers::spawn(2, probe, continuo::lifecycle::hooks::TestHook::None);
+    let workers = MetadataWorkers::spawn(2, probe, tenuto::lifecycle::hooks::TestHook::None);
     let path = AbsolutePath::new("/music/a.flac".into()).expect("abs");
     workers.request(MediaId::LocalFile(path.clone()), path);
     workers.cancel_all();

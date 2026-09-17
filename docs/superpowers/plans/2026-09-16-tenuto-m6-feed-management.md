@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust 2024, Ratatui 0.30 + Crossterm 0.29, crossbeam-channel, tokio (already present via `HttpService`), `tracing`. No new dependencies.
 
-**Spec:** `docs/superpowers/specs/2026-09-16-continuo-m6-feed-management-design.md`
+**Spec:** `docs/superpowers/specs/2026-09-16-tenuto-m6-feed-management-design.md`
 
 ## Global Constraints
 
@@ -65,12 +65,12 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use continuo::application::browse::{BrowseRequest, BrowseResult, BrowseWorker};
-use continuo::application::runtime::LibraryStores;
-use continuo::clock::SystemClock;
-use continuo::feed::cache::CacheStore;
-use continuo::library::list_feeds;
-use continuo::subscription::store::SubscriptionStore;
+use tenuto::application::browse::{BrowseRequest, BrowseResult, BrowseWorker};
+use tenuto::application::runtime::LibraryStores;
+use tenuto::clock::SystemClock;
+use tenuto::feed::cache::CacheStore;
+use tenuto::library::list_feeds;
+use tenuto::subscription::store::SubscriptionStore;
 use support::server::{DocumentReply, Script, TestServer};
 
 fn rss(title: &str) -> Vec<u8> {
@@ -96,10 +96,10 @@ fn reply(path: &str, status: u16, body: Vec<u8>) -> DocumentReply {
 fn stores(root: &Path) -> LibraryStores {
     LibraryStores {
         subscriptions: SubscriptionStore::new(
-            root.join("data/continuo/subscriptions.json"),
+            root.join("data/tenuto/subscriptions.json"),
             Arc::new(SystemClock),
         ),
-        cache: CacheStore::new(root.join("cache/continuo/feeds")),
+        cache: CacheStore::new(root.join("cache/tenuto/feeds")),
     }
 }
 
@@ -270,7 +270,7 @@ In `src/application/browse.rs` replace the module doc's second paragraph:
 //! Only an explicit `Subscribe` or `Refresh` request touches the network.
 //! The worker owns its own [`LibraryStores`] and builds an `HttpService`
 //! lazily, on the first request that needs one; the feed listings are the
-//! same read-only snapshot reads `continuo feeds` uses, so opening the
+//! same read-only snapshot reads `tenuto feeds` uses, so opening the
 //! browser or listing episodes never refreshes a feed. A listing is a
 //! directory read and a `stat` per entry — no recursion and no media
 //! metadata probing. Mutations run one at a time, in order with the
@@ -305,11 +305,11 @@ pub enum BrowseRequest {
     Directory(PathBuf),
     Feeds,
     Episodes { slug: String },
-    /// `continuo subscribe <url>`, slug derived.
+    /// `tenuto subscribe <url>`, slug derived.
     Subscribe { url: String },
-    /// `continuo refresh [slug]`: one feed, or every feed for `None`.
+    /// `tenuto refresh [slug]`: one feed, or every feed for `None`.
     Refresh { slug: Option<String> },
-    /// `continuo unsubscribe <slug>`.
+    /// `tenuto unsubscribe <slug>`.
     Unsubscribe { slug: String },
 }
 
@@ -462,7 +462,7 @@ git commit -m "feat(browse): subscribe, refresh and unsubscribe requests on the 
 
 - [ ] **Step 1: Write the failing tests**
 
-Append to `tests/m5_browser.rs` (the imports at the top gain `use continuo::tui::browser::{BrowserEffect, BrowserState, BrowserTab, NoticeKind};`):
+Append to `tests/m5_browser.rs` (the imports at the top gain `use tenuto::tui::browser::{BrowserEffect, BrowserState, BrowserTab, NoticeKind};`):
 
 ```rust
 /// A Podcasts tab showing `feeds`.
@@ -1196,7 +1196,7 @@ git commit -m "feat(tui): notice block, feed prompt and confirmation in the brow
 
 **Files:**
 - Modify: `src/tui/mod.rs:614-626` (`Browsing::poll`)
-- Modify: `README.md`, `docs/architecture.md:259-266`, `docs/superpowers/specs/2026-09-14-continuo-ratatui-design.md:172`
+- Modify: `README.md`, `docs/architecture.md:259-266`, `docs/superpowers/specs/2026-09-14-tenuto-ratatui-design.md:172`
 - Create: `docs/m6-acceptance.md`
 
 **Interfaces:**
@@ -1237,14 +1237,14 @@ Expected: everything passes; note the totals.
 | **M6** | Feed management from the terminal player: subscribe, refresh one/all and unsubscribe on the browser's Podcasts tab, over the same library functions the CLI calls — implemented; manual check pending (`docs/m6-acceptance.md`) |
 ```
 
-and in the same section's paragraph that begins "M0 explicitly defers", append: "M6 adds the three subscription commands to the browser (`docs/superpowers/specs/2026-09-16-continuo-m6-feed-management-design.md`)."
+and in the same section's paragraph that begins "M0 explicitly defers", append: "M6 adds the three subscription commands to the browser (`docs/superpowers/specs/2026-09-16-tenuto-m6-feed-management-design.md`)."
 
 `README.md`: in the milestones paragraph (line 5) change "Milestones 0 through 5 are implemented" to "Milestones 0 through 6 are implemented" and append after the M5 clause: ", and subscribing, refreshing and unsubscribing from the player's Podcasts tab (M6)". In the terminal player section's key table (search for `b` / "Open/close browser"), add a row: `a` / `r` / `R` / `d` in the browser's Podcasts tab — subscribe by URL, refresh the highlighted feed, refresh all, remove with `y` to confirm.
 
-M5 spec `docs/superpowers/specs/2026-09-14-continuo-ratatui-design.md`, end of §8's second paragraph, append:
+M5 spec `docs/superpowers/specs/2026-09-14-tenuto-ratatui-design.md`, end of §8's second paragraph, append:
 
 ```markdown
-*Superseded for subscribe, refresh and unsubscribe by the M6 design (`2026-09-16-continuo-m6-feed-management-design.md`).*
+*Superseded for subscribe, refresh and unsubscribe by the M6 design (`2026-09-16-tenuto-m6-feed-management-design.md`).*
 ```
 
 Create `docs/m6-acceptance.md`:
@@ -1252,7 +1252,7 @@ Create `docs/m6-acceptance.md`:
 ```markdown
 # M6 acceptance
 
-`docs/superpowers/specs/2026-09-16-continuo-m6-feed-management-design.md` §8 lists the evidence: the automated suites, then one manual run against Radio-T.
+`docs/superpowers/specs/2026-09-16-tenuto-m6-feed-management-design.md` §8 lists the evidence: the automated suites, then one manual run against Radio-T.
 
 ## Automated
 
@@ -1290,7 +1290,7 @@ Expected: all three exit 0. Fix anything they raise (a `#[must_use]` or an unuse
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/tui/mod.rs README.md docs/architecture.md docs/superpowers/specs/2026-09-14-continuo-ratatui-design.md docs/m6-acceptance.md
+git add src/tui/mod.rs README.md docs/architecture.md docs/superpowers/specs/2026-09-14-tenuto-ratatui-design.md docs/m6-acceptance.md
 git commit -m "feat(tui): feed management from the Podcasts tab (M6)"
 ```
 

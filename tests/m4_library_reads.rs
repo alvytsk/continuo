@@ -13,11 +13,11 @@ use std::num::NonZeroUsize;
 use std::path::Path;
 use std::time::Duration;
 
-use continuo::feed::error::FeedError;
-use continuo::library::{Progress, list_episodes, list_feeds, resolve_episode};
-use continuo::media::source::SourceLocation;
-use continuo::persistence::model::PersistedState;
 use serde_json::json;
+use tenuto::feed::error::FeedError;
+use tenuto::library::{Progress, list_episodes, list_feeds, resolve_episode};
+use tenuto::media::source::SourceLocation;
+use tenuto::persistence::model::PersistedState;
 
 /// Six items, deliberately out of chronological order and with two missing
 /// `pubDate`s, so that stored (document) order is the only order a

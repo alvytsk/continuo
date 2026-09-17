@@ -1,4 +1,4 @@
-# Continuo — Finite HTTP Media (Milestone 3)
+# Tenuto — Finite HTTP Media (Milestone 3)
 
 Date: 2026-09-09.
 Status: draft for review; not approved for implementation.
@@ -7,7 +7,7 @@ Refines `docs/architecture.md` §§2–5, 7–9 and extends the M1/M2 contracts.
 
 ## 1. Outcome and scope
 
-`continuo play <http-or-https-url>` plays a finite remote recording through the
+`tenuto play <http-or-https-url>` plays a finite remote recording through the
 existing Symphonia/CPAL pipeline. A range-capable recording can be sought,
 stopped and resumed, and reopened near its saved checkpoint in a later process.
 Redirects and transport recreation preserve the original media identity.
@@ -106,7 +106,7 @@ body access. No dependency version is prescribed by this draft.
 
 ## 5. CLI and opening sequence
 
-Accept `continuo play <source> [--probe-only]`, where a source is a local path or
+Accept `tenuto play <source> [--probe-only]`, where a source is a local path or
 an HTTP(S) URL. Parse an explicit HTTP(S) scheme as a URL and report malformed
 URLs as such. Other values retain existing path behavior; `./https:...` remains
 an unambiguous local spelling. Reject URL userinfo rather than introducing an

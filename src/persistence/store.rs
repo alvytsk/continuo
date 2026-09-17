@@ -203,7 +203,7 @@ impl StateStore {
     /// The platform state path. Only `app` calls this, which is what keeps the
     /// tests off `$HOME` (§13).
     pub fn platform_path() -> Result<PathBuf, PersistenceError> {
-        let dirs = directories::ProjectDirs::from("", "", "continuo")
+        let dirs = directories::ProjectDirs::from("", "", "tenuto")
             .ok_or(PersistenceError::NoStateDirectory)?;
         // `state_dir` honors XDG_STATE_HOME on Linux and is None elsewhere.
         let base = dirs

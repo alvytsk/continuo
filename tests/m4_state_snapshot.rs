@@ -7,9 +7,9 @@ mod support;
 use std::sync::Arc;
 use std::time::Duration;
 
-use continuo::clock::FakeClock;
-use continuo::persistence::store::StateStore;
 use support::media;
+use tenuto::clock::FakeClock;
+use tenuto::persistence::store::StateStore;
 
 #[test]
 fn snapshot_read_does_not_quarantine() -> Result<(), Box<dyn std::error::Error>> {

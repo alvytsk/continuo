@@ -1,4 +1,4 @@
-# Continuo — Foundation Design (Milestone 0)
+# Tenuto — Foundation Design (Milestone 0)
 
 **Date:** 2026-09-07
 **Status:** Approved for implementation
@@ -6,11 +6,11 @@
 
 ---
 
-## 1. What Continuo is
+## 1. What Tenuto is
 
-Continuo is a keyboard-first terminal audio player for local files, finite remote audio over HTTP, and podcasts delivered through RSS/Atom feeds.
+Tenuto is a keyboard-first terminal audio player for local files, finite remote audio over HTTP, and podcasts delivered through RSS/Atom feeds.
 
-Its organizing motivation is correct playback-state handling. A podcast episode fetched over HTTP is finite, seekable when the server supports byte ranges, and resumable. Internet radio fetched over the same protocol is none of those things. Transport does not determine media semantics, and Continuo models the two separately rather than collapsing them into a single boolean.
+Its organizing motivation is correct playback-state handling. A podcast episode fetched over HTTP is finite, seekable when the server supports byte ranges, and resumable. Internet radio fetched over the same protocol is none of those things. Transport does not determine media semantics, and Tenuto models the two separately rather than collapsing them into a single boolean.
 
 ### The central invariant
 
@@ -68,7 +68,7 @@ This position — and only this position — is reported in ordinary playback ev
 
 Position derives from an anchor `(media_timestamp, output_frame_count, generation)` plus the frames the callback has submitted since that anchor, converted at the **output** sample rate after resampling, with resampler delay and padding accounted for.
 
-- **Submitted is not audible.** The callback's counter measures audio handed to the device. Output latency is compensated where CPAL reports it; otherwise the position is documented as an estimate. Continuo makes no claim of sample-accurate audible position.
+- **Submitted is not audible.** The callback's counter measures audio handed to the device. Output latency is compensated where CPAL reports it; otherwise the position is documented as an estimate. Tenuto makes no claim of sample-accurate audible position.
 - **Only media frames advance position.** Silence inserted during underrun or pause does not. Silence recorded within the media does.
 - **A successful seek anchors at the actual resulting media position**, not the requested target.
 - **A failed seek preserves the logical position** but may leave the decoder unusable. Recovery reopens the source at that position or transitions to an error state. The position survives either outcome; the requested target is never persisted.
@@ -148,7 +148,7 @@ Identity requirements:
 - **Serde uses an explicit string representation** via `#[serde(into = "String", try_from = "String")]`. `Display`/`FromStr` alone do not give JSON map-key serialization; this does.
 - **GUIDs are opaque.** They are never parsed, normalized, or interpreted — only escaped and compared byte-for-byte.
 - **Identity normalization is never applied to the fetch URL.** The enclosure URL used to retrieve bytes preserves its query string exactly as parsed — parameter order and percent-encoding included — because CDN signatures are computed over the query. Note the precise claim: host lowercasing and default-port removal do not generally invalidate signed URLs; query rewriting does. The rule is that the fetch URL is never routed through identity normalization, not that identity normalization is inherently destructive.
-- **"Not normalized" is not "byte-identical to the feed."** `Url` stores a parsed serialization, which may differ from the feed's original text (notably in percent-encoding). The contract is that Continuo applies no normalization of its own. If M4 encounters a real signed URL that `Url::parse` round-trips lossily, the remedy is to store the original string alongside the parsed value — deferred until such a case actually appears.
+- **"Not normalized" is not "byte-identical to the feed."** `Url` stores a parsed serialization, which may differ from the feed's original text (notably in percent-encoding). The contract is that Tenuto applies no normalization of its own. If M4 encounters a real signed URL that `Url::parse` round-trips lossily, the remedy is to store the original string alongside the parsed value — deferred until such a case actually appears.
 - **Non-UTF-8 paths are rejected** with a domain error rather than lossily converted. Documented v0.1 limitation.
 - **M0 accepts a validated absolute path and performs no I/O.** `fs::canonicalize` is I/O and belongs at the source-opening boundary in M1.
 - **`AbsolutePath` never collapses `..` lexically.** Collapsing `/a/link/../episode.mp3` to `/a/episode.mp3` is wrong whenever `link` is a symlink, and would attach the checkpoint to the wrong file. Rather than normalize, the constructor **rejects** paths containing `.` or `..`, so the hazard cannot be represented. M1 feeds it the output of `fs::canonicalize`, which resolves symlinks and by construction contains no parent components.
@@ -195,10 +195,10 @@ Documented in M0; implemented in M2. No filesystem I/O ships in M0.
 
 | Location | Contents |
 |---|---|
-| `$XDG_CONFIG_HOME/continuo/config.toml` | User preferences |
-| `$XDG_STATE_HOME/continuo/state.json` | Current media, queue, volume, checkpoints, played status — **one atomic snapshot** |
-| `$XDG_DATA_HOME/continuo/subscriptions.json` | Podcast subscriptions (durable user data) |
-| `$XDG_CACHE_HOME/continuo/` | Refetchable feed data |
+| `$XDG_CONFIG_HOME/tenuto/config.toml` | User preferences |
+| `$XDG_STATE_HOME/tenuto/state.json` | Current media, queue, volume, checkpoints, played status — **one atomic snapshot** |
+| `$XDG_DATA_HOME/tenuto/subscriptions.json` | Podcast subscriptions (durable user data) |
+| `$XDG_CACHE_HOME/tenuto/` | Refetchable feed data |
 
 XDG environment variables and their standard defaults are honored.
 
@@ -265,7 +265,7 @@ At the application boundary, errors present concisely to the user while the full
 ### Tooling
 
 - `rust-toolchain.toml` pinning Rust **1.98.1** with `rustfmt` and `clippy`. A specific release, not `channel = "stable"` — edition 2024 alone does not select a compiler version.
-- `Cargo.lock` committed; Continuo is an application.
+- `Cargo.lock` committed; Tenuto is an application.
 - One CI workflow on `ubuntu-latest`, triggered on push and pull request:
   - `cargo fmt --check`
   - `cargo clippy --locked --all-targets --all-features -- -D warnings`
@@ -328,8 +328,8 @@ The reference manual acceptance scenario, exercised from M3 onward. Radio-T epis
 6. Stop playback
 7. Start the same episode again
 8. Resume from the previous logical position, not `00:00`
-9. Exit Continuo
-10. Start Continuo again
+9. Exit Tenuto
+10. Start Tenuto again
 11. Restore the episode and resume close to the last saved checkpoint
 
 The episode must be treated as finite remote media, never as live radio merely because the transport is HTTP.

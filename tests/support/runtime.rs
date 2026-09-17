@@ -7,19 +7,19 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use continuo::application::enrich::TagProbe;
-use continuo::application::runtime::{EngineFactory, LibraryStores, PlayerRuntime, RuntimeParts};
-use continuo::application::view::PlayerView;
-use continuo::clock::{Clock, SystemClock};
-use continuo::http::limits::Limits;
-use continuo::lifecycle::hooks::TestHook;
-use continuo::persistence::model::PersistedState;
-use continuo::persistence::store::StateStore;
-use continuo::persistence::writer::WriterHandle;
-use continuo::playback::engine::EngineHandle;
-use continuo::playback::output::null_output::NullOutput;
-use continuo::queue::QueueEntryId;
-use continuo::session::Session;
+use tenuto::application::enrich::TagProbe;
+use tenuto::application::runtime::{EngineFactory, LibraryStores, PlayerRuntime, RuntimeParts};
+use tenuto::application::view::PlayerView;
+use tenuto::clock::{Clock, SystemClock};
+use tenuto::http::limits::Limits;
+use tenuto::lifecycle::hooks::TestHook;
+use tenuto::persistence::model::PersistedState;
+use tenuto::persistence::store::StateStore;
+use tenuto::persistence::writer::WriterHandle;
+use tenuto::playback::engine::EngineHandle;
+use tenuto::playback::output::null_output::NullOutput;
+use tenuto::queue::QueueEntryId;
+use tenuto::session::Session;
 
 pub struct Rig {
     pub _dir: tempfile::TempDir,

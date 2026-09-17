@@ -7,10 +7,10 @@ mod support;
 
 use std::time::{Duration, Instant};
 
-use continuo::media::capabilities::SeekSupport;
-use continuo::playback::command::Admission;
-use continuo::playback::event::PlaybackEvent;
-use continuo::playback::state::PlaybackState;
+use tenuto::media::capabilities::SeekSupport;
+use tenuto::playback::command::Admission;
+use tenuto::playback::event::PlaybackEvent;
+use tenuto::playback::state::PlaybackState;
 
 use support::server::{Script, TestServer};
 use support::{TestEngine, fixture_path};
@@ -945,7 +945,7 @@ fn a_seek_cancelled_while_reopening_from_stopped_reports_cancelled_not_rejected(
 // `SeekMode::Coarse` rather than `Accurate`, which computes a byte offset
 // directly from the track's own duration arithmetic instead of asking the
 // demuxer to scan - see `docs/superpowers/specs/
-// 2026-09-10-continuo-estimated-seek-design.md` §5.2 for the measurements.
+// 2026-09-10-tenuto-estimated-seek-design.md` §5.2 for the measurements.
 // This is now the regression test for that fix. It was committed
 // `#[ignore]`d as a failing reproduction and un-ignored when Task 4 made it
 // pass; the assertions below are unchanged from that failing version, which

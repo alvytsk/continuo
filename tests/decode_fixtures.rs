@@ -1,9 +1,9 @@
 use std::path::Path;
 use std::time::Duration;
 
-use continuo::media::capabilities::{Continuity, SeekSupport};
-use continuo::media::id::AbsolutePath;
-use continuo::playback::decode::DecodedSource;
+use tenuto::media::capabilities::{Continuity, SeekSupport};
+use tenuto::media::id::AbsolutePath;
+use tenuto::playback::decode::DecodedSource;
 
 #[allow(clippy::unwrap_used)]
 fn fixture(name: &str) -> AbsolutePath {
@@ -206,7 +206,7 @@ fn cancellation_is_observed_between_decode_steps() {
     });
     assert!(matches!(
         result,
-        Err(continuo::playback::error::PlaybackError::Cancelled)
+        Err(tenuto::playback::error::PlaybackError::Cancelled)
     ));
 }
 

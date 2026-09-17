@@ -44,7 +44,7 @@ impl InputReader {
         let stop = Arc::new(AtomicBool::new(false));
         let stopping = Arc::clone(&stop);
         std::thread::Builder::new()
-            .name("continuo-input".to_owned())
+            .name("tenuto-input".to_owned())
             .spawn(move || read_events(&sender, &stopping))?;
         Ok(Self { events, stop })
     }

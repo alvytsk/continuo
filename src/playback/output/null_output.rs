@@ -1,4 +1,4 @@
-//! A paced virtual output with no sound device (`CONTINUO_AUDIO_OUTPUT=null`,
+//! A paced virtual output with no sound device (`TENUTO_AUDIO_OUTPUT=null`,
 //! [`crate::playback::engine::EngineHandle::spawn_for_environment`]).
 //!
 //! A CI machine has no audio device, but a subprocess test still needs
@@ -78,7 +78,7 @@ impl AudioOutput for NullOutput {
         stop.store(false, Ordering::SeqCst);
 
         let thread = std::thread::Builder::new()
-            .name("continuo-null-output".to_string())
+            .name("tenuto-null-output".to_string())
             .spawn(move || {
                 let opened_at = Instant::now();
                 let mut buffer = vec![0.0_f32; samples];

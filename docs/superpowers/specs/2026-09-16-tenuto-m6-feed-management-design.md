@@ -1,4 +1,4 @@
-# Continuo M6: feed management from the terminal player
+# Tenuto M6: feed management from the terminal player
 
 Status: approved in conversation on 2026-09-16; ready for an implementation plan. The behavior below is the proposed contract, not an assertion that it already exists.
 
@@ -6,7 +6,7 @@ Branch: `feat/m6-feed-management`.
 
 ## 1. Product decision
 
-After two days of daily use the M5 player is fine except for one gap: adding a podcast means leaving the TUI for `continuo subscribe`. M6 closes it. The Podcasts tab of the on-demand browser gains the three subscription commands the CLI already has — subscribe, refresh (one or all), unsubscribe — and nothing else. The M5 design (§8) deliberately excluded "full subscription management screens"; this milestone adds exactly those three actions to the existing tab rather than a new screen.
+After two days of daily use the M5 player is fine except for one gap: adding a podcast means leaving the TUI for `tenuto subscribe`. M6 closes it. The Podcasts tab of the on-demand browser gains the three subscription commands the CLI already has — subscribe, refresh (one or all), unsubscribe — and nothing else. The M5 design (§8) deliberately excluded "full subscription management screens"; this milestone adds exactly those three actions to the existing tab rather than a new screen.
 
 The CLI commands remain, unchanged. The TUI reuses their library functions and their result wording.
 
@@ -32,7 +32,7 @@ The CLI commands remain, unchanged. The TUI reuses their library functions and t
 
 The worker keeps its single thread. It builds an `HttpService` with the default `Limits` lazily, on the first request that needs one, and keeps it for the thread's lifetime. A service that fails to start is reported as that request's `Err` and retried on the next network request. Async calls run through `service.handle().block_on`, the same pattern `commands.rs` uses, so `library.rs` stays free of `block_on`.
 
-The slug is always derived, as `continuo subscribe <url>` without `--as` does. A slug override is out of scope.
+The slug is always derived, as `tenuto subscribe <url>` without `--as` does. A slug override is out of scope.
 
 Requests stay serial: a directory read issued while a refresh-all is in flight waits behind it. This mirrors the CLI's serial refresh and is marked in code with a `ponytail:` note naming the upgrade path (a second worker for mutations). The module's doc comment changes from "nothing here touches the network" to "only an explicit `Subscribe` or `Refresh` request touches the network"; the M5 no-network invariant — browsing, enqueueing and restoring make no requests — is unchanged and its test (`tests/m5_no_network.rs`) must keep passing.
 
@@ -97,7 +97,7 @@ A slug override, cancelling an in-flight request, a footer fallback for results 
 Automated:
 
 - `tests/m5_browser.rs`, with the existing `press` and `screen` helpers: `a` opens the prompt and the prompt swallows `q`, `b`, space and `d`; Enter with text sends `Subscribe` and sets `pending`, Enter empty sends nothing, Esc cancels; `r`/`R`/`d` on an empty list send nothing; `a`/`r`/`R`/`d` while `pending` send nothing; `d` then a non-`y` key sends nothing, `d` then `y` sends `Unsubscribe` for the cursor feed; `r` inside an open feed's episodes refreshes that slug; `back()` from an episode view requests `Feeds` while keeping the cached rows; a matching `Mutation` `Ok` clears `pending`, shows the notice in the muted color, and re-requests the visible list; `Err` shows amber; a `Mutation` whose request differs from `pending`, and one arriving in a fresh `BrowserState`, change nothing; an `Unsubscribe` answer for the open feed leaves the episode view and requests `Feeds`, for `Ok`, for a follow-up cache failure, and for `UnknownSlug`; the follow-up listing answer keeps the notice; a mutation answer on the Files tab shows the notice and requests nothing; the drawn overlay contains the prompt, the confirmation question, and a notice above visible rows; an eight-line notice in a seventeen-row list shows four lines and the `+4 more lines` marker.
-- New `tests/m6_feed_management.rs`, using `support/server.rs`'s `TestServer` scripts and the worker harness from `tests/m5_no_network.rs`: subscribe, then refresh one, then refresh all, then unsubscribe through `BrowseWorker`, asserting the summaries match what `continuo subscribe`/`refresh`/`unsubscribe` print for the same fixture; a URL that fails validation and a server returning 500 each yield `Err` and leave the store as it was; a refresh-all whose first feed succeeds and second fails yields `Err` whose text contains the first feed's success line, the second feed's failure and the batch line, and the first feed's cache is updated; browsing alone (`Feeds`, `Episodes`) keeps the server's request count at zero; an `Unsubscribe` request builds no `HttpService` (the server sees no connection); every `Mutation` echoes the request it answers. Close–reopen: with a server script that delays the feed response, submit `Refresh`, drop the `BrowserState`, build a new one, then deliver the answer through `apply` and assert the new state shows no notice and requests nothing.
+- New `tests/m6_feed_management.rs`, using `support/server.rs`'s `TestServer` scripts and the worker harness from `tests/m5_no_network.rs`: subscribe, then refresh one, then refresh all, then unsubscribe through `BrowseWorker`, asserting the summaries match what `tenuto subscribe`/`refresh`/`unsubscribe` print for the same fixture; a URL that fails validation and a server returning 500 each yield `Err` and leave the store as it was; a refresh-all whose first feed succeeds and second fails yields `Err` whose text contains the first feed's success line, the second feed's failure and the batch line, and the first feed's cache is updated; browsing alone (`Feeds`, `Episodes`) keeps the server's request count at zero; an `Unsubscribe` request builds no `HttpService` (the server sees no connection); every `Mutation` echoes the request it answers. Close–reopen: with a server script that delays the feed response, submit `Refresh`, drop the `BrowserState`, build a new one, then deliver the answer through `apply` and assert the new state shows no notice and requests nothing.
 - `tests/m5_no_network.rs` unchanged and green.
 - Gates: `cargo fmt --check`, `cargo clippy --locked --all-targets --all-features -- -D warnings`, `cargo test --locked`.
 

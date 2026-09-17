@@ -1,4 +1,4 @@
-//! The one way a test launches `continuo` (M5 §12). Every child gets its own
+//! The one way a test launches `tenuto` (M5 §12). Every child gets its own
 //! state, data, cache and config directories, so no test can read, lock or
 //! write the developer's playback profile. Keep the `Profile` alive until the
 //! child has exited: dropping it deletes the directories under the child.
@@ -15,7 +15,7 @@ pub fn binary() -> &'static str {
         cfg!(target_os = "linux"),
         "subprocess profile isolation is verified only on Linux"
     );
-    env!("CARGO_BIN_EXE_continuo")
+    env!("CARGO_BIN_EXE_tenuto")
 }
 
 /// The environment that isolates a child's profile under `root`, laid out the
@@ -31,13 +31,13 @@ pub fn profile_env(root: &Path) -> Vec<(&'static str, OsString)> {
     ]
 }
 
-/// A command for `continuo` whose profile lives under `root`.
+/// A command for `tenuto` whose profile lives under `root`.
 pub fn command_in(root: &Path) -> Command {
     let mut command = Command::new(binary());
     command
         .envs(profile_env(root))
-        .env_remove("CONTINUO_TEST_HOOK")
-        .env_remove("CONTINUO_AUDIO_OUTPUT");
+        .env_remove("TENUTO_TEST_HOOK")
+        .env_remove("TENUTO_AUDIO_OUTPUT");
     command
 }
 
@@ -58,7 +58,7 @@ impl Profile {
 
     /// Where `StateStore::platform_path` resolves on Linux under this profile.
     pub fn state_dir(&self) -> PathBuf {
-        self.root().join("state").join("continuo")
+        self.root().join("state").join("tenuto")
     }
 
     pub fn state_file(&self) -> PathBuf {

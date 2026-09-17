@@ -4,14 +4,14 @@
 
 use std::time::Duration;
 
-use continuo::media::id::MediaId;
-use continuo::media::source::SourceLocation;
-use continuo::playback::command::{LoadRequestId, PlaybackCommand, ResumeIntent};
-use continuo::playback::event::{PlaybackEvent, StartDisposition};
-use continuo::playback::provenance::PositionProvenance;
-use continuo::playback::state::PlaybackState;
-use continuo::playback::volume::Volume;
-use continuo::resume::ResumeCandidate;
+use tenuto::media::id::MediaId;
+use tenuto::media::source::SourceLocation;
+use tenuto::playback::command::{LoadRequestId, PlaybackCommand, ResumeIntent};
+use tenuto::playback::event::{PlaybackEvent, StartDisposition};
+use tenuto::playback::provenance::PositionProvenance;
+use tenuto::playback::state::PlaybackState;
+use tenuto::playback::volume::Volume;
+use tenuto::resume::ResumeCandidate;
 
 mod support;
 use support::TestEngine;
@@ -622,11 +622,11 @@ fn a_load_echoes_its_request_on_loading_loaded_and_progress() {
 #[test]
 fn an_open_failure_is_the_load_outcome_for_its_request() {
     let mut engine = TestEngine::start_idle();
-    let missing = std::env::temp_dir().join("continuo-m5-definitely-missing.flac");
+    let missing = std::env::temp_dir().join("tenuto-m5-definitely-missing.flac");
     engine.send(PlaybackCommand::Load {
         request: LoadRequestId::from_raw(42),
         media: MediaId::LocalFile(
-            continuo::media::id::AbsolutePath::new(missing.clone()).expect("absolute"),
+            tenuto::media::id::AbsolutePath::new(missing.clone()).expect("absolute"),
         ),
         source: SourceLocation::LocalPath(missing),
         resume: ResumeIntent::StartAt(Duration::ZERO),

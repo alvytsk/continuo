@@ -32,22 +32,22 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::Sender;
 use url::Url;
 
-use continuo::http::limits::Limits;
-use continuo::http::service::HttpService;
-use continuo::media::id::{AbsolutePath, MediaId, NormalizedUrl};
-use continuo::media::source::SourceLocation;
-use continuo::playback::callback::CallbackCore;
-use continuo::playback::command::{LoadRequestId, PlaybackCommand, ResumeIntent};
-use continuo::playback::engine::EngineHandle;
-use continuo::playback::error::PlaybackError;
-use continuo::playback::event::{PlaybackEvent, Progress, ShutdownReport, StartDisposition};
-use continuo::playback::link::{OutputLink, Phase};
-use continuo::playback::output::cpal_output::OutputFault;
-use continuo::playback::output::test_output::TestOutput;
-use continuo::playback::output::{AudioOutput, Nanos, NegotiatedOutput, OutputRequest};
-use continuo::playback::provenance::PositionProvenance;
-use continuo::playback::state::PlaybackState;
-use continuo::playback::volume::Volume;
+use tenuto::http::limits::Limits;
+use tenuto::http::service::HttpService;
+use tenuto::media::id::{AbsolutePath, MediaId, NormalizedUrl};
+use tenuto::media::source::SourceLocation;
+use tenuto::playback::callback::CallbackCore;
+use tenuto::playback::command::{LoadRequestId, PlaybackCommand, ResumeIntent};
+use tenuto::playback::engine::EngineHandle;
+use tenuto::playback::error::PlaybackError;
+use tenuto::playback::event::{PlaybackEvent, Progress, ShutdownReport, StartDisposition};
+use tenuto::playback::link::{OutputLink, Phase};
+use tenuto::playback::output::cpal_output::OutputFault;
+use tenuto::playback::output::test_output::TestOutput;
+use tenuto::playback::output::{AudioOutput, Nanos, NegotiatedOutput, OutputRequest};
+use tenuto::playback::provenance::PositionProvenance;
+use tenuto::playback::state::PlaybackState;
+use tenuto::playback::volume::Volume;
 
 const CHANNELS: u16 = 2;
 const RATE: u32 = 48_000;
@@ -1198,7 +1198,7 @@ pub fn failed_load_position(
     let handle =
         EngineHandle::spawn_with(Box::new(HarnessOutput::new(Arc::clone(&device))), fault_rx);
     let id = MediaId::LocalFile(
-        continuo::media::id::AbsolutePath::new(missing.to_path_buf()).expect("absolute path"),
+        tenuto::media::id::AbsolutePath::new(missing.to_path_buf()).expect("absolute path"),
     );
     handle
         .commands()

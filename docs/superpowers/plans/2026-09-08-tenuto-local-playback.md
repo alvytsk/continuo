@@ -1,14 +1,14 @@
-# Continuo Local Playback (Milestone 1) Implementation Plan
+# Tenuto Local Playback (Milestone 1) Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Deliver the first audible slice — `continuo play <path>` decodes a local MP3/FLAC/WAV file through CPAL with keyboard control, and preserves its logical position across pause, stop, seek, and device recreation.
+**Goal:** Deliver the first audible slice — `tenuto play <path>` decodes a local MP3/FLAC/WAV file through CPAL with keyboard control, and preserves its logical position across pause, stop, seek, and device recreation.
 
 **Architecture:** A decode worker thread owns the entire audio pipeline and is the sole authority for playback state, the position anchor, and the transport generation. The main thread reads keys, renders, and holds a mirror it never writes back. The CPAL callback publishes *media spans* — cumulative frame totals tagged with CPAL's predicted playback instant — into a lock-free ring, from which the worker reconstructs position without ever subtracting a latency estimate from a frame counter.
 
 **Tech Stack:** Rust 1.98.1, edition 2024; symphonia 0.6.1, cpal 0.18.2, rubato 5.0.0, rtrb 0.4.0, crossbeam-channel 0.5.17, crossterm 0.29.0, clap 4; existing thiserror 2, tracing 0.1, time 0.3.
 
-**Spec:** `docs/superpowers/specs/2026-09-08-continuo-local-playback-design.md` (approved; read alongside this plan).
+**Spec:** `docs/superpowers/specs/2026-09-08-tenuto-local-playback-design.md` (approved; read alongside this plan).
 
 ## Global Constraints
 
@@ -1724,9 +1724,9 @@ git commit -m "Add acknowledged freeze/discard/install handshake with draining w
 use std::path::Path;
 use std::time::Duration;
 
-use continuo::media::capabilities::{Continuity, SeekSupport};
-use continuo::media::id::AbsolutePath;
-use continuo::playback::decode::DecodedSource;
+use tenuto::media::capabilities::{Continuity, SeekSupport};
+use tenuto::media::id::AbsolutePath;
+use tenuto::playback::decode::DecodedSource;
 
 fn fixture(name: &str) -> AbsolutePath {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(name);
@@ -1794,7 +1794,7 @@ fn cancellation_is_observed_between_decode_steps() {
         calls += 1;
         true
     });
-    assert!(matches!(result, Err(continuo::playback::error::PlaybackError::Cancelled)));
+    assert!(matches!(result, Err(tenuto::playback::error::PlaybackError::Cancelled)));
 }
 
 #[test]
@@ -1808,7 +1808,7 @@ fn a_missing_file_reports_a_contextual_error() {
 - [ ] **Step 2: Run the tests and confirm they fail**
 
 Run: `cargo test --locked --test decode_fixtures`
-Expected: FAIL — `continuo::playback::decode` does not exist.
+Expected: FAIL — `tenuto::playback::decode` does not exist.
 
 - [ ] **Step 3: Write the error type**
 
@@ -2520,8 +2520,8 @@ mod tests {
 
 use std::time::Duration;
 
-use continuo::playback::output::cpal_output::CpalOutput;
-use continuo::playback::output::{AudioOutput, OutputRequest};
+use tenuto::playback::output::cpal_output::CpalOutput;
+use tenuto::playback::output::{AudioOutput, OutputRequest};
 
 #[test]
 #[ignore = "requires a real audio device"]
@@ -2823,9 +2823,9 @@ git commit -m "Add CPAL output with two-phase negotiation and fault classificati
 
 use std::time::Duration;
 
-use continuo::playback::command::PlaybackCommand;
-use continuo::playback::event::PlaybackEvent;
-use continuo::playback::state::PlaybackState;
+use tenuto::playback::command::PlaybackCommand;
+use tenuto::playback::event::PlaybackEvent;
+use tenuto::playback::state::PlaybackState;
 
 mod support;
 use support::TestEngine;
@@ -3259,7 +3259,7 @@ git commit -m "Add playback engine with state machine, admission control, and re
 
 **Interfaces:**
 - Consumes: `EngineHandle`, `PlaybackCommand`, `PlaybackEvent`, `Progress`, `Volume` (Task 9).
-- Produces: the `continuo play <path>` binary surface.
+- Produces: the `tenuto play <path>` binary surface.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -3268,7 +3268,7 @@ git commit -m "Add playback engine with state machine, admission control, and re
 use std::process::Command;
 
 fn run(args: &[&str]) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_continuo")).args(args).output().unwrap()
+    Command::new(env!("CARGO_BIN_EXE_tenuto")).args(args).output().unwrap()
 }
 
 #[test]
@@ -3284,7 +3284,7 @@ fn an_absent_file_exits_nonzero_with_a_concise_message() {
     let output = run(&["play", "/nonexistent/definitely-not-here.flac"]);
     assert!(!output.status.success());
     let text = String::from_utf8_lossy(&output.stderr);
-    assert!(text.contains("continuo:"), "expected a prefixed message: {text}");
+    assert!(text.contains("tenuto:"), "expected a prefixed message: {text}");
     assert!(text.contains("definitely-not-here.flac"), "expected the path: {text}");
 }
 
@@ -3300,7 +3300,7 @@ fn a_directory_is_rejected_as_not_a_regular_file() {
 fn a_relative_path_is_accepted_and_canonicalized() {
     // Canonicalization happens at the worker's source-opening boundary, so a
     // relative path must not be rejected by argument parsing.
-    let output = Command::new(env!("CARGO_BIN_EXE_continuo"))
+    let output = Command::new(env!("CARGO_BIN_EXE_tenuto"))
         .args(["play", "tests/fixtures/sine.flac", "--probe-only"])
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .output()
@@ -3327,7 +3327,7 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 
 #[derive(Debug, Parser)]
-#[command(name = "continuo", about = "A keyboard-first terminal audio player")]
+#[command(name = "tenuto", about = "A keyboard-first terminal audio player")]
 pub struct Cli {
     #[command(subcommand)]
     pub command: CliCommand,
@@ -3448,11 +3448,11 @@ Unknown duration renders as `--:--:--`. `PositionQuality::Degraded` appends ` ~`
 use std::process::ExitCode;
 
 use clap::Parser;
-use continuo::{app, cli, telemetry};
+use tenuto::{app, cli, telemetry};
 
 fn main() -> ExitCode {
     if let Err(error) = telemetry::init() {
-        eprintln!("continuo: {error}");
+        eprintln!("tenuto: {error}");
         return ExitCode::FAILURE;
     }
     let cli = match cli::Cli::try_parse() {
@@ -3465,7 +3465,7 @@ fn main() -> ExitCode {
     match app::run(cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("continuo: {error}");
+            eprintln!("tenuto: {error}");
             tracing::error!(error = ?error, "playback failed");
             ExitCode::FAILURE
         }
@@ -3480,7 +3480,7 @@ Add `pub mod app;` and `pub mod cli;` to `src/lib.rs`.
 Run: `cargo test --locked --test cli_playback`
 Expected: PASS — all four tests.
 
-`tests/cli.rs` from M0 asserts the old "Continuo foundation initialized" startup message on a bare invocation. That invocation now prints help and exits nonzero, so update that test to assert the new behaviour rather than deleting it.
+`tests/cli.rs` from M0 asserts the old "Tenuto foundation initialized" startup message on a bare invocation. That invocation now prints help and exits nonzero, so update that test to assert the new behaviour rather than deleting it.
 
 - [ ] **Step 7: Manual acceptance**
 

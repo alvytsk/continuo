@@ -1,8 +1,8 @@
-# Continuo M4 — feeds, subscriptions, episode listing and progress
+# Tenuto M4 — feeds, subscriptions, episode listing and progress
 
-Approved design for Milestone 4. It builds on the [foundation spec](2026-09-07-continuo-foundation-design.md),
-[local playback](2026-09-08-continuo-local-playback-design.md), [durable state](2026-09-08-continuo-durable-state-design.md),
-[finite HTTP](2026-09-09-continuo-finite-http-design.md) and [estimated seeking](2026-09-10-continuo-estimated-seek-design.md).
+Approved design for Milestone 4. It builds on the [foundation spec](2026-09-07-tenuto-foundation-design.md),
+[local playback](2026-09-08-tenuto-local-playback-design.md), [durable state](2026-09-08-tenuto-durable-state-design.md),
+[finite HTTP](2026-09-09-tenuto-finite-http-design.md) and [estimated seeking](2026-09-10-tenuto-estimated-seek-design.md).
 
 M4 turns the podcast identity types M0 shipped and never used into a working feed subsystem: fetch and parse
 RSS 2.0 and Atom 1.0, keep durable subscriptions, list episodes with the progress M2 already records, and play a
@@ -16,12 +16,12 @@ Five new commands, plus a second form for the existing `play`.
 
 | Command | Behavior |
 |---|---|
-| `continuo subscribe <url> [--as <slug>]` | Fetch once, parse, assign an immutable `FeedId`, derive or accept a slug, write the cache and then the subscription |
-| `continuo unsubscribe <slug>` | Remove the subscription, then delete its cache. Checkpoints are **not** deleted |
-| `continuo feeds` | List subscriptions: slug, retained episode count, when last refreshed, title |
-| `continuo refresh [<slug>]` | Conditional GET one feed, or every feed when no slug is given. One outcome per feed |
-| `continuo episodes <slug> [-n N] [--reverse]` | Read the cache only, never the network. Numbered listing with progress |
-| `continuo play <slug> <index> [--probe-only]` | Resolve to a `MediaId::PodcastEpisode` plus its enclosure, then run the existing playback path |
+| `tenuto subscribe <url> [--as <slug>]` | Fetch once, parse, assign an immutable `FeedId`, derive or accept a slug, write the cache and then the subscription |
+| `tenuto unsubscribe <slug>` | Remove the subscription, then delete its cache. Checkpoints are **not** deleted |
+| `tenuto feeds` | List subscriptions: slug, retained episode count, when last refreshed, title |
+| `tenuto refresh [<slug>]` | Conditional GET one feed, or every feed when no slug is given. One outcome per feed |
+| `tenuto episodes <slug> [-n N] [--reverse]` | Read the cache only, never the network. Numbered listing with progress |
+| `tenuto play <slug> <index> [--probe-only]` | Resolve to a `MediaId::PodcastEpisode` plus its enclosure, then run the existing playback path |
 
 `play` distinguishes its two forms by arity: one positional is a path or an HTTP(S) URL — the M1–M3 behavior,
 unchanged — and two positionals are a slug and an index. A second positional that is not a positive integer is
@@ -98,8 +98,8 @@ no TUI.
 
 ### 1.6 Two consequences accepted rather than solved
 
-**The same audio reached two ways has two identities.** `continuo play <url>` yields `MediaId::RemoteUrl`;
-`continuo play radio-t 3` yields `MediaId::PodcastEpisode`. They are separate checkpoints. This is the
+**The same audio reached two ways has two identities.** `tenuto play <url>` yields `MediaId::RemoteUrl`;
+`tenuto play radio-t 3` yields `MediaId::PodcastEpisode`. They are separate checkpoints. This is the
 foundation spec's deliberate design — identity follows how the media was reached — and M4 documents it in the
 README rather than unifying the two.
 
@@ -408,7 +408,7 @@ an identity field (§4.8).
 bad timestamp is not a reason to hide an episode.
 
 Skipped items are counted, logged at warn with the reason, and reported: `3 items skipped
-(RUST_LOG=continuo=warn for detail)`.
+(RUST_LOG=tenuto=warn for detail)`.
 
 ### 4.7 Multiple enclosures and duplicate keys
 
@@ -443,7 +443,7 @@ display-only.
 
 ### 5.1 subscriptions.json
 
-At `ProjectDirs::data_dir()` — `$XDG_DATA_HOME/continuo/subscriptions.json` on Linux.
+At `ProjectDirs::data_dir()` — `$XDG_DATA_HOME/tenuto/subscriptions.json` on Linux.
 
 ```json
 {
@@ -608,7 +608,7 @@ nonzero exit; `Missing` alone means "no subscriptions yet", and an empty listing
 
 ### 5.7 Concurrency
 
-Atomic replacement prevents a torn file, not a lost update. Two concurrent `continuo refresh` processes can
+Atomic replacement prevents a torn file, not a lost update. Two concurrent `tenuto refresh` processes can
 overwrite each other's subscription changes. The project is single-user and single-process by design; M4 adds
 no locking and states this limitation in the README.
 
@@ -617,12 +617,12 @@ no locking and states this limitation in the README.
 ### 6.1 Output
 
 ```text
-$ continuo feeds
+$ tenuto feeds
 SLUG        EPISODES  REFRESHED (UTC)   TITLE
 radio-t          412  2026-09-11 09:14  Радио-Т
 sysdesign          —  never             System Design
 
-$ continuo episodes radio-t -n 5
+$ tenuto episodes radio-t -n 5
   #  PROGRESS            AUDIO  PUBLISHED (UTC)  TITLE
   1  —                   -      2026-09-06       Радио-Т 987
   2  23:14 / (1:42:00)   -      2026-08-30       Радио-Т 986

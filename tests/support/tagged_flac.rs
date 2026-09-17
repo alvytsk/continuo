@@ -90,7 +90,7 @@ fn mark_last(blocks: &mut [u8]) {
 /// Vorbis comment lengths and counts are little-endian, unlike the rest of
 /// FLAC's metadata.
 fn vorbis_comment(entries: &[String]) -> Vec<u8> {
-    let vendor = b"continuo tests";
+    let vendor = b"tenuto tests";
     let mut body = Vec::new();
     body.extend_from_slice(&le_len(vendor.len()));
     body.extend_from_slice(vendor);
