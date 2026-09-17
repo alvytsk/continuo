@@ -10,6 +10,7 @@ pub mod link;
 pub mod output;
 pub mod prepare;
 pub mod provenance;
+pub mod reconnect;
 pub mod resample;
 pub mod spectrum;
 pub mod state;
