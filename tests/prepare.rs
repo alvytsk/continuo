@@ -34,11 +34,24 @@ fn context() -> PrepareContext {
         interrupt: SourceInterrupt::new(Limits::default().buffer_bytes),
         hook: Arc::new(NoHook),
         limits: Limits::default(),
+        expected: None,
     }
 }
 
 fn remote(server: &TestServer) -> SourceLocation {
     SourceLocation::Http(url(&server.url("/audio.flac")))
+}
+
+fn http_location(server: &TestServer, path: &str) -> SourceLocation {
+    SourceLocation::Http(url(&server.url(path)))
+}
+
+/// The `RemoteFailure` a `prepare` error carries, if any.
+fn remote_cause(error: &PlaybackError) -> Option<RemoteFailure> {
+    match error {
+        PlaybackError::Remote(failure) => Some(failure.clone()),
+        _ => None,
+    }
 }
 
 #[test]
@@ -218,6 +231,7 @@ fn a_local_file_prepares_through_the_same_path_with_no_http_service() {
         interrupt: SourceInterrupt::new(Limits::default().buffer_bytes),
         hook: Arc::new(NoHook),
         limits: Limits::default(),
+        expected: None,
     };
     let prepared = match prepare(&SourceLocation::LocalPath(canonical), &context) {
         Ok(prepared) => prepared,
@@ -234,6 +248,7 @@ fn an_http_url_without_a_service_is_refused_rather_than_silently_ignored() {
         interrupt: SourceInterrupt::new(Limits::default().buffer_bytes),
         hook: Arc::new(NoHook),
         limits: Limits::default(),
+        expected: None,
     };
     let error = match prepare(
         &SourceLocation::Http(url("https://example.com/a.mp3")),
@@ -334,4 +349,40 @@ fn a_probe_that_outlives_its_deadline_is_refused() {
         "{error}"
     );
     server.shutdown();
+}
+
+#[test]
+fn a_station_prepares_as_indefinite_and_unseekable_with_its_name_as_title() {
+    let server = TestServer::start(Script::from_fixture("sine-noxing.mp3").icy_station());
+    let location = http_location(&server, "/radio");
+    let prepared = prepare(&location, &context()).unwrap_or_else(|error| panic!("{error}"));
+    assert_eq!(prepared.capabilities.continuity, Continuity::Indefinite);
+    assert_eq!(prepared.capabilities.seek, SeekSupport::Unsupported);
+    assert_eq!(
+        prepared.source.metadata().title.as_deref(),
+        Some("Test Radio")
+    );
+    drop(prepared);
+    server.shutdown();
+}
+
+#[test]
+fn a_reopen_that_changes_continuity_is_resource_changed_in_both_directions() {
+    let station = TestServer::start(Script::from_fixture("sine-noxing.mp3").icy_station());
+    let mut expecting_finite = context();
+    expecting_finite.expected = Some(Continuity::Finite);
+    let error = prepare(&http_location(&station, "/radio"), &expecting_finite)
+        .err()
+        .unwrap_or_else(|| panic!("a live source must not satisfy an expected finite one"));
+    assert_eq!(remote_cause(&error), Some(RemoteFailure::ResourceChanged));
+    station.shutdown();
+
+    let file = TestServer::start(Script::from_fixture("sine-5s.mp3"));
+    let mut expecting_live = context();
+    expecting_live.expected = Some(Continuity::Indefinite);
+    let error = prepare(&http_location(&file, "/a.mp3"), &expecting_live)
+        .err()
+        .unwrap_or_else(|| panic!("a finite source must not satisfy an expected live one"));
+    assert_eq!(remote_cause(&error), Some(RemoteFailure::ResourceChanged));
+    file.shutdown();
 }

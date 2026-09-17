@@ -177,6 +177,13 @@ impl DecodedSource {
         &self.metadata
     }
 
+    /// A transport-supplied title, used only when the container gave none.
+    pub fn set_fallback_title(&mut self, title: String) {
+        if self.metadata.title.is_none() {
+            self.metadata.title = Some(title);
+        }
+    }
+
     /// Capabilities the decoder can establish *on its own*. The engine combines
     /// these with transport evidence: HTTP range support alone does not prove
     /// that a particular container can seek in media time (§4).

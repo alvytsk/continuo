@@ -2922,6 +2922,7 @@ impl Worker {
             interrupt: Arc::clone(&self.source_interrupt),
             hook: Arc::clone(&self.service) as Arc<dyn WaitHook>,
             limits,
+            expected: None,
         }
     }
 

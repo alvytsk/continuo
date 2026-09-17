@@ -57,6 +57,7 @@ fn context() -> PrepareContext {
         interrupt: SourceInterrupt::new(Limits::default().buffer_bytes),
         hook: std::sync::Arc::new(NoHook),
         limits: Limits::default(),
+        expected: None,
     }
 }
 

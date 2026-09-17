@@ -469,6 +469,7 @@ fn run_probe_only(source: &str) -> Result<(), PlaybackError> {
         interrupt: SourceInterrupt::new(Limits::default().buffer_bytes),
         hook: Arc::new(InertHook),
         limits: Limits::default(),
+        expected: None,
     };
     let mut prepared = prepare(&location, &context)?;
 
