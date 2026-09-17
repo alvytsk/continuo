@@ -279,7 +279,24 @@ fn pause_stop_and_quit_are_serviced_during_a_seek() {
     let server =
         TestServer::start(Script::from_fixture(NOXING).trickle(512, Duration::from_millis(50)));
     let mut engine = TestEngine::start_idle();
-    engine.load_remote(&server.url("/audio.mp3"));
+    // The trickle is here to keep the *seek* in flight, but it slows the
+    // open just as much: symphonia's frame-count estimate for a no-index
+    // MP3 reads up to 16 KiB sequentially, which at 512 bytes per 50 ms is
+    // 1.6 s of `Limits::brisk`'s 2 s opening budget, and the estimator
+    // swallows a read that runs out of budget and returns no count. The
+    // macOS leg (2026-09-17, diagnosed on the runner) spent 0.8 s on the
+    // first open alone, the deadline expired inside the estimator, the
+    // track loaded with `duration: None`, and the seek to 300 s then failed
+    // in the demuxer without ever issuing a request - not the failure this
+    // test is about. The opening budget is lifted so the open is never the
+    // thing under test here; the stall budget stays brisk.
+    engine.load_remote_with_limits(
+        &server.url("/audio.mp3"),
+        Limits {
+            open: Duration::from_secs(30),
+            ..Limits::brisk()
+        },
+    );
     assert_eq!(engine.handle().submit_play(), Admission::Accepted);
     engine.await_state(PlaybackState::Playing);
     engine.play_for(Duration::from_millis(200));
