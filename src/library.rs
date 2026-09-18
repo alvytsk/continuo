@@ -1178,8 +1178,16 @@ pub async fn add_station(
             })
         }
         // Positively classified as not a station: never stored (§3 R1).
-        Err(failure) => Err(FeedError::StationsUnreadable {
+        // §10 reserves "not a live stream" for the finite/HLS/icy-metaint
+        // row; every other non-retryable failure (a 404, a refused
+        // redirect, …) gets an error notice carrying the reason instead.
+        Err(
+            failure @ (RemoteFailure::UnsupportedLiveMedia | RemoteFailure::IcyFramingUnsupported),
+        ) => Err(FeedError::StationsUnreadable {
             reason: format!("{} is not a live stream: {failure}", redact_url(url)),
+        }),
+        Err(failure) => Err(FeedError::StationsUnreadable {
+            reason: format!("{}: {failure}", redact_url(url)),
         }),
     }
 }

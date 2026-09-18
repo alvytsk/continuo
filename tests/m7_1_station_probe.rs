@@ -153,7 +153,9 @@ fn a_non_retryable_failure_saves_nothing() {
 
     let error = add(&http, &st, &server.url("/radio")).expect_err("a 404 must not be saved");
     // R1: a 404 is a statement about the URL, a 503 is not.
-    let _ = error;
+    let text = error.to_string();
+    assert!(text.contains("404"), "{text}");
+    assert!(!text.contains("not a live stream"), "{text}");
     let rows = list_stations(&st).unwrap_or_else(|error| panic!("list: {error}"));
     assert!(rows.is_empty());
     server.shutdown();
@@ -180,8 +182,9 @@ fn an_icy_metaint_response_is_not_a_station_and_is_not_saved() {
     let http = service();
     let st = store(root.path());
 
-    let _error =
+    let error =
         add(&http, &st, &server.url("/radio")).expect_err("icy-metaint must refuse the probe");
+    assert!(error.to_string().contains("not a live stream"), "{error}");
     let rows = list_stations(&st).unwrap_or_else(|error| panic!("list: {error}"));
     assert!(rows.is_empty());
     server.shutdown();
