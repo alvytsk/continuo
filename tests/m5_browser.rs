@@ -1186,6 +1186,88 @@ fn a_stations_identity_text_is_escaped() {
 }
 
 #[test]
+fn the_radio_tab_draws_name_genre_and_bitrate() {
+    let mut row = station_row("lofi", "https://one.example/stream");
+    row.identity = Some(StationIdentity {
+        name: Some("Lofi".to_owned()),
+        genre: Some("Lofi".to_owned()),
+        bitrate_kbps: Some(128),
+        logo: None,
+    });
+    let state = radio(vec![row]);
+
+    let (text, _) = screen(&state);
+    let line = text
+        .lines()
+        .find(|line| line.contains("lofi"))
+        .unwrap_or_else(|| panic!("no row for the station: {text}"));
+    assert!(line.contains("lofi"), "the slug is drawn: {line}");
+    // The row renderer (src/tui/render/browser.rs ~line 223) joins every
+    // present identity field with " · ", with no dedup between name and
+    // genre; the 14-column detail area is right-aligned and clips from the
+    // left, so the leading "L" of the joined "Lofi · Lofi · 128 kbps" is
+    // truncated away.
+    assert!(line.contains("ofi · 128 kbps"), "{line}");
+}
+
+#[test]
+fn an_unverified_station_draws_its_url_and_an_unreached_marker() {
+    let row = station_row("one", "https://one.example/stream");
+    let state = radio(vec![row]);
+
+    let (text, _) = screen(&state);
+    let line = text
+        .lines()
+        .find(|line| line.contains("one.example"))
+        .unwrap_or_else(|| panic!("no row for the station: {text}"));
+    assert!(
+        line.contains("https://one.example/stream"),
+        "the url is drawn: {line}"
+    );
+    assert!(line.contains("(unreached)"), "{line}");
+}
+
+#[test]
+fn an_empty_radio_tab_says_so_and_the_hints_name_three_tabs() {
+    let state = radio(Vec::new());
+    let (text, _) = screen(&state);
+    assert!(
+        text.contains("No saved stations — press a to add a stream URL"),
+        "{text}"
+    );
+    assert!(text.contains("files/podcasts/radio"), "{text}");
+}
+
+#[test]
+fn the_tab_bar_names_all_three_tabs() {
+    let (_dir, root) = sample_dir();
+    let files_state = listed(&root);
+    let (files_text, _) = screen(&files_state);
+    for label in [" Files ", " Podcasts ", " Radio "] {
+        assert!(files_text.contains(label), "{files_text}");
+    }
+
+    let radio_state = radio(Vec::new());
+    let (radio_text, _) = screen(&radio_state);
+    for label in [" Files ", " Podcasts ", " Radio "] {
+        assert!(radio_text.contains(label), "{radio_text}");
+    }
+}
+
+#[test]
+fn the_radio_prompt_asks_for_a_stream_url() {
+    let mut state = radio(Vec::new());
+    press(&mut state, &[KeyCode::Char('a')]);
+    let (text, _) = screen(&state);
+    assert!(text.contains("Stream URL: "), "{text}");
+
+    let mut state = podcasts(vec![feed("one")]);
+    press(&mut state, &[KeyCode::Char('a')]);
+    let (text, _) = screen(&state);
+    assert!(text.contains("Feed URL: "), "{text}");
+}
+
+#[test]
 fn a_stations_answer_for_a_tab_already_left_is_dropped() {
     let mut state = radio(vec![station_row("one", "https://one.example/stream")]);
     press(&mut state, &[KeyCode::Tab]);

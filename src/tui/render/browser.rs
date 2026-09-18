@@ -16,18 +16,17 @@ use crate::tui::browser::{BrowserState, BrowserTab, NoticeKind};
 use crate::tui::layout::{inset, take_left, take_right, visible_rows};
 use crate::tui::theme::Theme;
 
-const HINTS: &str = "enter open/add/remove · space mark · tab files/podcasts · ⌫ back · b close";
-const PODCAST_HINTS: &str =
-    "enter open/add/remove · space mark · a subscribe · r/R refresh · d remove · ⌫ back · b close";
+const HINTS: &str =
+    "enter open/add/remove · space mark · tab files/podcasts/radio · ⌫ back · b close";
+const PODCAST_HINTS: &str = "enter open/add/remove · space mark · tab files/podcasts/radio · \
+    a subscribe · r/R refresh · d remove · ⌫ back · b close";
 const NO_FEEDS: &str = "No subscriptions — press a to add a feed URL";
-// M7.1 §7's own hints and empty text; Task 7 owns their final wording and the
-// Radio tab's tab bar, title and row layout (slug/identity, URL/unreached
-// marker) in full. This much exists so `BrowserTab::Radio`'s exhaustive
-// matches here compile and the Radio tab is not left blank meanwhile.
-const RADIO_HINTS: &str =
-    "enter add/remove · space mark · a add · r re-probe · d remove · ⌫ back · b close";
+// The Radio tab's hints and empty-list text (M7.1 §7).
+const RADIO_HINTS: &str = "enter add/remove · space mark · tab files/podcasts/radio · \
+    a add · r re-probe · d remove · ⌫ back · b close";
 const NO_STATIONS: &str = "No saved stations — press a to add a stream URL";
 const PROMPT: &str = "Feed URL: ";
+const RADIO_PROMPT: &str = "Stream URL: ";
 const LOADING: &str = "Loading…";
 const EMPTY_DIRECTORY: &str = "(empty directory)";
 const NO_EPISODES: &str = "No cached episodes";
@@ -93,6 +92,8 @@ fn tabs(active: BrowserTab, theme: &Theme) -> Line<'static> {
         Span::styled(" Files ", style(BrowserTab::Files)),
         Span::raw(" "),
         Span::styled(" Podcasts ", style(BrowserTab::Podcasts)),
+        Span::raw(" "),
+        Span::styled(" Radio ", style(BrowserTab::Radio)),
     ])
 }
 
@@ -340,10 +341,11 @@ fn draw_notice_block(
 
 fn notice_lines(browser: &BrowserState, theme: &Theme) -> Option<(Vec<String>, Color)> {
     if let Some(prompt) = &browser.prompt {
-        return Some((
-            vec![format!("{PROMPT}{}▏", displayable(prompt))],
-            theme.text,
-        ));
+        let label = match browser.tab {
+            BrowserTab::Radio => RADIO_PROMPT,
+            BrowserTab::Files | BrowserTab::Podcasts => PROMPT,
+        };
+        return Some((vec![format!("{label}{}▏", displayable(prompt))], theme.text));
     }
     if let Some(slug) = &browser.confirm {
         return Some((
