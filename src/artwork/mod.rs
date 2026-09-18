@@ -7,4 +7,5 @@
 
 pub mod decode;
 pub mod resolve;
+pub mod svg;
 pub mod worker;
