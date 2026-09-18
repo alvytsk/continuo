@@ -13,6 +13,7 @@ mod runtime;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use ratatui::{Terminal, backend::TestBackend};
 use runtime::{pump_for, rig_with, rig_with_probe, row_ids};
 use support::server::{Script, TestServer};
 use tenuto::application::browse::{BrowseRequest, BrowseResult, BrowseWorker};
@@ -27,6 +28,8 @@ use tenuto::persistence::model::PersistedState;
 use tenuto::queue::{NewQueueEntry, QueueSource};
 use tenuto::session::Session;
 use tenuto::subscription::store::SubscriptionStore;
+use tenuto::tui::render::{Visuals, draw};
+use tenuto::tui::state::UiState;
 
 const FEED_URL: &str = "https://feeds.example/radio-t.xml";
 const LOCAL: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/sine.flac");
@@ -213,6 +216,37 @@ fn only_an_explicit_play_prepares_the_remote_source() {
         rig.runtime.pump();
         std::thread::sleep(Duration::from_millis(10));
     }
+    let _ = rig.runtime.shutdown();
+    server.shutdown();
+}
+
+/// M7 §10: a station is a remote entry like any other — restoring one,
+/// pumping and drawing it all happen with the radio off.
+#[test]
+fn a_restored_station_is_listed_and_drawn_without_a_request() {
+    let server = TestServer::start(Script::from_fixture("sine-noxing.mp3").icy_station());
+    let mut rig = rig_with(seeded(vec![remote_entry(&server.url("/radio"))]));
+    pump_for(&mut rig.runtime, Duration::from_millis(300));
+
+    let view = rig.runtime.view();
+    assert_eq!(view.rows.len(), 1, "{view:?}");
+    assert!(
+        !view.live && !view.reconnecting,
+        "nothing is loaded: {view:?}"
+    );
+    let mut terminal =
+        Terminal::new(TestBackend::new(100, 30)).unwrap_or_else(|error| panic!("backend: {error}"));
+    terminal
+        .draw(|frame| {
+            draw(frame, &view, &UiState::new(true), &Visuals::default());
+        })
+        .unwrap_or_else(|error| panic!("draw: {error}"));
+
+    assert!(
+        server.requests().is_empty(),
+        "a station was contacted before an explicit play: {:?}",
+        server.requests()
+    );
     let _ = rig.runtime.shutdown();
     server.shutdown();
 }

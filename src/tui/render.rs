@@ -449,7 +449,12 @@ fn draw_transport(
     tier: Tier,
     theme: &Theme,
 ) -> Vec<(Rect, TransportButton)> {
-    let play_pause = if view.phase == PlaybackPhase::Playing {
+    // Reconnecting alongside Playing: Space means pause in both (M7 §6.3),
+    // so the button has to say so.
+    let play_pause = if matches!(
+        view.phase,
+        PlaybackPhase::Playing | PlaybackPhase::Reconnecting
+    ) {
         "[||]"
     } else {
         "[>]"
@@ -517,6 +522,7 @@ fn state_line(view: &PlayerView, theme: &Theme) -> Line<'static> {
         PlaybackPhase::Loading => ("loading", theme.amber),
         PlaybackPhase::LoadFailed => ("failed", theme.amber),
         PlaybackPhase::Playing => ("playing", theme.green),
+        PlaybackPhase::Reconnecting => ("reconnecting", theme.amber),
         PlaybackPhase::Paused => ("paused", theme.cyan),
         PlaybackPhase::Stopped => ("stopped", theme.muted),
         PlaybackPhase::Ended => ("ended", theme.muted),
@@ -555,7 +561,7 @@ fn draw_progress(
         take_left(&mut bar, used);
     } else {
         let glyph = match view.phase {
-            PlaybackPhase::Playing => "▶ ",
+            PlaybackPhase::Playing | PlaybackPhase::Reconnecting => "▶ ",
             PlaybackPhase::Paused => "Ⅱ ",
             _ => "",
         };

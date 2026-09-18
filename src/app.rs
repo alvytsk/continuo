@@ -424,7 +424,10 @@ fn handle_keys(
             Some(command) => {
                 let optimistic = router.route(
                     engine,
-                    mirror.state == PlaybackState::Playing,
+                    matches!(
+                        mirror.state,
+                        PlaybackState::Playing | PlaybackState::Reconnecting
+                    ),
                     mirror.position,
                     mirror.duration,
                     Instant::now(),

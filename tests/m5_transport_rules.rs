@@ -74,6 +74,7 @@ fn run(
             selected,
             phase,
             last_requested: last,
+            live: false,
         },
     )
 }
@@ -573,5 +574,57 @@ fn playing_with_no_active_entry_does_not_navigate() {
             TransportInput::Next
         ),
         TransportDecision::Nothing
+    );
+}
+
+// M7 §3.4/§6.3: a live entry is controlled like a playing one, but it has no
+// timeline to move around in.
+
+fn live(queue: &Queue, phase: PlaybackPhase, input: TransportInput) -> TransportDecision {
+    decide(
+        input,
+        &TransportSituation {
+            queue,
+            selected: None,
+            phase,
+            last_requested: None,
+            live: true,
+        },
+    )
+}
+
+#[test]
+fn a_live_entry_answers_every_seek_and_home_with_a_notice() {
+    let (queue, _) = with_active();
+    for phase in [
+        PlaybackPhase::Playing,
+        PlaybackPhase::Reconnecting,
+        PlaybackPhase::Paused,
+        PlaybackPhase::Stopped,
+    ] {
+        for input in [
+            TransportInput::SeekBy(10),
+            TransportInput::SeekTo(Duration::from_secs(5)),
+            TransportInput::Home,
+        ] {
+            assert_eq!(
+                live(&queue, phase, input),
+                TransportDecision::Notice(LIVE_NO_SEEK),
+                "{phase:?} {input:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn reconnecting_is_controlled_like_playing() {
+    let (queue, _) = with_active();
+    assert_eq!(
+        live(&queue, PlaybackPhase::Reconnecting, TransportInput::Space),
+        TransportDecision::TogglePause
+    );
+    assert_eq!(
+        live(&queue, PlaybackPhase::Reconnecting, TransportInput::Play),
+        TransportDecision::Play
     );
 }

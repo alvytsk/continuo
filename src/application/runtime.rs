@@ -32,7 +32,7 @@ use crate::http::limits::Limits;
 use crate::http::service::HttpService;
 use crate::library::EpisodeCandidate;
 use crate::lifecycle::hooks::TestHook;
-use crate::media::capabilities::{MediaCapabilities, SeekSupport};
+use crate::media::capabilities::{Continuity, MediaCapabilities, SeekSupport};
 use crate::media::id::MediaId;
 use crate::media::source::SourceLocation;
 use crate::media::tags::CoverBytes;
@@ -552,6 +552,11 @@ impl PlayerRuntime {
                 PersistenceStatus::Saving
             },
             last_requested: self.last_requested,
+            live: self.indefinite(),
+            reconnecting: self
+                .mirror
+                .as_ref()
+                .is_some_and(|mirror| mirror.state == PlaybackState::Reconnecting),
         }
     }
 
@@ -599,9 +604,10 @@ impl PlayerRuntime {
             None => PlaybackPhase::Unloaded,
             Some(PlaybackState::Ended) => PlaybackPhase::Ended,
             Some(PlaybackState::Paused) => PlaybackPhase::Paused,
-            // A reconnecting station is still the playing transport as far as
-            // the transport rules are concerned (M7 §5); Task 11 refines it.
-            Some(PlaybackState::Playing | PlaybackState::Reconnecting) => PlaybackPhase::Playing,
+            Some(PlaybackState::Playing) => PlaybackPhase::Playing,
+            // Controlled exactly like Playing by the decision table; its own
+            // phase only so a front end can say the connection is gone.
+            Some(PlaybackState::Reconnecting) => PlaybackPhase::Reconnecting,
             Some(PlaybackState::Stopped | PlaybackState::Failed) => PlaybackPhase::Stopped,
             Some(PlaybackState::Idle | PlaybackState::Loading) => PlaybackPhase::Loading,
         }
@@ -615,8 +621,19 @@ impl PlayerRuntime {
                 selected,
                 phase: self.phase(),
                 last_requested: self.last_requested,
+                live: self.indefinite(),
             },
         )
+    }
+
+    /// Whether the engine is holding indefinite media. Named for
+    /// `Continuity`, not "live", so it cannot be read as `phase`'s own local
+    /// `live` — which asks the unrelated question of whether anything is
+    /// still answering the transport keys.
+    fn indefinite(&self) -> bool {
+        self.mirror
+            .as_ref()
+            .is_some_and(|mirror| mirror.capabilities.continuity == Continuity::Indefinite)
     }
 
     /// Whether the decision table would let a seek through right now — the
@@ -647,7 +664,10 @@ impl PlayerRuntime {
         };
         let optimistic = self.router.route(
             engine,
-            mirror.state == PlaybackState::Playing,
+            matches!(
+                mirror.state,
+                PlaybackState::Playing | PlaybackState::Reconnecting
+            ),
             mirror.position,
             mirror.duration,
             Instant::now(),
@@ -1101,13 +1121,19 @@ impl PlayerRuntime {
             loaded: true,
             state: mirror.state,
             position: mirror.position,
-            duration: mirror
-                .duration
-                .map(|value| DisplayDuration {
-                    value,
-                    source: DurationSource::Decoded(mirror.duration_provenance),
-                })
-                .or(display.duration),
+            // Indefinite media has no length, so a duration a feed or a tag
+            // declared for it is wrong rather than merely unconfirmed (M7 §5).
+            duration: if mirror.capabilities.continuity == Continuity::Indefinite {
+                None
+            } else {
+                mirror
+                    .duration
+                    .map(|value| DisplayDuration {
+                        value,
+                        source: DurationSource::Decoded(mirror.duration_provenance),
+                    })
+                    .or(display.duration)
+            },
             estimated_position: mirror.provenance == PositionProvenance::Estimated,
             degraded: mirror.quality == PositionQuality::Degraded,
             buffering: mirror.buffering,

@@ -19,7 +19,7 @@ use crate::playback::event::PlaybackEvent;
 /// `SeekBy` is the one command this does not handle: an arrow press
 /// accumulates into a [`SeekBurst`] rather than reaching the engine on its
 /// own, so it is routed by [`KeyRouter::route`] before it ever gets here.
-fn route_command(engine: &EngineHandle, playing: bool, command: PlaybackCommand) {
+fn route_command(engine: &EngineHandle, pausable: bool, command: PlaybackCommand) {
     match command {
         // Loop control, decided by `handle_keys` itself before this is ever
         // called - nothing to route.
@@ -42,7 +42,7 @@ fn route_command(engine: &EngineHandle, playing: bool, command: PlaybackCommand)
         // cycle - the same staleness every other read of it in this file
         // already lives with.
         PlaybackCommand::TogglePause => {
-            report_admission(if playing {
+            report_admission(if pausable {
                 engine.submit_pause()
             } else {
                 engine.submit_play()
@@ -174,12 +174,14 @@ impl KeyRouter {
     /// immediately when an arrow press accumulated into the burst, and `None`
     /// for every command that leaves the displayed position alone.
     ///
-    /// `playing`, `position` and `duration` are the three `Mirror` fields this
-    /// routing reads, taken separately so `Mirror` itself can stay private.
+    /// `pausable` is whether `TogglePause` means *pause*: true while playing
+    /// **or reconnecting** (M7 §6.3). It, `position` and `duration` are the
+    /// three `Mirror` fields this routing reads, taken separately so `Mirror`
+    /// itself can stay private.
     pub fn route(
         &mut self,
         engine: &EngineHandle,
-        playing: bool,
+        pausable: bool,
         position: Duration,
         duration: Option<Duration>,
         now: Instant,
@@ -199,7 +201,7 @@ impl KeyRouter {
             // burst: routing them must not cost the listener their scrub.
             _ => {}
         }
-        route_command(engine, playing, command);
+        route_command(engine, pausable, command);
         None
     }
 

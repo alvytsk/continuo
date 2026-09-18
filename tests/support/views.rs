@@ -96,6 +96,8 @@ pub fn view(phase: PlaybackPhase, now: Option<NowPlaying>) -> PlayerView {
         status: None,
         persistence: PersistenceStatus::Saving,
         last_requested: None,
+        live: false,
+        reconnecting: false,
     }
 }
 

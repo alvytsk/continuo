@@ -11,6 +11,7 @@ pub const PLAY_BEFORE_SEEK: &str = "Play a track before seeking";
 pub const QUEUE_EMPTY: &str = "Queue is empty";
 pub const TRACK_ENDED: &str = "Track ended; press play to replay";
 pub const STILL_LOADING: &str = "Still loading";
+pub const LIVE_NO_SEEK: &str = "live stream: seeking is unavailable";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PlaybackPhase {
@@ -18,6 +19,10 @@ pub enum PlaybackPhase {
     Loading,
     LoadFailed,
     Playing,
+    /// A live source between a disconnect and the reconnect that ends it
+    /// (M7 §7). Controlled exactly like `Playing`, and named apart from it
+    /// only so a front end can say so.
+    Reconnecting,
     Paused,
     Stopped,
     Ended,
@@ -40,6 +45,9 @@ pub struct TransportSituation<'a> {
     pub selected: Option<QueueEntryId>,
     pub phase: PlaybackPhase,
     pub last_requested: Option<QueueEntryId>,
+    /// Whether what the engine holds is indefinite — a station, with no
+    /// timeline to move around in.
+    pub live: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -94,9 +102,10 @@ fn anchor(situation: &TransportSituation<'_>) -> Option<QueueEntryId> {
         PlaybackPhase::Loading => still_queued(situation.queue, situation.last_requested)
             .or_else(|| situation.queue.active())
             .or_else(|| selection(situation)),
-        PlaybackPhase::Playing | PlaybackPhase::Paused | PlaybackPhase::Stopped => {
-            situation.queue.active()
-        }
+        PlaybackPhase::Playing
+        | PlaybackPhase::Reconnecting
+        | PlaybackPhase::Paused
+        | PlaybackPhase::Stopped => situation.queue.active(),
     }
 }
 
@@ -128,11 +137,30 @@ fn decide_engine_with_empty_queue(input: TransportInput) -> TransportDecision {
 }
 
 pub fn decide(input: TransportInput, situation: &TransportSituation<'_>) -> TransportDecision {
+    // M7 §3.4: a rejected seek must be harmless, and the cheapest way is not
+    // to submit one. No `KeyRouter` burst opens either. Before the
+    // empty-queue branch: what the engine holds is live whether or not the
+    // queue still lists it.
+    if situation.live
+        && matches!(
+            input,
+            TransportInput::Home | TransportInput::SeekBy(_) | TransportInput::SeekTo(_)
+        )
+        && !matches!(
+            situation.phase,
+            PlaybackPhase::Unloaded | PlaybackPhase::LoadFailed
+        )
+    {
+        return TransportDecision::Notice(LIVE_NO_SEEK);
+    }
+
     if situation.queue.is_empty() {
         return match situation.phase {
             // A playing or paused track was not necessarily fed by this now-empty
             // queue's current contents, so the engine keeps running it.
-            PlaybackPhase::Playing | PlaybackPhase::Paused => decide_engine_with_empty_queue(input),
+            PlaybackPhase::Playing | PlaybackPhase::Reconnecting | PlaybackPhase::Paused => {
+                decide_engine_with_empty_queue(input)
+            }
             // Stopped playback drops its adoption along with the entry that fed
             // it, so restarting would replay media the listener just removed.
             _ => match input {
@@ -142,7 +170,9 @@ pub fn decide(input: TransportInput, situation: &TransportSituation<'_>) -> Tran
         };
     }
 
-    use PlaybackPhase::{Ended, LoadFailed, Loading, Paused, Playing, Stopped, Unloaded};
+    use PlaybackPhase::{
+        Ended, LoadFailed, Loading, Paused, Playing, Reconnecting, Stopped, Unloaded,
+    };
     use TransportInput::{Enter, Home, Next, Play, Previous, SeekBy, SeekTo, Space};
 
     match (situation.phase, input) {
@@ -173,14 +203,14 @@ pub fn decide(input: TransportInput, situation: &TransportSituation<'_>) -> Tran
         (Loading, Previous) => navigate(situation, Direction::Up),
         (Loading, Next) => navigate(situation, Direction::Down),
 
-        (Playing | Paused | Stopped, Space) => TransportDecision::TogglePause,
-        (Playing | Paused | Stopped, Play) => TransportDecision::Play,
-        (Playing | Paused | Stopped, Enter) => load_or_notice(selection(situation)),
-        (Playing | Paused | Stopped, Home) => TransportDecision::Restart,
-        (Playing | Paused | Stopped, SeekBy(n)) => TransportDecision::SeekBy(n),
-        (Playing | Paused | Stopped, SeekTo(d)) => TransportDecision::SeekTo(d),
-        (Playing | Paused | Stopped, Previous) => navigate(situation, Direction::Up),
-        (Playing | Paused | Stopped, Next) => navigate(situation, Direction::Down),
+        (Playing | Reconnecting | Paused | Stopped, Space) => TransportDecision::TogglePause,
+        (Playing | Reconnecting | Paused | Stopped, Play) => TransportDecision::Play,
+        (Playing | Reconnecting | Paused | Stopped, Enter) => load_or_notice(selection(situation)),
+        (Playing | Reconnecting | Paused | Stopped, Home) => TransportDecision::Restart,
+        (Playing | Reconnecting | Paused | Stopped, SeekBy(n)) => TransportDecision::SeekBy(n),
+        (Playing | Reconnecting | Paused | Stopped, SeekTo(d)) => TransportDecision::SeekTo(d),
+        (Playing | Reconnecting | Paused | Stopped, Previous) => navigate(situation, Direction::Up),
+        (Playing | Reconnecting | Paused | Stopped, Next) => navigate(situation, Direction::Down),
 
         (Ended, Space | Play) => {
             load_or_notice(situation.queue.active().or_else(|| selection(situation)))
