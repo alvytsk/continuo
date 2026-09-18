@@ -21,6 +21,7 @@ use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use crate::clock::ClockSample;
+use crate::media::capabilities::{Continuity, MediaCapabilities};
 use crate::media::id::MediaId;
 use crate::media::metadata::MediaMetadata;
 use crate::persistence::model::{PersistedCheckpoint, PersistedState};
@@ -256,6 +257,11 @@ pub struct Session {
     /// this session recorded, so a duplicate delivery of the same completion
     /// cannot record history or advance the queue twice (§6).
     completion_seen: Option<(LoadRequestId, u64)>,
+    /// Whether the adopted media may be checkpointed. `false` for
+    /// `Continuity::Indefinite`: listening time is not a resume point (M7
+    /// §9). Set last in `on_loaded`, so `record_outgoing` always runs under
+    /// the outgoing media's value.
+    checkpointable: bool,
 }
 
 impl Session {
@@ -284,6 +290,7 @@ impl Session {
             stop_requested: false,
             advance: None,
             completion_seen: None,
+            checkpointable: true,
         }
     }
 
@@ -670,6 +677,7 @@ impl Session {
                     position,
                     disposition,
                     metadata,
+                    capabilities,
                     ..
                 } => {
                     self.latest_engine_rev = event_rev;
@@ -683,6 +691,7 @@ impl Session {
                             *position,
                             disposition,
                             metadata,
+                            capabilities,
                             now,
                         )
                     } else {
@@ -900,9 +909,18 @@ impl Session {
             // §10: "Capability changes alone never delete, clear or replace
             // checkpoints." A server that starts advertising ranges mid-session
             // must not be able to discard a protected entry by saying so —
-            // this is `Action::None` and falls through to the catch-all below
-            // for exactly that reason: there is nothing here to touch.
-            PlaybackEvent::CapabilitiesChanged { .. } => Action::None,
+            // this is otherwise `Action::None` and falls through to the
+            // catch-all below for exactly that reason: there is nothing else
+            // here to touch. M7 §9's gate is the one exception, and only in
+            // the direction that protects a checkpoint further: evidence that
+            // arrives late that this media is actually live must shut the
+            // gate, but nothing here may reopen one `on_loaded` already shut.
+            PlaybackEvent::CapabilitiesChanged { capabilities, .. } => {
+                if capabilities.continuity == Continuity::Indefinite {
+                    self.checkpointable = false;
+                }
+                Action::None
+            }
             // A cancelled seek commits no target — `resolve_target()` is
             // deliberately not called here, because the stored target it
             // would discard belongs to a stopped seek that is still
@@ -925,10 +943,11 @@ impl Session {
         position: Duration,
         disposition: &StartDisposition,
         metadata: &MediaMetadata,
+        capabilities: &MediaCapabilities,
         now: ClockSample,
     ) -> Action {
         let previous_active = self.state.queue().active();
-        let switched_media = self.on_loaded(media, position, disposition, now);
+        let switched_media = self.on_loaded(media, position, disposition, capabilities, now);
         let active = match target {
             LoadTarget::Queue(id) => Some(id),
             LoadTarget::Legacy => None,
@@ -1034,6 +1053,9 @@ impl Session {
     /// the position D1 retains. The two positions that arrive on events of their
     /// own do not come through here and are not gated (D6).
     fn checkpoint_from_progress(&mut self, sampled: Duration, now: ClockSample) -> bool {
+        if !self.checkpointable {
+            return false;
+        }
         if !self.established {
             return false;
         }
@@ -1112,6 +1134,7 @@ impl Session {
         media: &MediaId,
         position: Duration,
         disposition: &StartDisposition,
+        capabilities: &MediaCapabilities,
         now: ClockSample,
     ) -> bool {
         let switching = self.current_media.as_ref() != Some(media);
@@ -1161,6 +1184,10 @@ impl Session {
             provenance: self.position_provenance,
         });
 
+        // Last, deliberately: everything above that writes for the outgoing
+        // media has already run under the outgoing media's gate.
+        self.checkpointable = capabilities.continuity != Continuity::Indefinite;
+
         switching
     }
 
@@ -1196,7 +1223,17 @@ impl Session {
     /// `last_sample`, never through `record_current`, so a routing decision
     /// placed only there would leave a switch away from an estimated landing
     /// free to promote it to `position` anyway.
+    ///
+    /// A fifth, added by M7 §9: `self.checkpointable` still describes the
+    /// *outgoing* media here, since `on_loaded` calls this before resetting
+    /// it — a station's listening time must not be written just because
+    /// something else is loading next. This writes straight to `self.state`
+    /// rather than through `record_current`/`record_current_estimated`, so it
+    /// carries the same gate on its own rather than inheriting theirs.
     fn record_outgoing(&mut self, now: ClockSample) {
+        if !self.checkpointable {
+            return;
+        }
         let Some(previous) = self.last_sample.take() else {
             return;
         };
@@ -1332,6 +1369,9 @@ impl Session {
     /// (§4.2) — this function itself has no branch on provenance, because a
     /// caller only reaches it once that decision already went one way.
     fn record_current(&mut self, position: Duration, now: ClockSample) {
+        if !self.checkpointable {
+            return;
+        }
         if self.protected.is_some() {
             return;
         }
@@ -1361,6 +1401,9 @@ impl Session {
     /// (`EndOfTrack`'s handler, which must decide *before* touching
     /// `protected` — see its own comment) both reach here safely either way.
     fn record_current_estimated(&mut self, position: Duration, now: ClockSample) {
+        if !self.checkpointable {
+            return;
+        }
         if self.protected.is_some() {
             return;
         }
