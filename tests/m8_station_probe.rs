@@ -189,6 +189,34 @@ fn a_url_with_embedded_credentials_is_refused_and_never_echoed() {
     server.shutdown();
 }
 
+/// §10's last row via a different door: a URL malformed enough that
+/// `url::Url::parse` itself rejects it (an empty host) must be refused
+/// without ever being treated as a filesystem path. `is_url_spelling`
+/// (`application::source`) only recognizes a literal `http://`/`https://`
+/// prefix, so a single-slash typo like this one would, under
+/// `resolve_source`, fall through to `resolve_path`: canonicalizing the raw
+/// string as a local path, failing, and building a `PlaybackError::Open`
+/// whose `Display` is `cannot open media {path:?}` — the *entire* raw
+/// input, verbatim, including the query token. `station_identity_of` must
+/// never take that branch at all.
+#[test]
+fn a_malformed_secret_bearing_url_is_refused_without_echoing_the_token() {
+    let root = tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir: {error}"));
+    let server = TestServer::start(Script::from_fixture("sine-noxing.mp3").icy_station());
+    let http = service();
+    let st = store(root.path());
+
+    let input = "https:/?token=SECRETVALUE";
+    let error = add(&http, &st, input).expect_err("an empty host must be refused");
+    assert_eq!(server.requests().len(), 0, "a malformed URL made a request");
+    let text = error.to_string();
+    assert!(!text.contains("SECRETVALUE"), "{text}");
+    assert!(!text.contains(input), "{text}");
+    let rows = list_stations(&st).unwrap_or_else(|error| panic!("list: {error}"));
+    assert!(rows.is_empty());
+    server.shutdown();
+}
+
 #[test]
 fn a_duplicate_url_resolves_to_the_existing_station() {
     let root = tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir: {error}"));
@@ -205,15 +233,72 @@ fn a_duplicate_url_resolves_to_the_existing_station() {
     };
 
     let second = add(&http, &st, &server.url("/radio")).unwrap_or_else(|error| panic!("{error}"));
-    let AddStationOutcome::AlreadySaved { slug, identity } = second else {
+    let AddStationOutcome::AlreadySaved {
+        slug,
+        identity,
+        reprobe_failure,
+    } = second
+    else {
         panic!("expected AlreadySaved, got {second:?}");
     };
     assert_eq!(slug, first_slug);
     assert!(identity.is_some(), "the re-probe on add succeeded");
+    assert_eq!(
+        reprobe_failure, None,
+        "a successful re-probe must not report a failure"
+    );
 
     let rows = list_stations(&st).unwrap_or_else(|error| panic!("list: {error}"));
     assert_eq!(rows.len(), 1, "a duplicate must not be saved twice");
     assert_eq!(server.requests().len(), 2, "the second add still re-probed");
+    server.shutdown();
+}
+
+/// §6/§10: a duplicate add still re-probes, and when that re-probe fails
+/// the failure must reach the caller through `AlreadySaved`, not be
+/// swallowed — the same "record kept, failure reported" contract
+/// `reprobe_station` holds for an explicit re-probe (M8 §6: "leaves the
+/// record alone and reports the failure").
+#[test]
+fn a_duplicate_add_whose_reprobe_fails_reports_the_reason_and_keeps_the_old_identity() {
+    let root = tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir: {error}"));
+    let server = TestServer::start(
+        Script::from_fixture("sine-noxing.mp3")
+            .icy_station()
+            .then(Script::from_fixture("sine-noxing.mp3")),
+    );
+    let http = service();
+    let st = store(root.path());
+
+    let first = add(&http, &st, &server.url("/radio")).unwrap_or_else(|error| panic!("{error}"));
+    let AddStationOutcome::Verified {
+        slug: first_slug,
+        identity: first_identity,
+    } = first
+    else {
+        panic!("expected Verified, got {first:?}");
+    };
+
+    let second = add(&http, &st, &server.url("/radio")).unwrap_or_else(|error| panic!("{error}"));
+    let AddStationOutcome::AlreadySaved {
+        slug,
+        identity,
+        reprobe_failure,
+    } = second
+    else {
+        panic!("expected AlreadySaved, got {second:?}");
+    };
+    assert_eq!(slug, first_slug);
+    assert_eq!(
+        identity,
+        Some(first_identity),
+        "a failed re-probe must not disturb the stored identity"
+    );
+    let reason = reprobe_failure.expect("a now-finite URL must report a re-probe failure");
+    assert!(reason.contains("live"), "{reason}");
+
+    let rows = list_stations(&st).unwrap_or_else(|error| panic!("list: {error}"));
+    assert_eq!(rows.len(), 1, "a duplicate must not be saved twice");
     server.shutdown();
 }
 
@@ -237,7 +322,10 @@ fn a_reprobe_of_a_now_finite_url_keeps_the_record_and_reports_the_failure() {
     assert_eq!(before.stations.len(), 1);
 
     let outcome = reprobe(&http, &st, &slug).expect_err("a now-finite URL must fail the reprobe");
-    let _ = outcome;
+    assert!(
+        outcome.to_string().contains("could not be reprobed"),
+        "{outcome}"
+    );
 
     let after = st.read_snapshot().unwrap_or_else(|error| panic!("{error}"));
     assert_eq!(after.stations.len(), 1, "R1 governs entry, not eviction");
@@ -289,18 +377,19 @@ fn a_protected_store_unreadable_is_never_overwritten() {
         fs::set_permissions(&path, fs::Permissions::from_mode(0o000))
             .unwrap_or_else(|error| panic!("chmod: {error}"));
 
-        // Root, and some filesystems/CI containers, ignore a 0o000 mode; skip
-        // rather than report a false failure when that is the environment
-        // this runs in.
-        if fs::read(&path).is_ok() {
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).ok();
-            eprintln!(
-                "skipping a_protected_store_unreadable_is_never_overwritten: \
-                 this environment does not enforce file mode 0o000 (root, or a \
-                 permissive filesystem)"
-            );
-            return;
-        }
+        // Root, and some filesystems/CI containers, ignore a 0o000 mode. A
+        // quiet `return` here would let this test print a plain `ok` having
+        // executed zero assertions — `cargo test` shows captured output only
+        // for a *failing* test, so a silent skip is invisible on a normal
+        // run. Fail loudly instead: an environment that cannot exercise this
+        // path is worth surfacing, not swallowing.
+        assert!(
+            fs::read(&path).is_err(),
+            "this environment does not enforce file mode 0o000 (running as \
+             root, or a permissive filesystem); \
+             a_protected_store_unreadable_is_never_overwritten cannot \
+             exercise the path it targets here"
+        );
 
         let server = TestServer::start(Script::from_fixture("sine-noxing.mp3").icy_station());
         let http = service();
@@ -342,16 +431,16 @@ fn a_protected_store_quarantine_failure_is_never_overwritten() {
         fs::set_permissions(root.path(), fs::Permissions::from_mode(0o755))
             .unwrap_or_else(|error| panic!("chmod dir back: {error}"));
 
-        // Root, and some filesystems, ignore a read-only directory; skip
-        // rather than report a false failure when the rename went ahead.
-        if outcome.is_ok() {
-            eprintln!(
-                "skipping a_protected_store_quarantine_failure_is_never_overwritten: \
-                 this environment does not enforce a read-only directory (root, \
-                 or a permissive filesystem)"
-            );
-            return;
-        }
+        // Root, and some filesystems, ignore a read-only directory. As
+        // above: fail loudly rather than returning quietly, so a run in
+        // such an environment cannot pass having exercised nothing.
+        assert!(
+            outcome.is_err(),
+            "this environment does not enforce a read-only directory \
+             (running as root, or a permissive filesystem); \
+             a_protected_store_quarantine_failure_is_never_overwritten \
+             cannot exercise the path it targets here"
+        );
 
         let after = fs::read(&path).unwrap_or_else(|error| panic!("reread: {error}"));
         assert_eq!(

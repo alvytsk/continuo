@@ -49,7 +49,6 @@ use std::time::{Duration, Instant};
 use time::OffsetDateTime;
 use url::Url;
 
-use crate::application::source::resolve_source;
 use crate::feed::cache::{CacheStore, CachedEpisode, CachedFeed};
 use crate::feed::episode::bind_feed;
 use crate::feed::error::FeedError;
@@ -1001,9 +1000,18 @@ pub enum AddStationOutcome {
     /// The URL was already saved. Re-probed anyway, so an add against a
     /// duplicate still refreshes what it can; `identity` is whatever the
     /// station now holds, whether or not this re-probe itself succeeded.
+    /// `reprobe_failure` carries the reason when it did not: `None` means
+    /// the re-probe succeeded and `identity` is its result, `Some(reason)`
+    /// means it failed and `identity` is the station's *prior* value,
+    /// untouched — the same "record kept, failure reported" contract
+    /// [`reprobe_station`] holds for an explicit re-probe. Without this
+    /// field the two entry points would answer the identical operation
+    /// with different information: an explicit re-probe reports its
+    /// failure, and a duplicate add's implicit one must too.
     AlreadySaved {
         slug: String,
         identity: Option<StationIdentity>,
+        reprobe_failure: Option<String>,
     },
 }
 
@@ -1024,23 +1032,25 @@ impl WaitHook for InertHook {
     fn service(&self) {}
 }
 
-/// Validates a station URL exactly as playback does (§10's last row), and
-/// yields the identity the queue will give it. Never echoes `input` on a
-/// parse failure: a malformed URL may itself carry a token
-/// (`application::source` Ruling 5), and `resolve_source`'s own errors are
-/// already redacted before they reach here.
+/// Validates a station URL through [`validate_public_url`] — the same
+/// URL-only bar `subscribe` holds a feed's `fetch_url` to — never through
+/// [`resolve_source`](crate::application::source::resolve_source).
+/// `resolve_source` exists for the `play` command, where a bare argument
+/// may legitimately be a local path, and `is_url_spelling`'s literal
+/// `http://`/`https://` prefix check is deliberately narrow (§5 of
+/// `application::source`): a spelling that misses it — a single slash, a
+/// missing scheme — falls through to `resolve_path`, which canonicalizes
+/// the raw string and, on failure, hands back a `PlaybackError::Open`
+/// whose `Display` is `cannot open media {path:?}` — the input, unredacted,
+/// verbatim, including any token it carries. A station add has no local-path
+/// case to fall back to, so it must never take that branch at all: every
+/// rejection here goes through `redact_url`, and every acceptance derives
+/// straight from the URL `validate_public_url` already parsed rather than
+/// re-parsing the raw, untrusted `input`.
 fn station_identity_of(input: &str) -> Result<(MediaId, Url), FeedError> {
-    match resolve_source(input) {
-        Ok((media, SourceLocation::Http(url))) => Ok((media, url)),
-        // A local path is not a station, and neither is anything else that
-        // resolves to a non-HTTP location.
-        Ok(_) => Err(FeedError::StationsUnreadable {
-            reason: format!("{} is not an http(s) URL", redact_url(input)),
-        }),
-        Err(error) => Err(FeedError::StationsUnreadable {
-            reason: error.to_string(),
-        }),
-    }
+    let parsed = validate_public_url(input)?;
+    let normalized = normalize_requested(parsed.as_str())?;
+    Ok((MediaId::RemoteUrl(normalized), parsed))
 }
 
 /// Probes `url` by opening the real source and reading its headers (§5).
@@ -1116,13 +1126,21 @@ pub async fn add_station(
 
     if let Some(existing) = snapshot.stations.iter().position(|s| s.media == media) {
         let slug = snapshot.stations[existing].slug.clone();
-        if let Ok(identity) = probe_station(http, &parsed).await {
-            snapshot.stations[existing].identity = Some(identity);
-            snapshot.stations[existing].probed_at = Some(stations.now());
-            stations.save(&snapshot)?;
-        }
+        let reprobe_failure = match probe_station(http, &parsed).await {
+            Ok(identity) => {
+                snapshot.stations[existing].identity = Some(identity);
+                snapshot.stations[existing].probed_at = Some(stations.now());
+                stations.save(&snapshot)?;
+                None
+            }
+            Err(failure) => Some(failure.to_string()),
+        };
         let identity = snapshot.stations[existing].identity.clone();
-        return Ok(AddStationOutcome::AlreadySaved { slug, identity });
+        return Ok(AddStationOutcome::AlreadySaved {
+            slug,
+            identity,
+            reprobe_failure,
+        });
     }
 
     let occupied: BTreeSet<String> = snapshot.stations.iter().map(|s| s.slug.clone()).collect();
