@@ -1151,24 +1151,25 @@ fn a_queued_station_draws_a_tick() {
     assert!(line.contains('✓'), "{line}");
 }
 
-/// A hostile station can put anything it likes in `icy-name`/`icy-genre`
-/// (M7.1 §5 probes them straight off the response headers); `StationIdentity`
-/// carries its own doc comment obligation ("the caller escapes it before
-/// drawing it"). This is the same terminal-injection hazard
+/// A hostile station can put anything it likes in `icy-genre` (M7.1 §5
+/// probes it straight off the response header); `StationIdentity` carries
+/// its own doc comment obligation ("the caller escapes it before drawing
+/// it"). This is the same terminal-injection hazard
 /// `the_overlay_draws_safe_names_marks_and_dimmed_unplayable_episodes`
 /// covers for a directory entry's name — an unescaped ESC byte reaching a
-/// real terminal can rewrite rows the user never asked to see.
+/// real terminal can rewrite rows the user never asked to see. The name
+/// field is not exercised here: the row renderer never draws it (spec §7
+/// — the slug already stands for the station's name), so it carries no
+/// injection risk of its own.
 #[test]
 fn a_stations_identity_text_is_escaped() {
-    // Short enough to survive the detail column's 14-character width whole
-    // (unlike the label, the identity detail is right-aligned and clipped,
-    // so a long escaped string would fail this test for a display reason
-    // that has nothing to do with escaping); genre and bitrate are left out
-    // so the joined detail is exactly this string, with nothing to hide it.
+    // Short enough to survive the identity column's width whole (unlike the
+    // label, the identity detail is right-aligned; bitrate is left out so
+    // the joined detail is exactly this string, with nothing to hide it).
     let mut row = station_row("one", "https://one.example/stream");
     row.identity = Some(StationIdentity {
-        name: Some("ev\u{1b}il".to_owned()),
-        genre: None,
+        name: None,
+        genre: Some("ev\u{1b}il".to_owned()),
         bitrate_kbps: None,
         logo: None,
     });
@@ -1185,8 +1186,14 @@ fn a_stations_identity_text_is_escaped() {
     );
 }
 
+/// Spec §7: "A row draws the slug, then the identity: `Lofi · 128 kbps`,
+/// with genre and bitrate omitted when absent." Name is set equal to genre
+/// here deliberately — a station legitimately naming its genre after itself
+/// — to prove the renderer does not draw the name a second time, which a
+/// weaker assertion (a substring that also matches a deduplicated *or* a
+/// clipped, non-deduplicated string) would not catch.
 #[test]
-fn the_radio_tab_draws_name_genre_and_bitrate() {
+fn a_verified_row_draws_its_slug_then_genre_and_bitrate() {
     let mut row = station_row("lofi", "https://one.example/stream");
     row.identity = Some(StationIdentity {
         name: Some("Lofi".to_owned()),
@@ -1202,12 +1209,61 @@ fn the_radio_tab_draws_name_genre_and_bitrate() {
         .find(|line| line.contains("lofi"))
         .unwrap_or_else(|| panic!("no row for the station: {text}"));
     assert!(line.contains("lofi"), "the slug is drawn: {line}");
-    // The row renderer (src/tui/render/browser.rs ~line 223) joins every
-    // present identity field with " · ", with no dedup between name and
-    // genre; the 14-column detail area is right-aligned and clips from the
-    // left, so the leading "L" of the joined "Lofi · Lofi · 128 kbps" is
-    // truncated away.
-    assert!(line.contains("ofi · 128 kbps"), "{line}");
+    assert!(
+        line.contains("Lofi · 128 kbps"),
+        "genre and bitrate are drawn whole, unclipped: {line}"
+    );
+    assert!(
+        !line.contains("Lofi · Lofi"),
+        "the name is not drawn a second time: {line}"
+    );
+}
+
+#[test]
+fn a_verified_row_with_only_a_bitrate_draws_just_the_bitrate() {
+    let mut row = station_row("one", "https://one.example/stream");
+    row.identity = Some(StationIdentity {
+        name: Some("Anything".to_owned()),
+        genre: None,
+        bitrate_kbps: Some(128),
+        logo: None,
+    });
+    let state = radio(vec![row]);
+
+    let (text, _) = screen(&state);
+    let line = text
+        .lines()
+        .find(|line| line.contains("one"))
+        .unwrap_or_else(|| panic!("no row for the station: {text}"));
+    assert!(line.contains("128 kbps"), "{line}");
+    assert!(
+        !line.contains('·'),
+        "no separator with nothing to join: {line}"
+    );
+}
+
+#[test]
+fn a_verified_row_with_only_a_genre_draws_just_the_genre() {
+    let mut row = station_row("one", "https://one.example/stream");
+    row.identity = Some(StationIdentity {
+        name: Some("Anything".to_owned()),
+        genre: Some("Lofi".to_owned()),
+        bitrate_kbps: None,
+        logo: None,
+    });
+    let state = radio(vec![row]);
+
+    let (text, _) = screen(&state);
+    let line = text
+        .lines()
+        .find(|line| line.contains("one"))
+        .unwrap_or_else(|| panic!("no row for the station: {text}"));
+    assert!(line.contains("Lofi"), "{line}");
+    assert!(!line.contains("kbps"), "no bitrate to join: {line}");
+    assert!(
+        !line.contains('·'),
+        "no separator with nothing to join: {line}"
+    );
 }
 
 #[test]

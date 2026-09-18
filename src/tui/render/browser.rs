@@ -34,6 +34,12 @@ const UNTITLED: &str = "(untitled)";
 const UNREACHED: &str = "(unreached)";
 const MARK_COLUMNS: u16 = 2;
 const DETAIL_COLUMNS: u16 = 14;
+/// A verified station's identity ("genre · bitrate") needs more room than
+/// `DETAIL_COLUMNS` gives the Files/Podcasts detail column — spec §7's own
+/// example, `Lofi · 128 kbps`, is 15 characters, one past `DETAIL_COLUMNS`
+/// — so the Radio tab gets a wider column of its own rather than widening
+/// `DETAIL_COLUMNS` for every tab.
+const RADIO_DETAIL_COLUMNS: u16 = 24;
 /// The row width below which the detail column is dropped.
 const DETAIL_MIN_ROW: u16 = 40;
 
@@ -168,11 +174,13 @@ fn draw_list(buffer: &mut Buffer, area: Rect, browser: &BrowserState, theme: &Th
     }
 }
 
-/// What one list row shows: its label, an optional right-hand detail, and
-/// the style both take when the row is not under the cursor.
+/// What one list row shows: its label, an optional right-hand detail (drawn
+/// in a column `detail_columns` wide when there is room), and the style both
+/// take when the row is not under the cursor.
 struct RowCells {
     label: String,
     detail: Option<String>,
+    detail_columns: u16,
     style: Style,
 }
 
@@ -188,6 +196,7 @@ fn row_cells(browser: &BrowserState, index: usize, theme: &Theme) -> Option<RowC
             RowCells {
                 label,
                 detail: None,
+                detail_columns: DETAIL_COLUMNS,
                 style: Style::new().fg(color),
             }
         }),
@@ -197,6 +206,7 @@ fn row_cells(browser: &BrowserState, index: usize, theme: &Theme) -> Option<RowC
                 Some(count) => format!("{count} episodes"),
                 None => "not refreshed".to_owned(),
             }),
+            detail_columns: DETAIL_COLUMNS,
             style: Style::new().fg(theme.text),
         }),
         (BrowserTab::Podcasts, Some((_, episodes))) => episodes.get(index).map(|episode| {
@@ -214,13 +224,15 @@ fn row_cells(browser: &BrowserState, index: usize, theme: &Theme) -> Option<RowC
                 detail: episode
                     .declared_duration
                     .map(|value| format!("({})", clock(value))),
+                detail_columns: DETAIL_COLUMNS,
                 style,
             }
         }),
-        // Slug then identity (name/genre/bitrate, joined and omitted when
-        // absent) for a verified station, else its URL and an unreached
-        // marker (M7.1 §7); untrusted server text, so escaped the same way
-        // the Files tab's names are at line 181.
+        // Slug, then identity for a verified station: genre and bitrate,
+        // joined and omitted when absent — the name is not drawn again, the
+        // slug already stands for it (M7.1 §7). An unverified station draws
+        // its URL and an unreached marker instead. Untrusted server text, so
+        // escaped the same way the Files tab's names are at line 181.
         (BrowserTab::Radio, _) => {
             browser
                 .stations
@@ -228,22 +240,36 @@ fn row_cells(browser: &BrowserState, index: usize, theme: &Theme) -> Option<RowC
                 .map(|station| match &station.identity {
                     Some(identity) => {
                         let parts: Vec<String> = [
-                            identity.name.as_deref().map(displayable),
                             identity.genre.as_deref().map(displayable),
                             identity.bitrate_kbps.map(|kbps| format!("{kbps} kbps")),
                         ]
                         .into_iter()
                         .flatten()
                         .collect();
+                        let detail = (!parts.is_empty()).then(|| {
+                            // A hostile genre can be arbitrarily long; a
+                            // right-aligned Line that overflows its column
+                            // truncates from the left (keeps the tail), so
+                            // clip it ourselves from the end first — the
+                            // whole joined string renders untouched whenever
+                            // it already fits.
+                            parts
+                                .join(" · ")
+                                .chars()
+                                .take(usize::from(RADIO_DETAIL_COLUMNS))
+                                .collect::<String>()
+                        });
                         RowCells {
                             label: displayable(&station.slug),
-                            detail: (!parts.is_empty()).then(|| parts.join(" · ")),
+                            detail,
+                            detail_columns: RADIO_DETAIL_COLUMNS,
                             style: Style::new().fg(theme.text),
                         }
                     }
                     None => RowCells {
                         label: displayable(station.url.as_str()),
                         detail: Some(UNREACHED.to_owned()),
+                        detail_columns: RADIO_DETAIL_COLUMNS,
                         style: Style::new().fg(theme.muted),
                     },
                 })
@@ -287,7 +313,7 @@ fn draw_row(
     if let Some(detail) = cells.detail
         && rest.width >= DETAIL_MIN_ROW
     {
-        let column = take_right(&mut rest, DETAIL_COLUMNS);
+        let column = take_right(&mut rest, cells.detail_columns);
         take_right(&mut rest, 1);
         Line::styled(detail, style)
             .alignment(Alignment::Right)
