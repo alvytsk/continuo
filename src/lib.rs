@@ -15,6 +15,7 @@ pub mod playback;
 pub mod queue;
 pub mod resume;
 pub mod session;
+pub mod station;
 pub mod subscription;
 pub mod telemetry;
 pub mod tui;

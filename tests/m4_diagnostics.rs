@@ -641,6 +641,7 @@ fn a_control_character_in_the_encoding_label_never_reaches_a_terminal() -> Falli
 /// | `CacheCorrupt` | `slug`, `detail` | `feed::cache::malformed` | A serde *category* plus line and column; the error's own `Display`, which quotes the file, is dropped. |
 /// | `CacheParserMismatch` | `slug`, versions | `feed::cache::check_versions` | Integers from the envelope. |
 /// | `SubscriptionsUnreadable` | `reason` | `subscription::store`, `library::load_mutating` | A fixed phrase, a quarantine path this process chose, or the same category/line/column reduction. |
+/// | `StationsUnreadable` | `reason` | `station::store` | A fixed phrase, a quarantine path this process chose, or the same category/line/column reduction — the same shape as `SubscriptionsUnreadable`, never the file's raw bytes. |
 /// | `SubscriptionsBusy` | — | `library::lock_subscriptions` | Nothing: a fixed phrase. |
 /// | `InvalidSlug` | `slug` | `subscription::model::validate_slug` | The alias the listener typed. |
 /// | `SlugTaken` | `slug` | `library::subscribe` | A stored, already-validated slug. |
@@ -662,6 +663,7 @@ fn every_feed_error_variant_has_a_recorded_safe_context() {
             FeedError::CacheCorrupt { .. } => "a slug and a serde category plus position",
             FeedError::CacheParserMismatch { .. } => "a slug and two versions",
             FeedError::SubscriptionsUnreadable { .. } => "a fixed phrase or a chosen path",
+            FeedError::StationsUnreadable { .. } => "a fixed phrase or a chosen path",
             FeedError::SubscriptionsBusy => "none",
             FeedError::SlugTaken { .. } | FeedError::AlreadySubscribed { .. } => "a stored slug",
             FeedError::BatchIncomplete { .. } => "two integers",
@@ -710,6 +712,9 @@ fn every_feed_error_variant_has_a_recorded_safe_context() {
         },
         FeedError::SubscriptionsUnreadable {
             reason: "subscriptions file could not be read".into(),
+        },
+        FeedError::StationsUnreadable {
+            reason: "stations file could not be read".into(),
         },
         FeedError::SubscriptionsBusy,
         FeedError::InvalidSlug {

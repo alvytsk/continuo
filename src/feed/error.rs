@@ -44,6 +44,8 @@ pub enum FeedError {
     },
     #[error("cannot use subscriptions: {reason}")]
     SubscriptionsUnreadable { reason: String },
+    #[error("{reason}")]
+    StationsUnreadable { reason: String },
     #[error("Another subscription update is in progress")]
     SubscriptionsBusy,
     #[error("invalid slug {slug:?}; expected 1-32 ASCII lowercase letters, digits or hyphens")]
