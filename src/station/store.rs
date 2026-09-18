@@ -110,7 +110,7 @@ enum DecodeError {
     /// Deliberately carrying only a sanitized, pre-built reason: a station
     /// record can hold an untrusted URL, and this must never echo the
     /// file's raw JSON bytes back into a log or an error message, under
-    /// `Debug` as much as `Display`.
+    /// `Debug` as much as `Display` (design doc §7.2).
     Malformed(String),
     UnsupportedVersion(u32),
 }

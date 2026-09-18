@@ -44,7 +44,7 @@ pub enum FeedError {
     },
     #[error("cannot use subscriptions: {reason}")]
     SubscriptionsUnreadable { reason: String },
-    #[error("{reason}")]
+    #[error("cannot use stations: {reason}")]
     StationsUnreadable { reason: String },
     #[error("Another subscription update is in progress")]
     SubscriptionsBusy,
