@@ -14,6 +14,7 @@ use tenuto::application::runtime::LibraryStores;
 use tenuto::clock::SystemClock;
 use tenuto::feed::cache::CacheStore;
 use tenuto::library::list_feeds;
+use tenuto::station::store::StationStore;
 use tenuto::subscription::store::SubscriptionStore;
 
 fn rss(title: &str) -> Vec<u8> {
@@ -43,6 +44,10 @@ fn stores(root: &Path) -> LibraryStores {
             Arc::new(SystemClock),
         ),
         cache: CacheStore::new(root.join("cache/tenuto/feeds")),
+        stations: StationStore::new(
+            root.join("data/tenuto/stations.json"),
+            Arc::new(SystemClock),
+        ),
     }
 }
 

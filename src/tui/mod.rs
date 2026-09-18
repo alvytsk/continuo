@@ -301,16 +301,17 @@ fn start_runtime(
     runtime
 }
 
-/// The platform's subscription and feed-cache stores, or `None` when there
-/// is no platform data directory. Both the runtime and the browse worker
-/// call this, each owning its own stores.
+/// The platform's subscription, feed-cache and station stores, or `None`
+/// when there is no platform data directory. Both the runtime and the
+/// browse worker call this, each owning its own stores.
 fn library_stores() -> Option<LibraryStores> {
-    crate::commands::platform_subscription_stores()
-        .ok()
-        .map(|(subscriptions, cache)| LibraryStores {
-            subscriptions,
-            cache,
-        })
+    let (subscriptions, cache) = crate::commands::platform_subscription_stores().ok()?;
+    let stations = crate::commands::platform_station_store().ok()?;
+    Some(LibraryStores {
+        subscriptions,
+        cache,
+        stations,
+    })
 }
 
 /// Each change is marked for cleanup as soon as it is made, so a failure

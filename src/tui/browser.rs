@@ -151,6 +151,10 @@ impl BrowserState {
                     self.episodes = Some((slug, list));
                 }
             }
+            // No `BrowserTab::Radio` exists yet — that is M8 §7's job
+            // (Tasks 6-7) — so a `Stations` answer has nowhere to land and
+            // is dropped, exactly as an answer for a tab already left is.
+            BrowseResult::Stations(_) => {}
             BrowseResult::Mutation { request, outcome } => {
                 // ponytail: an identical mutation resubmitted after a close
                 // and reopen adopts the earlier answer; both committed, and
@@ -320,9 +324,16 @@ impl BrowserState {
             BrowseRequest::Subscribe { .. } => "Subscribing…",
             BrowseRequest::Refresh { .. } => "Refreshing…",
             BrowseRequest::Unsubscribe { .. } => "Removing…",
-            BrowseRequest::Directory(_) | BrowseRequest::Feeds | BrowseRequest::Episodes { .. } => {
-                "Loading…"
-            }
+            // Not reachable before M8 §7 (Tasks 6-7) adds the Radio tab's
+            // keys, which are the only source of these three requests; the
+            // arms exist so this match stays exhaustive over `BrowseRequest`.
+            BrowseRequest::AddStation { .. } => "Adding…",
+            BrowseRequest::RemoveStation { .. } => "Removing…",
+            BrowseRequest::ReprobeStation { .. } => "Re-probing…",
+            BrowseRequest::Directory(_)
+            | BrowseRequest::Feeds
+            | BrowseRequest::Episodes { .. }
+            | BrowseRequest::Stations => "Loading…",
         };
         self.notice = Some(Notice {
             text: text.to_owned(),

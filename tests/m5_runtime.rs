@@ -31,6 +31,7 @@ use tenuto::persistence::model::PersistedState;
 use tenuto::persistence::writer::WriterHandle;
 use tenuto::queue::{NewQueueEntry, QueueEntryId, QueueSource};
 use tenuto::session::Session;
+use tenuto::station::store::StationStore;
 use tenuto::subscription::store::SubscriptionStore;
 
 const SHORT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/sine.flac");
@@ -704,9 +705,10 @@ fn corrupt_podcast(enclosure: &str) -> (feeds::Rig, NewQueueEntry, LibraryStores
     let stores = LibraryStores {
         subscriptions: SubscriptionStore::new(
             library.root.path().join("data/tenuto/subscriptions.json"),
-            clock,
+            Arc::clone(&clock),
         ),
         cache: CacheStore::new(library.root.path().join("cache/tenuto/feeds")),
+        stations: StationStore::new(library.root.path().join("data/tenuto/stations.json"), clock),
     };
     (library, podcast, stores)
 }

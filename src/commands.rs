@@ -21,12 +21,14 @@ use crate::feed::error::FeedError;
 use crate::http::error::redact_url;
 use crate::http::limits::Limits;
 use crate::http::service::HttpService;
+use crate::http::source::StationIdentity;
 use crate::library::{
-    EpisodeRow, FeedSummary, FollowupStep, Progress, RefreshOutcome, SubscribeOutcome,
-    UnsubscribeOutcome,
+    AddStationOutcome, EpisodeRow, FeedSummary, FollowupStep, Progress, RefreshOutcome,
+    RemoveStationOutcome, SubscribeOutcome, UnsubscribeOutcome,
 };
 use crate::persistence::PersistenceError;
 use crate::persistence::store::StateStore;
+use crate::station::store::StationStore;
 use crate::subscription::store::SubscriptionStore;
 
 /// Runs one feed command to completion.
@@ -125,6 +127,24 @@ pub(crate) fn platform_subscription_stores() -> Result<(SubscriptionStore, Cache
     Ok((
         SubscriptionStore::new(dirs.data_dir().join("subscriptions.json"), clock),
         CacheStore::new(dirs.cache_dir().join("feeds")),
+    ))
+}
+
+/// The saved-station store on this platform's directory (M8 design doc §4,
+/// §6), at `stations.json` beside `subscriptions.json` in the same
+/// `data_dir`. A separate lookup from [`platform_subscription_stores`]
+/// rather than a third element of its tuple: every one of that function's
+/// callers is a feed command with no use for a station store, and widening
+/// its return type would hand each of them a store they never touch.
+pub(crate) fn platform_station_store() -> Result<StationStore, FeedError> {
+    let dirs = directories::ProjectDirs::from("", "", "tenuto").ok_or_else(|| {
+        FeedError::StationsUnreadable {
+            reason: "no platform data directory is available".to_string(),
+        }
+    })?;
+    Ok(StationStore::new(
+        dirs.data_dir().join("stations.json"),
+        Arc::new(SystemClock),
     ))
 }
 
@@ -616,6 +636,110 @@ pub(crate) fn finish_unsubscribe(
     )
     .map_err(stdout_failure)?;
     Err(failure.error)
+}
+
+/// A verified station's identity, on one line: name, genre and bitrate,
+/// joined by ` · ` and each omitted when absent, matching the Radio tab's
+/// own row rendering (M8 design doc §7). `ABSENT` when nothing came back at
+/// all — legitimate for a station whose ICY headers carry neither a name
+/// nor a bitrate (§4).
+fn station_identity_text(identity: &StationIdentity) -> String {
+    let mut parts = Vec::new();
+    if let Some(name) = &identity.name {
+        parts.push(name.clone());
+    }
+    if let Some(genre) = &identity.genre {
+        parts.push(genre.clone());
+    }
+    if let Some(bitrate) = identity.bitrate_kbps {
+        parts.push(format!("{bitrate} kbps"));
+    }
+    if parts.is_empty() {
+        ABSENT.to_string()
+    } else {
+        parts.join(" · ")
+    }
+}
+
+/// `AddStation`'s and `ReprobeStation`'s shared report (M8 design doc §10),
+/// `action` naming which one so the same taxonomy reads as "added" or
+/// "re-probed" rather than composing two near-identical formatters.
+fn write_station_probe(
+    out: &mut dyn Write,
+    outcome: AddStationOutcome,
+    action: &str,
+) -> Result<(), FeedError> {
+    match outcome {
+        AddStationOutcome::Verified { slug, identity } => writeln!(
+            out,
+            "{slug}: {action}, verified — {}",
+            station_identity_text(&identity)
+        )
+        .map_err(stdout_failure),
+        AddStationOutcome::Unverified { slug, reason } => {
+            writeln!(out, "{slug}: {action}, unverified: {reason}").map_err(stdout_failure)
+        }
+        // A duplicate add resolves to the station already saved (§10) and
+        // is not itself an error; a failed implicit re-probe is reported in
+        // the same line rather than swallowed, exactly as an explicit
+        // `ReprobeStation`'s failure is (`AddStationOutcome::AlreadySaved`'s
+        // own doc comment explains why this field exists at all).
+        AddStationOutcome::AlreadySaved {
+            slug,
+            identity,
+            reprobe_failure: None,
+        } => writeln!(
+            out,
+            "{slug}: already saved, re-probed — {}",
+            identity
+                .as_ref()
+                .map_or_else(|| ABSENT.to_string(), station_identity_text)
+        )
+        .map_err(stdout_failure),
+        AddStationOutcome::AlreadySaved {
+            slug,
+            identity,
+            reprobe_failure: Some(reason),
+        } => writeln!(
+            out,
+            "{slug}: already saved; re-probe failed: {reason} (last known: {})",
+            identity
+                .as_ref()
+                .map_or_else(|| ABSENT.to_string(), station_identity_text)
+        )
+        .map_err(stdout_failure),
+    }
+}
+
+/// `AddStation` (M8 design doc §6, §10).
+pub(crate) fn finish_add_station(
+    out: &mut dyn Write,
+    outcome: AddStationOutcome,
+) -> Result<(), FeedError> {
+    write_station_probe(out, outcome, "added")
+}
+
+/// `ReprobeStation` (M8 design doc §6). [`reprobe_station`] only ever
+/// produces [`AddStationOutcome::Verified`] on success — a station cannot
+/// re-probe its way into being a duplicate of itself — but the outcome type
+/// is shared with `AddStation`, so every arm is still handled.
+///
+/// [`reprobe_station`]: crate::library::reprobe_station
+pub(crate) fn finish_reprobe_station(
+    out: &mut dyn Write,
+    outcome: AddStationOutcome,
+) -> Result<(), FeedError> {
+    write_station_probe(out, outcome, "re-probed")
+}
+
+/// `RemoveStation` (M8 design doc §6): a local edit, always successful once
+/// [`crate::library::remove_station`] returns `Ok`.
+pub(crate) fn finish_remove_station(
+    out: &mut dyn Write,
+    outcome: RemoveStationOutcome,
+) -> Result<(), FeedError> {
+    let RemoveStationOutcome { slug } = outcome;
+    writeln!(out, "{slug}: removed").map_err(stdout_failure)
 }
 
 #[cfg(test)]
@@ -1282,6 +1406,75 @@ mod tests {
             "{rendered}"
         );
         assert!(matches!(error, FeedError::UnsupportedFormat), "{error:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn adding_a_verified_station_prints_its_identity() -> Fallible {
+        let mut out = Vec::new();
+        finish_add_station(
+            &mut out,
+            AddStationOutcome::Verified {
+                slug: "test-radio".to_string(),
+                identity: StationIdentity {
+                    name: Some("Test Radio".to_string()),
+                    genre: Some("Lofi".to_string()),
+                    bitrate_kbps: Some(128),
+                    logo: None,
+                },
+            },
+        )?;
+        assert_eq!(
+            text(out)?,
+            "test-radio: added, verified — Test Radio · Lofi · 128 kbps\n"
+        );
+        Ok(())
+    }
+
+    /// `AddStationOutcome::AlreadySaved::reprobe_failure` exists so that a
+    /// duplicate add's implicit re-probe failure reaches the caller instead
+    /// of being swallowed by the "already saved" framing (M8 §6, §10); this
+    /// is the presentation-layer half of that fix — the reason must show up
+    /// in the printed line, not just in the value passed to `finish_add_station`.
+    #[test]
+    fn a_duplicate_adds_failed_reprobe_is_not_swallowed() -> Fallible {
+        let mut out = Vec::new();
+        finish_add_station(
+            &mut out,
+            AddStationOutcome::AlreadySaved {
+                slug: "test-radio".to_string(),
+                identity: Some(StationIdentity {
+                    name: Some("Test Radio".to_string()),
+                    genre: None,
+                    bitrate_kbps: None,
+                    logo: None,
+                }),
+                reprobe_failure: Some("connection reset".to_string()),
+            },
+        )?;
+        let rendered = text(out)?;
+        assert!(rendered.contains("already saved"), "{rendered}");
+        assert!(
+            rendered.contains("re-probe failed: connection reset"),
+            "the re-probe failure must be surfaced, not swallowed: {rendered}"
+        );
+        assert!(
+            rendered.contains("Test Radio"),
+            "the station's prior identity is still shown: {rendered}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn removing_a_station_prints_its_slug() -> Fallible {
+        let mut out = Vec::new();
+        finish_remove_station(
+            &mut out,
+            RemoveStationOutcome {
+                slug: "test-radio".to_string(),
+            },
+        )?;
+        assert_eq!(text(out)?, "test-radio: removed\n");
         Ok(())
     }
 

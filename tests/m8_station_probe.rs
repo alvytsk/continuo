@@ -13,13 +13,18 @@ mod support;
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use support::server::{Script, TestServer};
+use tenuto::application::browse::{BrowseRequest, BrowseResult, BrowseWorker};
+use tenuto::application::runtime::LibraryStores;
 use tenuto::clock::SystemClock;
+use tenuto::feed::cache::CacheStore;
 use tenuto::http::limits::Limits;
 use tenuto::http::service::HttpService;
-use tenuto::library::{AddStationOutcome, add_station, list_stations, reprobe_station};
+use tenuto::library::{AddStationOutcome, StationRow, add_station, list_stations, reprobe_station};
 use tenuto::station::store::StationStore;
+use tenuto::subscription::store::SubscriptionStore;
 use url::Url;
 
 /// A fresh `StationStore` rooted at `root/stations.json`, built repeatedly
@@ -52,6 +57,64 @@ fn reprobe(
     service
         .handle()
         .block_on(reprobe_station(service, store, slug))
+}
+
+// --- Task 5: browse worker wiring (M8 §6) -------------------------------
+
+/// A `LibraryStores` rooted at `root`, the station store built by [`store`]
+/// above so a worker-level test seeds and reads through the same helper the
+/// library-level tests above it use.
+fn stores(root: &Path) -> LibraryStores {
+    LibraryStores {
+        subscriptions: SubscriptionStore::new(
+            root.join("subscriptions.json"),
+            Arc::new(SystemClock),
+        ),
+        cache: CacheStore::new(root.join("feeds")),
+        stations: store(root),
+    }
+}
+
+/// Sends `request` and waits for its `Mutation` answer, the same shape
+/// `tests/m6_feed_management.rs::answer` uses for the feed mutations.
+fn answer(
+    worker: &BrowseWorker,
+    request: BrowseRequest,
+) -> (BrowseRequest, Result<String, String>) {
+    worker.request(request);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if let Some(result) = worker.try_result() {
+            match result {
+                BrowseResult::Mutation { request, outcome } => return (request, outcome),
+                other => panic!("expected a mutation answer, got {other:?}"),
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the browse worker never answered"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// Sends `Stations` and waits for its listing.
+fn list(worker: &BrowseWorker) -> Result<Vec<StationRow>, String> {
+    worker.request(BrowseRequest::Stations);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if let Some(result) = worker.try_result() {
+            match result {
+                BrowseResult::Stations(rows) => return rows,
+                other => panic!("expected a station listing, got {other:?}"),
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the browse worker never answered"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
 }
 
 #[test]
@@ -449,4 +512,109 @@ fn a_protected_store_quarantine_failure_is_never_overwritten() {
         );
         server.shutdown();
     }
+}
+
+/// M8 §6: the worker answers `AddStation` with a `Mutation` echoing the
+/// request, the added station then shows up in `Stations`, `RemoveStation`
+/// answers likewise, and the station is gone from a following `Stations`.
+#[test]
+fn the_worker_answers_every_station_request() {
+    let root = tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir: {error}"));
+    let server = TestServer::start(Script::from_fixture("sine-noxing.mp3").icy_station());
+    let worker = BrowseWorker::spawn(Some(stores(root.path())));
+
+    let add_request = BrowseRequest::AddStation {
+        url: server.url("/radio"),
+    };
+    let (echoed, outcome) = answer(&worker, add_request.clone());
+    assert_eq!(echoed, add_request);
+    let text = outcome.unwrap_or_else(|error| panic!("add failed: {error}"));
+    assert!(text.contains("added, verified"), "{text}");
+
+    let rows = list(&worker).unwrap_or_else(|error| panic!("list: {error}"));
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    let slug = rows[0].slug.clone();
+
+    let remove_request = BrowseRequest::RemoveStation { slug: slug.clone() };
+    let (echoed, outcome) = answer(&worker, remove_request.clone());
+    assert_eq!(echoed, remove_request);
+    assert_eq!(outcome, Ok(format!("{slug}: removed")), "{outcome:?}");
+
+    let rows = list(&worker).unwrap_or_else(|error| panic!("list: {error}"));
+    assert!(rows.is_empty(), "{rows:?}");
+    server.shutdown();
+}
+
+/// R3: drawing the Radio tab makes no request. A station already saved is
+/// listed, and then removed, with the server's request count unchanged —
+/// the worker-level counterpart to `tests/m5_no_network.rs`'s invariant,
+/// extended to the two station requests that must never touch the network
+/// (M8 §6).
+#[test]
+fn listing_and_removing_stations_open_no_connection() {
+    let root = tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir: {error}"));
+    let server = TestServer::start(Script::from_fixture("sine-noxing.mp3").icy_station());
+
+    // Seeded directly through `add_station`, off the worker under test, so
+    // the request that populates the store is never counted against it.
+    let seed = store(root.path());
+    let http = service();
+    let outcome =
+        add(&http, &seed, &server.url("/radio")).unwrap_or_else(|error| panic!("seed: {error}"));
+    let AddStationOutcome::Verified { slug, .. } = outcome else {
+        panic!("expected Verified, got {outcome:?}");
+    };
+    let seeded_requests = server.requests().len();
+    assert!(seeded_requests > 0, "the seed add must have made a request");
+
+    let worker = BrowseWorker::spawn(Some(stores(root.path())));
+    let rows = list(&worker).unwrap_or_else(|error| panic!("list: {error}"));
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].slug, slug);
+
+    let (_, removed) = answer(&worker, BrowseRequest::RemoveStation { slug: slug.clone() });
+    assert_eq!(removed, Ok(format!("{slug}: removed")), "{removed:?}");
+
+    assert_eq!(
+        server.requests().len(),
+        seeded_requests,
+        "listing and removing a station must open no connection"
+    );
+    server.shutdown();
+}
+
+/// M6 §5's correlation rule, extended to the three new station mutations:
+/// every `Mutation` answer echoes the exact request it answers, so a late
+/// answer for a place already left can be told from the one being awaited.
+#[test]
+fn every_station_mutation_echoes_the_request_it_answers() {
+    let root = tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir: {error}"));
+    let server = TestServer::start(
+        Script::from_fixture("sine-noxing.mp3")
+            .icy_station()
+            .then(Script::from_fixture("sine-noxing.mp3").icy_station()),
+    );
+    let worker = BrowseWorker::spawn(Some(stores(root.path())));
+
+    let add_request = BrowseRequest::AddStation {
+        url: server.url("/radio"),
+    };
+    let (echoed, outcome) = answer(&worker, add_request.clone());
+    assert_eq!(echoed, add_request);
+    outcome.unwrap_or_else(|error| panic!("add failed: {error}"));
+
+    let rows = list(&worker).unwrap_or_else(|error| panic!("list: {error}"));
+    let slug = rows[0].slug.clone();
+
+    let reprobe_request = BrowseRequest::ReprobeStation { slug: slug.clone() };
+    let (echoed, outcome) = answer(&worker, reprobe_request.clone());
+    assert_eq!(echoed, reprobe_request);
+    outcome.unwrap_or_else(|error| panic!("reprobe failed: {error}"));
+
+    let remove_request = BrowseRequest::RemoveStation { slug: slug.clone() };
+    let (echoed, outcome) = answer(&worker, remove_request.clone());
+    assert_eq!(echoed, remove_request);
+    outcome.unwrap_or_else(|error| panic!("remove failed: {error}"));
+
+    server.shutdown();
 }

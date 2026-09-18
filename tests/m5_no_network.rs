@@ -28,6 +28,8 @@ use tenuto::media::tags::probe_local_tags;
 use tenuto::persistence::model::PersistedState;
 use tenuto::queue::{NewQueueEntry, QueueSource};
 use tenuto::session::Session;
+use tenuto::station::model::Station;
+use tenuto::station::store::{StationSnapshot, StationStore};
 use tenuto::subscription::store::SubscriptionStore;
 use tenuto::tui::render::{Visuals, draw};
 use tenuto::tui::state::UiState;
@@ -159,9 +161,10 @@ fn restoring_enqueueing_and_browsing_remote_entries_make_no_requests() {
     let worker = BrowseWorker::spawn(Some(LibraryStores {
         subscriptions: SubscriptionStore::new(
             library.root.path().join("data/tenuto/subscriptions.json"),
-            clock,
+            Arc::clone(&clock),
         ),
         cache: CacheStore::new(library.root.path().join("cache/tenuto/feeds")),
+        stations: StationStore::new(library.root.path().join("data/tenuto/stations.json"), clock),
     }));
     worker.request(BrowseRequest::Feeds);
     assert!(
@@ -280,6 +283,76 @@ fn a_restored_active_station_is_listed_and_drawn_without_a_request() {
     assert!(
         server.requests().is_empty(),
         "a station was contacted before an explicit play: {:?}",
+        server.requests()
+    );
+    let _ = rig.runtime.shutdown();
+    server.shutdown();
+}
+
+/// The Radio tab's counterpart to the test above (M8 design doc §6, R3): a
+/// station already saved in the library is both restored as the active
+/// queue entry and drawn, and listed by the browse worker's `Stations`
+/// request, all without a request reaching the server.
+#[test]
+fn a_restored_station_is_listed_and_drawn_without_a_request() {
+    let server = TestServer::start(Script::from_fixture("sine-noxing.mp3").icy_station());
+    let url = server.url("/radio");
+    let mut rig = rig_with(station_active(&url));
+    pump_for(&mut rig.runtime, Duration::from_millis(300));
+
+    let view = rig.runtime.view();
+    assert_eq!(view.rows.len(), 1, "{view:?}");
+    assert_eq!(view.active, Some(view.rows[0].id), "{view:?}");
+    let mut terminal =
+        Terminal::new(TestBackend::new(100, 30)).unwrap_or_else(|error| panic!("backend: {error}"));
+    terminal
+        .draw(|frame| {
+            draw(frame, &view, &UiState::new(true), &Visuals::default());
+        })
+        .unwrap_or_else(|error| panic!("draw: {error}"));
+
+    // The same station, saved in the library, is listed by a fresh worker
+    // that has never made a request either: R3 extends the no-network
+    // invariant from restoring/drawing the queue entry above to reading the
+    // Radio tab.
+    let root = tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir: {error}"));
+    let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+    let stations = StationStore::new(root.path().join("stations.json"), Arc::clone(&clock));
+    let normalized = NormalizedUrl::parse(&url).unwrap_or_else(|error| panic!("url: {error}"));
+    let added_at = stations.now();
+    stations
+        .save(&StationSnapshot {
+            stations: vec![Station {
+                slug: "radio".to_owned(),
+                url: url.parse().unwrap_or_else(|error| panic!("url: {error}")),
+                media: MediaId::RemoteUrl(normalized),
+                identity: None,
+                added_at,
+                probed_at: None,
+            }],
+        })
+        .unwrap_or_else(|error| panic!("save: {error}"));
+
+    let worker = BrowseWorker::spawn(Some(LibraryStores {
+        subscriptions: SubscriptionStore::new(
+            root.path().join("subscriptions.json"),
+            Arc::clone(&clock),
+        ),
+        cache: CacheStore::new(root.path().join("feeds")),
+        stations,
+    }));
+    worker.request(BrowseRequest::Stations);
+    match wait_for_result(&worker) {
+        BrowseResult::Stations(Ok(rows)) => {
+            assert_eq!(rows.len(), 1, "{rows:?}");
+            assert_eq!(rows[0].slug, "radio", "{rows:?}");
+        }
+        other => panic!("expected a station listing, got {other:?}"),
+    }
+
+    assert!(
+        server.requests().is_empty(),
+        "a station was contacted before an explicit play or a Radio-tab read: {:?}",
         server.requests()
     );
     let _ = rig.runtime.shutdown();

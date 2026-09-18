@@ -55,6 +55,7 @@ use crate::queue::{
 use crate::session::{
     Action, Advance, DisplayUpdate, LoadTarget, RegisterLoadError, Removal, Session,
 };
+use crate::station::store::StationStore;
 use crate::subscription::store::SubscriptionStore;
 
 /// Shown when the engine refuses a command for want of queue room.
@@ -68,10 +69,15 @@ const METADATA_WORKERS: usize = 2;
 /// deviceless output while production uses the environment's choice.
 pub type EngineFactory = Box<dyn FnMut() -> EngineHandle + Send>;
 
-/// The local library files a podcast entry resolves against before it loads.
+/// The local library files a podcast entry resolves against before it
+/// loads, and, since M8 (design doc §6, §8.1), the saved radio stations the
+/// browse worker's `Stations`/`AddStation`/`RemoveStation`/`ReprobeStation`
+/// requests read and write, and `active_cover()` looks a station's logo up
+/// in.
 pub struct LibraryStores {
     pub subscriptions: SubscriptionStore,
     pub cache: CacheStore,
+    pub stations: StationStore,
 }
 
 pub struct RuntimeParts {
