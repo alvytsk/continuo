@@ -85,7 +85,7 @@ pub enum RemoteFailure {
     ProbeLimitExceeded { limit: u64 },
     #[error("cannot establish whether this source ever ends")]
     ContinuityUndetermined,
-    #[error("live streams are not supported")]
+    #[error("not a direct live audio stream; HLS playlists are not supported")]
     UnsupportedLiveMedia,
     #[error("this stream interleaves metadata, which is not supported yet")]
     IcyFramingUnsupported,
