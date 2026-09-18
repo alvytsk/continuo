@@ -97,15 +97,18 @@ fn a_relative_logo_and_a_non_numeric_bitrate_degrade_to_none() {
     let server = TestServer::start(
         Script::from_fixture("sine-noxing.mp3")
             .icy_station()
-            .icy_logo("/logo.svg".to_owned()),
+            .icy_logo("/logo.svg".to_owned())
+            .icy_br("not-a-number".to_owned()),
     );
     let source = open(&server);
     let identity = source
         .station_identity()
         .unwrap_or_else(|| panic!("a live source has an identity"));
-    // A relative `icy-logo` is dropped, and the station is still a station:
-    // a decorative field never costs a station its classification (§5).
+    // A relative `icy-logo` and a non-decimal `icy-br` are both dropped, and
+    // the station is still a station: neither decorative field costs it its
+    // classification (§5).
     assert!(identity.logo.is_none(), "a relative logo is not a URL");
+    assert!(identity.bitrate_kbps.is_none(), "not a decimal bitrate");
     assert!(source.evidence().live, "still live");
     drop(source);
     server.shutdown();

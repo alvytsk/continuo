@@ -135,6 +135,9 @@ pub struct Script {
     icy_station: bool,
     /// An absolute `icy-logo` URL for a station fixture; `None` sends none.
     icy_logo: Option<String>,
+    /// Overrides the station fixture's `icy-br` value; `None` sends the
+    /// default `128`.
+    icy_br: Option<String>,
     /// Connection n (1-based) is served by `sequence[n - 2]` once n > 1; the
     /// last entry serves every later connection.
     sequence: Vec<Script>,
@@ -299,6 +302,14 @@ impl Script {
     /// a relative value is deliberately dropped by the parser under test.
     pub fn icy_logo(mut self, url: String) -> Self {
         self.icy_logo = Some(url);
+        self
+    }
+
+    /// Overrides the station fixture's `icy-br` header, so a malformed
+    /// bitrate can be exercised (M8 §5: a decorative field never costs a
+    /// station its classification).
+    pub fn icy_br(mut self, value: String) -> Self {
+        self.icy_br = Some(value);
         self
     }
 
@@ -728,7 +739,10 @@ fn write_whole_body(
         header.push_str("icy-name: Test Radio\r\nicy-metaint: 16000\r\n");
     }
     if script.icy_station {
-        header.push_str("icy-name: Test Radio\r\nicy-br: 128\r\nicy-genre: Lofi\r\n");
+        let bitrate = script.icy_br.as_deref().unwrap_or("128");
+        header.push_str(&format!(
+            "icy-name: Test Radio\r\nicy-br: {bitrate}\r\nicy-genre: Lofi\r\n"
+        ));
         if let Some(logo) = &script.icy_logo {
             header.push_str(&format!("icy-logo: {logo}\r\n"));
         }
