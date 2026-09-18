@@ -50,6 +50,26 @@ fn a_station_carries_its_whole_icy_identity() {
 }
 
 #[test]
+fn a_padded_name_and_genre_are_trimmed() {
+    let server = TestServer::start(
+        Script::from_fixture("sine-noxing.mp3")
+            .icy_station()
+            .icy_name("  Test Radio  ".to_owned())
+            .icy_genre("  Lofi  ".to_owned()),
+    );
+    let source = open_station(&server);
+    let identity = source
+        .station_identity()
+        .unwrap_or_else(|| panic!("a live source has an identity"));
+    // §5/§7: `icy-br`/`icy-logo` were already trimmed; `icy-name`/`icy-genre`
+    // must be too, or a padded value draws e.g. `Lofi  · 128 kbps`.
+    assert_eq!(identity.name.as_deref(), Some("Test Radio"));
+    assert_eq!(identity.genre.as_deref(), Some("Lofi"));
+    drop(source);
+    server.shutdown();
+}
+
+#[test]
 fn a_station_with_no_logo_header_has_no_logo() {
     let server = TestServer::start(Script::from_fixture("sine-noxing.mp3").icy_station());
     let source = open_station(&server);
@@ -80,6 +100,41 @@ fn a_relative_logo_and_a_non_numeric_bitrate_degrade_to_none() {
     assert!(identity.logo.is_none(), "a relative logo is not a URL");
     assert!(identity.bitrate_kbps.is_none(), "not a decimal bitrate");
     assert!(source.evidence().live, "still live");
+    drop(source);
+    server.shutdown();
+}
+
+#[test]
+fn a_file_scheme_logo_degrades_to_none() {
+    let server = TestServer::start(
+        Script::from_fixture("sine-noxing.mp3")
+            .icy_station()
+            .icy_logo("file:///etc/passwd".to_owned()),
+    );
+    let source = open_station(&server);
+    let identity = source
+        .station_identity()
+        .unwrap_or_else(|| panic!("a live source has an identity"));
+    // §5: only an absolute http(s) URL with a host is kept — a `file:` value
+    // would never be fetched by `fetch_document` anyway, so admitting it
+    // here would just persist a logo that can never load.
+    assert!(identity.logo.is_none(), "a file: URL is not a usable logo");
+    drop(source);
+    server.shutdown();
+}
+
+#[test]
+fn a_data_scheme_logo_degrades_to_none() {
+    let server = TestServer::start(
+        Script::from_fixture("sine-noxing.mp3")
+            .icy_station()
+            .icy_logo("data:image/svg+xml;base64,PHN2Zy8+".to_owned()),
+    );
+    let source = open_station(&server);
+    let identity = source
+        .station_identity()
+        .unwrap_or_else(|| panic!("a live source has an identity"));
+    assert!(identity.logo.is_none(), "a data: URL is not a usable logo");
     drop(source);
     server.shutdown();
 }

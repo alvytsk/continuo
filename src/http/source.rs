@@ -134,6 +134,17 @@ impl WaitBudget {
     }
 }
 
+/// A station identity header, trimmed, with an all-whitespace value treated
+/// as absent — the same "decorative field, never costs a station its
+/// classification" rule `icy-br`/`icy-logo` already follow (§5). Otherwise
+/// a trailing space survives into the draw, e.g. `Lofi  · 128 kbps`.
+fn trimmed_or_none(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|trimmed| !trimmed.is_empty())
+        .map(str::to_string)
+}
+
 /// The wait budget for one blocking operation: `limits.stall` once opening is
 /// over, or the smaller of `limits.stall` and however much of the opening
 /// deadline remains while it is not - tagged with which of the two it was.
@@ -268,8 +279,8 @@ impl HttpMediaSource {
                 false,
                 true,
                 Some(StationIdentity {
-                    name: accepted.headers.get("icy-name").map(str::to_string),
-                    genre: accepted.headers.get("icy-genre").map(str::to_string),
+                    name: trimmed_or_none(accepted.headers.get("icy-name")),
+                    genre: trimmed_or_none(accepted.headers.get("icy-genre")),
                     // A bitrate that is not a plain decimal, and a logo that
                     // is not an absolute URL, are simply absent: a decorative
                     // field never costs a station its classification (§5).
@@ -277,10 +288,15 @@ impl HttpMediaSource {
                         .headers
                         .get("icy-br")
                         .and_then(|value| value.trim().parse::<u32>().ok()),
-                    logo: accepted
-                        .headers
-                        .get("icy-logo")
-                        .and_then(|value| Url::parse(value.trim()).ok()),
+                    // Only an absolute http(s) URL with a host is kept: a
+                    // `file:`/`data:`/`javascript:` value would never be
+                    // fetched by `fetch_document` anyway, and admitting it
+                    // here just persists a logo that can never load (§5).
+                    logo: accepted.headers.get("icy-logo").and_then(|value| {
+                        Url::parse(value.trim()).ok().filter(|u| {
+                            matches!(u.scheme(), "http" | "https") && u.host_str().is_some()
+                        })
+                    }),
                 }),
             ),
         };

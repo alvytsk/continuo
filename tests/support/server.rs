@@ -138,6 +138,12 @@ pub struct Script {
     /// Overrides the station fixture's `icy-br` value; `None` sends the
     /// default `128`.
     icy_br: Option<String>,
+    /// Overrides the station fixture's `icy-name` value; `None` sends the
+    /// default `Test Radio`.
+    icy_name: Option<String>,
+    /// Overrides the station fixture's `icy-genre` value; `None` sends the
+    /// default `Lofi`.
+    icy_genre: Option<String>,
     /// Connection n (1-based) is served by `sequence[n - 2]` once n > 1; the
     /// last entry serves every later connection.
     sequence: Vec<Script>,
@@ -310,6 +316,20 @@ impl Script {
     /// station its classification).
     pub fn icy_br(mut self, value: String) -> Self {
         self.icy_br = Some(value);
+        self
+    }
+
+    /// Overrides the station fixture's `icy-name` header, so a value padded
+    /// with whitespace can be exercised (the parser under test must trim it).
+    pub fn icy_name(mut self, value: String) -> Self {
+        self.icy_name = Some(value);
+        self
+    }
+
+    /// Overrides the station fixture's `icy-genre` header, so a value padded
+    /// with whitespace can be exercised (the parser under test must trim it).
+    pub fn icy_genre(mut self, value: String) -> Self {
+        self.icy_genre = Some(value);
         self
     }
 
@@ -740,8 +760,10 @@ fn write_whole_body(
     }
     if script.icy_station {
         let bitrate = script.icy_br.as_deref().unwrap_or("128");
+        let name = script.icy_name.as_deref().unwrap_or("Test Radio");
+        let genre = script.icy_genre.as_deref().unwrap_or("Lofi");
         header.push_str(&format!(
-            "icy-name: Test Radio\r\nicy-br: {bitrate}\r\nicy-genre: Lofi\r\n"
+            "icy-name: {name}\r\nicy-br: {bitrate}\r\nicy-genre: {genre}\r\n"
         ));
         if let Some(logo) = &script.icy_logo {
             header.push_str(&format!("icy-logo: {logo}\r\n"));
