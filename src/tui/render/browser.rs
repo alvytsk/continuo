@@ -24,7 +24,8 @@ const NO_FEEDS: &str = "No subscriptions — press a to add a feed URL";
 // Radio tab's tab bar, title and row layout (slug/identity, URL/unreached
 // marker) in full. This much exists so `BrowserTab::Radio`'s exhaustive
 // matches here compile and the Radio tab is not left blank meanwhile.
-const RADIO_HINTS: &str = "enter add/remove · a add · r re-probe · d remove · ⌫ back · b close";
+const RADIO_HINTS: &str =
+    "enter add/remove · space mark · a add · r re-probe · d remove · ⌫ back · b close";
 const NO_STATIONS: &str = "No saved stations — press a to add a stream URL";
 const PROMPT: &str = "Feed URL: ";
 const LOADING: &str = "Loading…";
@@ -226,8 +227,8 @@ fn row_cells(browser: &BrowserState, index: usize, theme: &Theme) -> Option<RowC
                 .map(|station| match &station.identity {
                     Some(identity) => {
                         let parts: Vec<String> = [
-                            identity.name.clone(),
-                            identity.genre.clone(),
+                            identity.name.as_deref().map(displayable),
+                            identity.genre.as_deref().map(displayable),
                             identity.bitrate_kbps.map(|kbps| format!("{kbps} kbps")),
                         ]
                         .into_iter()

@@ -13,6 +13,7 @@ use tenuto::application::browse::{
 use tenuto::application::runtime::EnqueueItem;
 use tenuto::application::source::resolve_source;
 use tenuto::application::view::QueueRow;
+use tenuto::http::source::StationIdentity;
 use tenuto::library::{EpisodeCandidate, FeedSummary, StationRow};
 use tenuto::media::id::{AbsolutePath, EpisodeKey, FeedId, MediaId, NormalizedUrl};
 use tenuto::queue::QueueEntryId;
@@ -1148,6 +1149,40 @@ fn a_queued_station_draws_a_tick() {
         .find(|line| line.contains("one"))
         .unwrap_or_else(|| panic!("no row for the station: {text}"));
     assert!(line.contains('✓'), "{line}");
+}
+
+/// A hostile station can put anything it likes in `icy-name`/`icy-genre`
+/// (M8 §5 probes them straight off the response headers); `StationIdentity`
+/// carries its own doc comment obligation ("the caller escapes it before
+/// drawing it"). This is the same terminal-injection hazard
+/// `the_overlay_draws_safe_names_marks_and_dimmed_unplayable_episodes`
+/// covers for a directory entry's name — an unescaped ESC byte reaching a
+/// real terminal can rewrite rows the user never asked to see.
+#[test]
+fn a_stations_identity_text_is_escaped() {
+    // Short enough to survive the detail column's 14-character width whole
+    // (unlike the label, the identity detail is right-aligned and clipped,
+    // so a long escaped string would fail this test for a display reason
+    // that has nothing to do with escaping); genre and bitrate are left out
+    // so the joined detail is exactly this string, with nothing to hide it.
+    let mut row = station_row("one", "https://one.example/stream");
+    row.identity = Some(StationIdentity {
+        name: Some("ev\u{1b}il".to_owned()),
+        genre: None,
+        bitrate_kbps: None,
+        logo: None,
+    });
+    let state = radio(vec![row]);
+
+    let (text, buffer) = screen(&state);
+    assert!(text.contains("ev\\u{1b}il"), "{text}");
+    assert!(
+        !buffer
+            .content()
+            .iter()
+            .any(|cell| cell.symbol().contains('\u{1b}')),
+        "no raw escape byte reaches the buffer"
+    );
 }
 
 #[test]
