@@ -531,6 +531,20 @@ fn metadata_framing_is_refused_until_it_can_be_demultiplexed() {
 }
 
 #[test]
+fn a_zero_or_unparseable_metaint_means_no_framing_and_the_station_is_live() {
+    // StreamGuys answers every client that did not ask for metadata with
+    // `icy-metaint: 0`: the header is present, the interval is not. Only a
+    // positive interval means the body is interleaved.
+    for value in ["0", "00", "junk", ""] {
+        assert_eq!(
+            accept(200, &icy(&[("icy-metaint", value)]), 0, true, None),
+            Ok(Accepted::Live),
+            "icy-metaint: {value:?}"
+        );
+    }
+}
+
+#[test]
 fn an_hls_playlist_is_refused_before_any_probe() {
     let headers = Headers::from_pairs(&[("content-type", "application/vnd.apple.mpegurl")]);
     assert_eq!(

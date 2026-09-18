@@ -188,7 +188,15 @@ fn classify_live(headers: &Headers) -> Option<Result<(), RemoteFailure>> {
     if is_hls(headers) {
         return Some(Err(RemoteFailure::UnsupportedLiveMedia));
     }
-    if headers.get("icy-metaint").is_some() {
+    // Only a positive interval means the body is interleaved. StreamGuys
+    // answers every client that did not ask for metadata with
+    // `icy-metaint: 0`, so presence alone proves nothing (M7 §12 models the
+    // value as `Option<NonZeroU32>` for the same reason).
+    if headers
+        .get("icy-metaint")
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .is_some_and(|interval| interval > 0)
+    {
         return Some(Err(RemoteFailure::IcyFramingUnsupported));
     }
     is_icy(headers).then_some(Ok(()))

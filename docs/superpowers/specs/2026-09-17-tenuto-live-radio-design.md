@@ -55,7 +55,7 @@ Verified externally: `https://radio.cliamp.stream/lofi/stream` answers `Range: b
 3. **A station never completes.** No `EndOfTrack`, no `completed`, no queue advance, no checkpoint.
 4. **User seeks on live media are rejected and harmless.** `SeekTo`, `SeekBy` and `Restart` are refused with a notice and leave the source, the playback intent and the reconnect budget exactly as they were. A recovery is never reported as a successful seek or restart.
 5. **Continuity is fixed for a session.** A reopen that comes back with a different continuity is a failure, detected before anything is adopted or published.
-6. **Metadata framing never reaches the decoder.** Until M7.2 exists, a response that carries `icy-metaint` is refused.
+6. **Metadata framing never reaches the decoder.** Until M7.2 exists, a response that carries a positive `icy-metaint` is refused; `icy-metaint: 0`, which StreamGuys sends to every client that did not ask for metadata, is no framing.
 
 ## 4. HTTP layer
 
@@ -71,7 +71,7 @@ Accepted::Sequential { len } | Accepted::Ranged { range } | Accepted::Live
 | --- | --- | --- |
 | any non-2xx, 416 | — | today's typed failure (`Status`, `InvalidRange`), whatever ICY headers it carries |
 | 200 or 206 | `content-type: application/vnd.apple.mpegurl` | `Err(UnsupportedLiveMedia)` — HLS stays refused, now before the probe |
-| 200 or 206 | `icy-metaint` present | `Err(RemoteFailure::IcyFramingUnsupported)` (new; deleted by M7.2) |
+| 200 or 206 | positive `icy-metaint` (a `0` or unparseable value is no framing) | `Err(RemoteFailure::IcyFramingUnsupported)` (new; deleted by M7.2) |
 | 200 at origin | `icy-name` or `icy-br` | `Accepted::Live`; `Content-Length` ignored |
 | 206 | `icy-name` or `icy-br`, `requested_start == 0`, `Content-Range` parses with `first == 0` | `Accepted::Live`; length and total ignored |
 | 206 | ICY headers, any other start | `Err(InvalidRange { WrongStart })` — Tenuto never requests one |
