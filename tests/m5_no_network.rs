@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 
 use ratatui::{Terminal, backend::TestBackend};
 use runtime::{pump_for, rig_with, rig_with_probe, row_ids};
+use serde_json::json;
 use support::server::{Script, TestServer};
 use tenuto::application::browse::{BrowseRequest, BrowseResult, BrowseWorker};
 use tenuto::application::enrich::TagProbe;
@@ -220,16 +221,50 @@ fn only_an_explicit_play_prepares_the_remote_source() {
     server.shutdown();
 }
 
-/// M7 §10: a station is a remote entry like any other — restoring one,
-/// pumping and drawing it all happen with the radio off.
+/// The state a process restart with a station *active* restores from (§9/§14
+/// L20). Built from the persisted JSON the way `m5_state_recovery` builds its
+/// fixtures: `active_entry` is written on disk, and nothing in the public API
+/// sets it without a real `Loaded` event from the engine.
+fn station_active(url: &str) -> PersistedState {
+    let normalized = NormalizedUrl::parse(url).unwrap_or_else(|error| panic!("url: {error}"));
+    // Spelled by `MediaId` itself rather than by hand, so the fixture cannot
+    // drift from the encoding the store actually writes.
+    let media = MediaId::RemoteUrl(normalized.clone()).to_string();
+    serde_json::from_value(json!({
+        "schema_version": 3,
+        "current_media": media,
+        "volume": 1.0,
+        "checkpoints": {},
+        "queue": [{
+            "id": 1,
+            "media": media,
+            "source": { "kind": "remote", "url": normalized.as_str() },
+        }],
+        "active_entry": 1,
+    }))
+    .unwrap_or_else(|error| panic!("persisted state: {error}"))
+}
+
+/// M7 §10 / L20: a station is a remote entry like any other — restoring one
+/// *as the active entry*, pumping and drawing it all happen with the radio
+/// off. The active shape is the one that matters: it is where a runtime could
+/// plausibly decide to prepare the source before anyone pressed Play.
 #[test]
-fn a_restored_station_is_listed_and_drawn_without_a_request() {
+fn a_restored_active_station_is_listed_and_drawn_without_a_request() {
     let server = TestServer::start(Script::from_fixture("sine-noxing.mp3").icy_station());
-    let mut rig = rig_with(seeded(vec![remote_entry(&server.url("/radio"))]));
+    let mut rig = rig_with(station_active(&server.url("/radio")));
     pump_for(&mut rig.runtime, Duration::from_millis(300));
 
     let view = rig.runtime.view();
     assert_eq!(view.rows.len(), 1, "{view:?}");
+    // The guard against this test quietly degrading back to a queued-but-not-
+    // active station, which is the weaker claim.
+    assert_eq!(view.active, Some(view.rows[0].id), "{view:?}");
+    let now = view
+        .now_playing
+        .as_ref()
+        .unwrap_or_else(|| panic!("the active entry is the current one: {view:?}"));
+    assert!(!now.loaded, "nothing was loaded by the restore: {view:?}");
     assert!(
         !view.live && !view.reconnecting,
         "nothing is loaded: {view:?}"
