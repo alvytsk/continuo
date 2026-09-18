@@ -20,7 +20,7 @@ use crate::http::service::HttpService;
 use crate::lifecycle::RunOutcome;
 use crate::lifecycle::input::InputReader;
 use crate::lifecycle::signals::ShutdownSignals;
-use crate::media::capabilities::{MediaCapabilities, SeekSupport};
+use crate::media::capabilities::{Continuity, MediaCapabilities, SeekSupport};
 use crate::media::display::{display_name, episode_name, fit_to_width, format_hms};
 use crate::media::id::MediaId;
 use crate::media::source::SourceLocation;
@@ -502,12 +502,18 @@ fn run_probe_only(source: &str) -> Result<(), PlaybackError> {
             .as_deref()
             .unwrap_or("(untitled)"),
     );
+    // §11's `Finite`/`Unresolved` printing is untouched Debug output; only
+    // `Indefinite` (M7: a live station) gets the friendlier `continuity:
+    // indefinite` spelling the probe test reads.
+    let continuity = match prepared.capabilities.continuity {
+        Continuity::Indefinite => "continuity: indefinite".to_owned(),
+        other => format!("continuity={other:?}"),
+    };
     println!(
-        "{title} {rate} Hz {channels} ch {duration:?} continuity={continuity:?} seek={seek:?} resume={resume:?}",
+        "{title} {rate} Hz {channels} ch {duration:?} {continuity} seek={seek:?} resume={resume:?}",
         rate = prepared.source.sample_rate(),
         channels = prepared.source.channels(),
         duration = prepared.source.metadata().duration,
-        continuity = prepared.capabilities.continuity,
         seek = prepared.capabilities.seek,
         resume = prepared.capabilities.resume_capability(),
     );
@@ -941,10 +947,17 @@ fn status_parts(mirror: &Mirror) -> (String, String) {
     if mirror.provenance == PositionProvenance::Estimated {
         suffix.push_str(" ~est");
     }
-    let duration = mirror
-        .duration
-        .map(format_hms)
-        .unwrap_or_else(|| "--:--:--".to_string());
+    let live = mirror
+        .capabilities
+        .is_some_and(|capabilities| capabilities.continuity == Continuity::Indefinite);
+    let duration = if live {
+        "live".to_owned()
+    } else {
+        mirror
+            .duration
+            .map(format_hms)
+            .unwrap_or_else(|| "--:--:--".to_string())
+    };
     // §11: unresolved and unsupported are different facts about the same
     // `SeekSupport`, and an HTTP transport must never be reported in a way
     // that reads as live radio — neither note ever replaces the duration
@@ -1505,6 +1518,16 @@ mod tests {
             }),
             ..Mirror::default()
         }
+    }
+
+    #[test]
+    fn a_live_source_reads_live_not_as_a_duration() {
+        let mut mirror = mirror_with_capabilities(SeekSupport::Unsupported);
+        if let Some(capabilities) = mirror.capabilities.as_mut() {
+            capabilities.continuity = Continuity::Indefinite;
+        }
+        let line = status_line(&mirror);
+        assert!(line.contains("live"), "{line}");
     }
 
     #[test]

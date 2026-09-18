@@ -331,6 +331,32 @@ fn an_estimated_duration_is_marked_like_an_estimated_position() {
 }
 
 #[test]
+fn a_live_entry_shows_live_and_listening_time_with_no_bar_or_duration() {
+    let mut now = playing(ids()[0], true, None, false);
+    now.position = Duration::from_secs(754);
+    let mut v = view(PlaybackPhase::Playing, Some(now));
+    v.live = true;
+    let screen = text(&v, &UiState::new(true), 100, 30);
+    assert!(screen.contains("LIVE"), "{screen}");
+    assert!(screen.contains("12:34"), "{screen}");
+    assert!(
+        !screen.contains(" / "),
+        "a live entry has no total: {screen}"
+    );
+}
+
+#[test]
+fn a_reconnecting_station_says_so() {
+    let mut now = playing(ids()[0], true, None, false);
+    now.position = Duration::from_secs(5);
+    let mut v = view(PlaybackPhase::Reconnecting, Some(now));
+    v.live = true;
+    v.reconnecting = true;
+    let screen = text(&v, &UiState::new(true), 100, 30);
+    assert!(screen.contains("reconnecting…"), "{screen}");
+}
+
+#[test]
 fn a_saved_but_unloaded_entry_shows_saved_history_not_live_progress() {
     let mut now = playing(ids()[0], false, None, false);
     now.saved = Some(SavedHistory::Position {

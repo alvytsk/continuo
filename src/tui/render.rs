@@ -522,7 +522,7 @@ fn state_line(view: &PlayerView, theme: &Theme) -> Line<'static> {
         PlaybackPhase::Loading => ("loading", theme.amber),
         PlaybackPhase::LoadFailed => ("failed", theme.amber),
         PlaybackPhase::Playing => ("playing", theme.green),
-        PlaybackPhase::Reconnecting => ("reconnecting", theme.amber),
+        PlaybackPhase::Reconnecting => ("reconnecting…", theme.amber),
         PlaybackPhase::Paused => ("paused", theme.cyan),
         PlaybackPhase::Stopped => ("stopped", theme.muted),
         PlaybackPhase::Ended => ("ended", theme.muted),
@@ -545,6 +545,9 @@ fn draw_progress(
     tier: Tier,
     theme: &Theme,
 ) -> Rect {
+    if view.live {
+        return draw_live_progress(buffer, regions, view, tier, theme);
+    }
     let (label, ratio) = progress_label(view.now_playing.as_ref());
     let mut bar = regions.progress;
     if regions.time == regions.progress {
@@ -586,6 +589,36 @@ fn draw_progress(
     ])
     .render(bar, buffer);
     bar
+}
+
+/// A live source has no timeline: the listening time replaces the
+/// position/total pair, and the bar and its brackets are skipped rather than
+/// drawn empty. The label is never wider than the finite line it replaces,
+/// so no region or tier changes.
+fn draw_live_progress(
+    buffer: &mut Buffer,
+    regions: &Regions,
+    view: &PlayerView,
+    tier: Tier,
+    theme: &Theme,
+) -> Rect {
+    let time = view
+        .now_playing
+        .as_ref()
+        .map_or_else(|| UNKNOWN_TIME.to_owned(), |now| clock(now.position));
+    let label = format!("LIVE  {time}");
+    if regions.time == regions.progress {
+        let mut spans = Vec::new();
+        if tier == Tier::Minimal {
+            spans.extend(state_line(view, theme).spans);
+            spans.push(Span::raw("  "));
+        }
+        spans.push(Span::styled(label, Style::new().fg(theme.text)));
+        Line::from(spans).render(regions.progress, buffer);
+    } else {
+        Line::styled(label, Style::new().fg(theme.green)).render(regions.time, buffer);
+    }
+    regions.progress
 }
 
 /// The time label and how much of the bar it fills. Only a loaded entry with

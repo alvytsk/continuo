@@ -51,6 +51,17 @@ fn probe_only_on_a_range_less_server_reports_no_seek_support() {
 }
 
 #[test]
+fn probe_only_reports_a_station_as_indefinite_and_exits_zero() {
+    let server = TestServer::start(Script::from_fixture("sine-noxing.mp3").icy_station());
+    let output = run(&["play", &server.url("/radio"), "--probe-only"]);
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("continuity: indefinite"), "{stdout}");
+    assert!(stdout.contains("Test Radio"), "{stdout}");
+    server.shutdown();
+}
+
+#[test]
 fn a_live_stream_is_refused_legibly_and_not_played() {
     // `TestServer` always receives a `Range` header (`HttpMediaSource::open`
     // sends one unconditionally), so a script that still advertises ranges is
