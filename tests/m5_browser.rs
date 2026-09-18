@@ -1266,6 +1266,74 @@ fn a_verified_row_with_only_a_genre_draws_just_the_genre() {
     );
 }
 
+/// `RADIO_DETAIL_COLUMNS` is 24; a genre long enough that `genre · 128 kbps`
+/// overflows it must be truncated from the right (front kept, tail
+/// dropped), never left-clipped the way `ratatui`'s own right-aligned
+/// overflow handling would clip it.
+#[test]
+fn a_long_ascii_genre_is_truncated_from_the_right_not_clipped_from_the_left() {
+    let mut row = station_row("one", "https://one.example/stream");
+    row.identity = Some(StationIdentity {
+        name: None,
+        genre: Some("Extremely Long Genre Name".to_owned()),
+        bitrate_kbps: Some(128),
+        logo: None,
+    });
+    let state = radio(vec![row]);
+
+    let (text, _) = screen(&state);
+    let line = text
+        .lines()
+        .find(|line| line.contains("one"))
+        .unwrap_or_else(|| panic!("no row for the station: {text}"));
+    assert!(
+        line.contains("Extremely Long Genre Na"),
+        "the genre's leading characters survive: {line}"
+    );
+    assert!(
+        !line.contains("Genre Name"),
+        "the genre's trailing characters are dropped: {line}"
+    );
+    assert!(
+        !line.contains("kbps"),
+        "the genre alone already overflows the column, so the joined \
+         bitrate never appears at all: {line}"
+    );
+}
+
+/// The same overflow, but with full-width characters: `.chars().count()`
+/// would undercount a CJK genre's display width and let it run past
+/// `RADIO_DETAIL_COLUMNS`, right back into `ratatui`'s left-clip. Distinct
+/// leading and trailing characters (`統` once, then `一` repeated) so a
+/// left-clip — which would drop the front and keep some of the repeated
+/// tail — is distinguishable from the intended right-truncation.
+#[test]
+fn a_wide_character_genre_is_not_left_clipped() {
+    let mut row = station_row("wide", "https://one.example/stream");
+    let genre = format!("統{}", "一".repeat(19));
+    row.identity = Some(StationIdentity {
+        name: None,
+        genre: Some(genre),
+        bitrate_kbps: None,
+        logo: None,
+    });
+    let state = radio(vec![row]);
+
+    let (text, _) = screen(&state);
+    let line = text
+        .lines()
+        .find(|line| line.contains("wide"))
+        .unwrap_or_else(|| panic!("no row for the station: {text}"));
+    assert!(
+        line.contains("wide"),
+        "the row still starts with the slug: {line}"
+    );
+    assert!(
+        line.contains('統'),
+        "the genre's leading (and distinct) character is not left-clipped: {line}"
+    );
+}
+
 #[test]
 fn an_unverified_station_draws_its_url_and_an_unreached_marker() {
     let row = station_row("one", "https://one.example/stream");

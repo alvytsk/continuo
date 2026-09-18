@@ -12,6 +12,7 @@ use ratatui::widgets::{Block, Clear, Widget};
 use super::{centered_box, clock, row};
 use crate::application::browse::EntryKind;
 use crate::commands::displayable;
+use crate::media::display::fit_to_width;
 use crate::tui::browser::{BrowserState, BrowserTab, NoticeKind};
 use crate::tui::layout::{inset, take_left, take_right, visible_rows};
 use crate::tui::theme::Theme;
@@ -247,17 +248,18 @@ fn row_cells(browser: &BrowserState, index: usize, theme: &Theme) -> Option<RowC
                         .flatten()
                         .collect();
                         let detail = (!parts.is_empty()).then(|| {
-                            // A hostile genre can be arbitrarily long; a
-                            // right-aligned Line that overflows its column
-                            // truncates from the left (keeps the tail), so
-                            // clip it ourselves from the end first — the
-                            // whole joined string renders untouched whenever
-                            // it already fits.
-                            parts
-                                .join(" · ")
-                                .chars()
-                                .take(usize::from(RADIO_DETAIL_COLUMNS))
-                                .collect::<String>()
+                            // A hostile genre can be arbitrarily long and may
+                            // be full-width (CJK, emoji); a right-aligned
+                            // Line that overflows its column truncates from
+                            // the left (keeps the tail), and counting `char`s
+                            // rather than display columns would still let a
+                            // wide genre overflow the column and hit that
+                            // same left-clip. `fit_to_width` (already used
+                            // for the status row) truncates by display width
+                            // from the right instead, so the whole joined
+                            // string renders untouched whenever it already
+                            // fits, and a long one keeps its front.
+                            fit_to_width(&parts.join(" · "), usize::from(RADIO_DETAIL_COLUMNS))
                         });
                         RowCells {
                             label: displayable(&station.slug),
