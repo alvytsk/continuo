@@ -350,7 +350,7 @@ Success is step 7, not the return of any earlier call. `reinstall()` is never us
 | Budget | 5 min of wall time from `outage_started`, evaluated only when an attempt or a playing connection fails; an in-flight open is not cut short by it |
 | Outage ends | after 30 s of sustained playback (listening time advanced, not bytes or decoded frames) |
 | Non-retryable failure | `Failed` at once |
-| Pause, Stop, Load | clear the outage; a `Play` from `Failed` therefore always starts with a fresh budget |
+| Pause, Stop, a new Load, Shutdown | clear the outage; a `Play` from `Failed` therefore always starts with a fresh budget |
 
 ## 8. Identity and capabilities
 
