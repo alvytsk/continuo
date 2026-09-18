@@ -502,18 +502,12 @@ fn run_probe_only(source: &str) -> Result<(), PlaybackError> {
             .as_deref()
             .unwrap_or("(untitled)"),
     );
-    // §11's `Finite`/`Unresolved` printing is untouched Debug output; only
-    // `Indefinite` (M7: a live station) gets the friendlier `continuity:
-    // indefinite` spelling the probe test reads.
-    let continuity = match prepared.capabilities.continuity {
-        Continuity::Indefinite => "continuity: indefinite".to_owned(),
-        other => format!("continuity={other:?}"),
-    };
     println!(
-        "{title} {rate} Hz {channels} ch {duration:?} {continuity} seek={seek:?} resume={resume:?}",
+        "{title} {rate} Hz {channels} ch {duration:?} continuity={continuity:?} seek={seek:?} resume={resume:?}",
         rate = prepared.source.sample_rate(),
         channels = prepared.source.channels(),
         duration = prepared.source.metadata().duration,
+        continuity = prepared.capabilities.continuity,
         seek = prepared.capabilities.seek,
         resume = prepared.capabilities.resume_capability(),
     );

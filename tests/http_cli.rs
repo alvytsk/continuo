@@ -56,7 +56,7 @@ fn probe_only_reports_a_station_as_indefinite_and_exits_zero() {
     let output = run(&["play", &server.url("/radio"), "--probe-only"]);
     assert!(output.status.success(), "{output:?}");
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("continuity: indefinite"), "{stdout}");
+    assert!(stdout.contains("continuity=Indefinite"), "{stdout}");
     assert!(stdout.contains("Test Radio"), "{stdout}");
     server.shutdown();
 }
