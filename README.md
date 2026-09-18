@@ -117,7 +117,7 @@ With the mouse on, a click selects a queue row, a second click plays it, the whe
 
 A row already in the queue shows a green `✓`. Opening the browser never refreshes a feed. `r` and `R` do, and so does `tenuto refresh` from a shell.
 
-**Radio.** Adding a station probes its stream once: the name, genre and bitrate ICY reports come back and are shown in the tab from then on, cached, so the list draws on a cold start without a request. A station whose probe only got a retryable failure (a `429`, a `503`, a reset connection) is saved anyway, shown by its URL with an unreached marker; `r` tries the probe again. A station's logo, when it has one and it decodes, shows in the cover pane while that station plays.
+**Radio.** Adding a station probes its stream once: the ICY identity it reports — name, genre, bitrate, logo — comes back cached, so the list draws on a cold start without a request. A verified row draws its slug, then genre and bitrate; the name itself is not drawn again, since the slug already stands for it. A station whose probe only got a retryable failure (a `429`, a `503`, a reset connection) is saved anyway, shown by its URL with an unreached marker; `r` tries the probe again. A station's logo, when it has one and it decodes, shows in the cover pane while that station plays.
 
 ### The queue
 
