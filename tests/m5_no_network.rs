@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 use ratatui::{Terminal, backend::TestBackend};
 use runtime::{pump_for, rig_with, rig_with_probe, row_ids};
 use serde_json::json;
+use support::browse::wait_for_result;
 use support::server::{Script, TestServer};
 use tenuto::application::browse::{BrowseRequest, BrowseResult, BrowseWorker};
 use tenuto::application::enrich::TagProbe;
@@ -78,20 +79,6 @@ fn podcast_rss(enclosure: &str) -> Vec<u8> {
         r#"<?xml version="1.0"?><rss version="2.0"><channel><title>Radio-T</title><item><title>e1</title><guid>e1</guid><enclosure url="{enclosure}" type="audio/mpeg"/></item></channel></rss>"#
     )
     .into_bytes()
-}
-
-fn wait_for_result(worker: &BrowseWorker) -> BrowseResult {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        if let Some(result) = worker.try_result() {
-            return result;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the browse worker never answered"
-        );
-        std::thread::sleep(Duration::from_millis(5));
-    }
 }
 
 #[test]

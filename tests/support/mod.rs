@@ -21,6 +21,7 @@
 
 #![allow(dead_code)]
 
+pub mod browse;
 pub mod server;
 
 use std::path::Path;

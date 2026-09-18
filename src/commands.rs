@@ -680,10 +680,7 @@ fn write_station_probe(
             writeln!(out, "{slug}: {action}, unverified: {reason}").map_err(stdout_failure)
         }
         // A duplicate add resolves to the station already saved (§10) and
-        // is not itself an error; a failed implicit re-probe is reported in
-        // the same line rather than swallowed, exactly as an explicit
-        // `ReprobeStation`'s failure is (`AddStationOutcome::AlreadySaved`'s
-        // own doc comment explains why this field exists at all).
+        // is not itself an error.
         AddStationOutcome::AlreadySaved {
             slug,
             identity,
@@ -696,18 +693,31 @@ fn write_station_probe(
                 .map_or_else(|| ABSENT.to_string(), station_identity_text)
         )
         .map_err(stdout_failure),
+        // A failed implicit re-probe is reported in the same line rather
+        // than swallowed, exactly as an explicit `ReprobeStation`'s failure
+        // is (`AddStationOutcome::AlreadySaved`'s own doc comment explains
+        // why this field exists at all) — and, like `finish_subscribe` and
+        // `finish_unsubscribe`'s own partial-failure arms, the text is
+        // written and *then* the call still returns `Err`. Returning `Ok`
+        // here would undo that fix at one remove: the reason would sit in
+        // the string, but `report()` would call it a success, the tracing
+        // line would drop its `failed:` prefix, and the browser would paint
+        // it with `NoticeKind::Ok` instead of the error colour.
         AddStationOutcome::AlreadySaved {
             slug,
             identity,
             reprobe_failure: Some(reason),
-        } => writeln!(
-            out,
-            "{slug}: already saved; re-probe failed: {reason} (last known: {})",
-            identity
-                .as_ref()
-                .map_or_else(|| ABSENT.to_string(), station_identity_text)
-        )
-        .map_err(stdout_failure),
+        } => {
+            writeln!(
+                out,
+                "{slug}: already saved; re-probe failed: {reason} (last known: {})",
+                identity
+                    .as_ref()
+                    .map_or_else(|| ABSENT.to_string(), station_identity_text)
+            )
+            .map_err(stdout_failure)?;
+            Err(FeedError::StationsUnreadable { reason })
+        }
     }
 }
 
@@ -1439,7 +1449,7 @@ mod tests {
     #[test]
     fn a_duplicate_adds_failed_reprobe_is_not_swallowed() -> Fallible {
         let mut out = Vec::new();
-        finish_add_station(
+        let error = finish_add_station(
             &mut out,
             AddStationOutcome::AlreadySaved {
                 slug: "test-radio".to_string(),
@@ -1451,7 +1461,19 @@ mod tests {
                 }),
                 reprobe_failure: Some("connection reset".to_string()),
             },
-        )?;
+        )
+        .err()
+        .ok_or("a failed implicit re-probe must not report success")?;
+        // Not just the text: `report()` (`src/commands.rs`) only calls
+        // `tracing::info!` with a `failed:` prefix, and the browser
+        // (`src/tui/browser.rs`) only paints `NoticeKind::Err`, when this
+        // call returns `Err` — exactly like `finish_subscribe`'s and
+        // `finish_unsubscribe`'s own partial-failure arms. A `contains()`
+        // check on the string alone would pass even if this returned `Ok`.
+        assert!(
+            matches!(error, FeedError::StationsUnreadable { .. }),
+            "{error:?}"
+        );
         let rendered = text(out)?;
         assert!(rendered.contains("already saved"), "{rendered}");
         assert!(

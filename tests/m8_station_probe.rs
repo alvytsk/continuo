@@ -13,8 +13,8 @@ mod support;
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
+use support::browse::{answer, wait_for_result};
 use support::server::{Script, TestServer};
 use tenuto::application::browse::{BrowseRequest, BrowseResult, BrowseWorker};
 use tenuto::application::runtime::LibraryStores;
@@ -75,45 +75,13 @@ fn stores(root: &Path) -> LibraryStores {
     }
 }
 
-/// Sends `request` and waits for its `Mutation` answer, the same shape
-/// `tests/m6_feed_management.rs::answer` uses for the feed mutations.
-fn answer(
-    worker: &BrowseWorker,
-    request: BrowseRequest,
-) -> (BrowseRequest, Result<String, String>) {
-    worker.request(request);
-    let deadline = Instant::now() + Duration::from_secs(20);
-    loop {
-        if let Some(result) = worker.try_result() {
-            match result {
-                BrowseResult::Mutation { request, outcome } => return (request, outcome),
-                other => panic!("expected a mutation answer, got {other:?}"),
-            }
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the browse worker never answered"
-        );
-        std::thread::sleep(Duration::from_millis(5));
-    }
-}
-
-/// Sends `Stations` and waits for its listing.
+/// Sends `Stations` and waits for its listing, over the shared poller
+/// (`tests/support/browse.rs`) `answer` above also uses.
 fn list(worker: &BrowseWorker) -> Result<Vec<StationRow>, String> {
     worker.request(BrowseRequest::Stations);
-    let deadline = Instant::now() + Duration::from_secs(20);
-    loop {
-        if let Some(result) = worker.try_result() {
-            match result {
-                BrowseResult::Stations(rows) => return rows,
-                other => panic!("expected a station listing, got {other:?}"),
-            }
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the browse worker never answered"
-        );
-        std::thread::sleep(Duration::from_millis(5));
+    match wait_for_result(worker) {
+        BrowseResult::Stations(rows) => rows,
+        other => panic!("expected a station listing, got {other:?}"),
     }
 }
 
@@ -545,10 +513,11 @@ fn the_worker_answers_every_station_request() {
     server.shutdown();
 }
 
-/// R3: drawing the Radio tab makes no request. A station already saved is
-/// listed, and then removed, with the server's request count unchanged —
-/// the worker-level counterpart to `tests/m5_no_network.rs`'s invariant,
-/// extended to the two station requests that must never touch the network
+/// R3 at the worker level (no `draw()` here — see
+/// `tests/m5_no_network.rs::a_restored_station_is_listed_and_drawn_without_a_request`
+/// for the drawn counterpart): a station already saved is listed, and then
+/// removed, with the server's request count unchanged, extending the
+/// invariant to the two station requests that must never touch the network
 /// (M8 §6).
 #[test]
 fn listing_and_removing_stations_open_no_connection() {
@@ -584,8 +553,12 @@ fn listing_and_removing_stations_open_no_connection() {
 }
 
 /// M6 §5's correlation rule, extended to the three new station mutations:
-/// every `Mutation` answer echoes the exact request it answers, so a late
-/// answer for a place already left can be told from the one being awaited.
+/// each of `AddStation`, `ReprobeStation` and `RemoveStation`'s `Mutation`
+/// answer echoes back the exact request it answers, round-trip by
+/// round-trip. (This test is strictly serial — one request outstanding at a
+/// time — so it proves per-round-trip echo correctness across the three
+/// variants, not the concurrent case the rule exists for; nothing here
+/// exercises a late answer arriving after its request was superseded.)
 #[test]
 fn every_station_mutation_echoes_the_request_it_answers() {
     let root = tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir: {error}"));

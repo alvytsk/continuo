@@ -8,6 +8,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use support::browse::answer;
 use support::server::{DocumentReply, Script, TestServer};
 use tenuto::application::browse::{BrowseRequest, BrowseResult, BrowseWorker};
 use tenuto::application::runtime::LibraryStores;
@@ -48,27 +49,6 @@ fn stores(root: &Path) -> LibraryStores {
             root.join("data/tenuto/stations.json"),
             Arc::new(SystemClock),
         ),
-    }
-}
-
-fn answer(
-    worker: &BrowseWorker,
-    request: BrowseRequest,
-) -> (BrowseRequest, Result<String, String>) {
-    worker.request(request);
-    let deadline = Instant::now() + Duration::from_secs(20);
-    loop {
-        if let Some(result) = worker.try_result() {
-            match result {
-                BrowseResult::Mutation { request, outcome } => return (request, outcome),
-                other => panic!("expected a mutation answer, got {other:?}"),
-            }
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the browse worker never answered"
-        );
-        std::thread::sleep(Duration::from_millis(5));
     }
 }
 
