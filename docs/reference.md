@@ -81,23 +81,36 @@ With mouse capture on, a click selects a queue row and a second click on the sel
 
 ### The browser
 
-`b` opens a browser with two tabs. Files shows one directory at a time, starting at the active local entry's directory or the directory `tui` started in. Podcasts shows the cached subscriptions.
+`b` opens a browser with three tabs. Files shows one directory at a time, starting at the active local entry's directory or the directory `tui` started in. Podcasts shows the cached subscriptions. Radio shows the saved stations. `Tab` cycles Files → Podcasts → Radio → Files.
 
 | Key | Action |
 |---|---|
 | Up, Down, `j`, `k` | Move |
-| Tab | Switch between Files and Podcasts |
-| Enter | Open a directory or a feed. Enqueue a file or an episode. On a row already queued, remove it from the queue |
+| Tab | Switch between Files, Podcasts and Radio |
+| Enter | Open a directory or a feed. Enqueue a file, an episode or a station. On a row already queued, remove it from the queue |
 | Space | Mark several rows to enqueue together. Rows already queued are skipped |
 | Backspace, Left | Go up one level |
 | `a` (Podcasts) | Subscribe by URL |
 | `r`, `R` (Podcasts) | Refresh the highlighted feed, or every feed |
 | `d` (Podcasts) | Unsubscribe after a `y` confirmation |
+| `a` (Radio) | Add a station by its stream URL |
+| `r` (Radio) | Re-probe the station under the cursor |
+| `d` (Radio) | Remove the station under the cursor, after a `y` confirmation |
 | `b`, Esc | Close the browser |
 
 A row already in the queue shows a green `✓`. A feed's episodes are listed newest first, with undated ones after the dated ones in feed order. `tenuto episodes` keeps feed order, so its indices do not move. Directories are read one level at a time. Nothing indexes a library recursively.
 
-Opening the browser never refreshes a feed. The Podcasts tab lists what was last cached. Updating it is an explicit act: `r` or `R` in the browser, or `tenuto refresh` from a shell. Enqueueing or restoring a URL or an episode makes no network request. Only playing it does.
+Opening the browser never refreshes a feed. The Podcasts tab lists what was last cached. Updating it is an explicit act: `r` or `R` in the browser, or `tenuto refresh` from a shell. Enqueueing or restoring a URL or an episode makes no network request. Only playing it does. The same holds for Radio: opening the tab and listing saved stations makes no request; only `a`, `r` and playing a station do.
+
+### The Radio tab
+
+A saved station is added with `a`: type the stream URL and press Enter. Tenuto opens it once, through the same path playback itself uses, and keeps whatever ICY identity comes back — name, genre, bitrate, logo — none of which is guaranteed present. A row with an identity draws its slug, then `name · genre · bitrate kbps`, with genre and bitrate left out when absent. A URL that answered with a retryable failure (`429`, `503`, a reset connection) is saved as an unverified candidate: the row shows its URL and an `(unreached)` marker instead, and `r` tries the probe again. A URL that is positively not a station — a finite file, an HLS playlist, an `icy-metaint` response, or a non-retryable failure such as `404` — is never saved at all, and the browser shows an error notice.
+
+`d` asks `Remove <slug>? y/N` before dropping a station; any key other than `y` cancels. Adding a URL that is already saved re-probes the existing station instead of creating a duplicate. Enter enqueues a station exactly as Enter enqueues a file or an episode, and Enter again on a queued row removes it — the Radio tab introduces no transport verb of its own.
+
+A station's logo, when its identity carries one and it decodes, shows in the player's cover pane while that station plays; it is fetched only once playback has opened a network connection, never while the tab merely lists or the station sits enqueued or restored. The logo refreshes only on add or re-probe, never mid-playback, so a station that changes its logo shows the old one until re-probed.
+
+`stations.json` is written atomically, exactly as `subscriptions.json` is. A file this build cannot parse is quarantined to `stations.json.rejected-<timestamp>` and the station list starts empty rather than being silently truncated; a file from a newer schema version is left in place with station writes disabled for the session.
 
 ### The queue
 
@@ -247,6 +260,7 @@ An item with a GUID keeps its position when the show moves its audio to another 
 | `$XDG_STATE_HOME/tenuto/logs/` | One log per `tui` run. The five most recent earlier ones are kept |
 | `$XDG_DATA_HOME/tenuto/subscriptions.json` | Subscriptions. Durable user data |
 | `$XDG_DATA_HOME/tenuto/subscriptions.lock` | The subscription writer lock |
+| `$XDG_DATA_HOME/tenuto/stations.json` | Saved radio stations. Durable user data |
 | `$XDG_CACHE_HOME/tenuto/feeds/<feed-id>.json` | Cached episodes. Refetchable |
 
 On macOS these resolve to the platform's own data, cache and local-data directories. The cache and the logs are disposable. Subscriptions and checkpoints are not.

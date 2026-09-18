@@ -98,21 +98,26 @@ With the mouse on, a click selects a queue row, a second click plays it, the whe
 
 ### The browser
 
-`b` opens a browser with two tabs. Files shows one directory at a time. Podcasts shows your subscriptions and their cached episodes.
+`b` opens a browser with three tabs. Files shows one directory at a time. Podcasts shows your subscriptions and their cached episodes. Radio shows your saved stations.
 
 | Key | Action |
 |---|---|
 | Up, Down, `j`, `k` | Move |
-| Tab | Switch between Files and Podcasts |
-| Enter | Open a directory or a feed. Enqueue a file or an episode. On a row already queued, remove it from the queue |
+| Tab | Switch between Files, Podcasts and Radio |
+| Enter | Open a directory or a feed. Enqueue a file, an episode or a station. On a row already queued, remove it from the queue |
 | Space | Mark several rows to enqueue together. Rows already queued are skipped |
 | Backspace, Left | Go up one level |
 | `a` (Podcasts) | Subscribe by URL |
+| `a` (Radio) | Add a station by its stream URL |
 | `r`, `R` (Podcasts) | Refresh the highlighted feed, or every feed |
+| `r` (Radio) | Re-probe the highlighted station |
 | `d` (Podcasts) | Unsubscribe after a `y` confirmation |
+| `d` (Radio) | Remove the station after a `y` confirmation |
 | `b`, Esc | Close the browser |
 
 A row already in the queue shows a green `✓`. Opening the browser never refreshes a feed. `r` and `R` do, and so does `tenuto refresh` from a shell.
+
+**Radio.** Adding a station probes its stream once: the name, genre and bitrate ICY reports come back and are shown in the tab from then on, cached, so the list draws on a cold start without a request. A station whose probe only got a retryable failure (a `429`, a `503`, a reset connection) is saved anyway, shown by its URL with an unreached marker; `r` tries the probe again. A station's logo, when it has one and it decodes, shows in the cover pane while that station plays.
 
 ### The queue
 
@@ -164,6 +169,7 @@ A seek inside an MP3 with no seek index lands on an estimate, which can be some 
 | `$XDG_STATE_HOME/tenuto/state.json` | Saved positions, volume and the queue |
 | `$XDG_STATE_HOME/tenuto/logs/` | One log per player run |
 | `$XDG_DATA_HOME/tenuto/subscriptions.json` | Your subscriptions |
+| `$XDG_DATA_HOME/tenuto/stations.json` | Your saved radio stations |
 | `$XDG_CACHE_HOME/tenuto/feeds/` | Cached episode lists |
 
 On macOS these resolve to the platform's own directories. The cache and the logs can be deleted at any time. Subscriptions and saved positions cannot be recovered once deleted.

@@ -55,7 +55,7 @@ Verified externally: `https://radio.cliamp.stream/lofi/stream` answers `Range: b
 3. **A station never completes.** No `EndOfTrack`, no `completed`, no queue advance, no checkpoint.
 4. **User seeks on live media are rejected and harmless.** `SeekTo`, `SeekBy` and `Restart` are refused with a notice and leave the source, the playback intent and the reconnect budget exactly as they were. A recovery is never reported as a successful seek or restart.
 5. **Continuity is fixed for a session.** A reopen that comes back with a different continuity is a failure, detected before anything is adopted or published.
-6. **Metadata framing never reaches the decoder.** Until M7.1 exists, a response that carries `icy-metaint` is refused.
+6. **Metadata framing never reaches the decoder.** Until M7.2 exists, a response that carries `icy-metaint` is refused.
 
 ## 4. HTTP layer
 
@@ -71,7 +71,7 @@ Accepted::Sequential { len } | Accepted::Ranged { range } | Accepted::Live
 | --- | --- | --- |
 | any non-2xx, 416 | — | today's typed failure (`Status`, `InvalidRange`), whatever ICY headers it carries |
 | 200 or 206 | `content-type: application/vnd.apple.mpegurl` | `Err(UnsupportedLiveMedia)` — HLS stays refused, now before the probe |
-| 200 or 206 | `icy-metaint` present | `Err(RemoteFailure::IcyFramingUnsupported)` (new; deleted by M7.1) |
+| 200 or 206 | `icy-metaint` present | `Err(RemoteFailure::IcyFramingUnsupported)` (new; deleted by M7.2) |
 | 200 at origin | `icy-name` or `icy-br` | `Accepted::Live`; `Content-Length` ignored |
 | 206 | `icy-name` or `icy-br`, `requested_start == 0`, `Content-Range` parses with `first == 0` | `Accepted::Live`; length and total ignored |
 | 206 | ICY headers, any other start | `Err(InvalidRange { WrongStart })` — Tenuto never requests one |
@@ -252,7 +252,7 @@ Each reconnect replays whatever burst-on-connect audio the server sends. M7 acce
 
 ICY now-playing titles (§12), `.m3u`/`.pls`, a station library or a `--live` override for header-less streams, Shoutcast v1, HLS/DASH, Ogg/Opus stations beyond the enabled Symphonia features, time-shift buffering, provider-resolved media.
 
-## 12. M7.1 follow-up: ICY metadata
+## 12. M7.2 follow-up: ICY metadata
 
 Recorded so M7 leaves the right seams; implemented separately.
 
@@ -265,6 +265,7 @@ reqwest chunk ─▶ IcyDemux (http/icy.rs, pure state machine)
 ```
 
 - `Icy-MetaData: 1` on an open-at-zero request only. Demultiplex iff the response carries a valid `icy-metaint`; `Accepted::Live` becomes `Live { metaint: Option<NonZeroU32> }` and `IcyFramingUnsupported` is deleted.
+- M7.1 §3 R2 makes the *absence* of this header a tested invariant (`tests/m7_1_no_icy_metadata.rs`). Implementing this section means deleting those assertions deliberately, in the same change that adds the header — not discovering them as a failure.
 - `StreamMetadata` is ordinary, droppable, coalescible. Now-playing text is never persisted and is separate from the persisted station name.
 - The title is cleared on every transport replacement — reconnect, Pause → Play, Stop → Play — though the logical session continues.
 - Titles: UTF-8, falling back to Latin-1, then the existing control/bidi escaping.
