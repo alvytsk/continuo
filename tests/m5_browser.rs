@@ -11,9 +11,10 @@ use tenuto::application::browse::{
     BrowseRequest, BrowseResult, BrowseWorker, DirEntry, EntryKind, list_directory,
 };
 use tenuto::application::runtime::EnqueueItem;
+use tenuto::application::source::resolve_source;
 use tenuto::application::view::QueueRow;
-use tenuto::library::{EpisodeCandidate, FeedSummary};
-use tenuto::media::id::{AbsolutePath, EpisodeKey, FeedId, MediaId};
+use tenuto::library::{EpisodeCandidate, FeedSummary, StationRow};
+use tenuto::media::id::{AbsolutePath, EpisodeKey, FeedId, MediaId, NormalizedUrl};
 use tenuto::queue::QueueEntryId;
 use tenuto::tui::browser::{BrowserEffect, BrowserState, BrowserTab, NoticeKind};
 use tenuto::tui::render::{Visuals, draw};
@@ -362,6 +363,16 @@ fn podcasts_tab_lists_feeds_then_episodes_and_skips_unplayable_marks() {
     assert_eq!(state.cursor, 1);
 
     let effects = press(&mut state, &[KeyCode::Tab]);
+    assert_eq!(state.tab, BrowserTab::Radio);
+    assert!(
+        matches!(
+            &effects[..],
+            [BrowserEffect::Request(BrowseRequest::Stations)]
+        ),
+        "{effects:?}"
+    );
+
+    let effects = press(&mut state, &[KeyCode::Tab]);
     assert_eq!(state.tab, BrowserTab::Files);
     assert!(
         matches!(&effects[..], [BrowserEffect::Request(BrowseRequest::Directory(path))] if *path == root),
@@ -492,6 +503,33 @@ fn podcasts(feeds: Vec<FeedSummary>) -> BrowserState {
     press(&mut state, &[KeyCode::Tab]);
     state.apply(BrowseResult::Feeds(Ok(feeds)));
     state
+}
+
+/// A Radio tab showing `stations`.
+fn radio(stations: Vec<StationRow>) -> BrowserState {
+    let mut state = BrowserState::new(PathBuf::from("/music"));
+    press(&mut state, &[KeyCode::Tab, KeyCode::Tab]);
+    assert_eq!(state.tab, BrowserTab::Radio);
+    state.apply(BrowseResult::Stations(Ok(stations)));
+    state
+}
+
+/// A `StationRow` whose `media` is derived exactly as
+/// `library::station_identity_of` derives it (private to `library.rs`, so
+/// reproduced here from its own two public steps): `Url::parse(url)`, then
+/// `NormalizedUrl::parse` on *that parsed URL's* serialized text — the
+/// canonical spelling, not the raw `url` argument.
+fn station_row(slug: &str, url: &str) -> StationRow {
+    let parsed = url::Url::parse(url).unwrap_or_else(|error| panic!("url: {error}"));
+    let media = MediaId::RemoteUrl(
+        NormalizedUrl::parse(parsed.as_str()).unwrap_or_else(|error| panic!("normalize: {error}")),
+    );
+    StationRow {
+        slug: slug.to_owned(),
+        url: parsed,
+        media,
+        identity: None,
+    }
 }
 
 fn requests(effects: &[BrowserEffect]) -> Vec<BrowseRequest> {
@@ -752,7 +790,7 @@ fn removing_the_open_feed_returns_to_the_list_whatever_the_outcome() {
 fn an_answer_on_the_files_tab_shows_the_notice_and_requests_nothing() {
     let mut state = podcasts(vec![feed("one")]);
     press(&mut state, &[KeyCode::Char('R')]);
-    press(&mut state, &[KeyCode::Tab]);
+    press(&mut state, &[KeyCode::Tab, KeyCode::Tab]);
     assert_eq!(state.tab, BrowserTab::Files);
     assert!(state.pending.is_some(), "a tab switch keeps the mutation");
     let follow_up = state.apply(mutation(BrowseRequest::Refresh { slug: None }, Ok("done")));
@@ -954,4 +992,306 @@ fn episodes_list_newest_first_with_undated_ones_last() {
             Some("undated-b")
         ]
     );
+}
+
+// --- M8 §7: the Radio tab -----------------------------------------------
+
+#[test]
+fn tab_cycles_files_podcasts_radio_and_back() {
+    let (_dir, root) = sample_dir();
+    let mut state = listed(&root);
+    assert_eq!(state.tab, BrowserTab::Files);
+
+    let effects = press(&mut state, &[KeyCode::Tab]);
+    assert_eq!(state.tab, BrowserTab::Podcasts);
+    assert!(
+        matches!(&effects[..], [BrowserEffect::Request(BrowseRequest::Feeds)]),
+        "{effects:?}"
+    );
+
+    let effects = press(&mut state, &[KeyCode::Tab]);
+    assert_eq!(state.tab, BrowserTab::Radio);
+    assert!(
+        matches!(
+            &effects[..],
+            [BrowserEffect::Request(BrowseRequest::Stations)]
+        ),
+        "{effects:?}"
+    );
+
+    let effects = press(&mut state, &[KeyCode::Tab]);
+    assert_eq!(state.tab, BrowserTab::Files);
+    assert!(
+        matches!(&effects[..], [BrowserEffect::Request(BrowseRequest::Directory(path))] if *path == root),
+        "{effects:?}"
+    );
+}
+
+#[test]
+fn a_on_the_radio_tab_opens_the_url_prompt_and_enter_sends_add_station() {
+    let mut state = radio(Vec::new());
+    assert!(press(&mut state, &[KeyCode::Char('a')]).is_empty());
+    assert_eq!(state.prompt.as_deref(), Some(""));
+
+    for c in "https://x.example/stream".chars() {
+        press(&mut state, &[KeyCode::Char(c)]);
+    }
+    let effects = press(&mut state, &[KeyCode::Enter]);
+    let expected = BrowseRequest::AddStation {
+        url: "https://x.example/stream".to_owned(),
+    };
+    assert_eq!(requests(&effects), vec![expected.clone()]);
+    assert_eq!(state.pending, Some(expected));
+    assert_eq!(
+        state.notice.as_ref().map(|n| n.text.as_str()),
+        Some("Adding…")
+    );
+}
+
+#[test]
+fn r_and_d_then_y_on_the_radio_tab_send_reprobe_and_remove() {
+    let mut state = radio(vec![
+        station_row("one", "https://one.example/stream"),
+        station_row("two", "https://two.example/stream"),
+    ]);
+    press(&mut state, &[KeyCode::Down]);
+    let effects = press(&mut state, &[KeyCode::Char('r')]);
+    let expected = BrowseRequest::ReprobeStation {
+        slug: "two".to_owned(),
+    };
+    assert_eq!(requests(&effects), vec![expected.clone()]);
+    assert_eq!(state.pending, Some(expected.clone()));
+    assert_eq!(
+        state.notice.as_ref().map(|n| n.text.as_str()),
+        Some("Re-probing…")
+    );
+
+    // Clear the pending mutation before exercising `d`.
+    state.apply(mutation(expected, Ok("two: reprobed")));
+    state.apply(BrowseResult::Stations(Ok(vec![
+        station_row("one", "https://one.example/stream"),
+        station_row("two", "https://two.example/stream"),
+    ])));
+
+    press(&mut state, &[KeyCode::Char('d')]);
+    assert_eq!(state.confirm.as_deref(), Some("two"));
+    let effects = press(&mut state, &[KeyCode::Char('y')]);
+    let expected = BrowseRequest::RemoveStation {
+        slug: "two".to_owned(),
+    };
+    assert_eq!(requests(&effects), vec![expected.clone()]);
+    assert_eq!(state.pending, Some(expected));
+    assert_eq!(
+        state.notice.as_ref().map(|n| n.text.as_str()),
+        Some("Removing…")
+    );
+}
+
+#[test]
+fn every_station_management_key_is_refused_while_pending() {
+    let mut state = radio(vec![station_row("one", "https://one.example/stream")]);
+    press(&mut state, &[KeyCode::Char('r')]);
+    assert!(state.pending.is_some());
+
+    for code in [KeyCode::Char('a'), KeyCode::Char('r'), KeyCode::Char('d')] {
+        assert!(press(&mut state, &[code]).is_empty(), "{code:?}");
+    }
+    assert!(state.prompt.is_none() && state.confirm.is_none());
+}
+
+#[test]
+fn refresh_all_does_nothing_on_the_radio_tab() {
+    // `can_manage` no longer implies Podcasts once Radio is added, so `R`
+    // needs its own guard; without it this would submit a `Refresh` the
+    // Radio tab has no business sending.
+    let mut state = radio(vec![station_row("one", "https://one.example/stream")]);
+    assert!(press(&mut state, &[KeyCode::Char('R')]).is_empty());
+    assert!(state.pending.is_none());
+}
+
+#[test]
+fn enter_on_a_station_enqueues_and_enter_again_removes_it() {
+    let url = "https://one.example/stream";
+    let mut state = radio(vec![station_row("one", url)]);
+    let effects = press(&mut state, &[KeyCode::Enter]);
+    let (media, _) = resolve_source(url).unwrap_or_else(|error| panic!("resolve: {error}"));
+    assert!(
+        matches!(
+            &effects[..],
+            [BrowserEffect::Enqueue(items)] if matches!(
+                &items[..],
+                [EnqueueItem::Url(enqueued)] if enqueued == url
+            )
+        ),
+        "{effects:?}"
+    );
+
+    let ids = views::ids();
+    state.sync_queue(&[queue_row(ids[0], media)]);
+    let effects = press(&mut state, &[KeyCode::Enter]);
+    assert!(
+        matches!(&effects[..], [BrowserEffect::Remove(id)] if *id == ids[0]),
+        "{effects:?}"
+    );
+}
+
+#[test]
+fn a_queued_station_draws_a_tick() {
+    let row = station_row("one", "https://one.example/stream");
+    let mut state = radio(vec![row.clone()]);
+    let ids = views::ids();
+    state.sync_queue(&[queue_row(ids[0], row.media.clone())]);
+
+    let (text, _) = screen(&state);
+    let line = text
+        .lines()
+        .find(|line| line.contains("one"))
+        .unwrap_or_else(|| panic!("no row for the station: {text}"));
+    assert!(line.contains('✓'), "{line}");
+}
+
+#[test]
+fn a_stations_answer_for_a_tab_already_left_is_dropped() {
+    let mut state = radio(vec![station_row("one", "https://one.example/stream")]);
+    press(&mut state, &[KeyCode::Tab]);
+    assert_eq!(state.tab, BrowserTab::Files);
+    state.apply(BrowseResult::Stations(Ok(vec![station_row(
+        "late",
+        "https://late.example/stream",
+    )])));
+    assert_eq!(state.stations.len(), 1);
+    assert_eq!(state.stations[0].slug, "one");
+}
+
+#[test]
+fn a_station_mutation_re_requests_the_visible_list() {
+    // AddStation, through the prompt.
+    let mut state = radio(vec![station_row("one", "https://one.example/stream")]);
+    press(&mut state, &[KeyCode::Char('a')]);
+    for c in "https://two.example/stream".chars() {
+        press(&mut state, &[KeyCode::Char(c)]);
+    }
+    press(&mut state, &[KeyCode::Enter]);
+    let follow_up = state.apply(mutation(
+        BrowseRequest::AddStation {
+            url: "https://two.example/stream".to_owned(),
+        },
+        Ok("two: added"),
+    ));
+    assert_eq!(follow_up, Some(BrowseRequest::Stations));
+    assert!(state.loading);
+
+    // ReprobeStation, through `r`.
+    let mut state = radio(vec![station_row("one", "https://one.example/stream")]);
+    press(&mut state, &[KeyCode::Char('r')]);
+    let follow_up = state.apply(mutation(
+        BrowseRequest::ReprobeStation {
+            slug: "one".to_owned(),
+        },
+        Ok("one: reprobed"),
+    ));
+    assert_eq!(follow_up, Some(BrowseRequest::Stations));
+    assert!(state.loading);
+
+    // RemoveStation, through `d`, `y`.
+    let mut state = radio(vec![station_row("one", "https://one.example/stream")]);
+    press(&mut state, &[KeyCode::Char('d'), KeyCode::Char('y')]);
+    let follow_up = state.apply(mutation(
+        BrowseRequest::RemoveStation {
+            slug: "one".to_owned(),
+        },
+        Ok("one: removed"),
+    ));
+    assert_eq!(follow_up, Some(BrowseRequest::Stations));
+    assert!(state.loading);
+}
+
+#[test]
+fn a_station_mutation_answer_on_another_tab_re_requests_nothing() {
+    let mut state = radio(vec![station_row("one", "https://one.example/stream")]);
+    press(&mut state, &[KeyCode::Char('d'), KeyCode::Char('y')]);
+    press(&mut state, &[KeyCode::Tab]);
+    assert_eq!(state.tab, BrowserTab::Files);
+    assert!(state.pending.is_some(), "a tab switch keeps the mutation");
+    let follow_up = state.apply(mutation(
+        BrowseRequest::RemoveStation {
+            slug: "one".to_owned(),
+        },
+        Ok("one: removed"),
+    ));
+    assert_eq!(follow_up, None);
+    assert_eq!(
+        state.notice.as_ref().map(|n| n.text.as_str()),
+        Some("one: removed")
+    );
+}
+
+#[test]
+fn a_station_queued_elsewhere_draws_a_tick_on_the_radio_tab() {
+    // Adversarial: `Url::parse` rewrites a mixed-case host to lowercase, so
+    // this spelling only proves the identity claim if both derivations —
+    // `station_identity_of`'s canonical one (`station_row` above) and
+    // `resolve_source`'s raw one (below) — agree on the rewrite. An
+    // already-canonical URL would pass this test without exercising either
+    // derivation's own normalization at all.
+    let raw = "https://Radio.Example/Stream";
+    let row = station_row("one", raw);
+    let mut state = radio(vec![row.clone()]);
+
+    let (elsewhere_media, _) =
+        resolve_source(raw).unwrap_or_else(|error| panic!("resolve_source: {error}"));
+    assert_eq!(
+        elsewhere_media, row.media,
+        "station_identity_of and resolve_source must derive the same MediaId \
+         for a URL Url::parse rewrites, or a station added through the Radio \
+         tab and the same URL enqueued elsewhere would draw no tick"
+    );
+
+    let ids = views::ids();
+    state.sync_queue(&[queue_row(ids[0], elsewhere_media)]);
+    assert_eq!(state.queued_at(0), Some(ids[0]));
+
+    // The toggle's other half: Enter on a row that draws a tick removes it.
+    let effects = press(&mut state, &[KeyCode::Enter]);
+    assert!(
+        matches!(&effects[..], [BrowserEffect::Remove(id)] if *id == ids[0]),
+        "{effects:?}"
+    );
+    state.sync_queue(&[]);
+    assert_eq!(state.queued_at(0), None, "the queue is now empty");
+}
+
+#[test]
+fn enter_on_an_unqueued_station_enqueues_it() {
+    let row = station_row("one", "https://one.example/stream");
+    let mut state = radio(vec![row.clone()]);
+    assert_eq!(state.queued_at(0), None);
+
+    let effects = press(&mut state, &[KeyCode::Enter]);
+    let items = match &effects[..] {
+        [BrowserEffect::Enqueue(items)] => items,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(items.len(), 1, "{items:?}");
+    let media = match &items[0] {
+        EnqueueItem::Url(url) => {
+            resolve_source(url)
+                .unwrap_or_else(|error| panic!("resolve: {error}"))
+                .0
+        }
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(
+        media, row.media,
+        "the enqueued item's identity matches the row's"
+    );
+
+    let ids = views::ids();
+    state.sync_queue(&[queue_row(ids[0], media)]);
+    let (text, _) = screen(&state);
+    let line = text
+        .lines()
+        .find(|line| line.contains("one"))
+        .unwrap_or_else(|| panic!("no row for the station: {text}"));
+    assert!(line.contains('✓'), "the row now draws a tick: {line}");
 }

@@ -20,11 +20,18 @@ const HINTS: &str = "enter open/add/remove · space mark · tab files/podcasts �
 const PODCAST_HINTS: &str =
     "enter open/add/remove · space mark · a subscribe · r/R refresh · d remove · ⌫ back · b close";
 const NO_FEEDS: &str = "No subscriptions — press a to add a feed URL";
+// M8 §7's own hints and empty text; Task 7 owns their final wording and the
+// Radio tab's tab bar, title and row layout (slug/identity, URL/unreached
+// marker) in full. This much exists so `BrowserTab::Radio`'s exhaustive
+// matches here compile and the Radio tab is not left blank meanwhile.
+const RADIO_HINTS: &str = "enter add/remove · a add · r re-probe · d remove · ⌫ back · b close";
+const NO_STATIONS: &str = "No saved stations — press a to add a stream URL";
 const PROMPT: &str = "Feed URL: ";
 const LOADING: &str = "Loading…";
 const EMPTY_DIRECTORY: &str = "(empty directory)";
 const NO_EPISODES: &str = "No cached episodes";
 const UNTITLED: &str = "(untitled)";
+const UNREACHED: &str = "(unreached)";
 const MARK_COLUMNS: u16 = 2;
 const DETAIL_COLUMNS: u16 = 14;
 /// The row width below which the detail column is dropped.
@@ -54,6 +61,7 @@ pub(super) fn draw_browser(buffer: &mut Buffer, area: Rect, browser: &BrowserSta
     let hints = match browser.tab {
         BrowserTab::Files => HINTS,
         BrowserTab::Podcasts => PODCAST_HINTS,
+        BrowserTab::Radio => RADIO_HINTS,
     };
     if body.height >= 4 {
         Line::styled(hints, Style::new().fg(theme.muted)).render(row(body, hint_y), buffer);
@@ -102,6 +110,7 @@ fn location(browser: &BrowserState) -> String {
                 .unwrap_or(slug);
             format!("Subscriptions › {}", displayable(title))
         }
+        (BrowserTab::Radio, _) => "Radio".to_owned(),
     }
 }
 
@@ -122,6 +131,7 @@ fn draw_list(buffer: &mut Buffer, area: Rect, browser: &BrowserState, theme: &Th
             (BrowserTab::Files, _) => EMPTY_DIRECTORY,
             (BrowserTab::Podcasts, None) => NO_FEEDS,
             (BrowserTab::Podcasts, Some(_)) => NO_EPISODES,
+            (BrowserTab::Radio, _) => NO_STATIONS,
         };
         Some((empty.to_owned(), theme.muted))
     } else {
@@ -205,6 +215,37 @@ fn row_cells(browser: &BrowserState, index: usize, theme: &Theme) -> Option<RowC
                 style,
             }
         }),
+        // Slug then identity (name/genre/bitrate, joined and omitted when
+        // absent) for a verified station, else its URL and an unreached
+        // marker (M8 §7); untrusted server text, so escaped the same way
+        // the Files tab's names are at line 181.
+        (BrowserTab::Radio, _) => {
+            browser
+                .stations
+                .get(index)
+                .map(|station| match &station.identity {
+                    Some(identity) => {
+                        let parts: Vec<String> = [
+                            identity.name.clone(),
+                            identity.genre.clone(),
+                            identity.bitrate_kbps.map(|kbps| format!("{kbps} kbps")),
+                        ]
+                        .into_iter()
+                        .flatten()
+                        .collect();
+                        RowCells {
+                            label: displayable(&station.slug),
+                            detail: (!parts.is_empty()).then(|| parts.join(" · ")),
+                            style: Style::new().fg(theme.text),
+                        }
+                    }
+                    None => RowCells {
+                        label: displayable(station.url.as_str()),
+                        detail: Some(UNREACHED.to_owned()),
+                        style: Style::new().fg(theme.muted),
+                    },
+                })
+        }
     }
 }
 
