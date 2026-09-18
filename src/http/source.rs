@@ -164,6 +164,19 @@ fn wait_budget(
     }
 }
 
+/// The ICY identity of a live source (M8 §5). Every field is optional
+/// because ICY guarantees none of them: `response::is_icy` accepts a
+/// response carrying `icy-br` and no `icy-name`, and such a station is
+/// legitimately verified-but-unnamed. Display text throughout — the caller
+/// escapes it before drawing it.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct StationIdentity {
+    pub name: Option<String>,
+    pub genre: Option<String>,
+    pub bitrate_kbps: Option<u32>,
+    pub logo: Option<Url>,
+}
+
 /// Finite remote media over HTTP, read and seekable through the byte channel.
 pub struct HttpMediaSource {
     service: Arc<HttpService>,
@@ -192,7 +205,7 @@ pub struct HttpMediaSource {
     /// re-entering the channel (§8).
     retired: bool,
     consumed: u64,
-    station_name: Option<String>,
+    identity: Option<StationIdentity>,
 }
 
 impl HttpMediaSource {
@@ -247,14 +260,28 @@ impl HttpMediaSource {
             }
         };
 
-        let (byte_len, byte_seekable, live, station_name) = match accepted.accepted {
+        let (byte_len, byte_seekable, live, identity) = match accepted.accepted {
             Accepted::Sequential { len } => (len, false, false, None),
             Accepted::Ranged { range } => (range.total, true, false, None),
             Accepted::Live => (
                 None,
                 false,
                 true,
-                accepted.headers.get("icy-name").map(str::to_string),
+                Some(StationIdentity {
+                    name: accepted.headers.get("icy-name").map(str::to_string),
+                    genre: accepted.headers.get("icy-genre").map(str::to_string),
+                    // A bitrate that is not a plain decimal, and a logo that
+                    // is not an absolute URL, are simply absent: a decorative
+                    // field never costs a station its classification (§5).
+                    bitrate_kbps: accepted
+                        .headers
+                        .get("icy-br")
+                        .and_then(|value| value.trim().parse::<u32>().ok()),
+                    logo: accepted
+                        .headers
+                        .get("icy-logo")
+                        .and_then(|value| Url::parse(value.trim()).ok()),
+                }),
             ),
         };
         let established = Established {
@@ -297,14 +324,15 @@ impl HttpMediaSource {
             at_byte_eof: false,
             retired: false,
             consumed: 0,
-            station_name,
+            identity,
         };
         Ok((source, opening_limits))
     }
 
-    /// The `icy-name` of a live source. Display text: the caller escapes it.
-    pub fn station_name(&self) -> Option<&str> {
-        self.station_name.as_deref()
+    /// The ICY identity of a live source (M8 §5); `None` for finite media.
+    /// Display text: the caller escapes it.
+    pub fn station_identity(&self) -> Option<&StationIdentity> {
+        self.identity.as_ref()
     }
 
     pub fn evidence(&self) -> SourceEvidence {

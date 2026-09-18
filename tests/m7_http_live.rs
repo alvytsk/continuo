@@ -47,7 +47,66 @@ fn a_station_is_live_unsized_unseekable_and_named() {
     assert!(evidence.live);
     assert_eq!(evidence.byte_len, None);
     assert!(!evidence.byte_seekable);
-    assert_eq!(source.station_name(), Some("Test Radio"));
+    assert_eq!(
+        source
+            .station_identity()
+            .and_then(|identity| identity.name.as_deref()),
+        Some("Test Radio"),
+    );
+    drop(source);
+    server.shutdown();
+}
+
+#[test]
+fn a_station_carries_its_whole_icy_identity() {
+    let server = TestServer::start(
+        Script::from_fixture("sine-noxing.mp3")
+            .icy_station()
+            .icy_logo("https://radio.example/logo.svg".to_owned()),
+    );
+    let source = open(&server);
+    let identity = source
+        .station_identity()
+        .unwrap_or_else(|| panic!("a live source has an identity"));
+    assert_eq!(identity.name.as_deref(), Some("Test Radio"));
+    assert_eq!(identity.genre.as_deref(), Some("Lofi"));
+    assert_eq!(identity.bitrate_kbps, Some(128));
+    assert_eq!(
+        identity.logo.as_ref().map(url::Url::as_str),
+        Some("https://radio.example/logo.svg"),
+    );
+    drop(source);
+    server.shutdown();
+}
+
+#[test]
+fn a_station_with_no_logo_header_has_no_logo() {
+    let server = TestServer::start(Script::from_fixture("sine-noxing.mp3").icy_station());
+    let source = open(&server);
+    let identity = source
+        .station_identity()
+        .unwrap_or_else(|| panic!("a live source has an identity"));
+    assert_eq!(identity.name.as_deref(), Some("Test Radio"));
+    assert!(identity.logo.is_none(), "no header, no logo");
+    drop(source);
+    server.shutdown();
+}
+
+#[test]
+fn a_relative_logo_and_a_non_numeric_bitrate_degrade_to_none() {
+    let server = TestServer::start(
+        Script::from_fixture("sine-noxing.mp3")
+            .icy_station()
+            .icy_logo("/logo.svg".to_owned()),
+    );
+    let source = open(&server);
+    let identity = source
+        .station_identity()
+        .unwrap_or_else(|| panic!("a live source has an identity"));
+    // A relative `icy-logo` is dropped, and the station is still a station:
+    // a decorative field never costs a station its classification (§5).
+    assert!(identity.logo.is_none(), "a relative logo is not a URL");
+    assert!(source.evidence().live, "still live");
     drop(source);
     server.shutdown();
 }

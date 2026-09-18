@@ -133,6 +133,8 @@ pub struct Script {
     documents: Option<Vec<DocumentReply>>,
     /// ICY response headers without metadata framing: a station M7 plays.
     icy_station: bool,
+    /// An absolute `icy-logo` URL for a station fixture; `None` sends none.
+    icy_logo: Option<String>,
     /// Connection n (1-based) is served by `sequence[n - 2]` once n > 1; the
     /// last entry serves every later connection.
     sequence: Vec<Script>,
@@ -290,6 +292,13 @@ impl Script {
     pub fn icy_station(mut self) -> Self {
         self.icy_station = true;
         self.ranges = false;
+        self
+    }
+
+    /// Sets the station fixture's `icy-logo` header (M8 §5). Absolute, since
+    /// a relative value is deliberately dropped by the parser under test.
+    pub fn icy_logo(mut self, url: String) -> Self {
+        self.icy_logo = Some(url);
         self
     }
 
@@ -719,7 +728,10 @@ fn write_whole_body(
         header.push_str("icy-name: Test Radio\r\nicy-metaint: 16000\r\n");
     }
     if script.icy_station {
-        header.push_str("icy-name: Test Radio\r\nicy-br: 128\r\n");
+        header.push_str("icy-name: Test Radio\r\nicy-br: 128\r\nicy-genre: Lofi\r\n");
+        if let Some(logo) = &script.icy_logo {
+            header.push_str(&format!("icy-logo: {logo}\r\n"));
+        }
     }
     if chunked_framing {
         header.push_str("Transfer-Encoding: chunked\r\n");

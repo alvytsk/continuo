@@ -118,7 +118,9 @@ fn open_http(url: &Url, context: &PrepareContext) -> Result<DecodedSource, Playb
     // boxed and consumed by the probe — there is no way back to it
     // afterwards.
     let evidence = source.evidence();
-    let station = source.station_name().map(str::to_string);
+    let station = source
+        .station_identity()
+        .and_then(|identity| identity.name.clone());
     let mut hint = Hint::new();
     if let Some(extension) = extension_from_url(url) {
         hint.with_extension(&extension);
