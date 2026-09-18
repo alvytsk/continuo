@@ -167,6 +167,53 @@ fn load_quarantines_a_malformed_file_and_starts_empty() {
     assert_eq!(moved.len(), 1, "exactly one quarantine file");
 }
 
+/// §6: `media` is derived from `url`, never an independent field. A
+/// hand-edited `url` whose `media` was left stale (the record a user is
+/// most likely to touch by hand) must be quarantined exactly like any
+/// other malformed file, mirroring `load_quarantines_a_malformed_file_and_starts_empty`.
+#[test]
+fn a_media_that_disagrees_with_its_url_is_malformed() {
+    let dir = tempfile::tempdir().unwrap_or_else(|error| panic!("{error}"));
+    let path = dir.path().join("stations.json");
+    std::fs::write(
+        &path,
+        br#"{
+            "schema_version": 1,
+            "stations": [
+                {
+                    "slug": "lofi",
+                    "url": "https://radio.example/lofi/stream",
+                    "media": "remote:https://radio.example/jazz/stream",
+                    "added_at": "1970-01-01T00:00:00Z"
+                }
+            ]
+        }"#,
+    )
+    .unwrap_or_else(|error| panic!("{error}"));
+    let store = StationStore::new(path.clone(), clock());
+
+    let load = store.load();
+    assert!(
+        load.writable,
+        "a quarantined file leaves the session writable"
+    );
+    assert!(load.snapshot.stations.is_empty());
+    assert!(matches!(load.reason, LoadReason::Quarantined { .. }));
+    assert!(!path.exists(), "the malformed file moved aside");
+
+    let moved: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap_or_else(|error| panic!("{error}"))
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("stations.json.rejected-")
+        })
+        .collect();
+    assert_eq!(moved.len(), 1, "exactly one quarantine file");
+}
+
 #[test]
 fn a_duplicate_slug_makes_the_whole_file_malformed() {
     let dir = tempfile::tempdir().unwrap_or_else(|error| panic!("{error}"));

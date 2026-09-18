@@ -147,15 +147,27 @@ fn validate_records(records: Vec<StationRecord>) -> Result<Vec<Station>, DecodeE
 
         // The DTO already deserialized `url` as a `Url`, so any scheme
         // parses; `NormalizedUrl::parse` re-checks it is `http(s)` with a
-        // host. Only its acceptance is used here — the stored field stays
-        // the plain `Url` the DTO carries.
-        NormalizedUrl::parse(record.url.as_str())
+        // host. The stored field stays the plain `Url` the DTO carries, but
+        // the normalized form is also what `media` must derive from below.
+        let normalized = NormalizedUrl::parse(record.url.as_str())
             .map_err(|_| DecodeError::Malformed("a url is not http(s)".to_string()))?;
 
         let media = record
             .media
             .parse::<MediaId>()
             .map_err(|_| DecodeError::Malformed("a media identifier is not valid".to_string()))?;
+
+        // §6: `media` is a derived field, not an independent one. A
+        // hand-edited `url` whose `media` no longer matches it must be
+        // quarantined like any other malformed file — silently trusting the
+        // stale `media` would let a later Enter enqueue the new URL under
+        // the old identity's slug, drawing no tick, so a second Enter would
+        // add a duplicate.
+        if media != MediaId::RemoteUrl(normalized) {
+            return Err(DecodeError::Malformed(
+                "a media identifier does not match its url".to_string(),
+            ));
+        }
 
         let identity = record.identity.map(|identity| StationIdentity {
             name: identity.name,
