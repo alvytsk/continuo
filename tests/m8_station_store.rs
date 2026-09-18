@@ -75,6 +75,42 @@ fn a_verified_and_an_unverified_station_round_trip() {
     );
 }
 
+/// The distinction a flat, field-level encoding of `StationIdentity` cannot
+/// make: a station that was genuinely probed and classified live, but whose
+/// response carried none of the four decorative ICY fields, must still
+/// round-trip as verified (`Some`), never fall back to "not yet reached"
+/// (`None`) just because every field inside it happens to be absent. This
+/// exact shape is unreachable through the HTTP layer today — `is_icy`
+/// requires `icy-name` or `icy-br` before classifying a response as live —
+/// which is exactly why the store's own encoding, rather than that
+/// invariant, must be what preserves it.
+#[test]
+fn a_verified_but_entirely_unnamed_station_round_trips_as_verified() {
+    let dir = tempfile::tempdir().unwrap_or_else(|error| panic!("{error}"));
+    let store = StationStore::new(dir.path().join("stations.json"), clock());
+
+    let blank_but_verified = StationIdentity::default();
+    let snapshot = StationSnapshot {
+        stations: vec![station(
+            "silent",
+            "https://radio.example/silent/stream",
+            Some(blank_but_verified.clone()),
+        )],
+    };
+    store
+        .save(&snapshot)
+        .unwrap_or_else(|error| panic!("save: {error}"));
+
+    let read = store
+        .read_snapshot()
+        .unwrap_or_else(|error| panic!("read: {error}"));
+    assert_eq!(
+        read.stations[0].identity.as_ref(),
+        Some(&blank_but_verified),
+        "an all-absent identity must still round-trip as verified, not fall back to unverified",
+    );
+}
+
 #[test]
 fn a_missing_file_is_an_empty_list_not_an_error() {
     let dir = tempfile::tempdir().unwrap_or_else(|error| panic!("{error}"));

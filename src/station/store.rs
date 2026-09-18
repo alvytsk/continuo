@@ -46,13 +46,6 @@ struct StationFile {
 /// One record inside `stations.json`. Deliberately a plain DTO, separate
 /// from [`Station`]: deserializing straight into the domain type would let
 /// a `slug` or `media` skip validation.
-///
-/// The four ICY fields are stored flat rather than nested under an
-/// `Option<StationIdentity>`, which is safe only because `is_icy`
-/// (`src/http/response.rs`) never classifies a response as live unless at
-/// least `icy-name` or `icy-br` was present — so a verified station can
-/// never round-trip with all four fields `None`, and `all four absent` is an
-/// unambiguous encoding of "unverified".
 #[derive(Clone, Serialize, Deserialize)]
 struct StationRecord {
     slug: String,
@@ -62,14 +55,29 @@ struct StationRecord {
     /// into the domain type, for the same reason `SubscriptionRecord`
     /// validates `feed_id`.
     media: String,
-    name: Option<String>,
-    genre: Option<String>,
-    bitrate_kbps: Option<u32>,
-    logo: Option<Url>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    identity: Option<IdentityRecord>,
     #[serde(with = "time::serde::rfc3339")]
     added_at: OffsetDateTime,
     #[serde(default, with = "time::serde::rfc3339::option")]
     probed_at: Option<OffsetDateTime>,
+}
+
+/// [`StationIdentity`]'s on-disk shape, nested under `StationRecord::identity`
+/// so the persisted shape matches the domain type one-to-one: `None` means
+/// unverified because the field itself is absent, never because its four
+/// members all happen to be `None`. A flat, field-level encoding would have
+/// relied on `is_icy` (`src/http/response.rs`) always setting at least one
+/// of `icy-name`/`icy-br` before classifying a response as live — true
+/// today, but not a promise this file format should depend on, and M7 §12
+/// already plans to widen live classification in a way that could make an
+/// all-absent-but-verified identity reachable.
+#[derive(Clone, Serialize, Deserialize)]
+struct IdentityRecord {
+    name: Option<String>,
+    genre: Option<String>,
+    bitrate_kbps: Option<u32>,
+    logo: Option<Url>,
 }
 
 /// Only the field every future version is obliged to keep. Read before the
@@ -149,20 +157,12 @@ fn validate_records(records: Vec<StationRecord>) -> Result<Vec<Station>, DecodeE
             .parse::<MediaId>()
             .map_err(|_| DecodeError::Malformed("a media identifier is not valid".to_string()))?;
 
-        let identity = if record.name.is_none()
-            && record.genre.is_none()
-            && record.bitrate_kbps.is_none()
-            && record.logo.is_none()
-        {
-            None
-        } else {
-            Some(StationIdentity {
-                name: record.name,
-                genre: record.genre,
-                bitrate_kbps: record.bitrate_kbps,
-                logo: record.logo,
-            })
-        };
+        let identity = record.identity.map(|identity| StationIdentity {
+            name: identity.name,
+            genre: identity.genre,
+            bitrate_kbps: identity.bitrate_kbps,
+            logo: identity.logo,
+        });
 
         stations.push(Station {
             slug: record.slug,
@@ -198,23 +198,17 @@ fn malformed(source: &serde_json::Error) -> DecodeError {
 
 /// Converts a validated domain [`Station`] back into the on-disk DTO.
 fn to_record(station: &Station) -> StationRecord {
-    let (name, genre, bitrate_kbps, logo) = match &station.identity {
-        Some(identity) => (
-            identity.name.clone(),
-            identity.genre.clone(),
-            identity.bitrate_kbps,
-            identity.logo.clone(),
-        ),
-        None => (None, None, None, None),
-    };
+    let identity = station.identity.as_ref().map(|identity| IdentityRecord {
+        name: identity.name.clone(),
+        genre: identity.genre.clone(),
+        bitrate_kbps: identity.bitrate_kbps,
+        logo: identity.logo.clone(),
+    });
     StationRecord {
         slug: station.slug.clone(),
         url: station.url.clone(),
         media: station.media.to_string(),
-        name,
-        genre,
-        bitrate_kbps,
-        logo,
+        identity,
         added_at: station.added_at,
         probed_at: station.probed_at,
     }
