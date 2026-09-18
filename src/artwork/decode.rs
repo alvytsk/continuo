@@ -1,7 +1,7 @@
 //! Reading and decoding a candidate cover within fixed limits (design doc
 //! M5 §9): at most 10 MiB encoded, at most 16 million decoded pixels, JPEG
 //! or PNG — or an SVG, rasterized within a fixed 512-pixel bound with every
-//! external reference refused (M8 §8.2, [`super::svg`]). Every rejection is a typed [`ArtworkError`] rather than a
+//! external reference refused (M7.1 §8.2, [`super::svg`]). Every rejection is a typed [`ArtworkError`] rather than a
 //! panic or an unbounded allocation, so a hostile or merely oversized file
 //! next to a track can never cost more than these limits allow.
 

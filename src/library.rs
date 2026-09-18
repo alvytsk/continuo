@@ -436,7 +436,7 @@ fn load_mutating(subs: &SubscriptionStore) -> Result<SubscriptionSnapshot, FeedE
     Err(FeedError::SubscriptionsUnreadable { reason })
 }
 
-/// [`load_mutating`]'s counterpart for stations (M8 §4). Every `LoadReason`
+/// [`load_mutating`]'s counterpart for stations (M7.1 §4). Every `LoadReason`
 /// but `Loaded` and `Missing` (both `writable`) becomes a visible
 /// [`FeedError::StationsUnreadable`], so a station mutation never overwrites
 /// a file the store chose to preserve — the exact failure this function
@@ -961,7 +961,7 @@ pub async fn refresh_all(
     Ok(results)
 }
 
-// --- Task 4: stations (M8 §6, §10) ------------------------------------
+// --- Task 4: stations (M7.1 §6, §10) ------------------------------------
 //
 // The add/remove/re-probe operations behind the Radio tab, and §10's
 // five-row taxonomy deciding what an add does for each probe outcome. Every

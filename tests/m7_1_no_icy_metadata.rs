@@ -1,4 +1,4 @@
-//! M8 §3 R2: Tenuto never asks a station for metadata framing.
+//! M7.1 §3 R2: Tenuto never asks a station for metadata framing.
 //!
 //! `src/http/response.rs` refuses any response carrying `icy-metaint`
 //! (`RemoteFailure::IcyFramingUnsupported`), and a real Icecast mount sends
@@ -31,7 +31,7 @@ fn assert_never_asked_for_metadata(server: &TestServer, situation: &str) {
             request.header("icy-metadata").is_none(),
             "request #{index} during {situation} asked for ICY metadata framing: {:?}\n\
              A station that answers this header sends icy-metaint, which \
-             http::response refuses as IcyFramingUnsupported (M8 §3 R2).",
+             http::response refuses as IcyFramingUnsupported (M7.1 §3 R2).",
             request.header("icy-metadata"),
         );
     }

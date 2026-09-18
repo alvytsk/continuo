@@ -26,7 +26,7 @@ use crate::tui::input::blocks_ordinary_bindings;
 pub enum BrowserTab {
     Files,
     Podcasts,
-    /// The Radio tab: saved stations (M8 §7).
+    /// The Radio tab: saved stations (M7.1 §7).
     Radio,
 }
 
@@ -56,7 +56,7 @@ pub struct BrowserState {
     /// The feed being viewed, by slug, and its episodes; `None` while the
     /// Podcasts tab shows the feed list.
     pub episodes: Option<(String, Vec<EpisodeCandidate>)>,
-    /// The Radio tab's saved stations (M8 §7).
+    /// The Radio tab's saved stations (M7.1 §7).
     pub stations: Vec<StationRow>,
     /// An index into the visible list.
     pub cursor: usize,
@@ -228,7 +228,7 @@ impl BrowserState {
     /// Podcasts tab `a` prompts for a feed URL, `r`/`R` refresh one/all and
     /// `d` asks before removing (M6 §4). The Radio tab's `a`/`r`/`d` mirror
     /// this exactly, sending `AddStation`/`ReprobeStation`/`RemoveStation`
-    /// instead (M8 §7); `R` stays Podcasts-only, since refreshing every feed
+    /// instead (M7.1 §7); `R` stays Podcasts-only, since refreshing every feed
     /// has no Radio equivalent. The prompt and the question take every key
     /// while they are up. A Ctrl or Alt chord does nothing, as in the rest
     /// of the keyboard map.
@@ -363,7 +363,7 @@ impl BrowserState {
             BrowseRequest::Subscribe { .. } => "Subscribing…",
             BrowseRequest::Refresh { .. } => "Refreshing…",
             BrowseRequest::Unsubscribe { .. } => "Removing…",
-            // Sent from the Radio tab's `a`, `r` and `d` (M8 §7).
+            // Sent from the Radio tab's `a`, `r` and `d` (M7.1 §7).
             BrowseRequest::AddStation { .. } => "Adding…",
             BrowseRequest::RemoveStation { .. } => "Removing…",
             BrowseRequest::ReprobeStation { .. } => "Re-probing…",
@@ -382,7 +382,7 @@ impl BrowserState {
 
     /// Printable characters append, Backspace pops, Enter submits the
     /// trimmed URL (nothing when empty) as `AddStation` on the Radio tab and
-    /// `Subscribe` on Podcasts (M8 §7), Esc cancels. Shortcuts never fire.
+    /// `Subscribe` on Podcasts (M7.1 §7), Esc cancels. Shortcuts never fire.
     fn prompt_key(&mut self, key: KeyEvent) -> Vec<BrowserEffect> {
         match key.code {
             KeyCode::Esc => {
@@ -441,7 +441,7 @@ impl BrowserState {
         self.error = None;
     }
 
-    /// Files → Podcasts → Radio → Files (M8 §7).
+    /// Files → Podcasts → Radio → Files (M7.1 §7).
     fn switch_tab(&mut self) -> Vec<BrowserEffect> {
         self.start_loading();
         let request = match self.tab {
@@ -505,7 +505,7 @@ impl BrowserState {
     /// queue are skipped, and Enter on one alone takes it out instead.
     ///
     /// A Radio row enqueues as `EnqueueItem::Url(station.url.to_string())`,
-    /// which `resolve_source` (M8 §7) resolves through the exact same
+    /// which `resolve_source` (M7.1 §7) resolves through the exact same
     /// `NormalizedUrl::parse` call `station_identity_of` used to derive
     /// `StationRow::media` at add time, from the same canonical `url::Url`
     /// text — so the identity this enqueue produces and the tick
@@ -565,7 +565,7 @@ impl BrowserState {
                 // the cached rows stay up until the answer lands (M6 §4).
                 vec![BrowserEffect::Request(BrowseRequest::Feeds)]
             }
-            // The Radio tab has no sub-view to leave (M8 §7).
+            // The Radio tab has no sub-view to leave (M7.1 §7).
             BrowserTab::Radio => Vec::new(),
         }
     }

@@ -130,7 +130,7 @@ pub(crate) fn platform_subscription_stores() -> Result<(SubscriptionStore, Cache
     ))
 }
 
-/// The saved-station store on this platform's directory (M8 design doc §4,
+/// The saved-station store on this platform's directory (M7.1 design doc §4,
 /// §6), at `stations.json` beside `subscriptions.json` in the same
 /// `data_dir`. A separate lookup from [`platform_subscription_stores`]
 /// rather than a third element of its tuple: every one of that function's
@@ -640,7 +640,7 @@ pub(crate) fn finish_unsubscribe(
 
 /// A verified station's identity, on one line: name, genre and bitrate,
 /// joined by ` · ` and each omitted when absent, matching the Radio tab's
-/// own row rendering (M8 design doc §7). `ABSENT` when nothing came back at
+/// own row rendering (M7.1 design doc §7). `ABSENT` when nothing came back at
 /// all — legitimate for a station whose ICY headers carry neither a name
 /// nor a bitrate (§4).
 fn station_identity_text(identity: &StationIdentity) -> String {
@@ -661,7 +661,7 @@ fn station_identity_text(identity: &StationIdentity) -> String {
     }
 }
 
-/// `AddStation`'s and `ReprobeStation`'s shared report (M8 design doc §10),
+/// `AddStation`'s and `ReprobeStation`'s shared report (M7.1 design doc §10),
 /// `action` naming which one so the same taxonomy reads as "added" or
 /// "re-probed" rather than composing two near-identical formatters.
 fn write_station_probe(
@@ -721,7 +721,7 @@ fn write_station_probe(
     }
 }
 
-/// `AddStation` (M8 design doc §6, §10).
+/// `AddStation` (M7.1 design doc §6, §10).
 pub(crate) fn finish_add_station(
     out: &mut dyn Write,
     outcome: AddStationOutcome,
@@ -729,7 +729,7 @@ pub(crate) fn finish_add_station(
     write_station_probe(out, outcome, "added")
 }
 
-/// `ReprobeStation` (M8 design doc §6). [`reprobe_station`] only ever
+/// `ReprobeStation` (M7.1 design doc §6). [`reprobe_station`] only ever
 /// produces [`AddStationOutcome::Verified`] on success — a station cannot
 /// re-probe its way into being a duplicate of itself — but the outcome type
 /// is shared with `AddStation`, so every arm is still handled.
@@ -742,7 +742,7 @@ pub(crate) fn finish_reprobe_station(
     write_station_probe(out, outcome, "re-probed")
 }
 
-/// `RemoveStation` (M8 design doc §6): a local edit, always successful once
+/// `RemoveStation` (M7.1 design doc §6): a local edit, always successful once
 /// [`crate::library::remove_station`] returns `Ok`.
 pub(crate) fn finish_remove_station(
     out: &mut dyn Write,
@@ -1443,7 +1443,7 @@ mod tests {
 
     /// `AddStationOutcome::AlreadySaved::reprobe_failure` exists so that a
     /// duplicate add's implicit re-probe failure reaches the caller instead
-    /// of being swallowed by the "already saved" framing (M8 §6, §10); this
+    /// of being swallowed by the "already saved" framing (M7.1 §6, §10); this
     /// is the presentation-layer half of that fix — the reason must show up
     /// in the printed line, not just in the value passed to `finish_add_station`.
     #[test]

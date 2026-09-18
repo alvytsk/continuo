@@ -995,7 +995,7 @@ fn episodes_list_newest_first_with_undated_ones_last() {
     );
 }
 
-// --- M8 §7: the Radio tab -----------------------------------------------
+// --- M7.1 §7: the Radio tab -----------------------------------------------
 
 #[test]
 fn tab_cycles_files_podcasts_radio_and_back() {
@@ -1152,7 +1152,7 @@ fn a_queued_station_draws_a_tick() {
 }
 
 /// A hostile station can put anything it likes in `icy-name`/`icy-genre`
-/// (M8 §5 probes them straight off the response headers); `StationIdentity`
+/// (M7.1 §5 probes them straight off the response headers); `StationIdentity`
 /// carries its own doc comment obligation ("the caller escapes it before
 /// drawing it"). This is the same terminal-injection hazard
 /// `the_overlay_draws_safe_names_marks_and_dimmed_unplayable_episodes`

@@ -1,4 +1,4 @@
-//! M8 §10: what an add does, per probe outcome.
+//! M7.1 §10: what an add does, per probe outcome.
 //!
 //! Tests were written after `src/library.rs`'s station functions, not
 //! before them — the implementer who wrote `add_station`, `remove_station`,
@@ -59,7 +59,7 @@ fn reprobe(
         .block_on(reprobe_station(service, store, slug))
 }
 
-// --- Task 5: browse worker wiring (M8 §6) -------------------------------
+// --- Task 5: browse worker wiring (M7.1 §6) -------------------------------
 
 /// A `LibraryStores` rooted at `root`, the station store built by [`store`]
 /// above so a worker-level test seeds and reads through the same helper the
@@ -288,7 +288,7 @@ fn a_duplicate_url_resolves_to_the_existing_station() {
 /// §6/§10: a duplicate add still re-probes, and when that re-probe fails
 /// the failure must reach the caller through `AlreadySaved`, not be
 /// swallowed — the same "record kept, failure reported" contract
-/// `reprobe_station` holds for an explicit re-probe (M8 §6: "leaves the
+/// `reprobe_station` holds for an explicit re-probe (M7.1 §6: "leaves the
 /// record alone and reports the failure").
 #[test]
 fn a_duplicate_add_whose_reprobe_fails_reports_the_reason_and_keeps_the_old_identity() {
@@ -482,7 +482,7 @@ fn a_protected_store_quarantine_failure_is_never_overwritten() {
     }
 }
 
-/// M8 §6: the worker answers `AddStation` with a `Mutation` echoing the
+/// M7.1 §6: the worker answers `AddStation` with a `Mutation` echoing the
 /// request, the added station then shows up in `Stations`, `RemoveStation`
 /// answers likewise, and the station is gone from a following `Stations`.
 #[test]
@@ -518,7 +518,7 @@ fn the_worker_answers_every_station_request() {
 /// for the drawn counterpart): a station already saved is listed, and then
 /// removed, with the server's request count unchanged, extending the
 /// invariant to the two station requests that must never touch the network
-/// (M8 §6).
+/// (M7.1 §6).
 #[test]
 fn listing_and_removing_stations_open_no_connection() {
     let root = tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir: {error}"));

@@ -1,4 +1,4 @@
-//! M8 §8.2: SVG logos decode within fixed bounds, and neither half of
+//! M7.1 §8.2: SVG logos decode within fixed bounds, and neither half of
 //! usvg's image-href resolver may reach outside the document.
 
 use tenuto::artwork::decode::{ArtworkError, decode_limited};

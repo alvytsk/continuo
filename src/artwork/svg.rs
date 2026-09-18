@@ -1,4 +1,4 @@
-//! Rasterizing an SVG cover within fixed bounds (design doc M8 §8.2).
+//! Rasterizing an SVG cover within fixed bounds (design doc M7.1 §8.2).
 //!
 //! Every external reference is refused, in **both** halves of usvg's
 //! resolver. Overriding only the string half is insufficient: usvg's

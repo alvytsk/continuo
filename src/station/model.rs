@@ -1,4 +1,4 @@
-//! The station domain type and its slug derivation (M8 §4).
+//! The station domain type and its slug derivation (M7.1 §4).
 
 use std::collections::BTreeSet;
 

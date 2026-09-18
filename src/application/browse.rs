@@ -129,18 +129,18 @@ pub enum BrowseRequest {
     Unsubscribe {
         slug: String,
     },
-    /// The Radio tab's listing (M8 design doc §6). Read-only, like `Feeds`:
+    /// The Radio tab's listing (M7.1 design doc §6). Read-only, like `Feeds`:
     /// never touches the network.
     Stations,
-    /// Validates, probes and saves a station by URL (M8 §6, §10).
+    /// Validates, probes and saves a station by URL (M7.1 §6, §10).
     AddStation {
         url: String,
     },
-    /// Drops a saved station. Local-only, like `Unsubscribe` (M8 §6).
+    /// Drops a saved station. Local-only, like `Unsubscribe` (M7.1 §6).
     RemoveStation {
         slug: String,
     },
-    /// Re-probes a saved station, refreshing its cached identity (M8 §6).
+    /// Re-probes a saved station, refreshing its cached identity (M7.1 §6).
     ReprobeStation {
         slug: String,
     },
@@ -155,7 +155,7 @@ pub enum BrowseResult {
         entries: Result<Vec<DirEntry>, String>,
     },
     Feeds(Result<Vec<FeedSummary>, String>),
-    /// The Radio tab's listing (M8 design doc §6).
+    /// The Radio tab's listing (M7.1 design doc §6).
     Stations(Result<Vec<StationRow>, String>),
     Episodes {
         slug: String,
@@ -300,7 +300,7 @@ fn answer(
 /// Runs one mutation the way its CLI command does, and reports it the way
 /// the CLI prints it (§3). Only `Subscribe`, `Refresh`, `AddStation` and
 /// `ReprobeStation` need the service; `RemoveStation` is a local edit like
-/// `Unsubscribe` and must never call [`http_service`] (M8 §6, R3).
+/// `Unsubscribe` and must never call [`http_service`] (M7.1 §6, R3).
 fn mutate(
     stores: &LibraryStores,
     http: &mut Option<Arc<HttpService>>,

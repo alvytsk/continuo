@@ -298,7 +298,7 @@ impl Script {
         self
     }
 
-    /// Sets the station fixture's `icy-logo` header (M8 §5). Absolute, since
+    /// Sets the station fixture's `icy-logo` header (M7.1 §5). Absolute, since
     /// a relative value is deliberately dropped by the parser under test.
     pub fn icy_logo(mut self, url: String) -> Self {
         self.icy_logo = Some(url);
@@ -306,7 +306,7 @@ impl Script {
     }
 
     /// Overrides the station fixture's `icy-br` header, so a malformed
-    /// bitrate can be exercised (M8 §5: a decorative field never costs a
+    /// bitrate can be exercised (M7.1 §5: a decorative field never costs a
     /// station its classification).
     pub fn icy_br(mut self, value: String) -> Self {
         self.icy_br = Some(value);

@@ -164,7 +164,7 @@ fn wait_budget(
     }
 }
 
-/// The ICY identity of a live source (M8 §5). Every field is optional
+/// The ICY identity of a live source (M7.1 §5). Every field is optional
 /// because ICY guarantees none of them: `response::is_icy` accepts a
 /// response carrying `icy-br` and no `icy-name`, and such a station is
 /// legitimately verified-but-unnamed. Display text throughout — the caller
@@ -329,7 +329,7 @@ impl HttpMediaSource {
         Ok((source, opening_limits))
     }
 
-    /// The ICY identity of a live source (M8 §5); `None` for finite media.
+    /// The ICY identity of a live source (M7.1 §5); `None` for finite media.
     /// Display text: the caller escapes it.
     pub fn station_identity(&self) -> Option<&StationIdentity> {
         self.identity.as_ref()

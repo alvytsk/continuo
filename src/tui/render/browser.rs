@@ -20,7 +20,7 @@ const HINTS: &str = "enter open/add/remove · space mark · tab files/podcasts �
 const PODCAST_HINTS: &str =
     "enter open/add/remove · space mark · a subscribe · r/R refresh · d remove · ⌫ back · b close";
 const NO_FEEDS: &str = "No subscriptions — press a to add a feed URL";
-// M8 §7's own hints and empty text; Task 7 owns their final wording and the
+// M7.1 §7's own hints and empty text; Task 7 owns their final wording and the
 // Radio tab's tab bar, title and row layout (slug/identity, URL/unreached
 // marker) in full. This much exists so `BrowserTab::Radio`'s exhaustive
 // matches here compile and the Radio tab is not left blank meanwhile.
@@ -218,7 +218,7 @@ fn row_cells(browser: &BrowserState, index: usize, theme: &Theme) -> Option<RowC
         }),
         // Slug then identity (name/genre/bitrate, joined and omitted when
         // absent) for a verified station, else its URL and an unreached
-        // marker (M8 §7); untrusted server text, so escaped the same way
+        // marker (M7.1 §7); untrusted server text, so escaped the same way
         // the Files tab's names are at line 181.
         (BrowserTab::Radio, _) => {
             browser

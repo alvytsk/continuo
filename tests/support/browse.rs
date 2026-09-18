@@ -1,9 +1,9 @@
-//! One poller for [`BrowseWorker`] answers, shared by every M5/M6/M8 test
+//! One poller for [`BrowseWorker`] answers, shared by every M5/M6/M7.1 test
 //! that drives the browse worker synchronously.
 //!
 //! Before this existed, the same ~20-line deadline/`try_result`/sleep loop
 //! was hand-rolled three times (`tests/m6_feed_management.rs`'s `answer`,
-//! and `tests/m8_station_probe.rs`'s `answer` and `list`) plus a fourth,
+//! and `tests/m7_1_station_probe.rs`'s `answer` and `list`) plus a fourth,
 //! differently-timed copy in `tests/m5_no_network.rs`. A copy left
 //! un-migrated is a silent liability: if a deadline is ever tuned to fix a
 //! flaky CI runner (see the project's own history of timing flakes on
@@ -40,7 +40,7 @@ pub fn wait_for_result(worker: &BrowseWorker) -> BrowseResult {
 
 /// Sends `request` and waits for its `Mutation` answer, panicking if the
 /// worker answers with anything else — the shape every mutation test
-/// (`Subscribe`/`Refresh`/`Unsubscribe`, and the M8 station mutations)
+/// (`Subscribe`/`Refresh`/`Unsubscribe`, and the M7.1 station mutations)
 /// needs.
 pub fn answer(
     worker: &BrowseWorker,

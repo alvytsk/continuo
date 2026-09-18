@@ -1,4 +1,4 @@
-//! M8 §4: `stations.json` is user-authored data — no cap, no eviction, and
+//! M7.1 §4: `stations.json` is user-authored data — no cap, no eviction, and
 //! a malformed file is quarantined rather than silently truncated.
 
 mod support;

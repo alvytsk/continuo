@@ -131,7 +131,7 @@ impl WaitHook for NoopHook {
 /// Open `/radio` on `server` at the HTTP seam, bypassing the engine, and
 /// finish opening immediately.
 ///
-/// Shared by `tests/m7_http_live.rs` and `tests/m8_no_icy_metadata.rs`, both
+/// Shared by `tests/m7_http_live.rs` and `tests/m7_1_no_icy_metadata.rs`, both
 /// of which only need the request the open makes, not a playing engine.
 pub fn open_station(server: &server::TestServer) -> HttpMediaSource {
     let limits = Limits::brisk();

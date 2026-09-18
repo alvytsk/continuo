@@ -276,7 +276,7 @@ fn a_restored_active_station_is_listed_and_drawn_without_a_request() {
     server.shutdown();
 }
 
-/// The Radio tab's counterpart to the test above (M8 design doc §6, R3): a
+/// The Radio tab's counterpart to the test above (M7.1 design doc §6, R3): a
 /// station already saved in the library is both restored as the active
 /// queue entry and drawn, and listed by the browse worker's `Stations`
 /// request, all without a request reaching the server.

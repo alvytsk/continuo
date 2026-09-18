@@ -70,7 +70,7 @@ const METADATA_WORKERS: usize = 2;
 pub type EngineFactory = Box<dyn FnMut() -> EngineHandle + Send>;
 
 /// The local library files a podcast entry resolves against before it
-/// loads, and, since M8 (design doc §6, §8.1), the saved radio stations the
+/// loads, and, since M7.1 (design doc §6, §8.1), the saved radio stations the
 /// browse worker's `Stations`/`AddStation`/`RemoveStation`/`ReprobeStation`
 /// requests read and write, and `active_cover()` looks a station's logo up
 /// in.
