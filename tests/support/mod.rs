@@ -32,8 +32,10 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::Sender;
 use url::Url;
 
+use tenuto::http::channel::{SourceInterrupt, WaitHook};
 use tenuto::http::limits::Limits;
 use tenuto::http::service::HttpService;
+use tenuto::http::source::{HttpMediaSource, OpeningDeadline};
 use tenuto::media::capabilities::MediaCapabilities;
 use tenuto::media::id::{AbsolutePath, MediaId, NormalizedUrl};
 use tenuto::media::source::SourceLocation;
@@ -116,6 +118,36 @@ pub fn media(name: &str) -> MediaId {
         Ok(path) => MediaId::LocalFile(path),
         Err(error) => panic!("a literal absolute path must parse: {error}"),
     }
+}
+
+/// A `WaitHook` that does nothing, for a harness open that never needs to
+/// service anything while waiting.
+struct NoopHook;
+impl WaitHook for NoopHook {
+    fn service(&self) {}
+}
+
+/// Open `/radio` on `server` at the HTTP seam, bypassing the engine, and
+/// finish opening immediately.
+///
+/// Shared by `tests/m7_http_live.rs` and `tests/m8_no_icy_metadata.rs`, both
+/// of which only need the request the open makes, not a playing engine.
+pub fn open_station(server: &server::TestServer) -> HttpMediaSource {
+    let limits = Limits::brisk();
+    let service = HttpService::spawn(limits).unwrap_or_else(|error| panic!("service: {error}"));
+    let url = Url::parse(&server.url("/radio")).unwrap_or_else(|error| panic!("{error}"));
+    let interrupt = SourceInterrupt::new(limits.buffer_bytes);
+    let (source, opening) = HttpMediaSource::open(
+        service,
+        url,
+        interrupt,
+        Arc::new(NoopHook),
+        limits,
+        OpeningDeadline(Instant::now() + limits.open),
+    )
+    .unwrap_or_else(|error| panic!("open: {error}"));
+    opening.finish_opening();
+    source
 }
 
 struct Device {
