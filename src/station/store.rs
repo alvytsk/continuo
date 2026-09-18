@@ -350,6 +350,12 @@ impl StationStore {
     ///
     /// Reads the file. Only ever called when `cover_key` moves, never per
     /// frame — the same contract `podcast_artwork` already lives under.
+    ///
+    /// Refreshes on add and on re-probe, never mid-playback: this is R4's
+    /// one exception (§8.1) — the store is authoritative for a station's
+    /// artwork, where R4 elsewhere holds that stored identity never
+    /// overrides a live open. A re-probed station shows its new logo on its
+    /// next play, not before.
     pub fn logo_for(&self, media: &MediaId) -> Option<Url> {
         self.read_snapshot()
             .ok()?

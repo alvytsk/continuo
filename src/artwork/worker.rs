@@ -37,6 +37,24 @@ pub enum CoverSource {
     Embedded(Arc<CoverBytes>),
 }
 
+/// Hand-written because `Arc<HttpService>` is not `PartialEq`, so `derive`
+/// cannot see past it: `Remote` compares by URL alone, ignoring which
+/// `HttpService` handle carried it, and `Embedded` compares by `Arc::ptr_eq`
+/// so a re-delivered identical cover still dedups. This is the key
+/// `Artwork::requested` (`src/tui/mod.rs`) widens to, so a re-probed
+/// station's changed logo URL is a different source even though its media
+/// identity is not (M7.1 §8.1).
+impl PartialEq for CoverSource {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Local(a), Self::Local(b)) => a == b,
+            (Self::Remote { url: a, .. }, Self::Remote { url: b, .. }) => a == b,
+            (Self::Embedded(a), Self::Embedded(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        }
+    }
+}
+
 /// Loads the decoded cover for a source. Shared with the worker thread, so
 /// it must be callable from another thread.
 pub type CoverLoader =

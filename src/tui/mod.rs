@@ -54,7 +54,7 @@ use crate::application::runtime::{
     AppCommand, CoverKey, FlushReport, LibraryStores, PlayerRuntime, RuntimeParts,
 };
 use crate::application::view::PlayerView;
-use crate::artwork::worker::{ArtworkWorker, default_loader};
+use crate::artwork::worker::{ArtworkWorker, CoverSource, default_loader};
 use crate::cli::{ArtworkMode, MouseMode};
 use crate::clock::{Clock, SystemClock};
 use crate::error::{AppError, LifecycleError};
@@ -454,9 +454,12 @@ struct Artwork {
     /// Started the first time a local entry becomes active, never under
     /// `--artwork off`.
     worker: Option<ArtworkWorker>,
-    /// The entry whose cover was last requested; `None` while the active
-    /// entry has no cover source (see `PlayerRuntime::active_cover`).
-    requested: Option<MediaId>,
+    /// The entry whose cover was last requested, **and the source it was
+    /// requested from**; `None` while the active entry has no cover source
+    /// (see `PlayerRuntime::active_cover`). The source belongs in the key
+    /// because a re-probe can change a station's (or a feed's) artwork URL
+    /// without changing its media identity (M7.1 §8.1).
+    requested: Option<(MediaId, CoverSource)>,
     /// The `cover_key` last seen; the cover is resolved only when it moves,
     /// because resolving a podcast's cover reads the feed cache from disk.
     key: Option<CoverKey>,
@@ -490,20 +493,23 @@ impl Artwork {
         if key != self.key {
             self.key = key;
             match runtime.active_cover() {
-                // A key move for a media already requested (its load landed,
-                // say) resolves to the same cover; only a new entry, or one
-                // whose cover just became available, is requested.
-                Some((media, _)) if self.requested.as_ref() == Some(&media) => {}
+                // A key move for a media already requested from the same
+                // source (its load landed, say) resolves to the same cover;
+                // only a new entry, or one whose cover just became
+                // available or changed source (a re-probe, §8.1), is
+                // requested.
+                Some((media, source))
+                    if self.requested.as_ref() == Some(&(media.clone(), source.clone())) => {}
                 Some((media, source)) => {
                     self.covers.set_image(media.clone(), None);
                     let hook = self.hook;
                     self.worker
                         .get_or_insert_with(|| ArtworkWorker::spawn(default_loader(hook)))
-                        .request(media.clone(), source);
-                    self.requested = Some(media);
+                        .request(media.clone(), source.clone());
+                    self.requested = Some((media, source));
                 }
                 None => {
-                    if let Some(previous) = self.requested.take() {
+                    if let Some((previous, _)) = self.requested.take() {
                         self.covers.set_image(previous, None);
                     }
                 }
@@ -513,7 +519,7 @@ impl Artwork {
             return;
         };
         while let Some(result) = worker.try_result() {
-            if self.requested.as_ref() != Some(&result.media) {
+            if self.requested.as_ref().map(|(media, _)| media) != Some(&result.media) {
                 continue;
             }
             let image = match result.image {

@@ -389,9 +389,11 @@ impl PlayerRuntime {
     /// unchanged, so a caller resolves a cover only when it moves — and it
     /// does move without the media changing, when a load brings HTTP up or
     /// delivers the stream's embedded cover.
-    // ponytail: a feed refresh that changes an episode's artwork URL is not
-    // in the key; the new art shows on the next load. Add a cache stamp if
-    // that ever matters.
+    // A feed refresh or a station re-probe that changes an entry's artwork
+    // URL is not itself part of this key — but `load` still moves on the
+    // entry's next load, and `Artwork::requested` (src/tui/mod.rs) is keyed
+    // on the cover source as well as the media, so the new art does show on
+    // that next load (M7.1 §8.1), not merely "eventually".
     pub fn cover_key(&self) -> Option<CoverKey> {
         let queue = self.session.state().queue();
         let entry = queue.get(queue.active()?)?;
@@ -403,12 +405,19 @@ impl PlayerRuntime {
     }
 
     /// The active queue entry's identity and where its cover comes from: a
-    /// local file's own path; a podcast episode's feed artwork URL, only
-    /// once playback has opened the HTTP service — nothing is fetched for a
-    /// merely restored or enqueued episode (§8); otherwise, for a podcast
-    /// without feed art or a plain remote URL, the front cover embedded in
-    /// the stream, which exists only once that stream is loaded. `None`
-    /// when none of those applies, or there is no active entry.
+    /// local file's own path; a podcast episode's feed artwork URL or a
+    /// saved station's logo URL, only once playback has opened the HTTP
+    /// service — nothing is fetched for a merely restored or enqueued
+    /// episode or station (§8, §8.1); otherwise, for a podcast without feed
+    /// art, a remote URL no station claims, or a station with no stored
+    /// logo, the front cover embedded in the stream, which exists only once
+    /// that stream is loaded. `None` when none of those applies, or there is
+    /// no active entry.
+    ///
+    /// Artwork is R4's one exception (§8.1): elsewhere stored identity never
+    /// overrides a live open, but a podcast's feed art and a station's logo
+    /// are read straight from the store, which is authoritative for them.
+    /// Both refresh on add or re-probe/feed refresh, never mid-playback.
     pub fn active_cover(&self) -> Option<(MediaId, CoverSource)> {
         let queue = self.session.state().queue();
         let entry = queue.get(queue.active()?)?;
@@ -423,7 +432,19 @@ impl PlayerRuntime {
         };
         let source = match entry.source() {
             QueueSource::LocalFile(path) => CoverSource::Local(path.clone()),
-            QueueSource::RemoteUrl(_) => embedded()?,
+            QueueSource::RemoteUrl(_) => {
+                // A saved station's logo, from the store (§8.1) — never from
+                // the response in hand, so `prepare()` and M7's contract
+                // surface stay out of it. `self.http` is the same gate the
+                // podcast arm uses: nothing is fetched for a merely listed,
+                // enqueued or restored station.
+                let station_art = || {
+                    let http = Arc::clone(self.http.as_ref()?);
+                    let logo = self.library.as_ref()?.stations.logo_for(entry.media())?;
+                    Some(CoverSource::Remote { url: logo, http })
+                };
+                station_art().or_else(embedded)?
+            }
             QueueSource::Podcast { .. } => {
                 let feed_art = || {
                     let http = Arc::clone(self.http.as_ref()?);
