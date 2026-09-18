@@ -23,8 +23,10 @@ The rules the player and the feed commands follow, stated precisely. The [README
 
 - A range-capable server can seek and resume. This includes MP3 files with no seek index, which is most podcasts.
 - A range-less server plays through from the start. It cannot seek or resume.
-- A live stream, or a source whose continuity cannot be established, is refused.
-- A dropped connection fails. There is no automatic reconnection. Playing again makes one attempt to reopen at the preserved position.
+- A live stream (Icecast, Shoutcast v2) plays without a position bar. It cannot seek or restart, and is never resumed: pausing closes the connection and playing rejoins the live edge.
+- If a live stream drops, Tenuto reconnects with backoff for up to five minutes, then fails; Space tries once more. Stop, pause, or another track cancels it immediately.
+- A dropped connection on a finite track fails. Playing again makes one attempt to reopen at the saved position.
+- A stream that interleaves ICY metadata, an HLS playlist, or a source whose continuity cannot be established is refused.
 
 ### Seeking accuracy
 

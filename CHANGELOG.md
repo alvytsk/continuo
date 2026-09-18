@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Live HTTP radio with bounded reconnect.
+
+### Changed
+
+- A seek on a source that cannot seek no longer drops its connection.
+- Loading another track interrupts a stalled one immediately.
+
 ## [0.1.2] - 2026-09-17
 
 ### Fixed

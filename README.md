@@ -146,8 +146,14 @@ The slug is the short name you use in commands. Pass `--as` to choose it, or let
 
 - A server that supports range requests can seek and resume. Most podcast hosts do, including for MP3 files with no seek index.
 - A server without range support plays through from the start and cannot seek or resume.
-- A live stream is refused. Tenuto plays finite media only.
-- A dropped connection fails rather than reconnecting. Playing again makes one attempt to reopen at the saved position.
+- A live stream (Icecast, Shoutcast v2) plays without a position bar. It cannot seek or restart, and is never resumed: pausing closes the connection and playing rejoins the live edge.
+- If a live stream drops, Tenuto reconnects with backoff for up to five minutes, then fails; Space tries once more. Stop, pause, or another track cancels it immediately.
+- A dropped connection on a finite track fails. Playing again makes one attempt to reopen at the saved position.
+- A stream that interleaves ICY metadata, an HLS playlist, or a source whose continuity cannot be established is refused.
+
+```sh
+tenuto play https://example.org/stream
+```
 
 A seek inside an MP3 with no seek index lands on an estimate, which can be some way off on a long variable-bitrate file. Such positions are shown with a leading `~`. [Seeking accuracy](https://github.com/alvytsk/tenuto/blob/main/docs/reference.md#seeking-accuracy) explains why.
 

@@ -452,3 +452,22 @@ the plan could not name them in advance.
   public API. Neither is attempted: this amendment removes a wedge, and
   widening it into duration-estimator work was deliberately kept out of
   scope.
+
+# Milestone 7 — carried debt
+
+Findings from the M7 live-radio work that were judged fine to carry. Neither
+threatens the milestone's invariant (recovery continues a current user
+request and never seeks listening time); each is a stated limit of what M7
+plays, not a defect in what it plays.
+
+- **A Shoutcast v1 station (a bare `ICY 200 OK` status line, no HTTP version
+  token) is unplayable.** hyper parses that line as malformed and reqwest
+  surfaces it as a transport error, so the initial open fails at once and a
+  reconnect exhausts its budget against the same error on every attempt. The
+  status line never reaches `response::accept`, so no amount of ICY-header
+  handling on Tenuto's side can classify it.
+- **A stream with no ICY headers at all stays `Continuity::Unresolved` and is
+  refused,** the same as before M7 — `response::is_live` has nothing to key
+  on. The upgrade path is a station library entry with an explicit `--live`
+  override, so a listener who knows a URL is a station can say so instead of
+  waiting on header sniffing; out of scope for M7 (spec §11).
