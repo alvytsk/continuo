@@ -9,14 +9,20 @@
 
 mod support;
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use support::TestEngine;
 use support::server::{Script, TestServer};
+use tenuto::clock::SystemClock;
+use tenuto::http::limits::Limits;
+use tenuto::http::service::HttpService;
+use tenuto::library::{AddStationOutcome, add_station};
 use tenuto::playback::command::{PlaybackCommand, ResumeIntent};
 use tenuto::playback::event::PlaybackEvent;
 use tenuto::playback::reconnect::ReconnectPolicy;
 use tenuto::playback::state::PlaybackState;
+use tenuto::station::store::StationStore;
 
 /// Panics naming the offending request if any request carried the header.
 fn assert_never_asked_for_metadata(server: &TestServer, situation: &str) {
@@ -167,10 +173,25 @@ fn a_pause_then_play_rejoin_never_asks_for_metadata() {
 }
 
 #[test]
-#[ignore = "enabled by Task 4, when probe_station exists"]
 fn a_station_probe_never_asks_for_metadata() {
-    // Filled in by Task 4, once `station::probe_station` exists. That probe
-    // is exactly the "helpful" call site R2 warns about: it will assert,
-    // through `assert_never_asked_for_metadata`, that a probe request never
-    // carries `Icy-MetaData` either.
+    let server = TestServer::start(station());
+    let root = tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir: {error}"));
+    let store = StationStore::new(root.path().join("stations.json"), Arc::new(SystemClock));
+    let http =
+        HttpService::spawn(Limits::brisk()).unwrap_or_else(|error| panic!("service: {error}"));
+
+    let outcome = http
+        .handle()
+        .block_on(add_station(&http, &store, &server.url("/radio")));
+    assert!(
+        matches!(outcome, Ok(AddStationOutcome::Verified { .. })),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        server.requests().len(),
+        1,
+        "expected exactly the probe request"
+    );
+    assert_never_asked_for_metadata(&server, "a station probe");
+    server.shutdown();
 }

@@ -43,23 +43,30 @@
 
 use std::collections::BTreeSet;
 use std::num::NonZeroUsize;
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use time::OffsetDateTime;
 use url::Url;
 
+use crate::application::source::resolve_source;
 use crate::feed::cache::{CacheStore, CachedEpisode, CachedFeed};
 use crate::feed::episode::bind_feed;
 use crate::feed::error::FeedError;
 use crate::feed::parse::{ParseWarning, parse_feed};
+use crate::http::channel::{SourceInterrupt, WaitHook};
 use crate::http::document::{DocumentOutcome, DocumentRequest};
 use crate::http::error::{RemoteFailure, redact_url};
+use crate::http::limits::Limits;
 use crate::http::service::HttpService;
+use crate::http::source::{HttpMediaSource, OpeningDeadline, StationIdentity};
 use crate::lifecycle::lock::{LockError, ProfileLock};
 use crate::media::id::{FeedId, MediaId, NormalizedUrl};
 use crate::media::source::SourceLocation;
 use crate::persistence::model::PersistedCheckpoint;
 use crate::persistence::store::{LoadReason, StateSnapshot};
+use crate::station::model::{Station, choose_station_slug};
+use crate::station::store::{StationLoad, StationSnapshot, StationStore};
 use crate::subscription::model::{Subscription, choose_slug, new_feed_id, validate_slug};
 use crate::subscription::store::{SubscriptionLoad, SubscriptionSnapshot, SubscriptionStore};
 
@@ -428,6 +435,48 @@ fn load_mutating(subs: &SubscriptionStore) -> Result<SubscriptionSnapshot, FeedE
         }
     };
     Err(FeedError::SubscriptionsUnreadable { reason })
+}
+
+/// [`load_mutating`]'s counterpart for stations (M8 §4). Every `LoadReason`
+/// but `Loaded` and `Missing` (both `writable`) becomes a visible
+/// [`FeedError::StationsUnreadable`], so a station mutation never overwrites
+/// a file the store chose to preserve — the exact failure this function
+/// exists to prevent: `StationStore::load` deliberately hands back an empty,
+/// non-writable snapshot for an unreadable or unsupported-version file, and
+/// saving that snapshot back would replace the preserved file with one
+/// holding only whatever this mutation just added.
+fn load_mutating_stations(stations: &StationStore) -> Result<StationSnapshot, FeedError> {
+    let StationLoad {
+        snapshot,
+        writable,
+        reason,
+    } = stations.load();
+
+    if writable && matches!(reason, LoadReason::Loaded | LoadReason::Missing) {
+        return Ok(snapshot);
+    }
+
+    let reason = match reason {
+        LoadReason::Quarantined { moved_to } => format!(
+            "stations file was malformed and has been moved to {}",
+            moved_to.display()
+        ),
+        LoadReason::QuarantineFailed => "stations file is malformed and could not be moved \
+             aside; no station was changed"
+            .to_string(),
+        LoadReason::Unreadable => {
+            "stations file could not be read; no station was changed".to_string()
+        }
+        LoadReason::UnsupportedVersion { found } => format!(
+            "stations file is schema version {found}, which this build does not write; \
+             no station was changed"
+        ),
+        // Unreachable given the `writable` guard above: kept so this match
+        // stays exhaustive over every `LoadReason` rather than relying on a
+        // wildcard arm to paper over a future variant.
+        LoadReason::Loaded | LoadReason::Missing => "stations file is not writable".to_string(),
+    };
+    Err(FeedError::StationsUnreadable { reason })
 }
 
 /// Parses `url` and validates it against the same public-source bar
@@ -911,4 +960,268 @@ pub async fn refresh_all(
         results.push(refresh_one(http, subs, cache, &mut snapshot, index).await);
     }
     Ok(results)
+}
+
+// --- Task 4: stations (M8 §6, §10) ------------------------------------
+//
+// The add/remove/re-probe operations behind the Radio tab, and §10's
+// five-row taxonomy deciding what an add does for each probe outcome. Every
+// mutating function here goes through `load_mutating_stations`, the exact
+// counterpart of `load_mutating` above: without it, a station add or remove
+// would be free to build a fresh snapshot on top of a `stations.json`
+// `StationStore::load` just quarantined or preserved unwritable, and the
+// save that follows would silently replace user-authored data.
+
+/// One row of the Radio tab (§6, §7). `media` is the identity
+/// `station_identity_of` derived once, at add time, from the same
+/// `resolve_source` call `EnqueueItem::Url` itself resolves through — never
+/// recomputed here, so a row's enqueue and a row's drawn tick can never
+/// disagree about which queue entry is theirs.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StationRow {
+    pub slug: String,
+    pub url: Url,
+    pub media: MediaId,
+    pub identity: Option<StationIdentity>,
+}
+
+/// `AddStation`'s and `ReprobeStation`'s result (§10).
+#[derive(Clone, Debug, PartialEq)]
+pub enum AddStationOutcome {
+    /// The probe returned `Accepted::Live`: the station is stored, verified,
+    /// with the identity that came back.
+    Verified {
+        slug: String,
+        identity: StationIdentity,
+    },
+    /// The probe failed with a retryable [`RemoteFailure`]: the server said
+    /// nothing about what the URL is, so the station is stored as an
+    /// unverified candidate (§3 R1).
+    Unverified { slug: String, reason: String },
+    /// The URL was already saved. Re-probed anyway, so an add against a
+    /// duplicate still refreshes what it can; `identity` is whatever the
+    /// station now holds, whether or not this re-probe itself succeeded.
+    AlreadySaved {
+        slug: String,
+        identity: Option<StationIdentity>,
+    },
+}
+
+/// `RemoveStation`'s result (§6).
+#[derive(Clone, Debug, PartialEq)]
+pub struct RemoveStationOutcome {
+    pub slug: String,
+}
+
+/// A `WaitHook` with nothing to do, for the probe's one-shot open. Mirrors
+/// `app::InertHook` — which cannot be reused directly, being private to
+/// `app.rs` — rather than inventing a differently-shaped hook: a probe opens
+/// a real source and retires it immediately, with no worker behind it for a
+/// blocked read to hand work to.
+struct InertHook;
+
+impl WaitHook for InertHook {
+    fn service(&self) {}
+}
+
+/// Validates a station URL exactly as playback does (§10's last row), and
+/// yields the identity the queue will give it. Never echoes `input` on a
+/// parse failure: a malformed URL may itself carry a token
+/// (`application::source` Ruling 5), and `resolve_source`'s own errors are
+/// already redacted before they reach here.
+fn station_identity_of(input: &str) -> Result<(MediaId, Url), FeedError> {
+    match resolve_source(input) {
+        Ok((media, SourceLocation::Http(url))) => Ok((media, url)),
+        // A local path is not a station, and neither is anything else that
+        // resolves to a non-HTTP location.
+        Ok(_) => Err(FeedError::StationsUnreadable {
+            reason: format!("{} is not an http(s) URL", redact_url(input)),
+        }),
+        Err(error) => Err(FeedError::StationsUnreadable {
+            reason: error.to_string(),
+        }),
+    }
+}
+
+/// Probes `url` by opening the real source and reading its headers (§5).
+///
+/// Deliberately **not** a bespoke header-only request: a second
+/// classification path would be free to disagree with
+/// [`crate::http::response::accept`], and a probe that says "fine" where
+/// playback says `IcyFramingUnsupported` is worse than no probe. One
+/// connection opened and immediately retired is the price — R2 holds here
+/// exactly as it does for playback, since this calls the same `open`.
+async fn probe_station(
+    http: &Arc<HttpService>,
+    url: &Url,
+) -> Result<StationIdentity, RemoteFailure> {
+    let limits = Limits::default();
+    let interrupt = SourceInterrupt::new(limits.buffer_bytes);
+    let (source, opening) = HttpMediaSource::open(
+        Arc::clone(http),
+        url.clone(),
+        interrupt,
+        Arc::new(InertHook),
+        limits,
+        OpeningDeadline(Instant::now() + limits.open),
+    )?;
+    opening.finish_opening();
+    let identity = source.station_identity().cloned();
+    drop(source);
+    // A source that opened but is not live classified as something other
+    // than `Accepted::Live`, so it is not a station (§3 R1).
+    identity.ok_or(RemoteFailure::UnsupportedLiveMedia)
+}
+
+/// The Radio tab's listing (§6, §7). Uses [`StationStore::read_snapshot`],
+/// never `load_mutating_stations`: listing must never quarantine a file
+/// merely because it was asked to display something, the same rule
+/// [`list_feeds`] follows for subscriptions.
+pub fn list_stations(stations: &StationStore) -> Result<Vec<StationRow>, FeedError> {
+    let snapshot = stations.read_snapshot()?;
+    Ok(snapshot
+        .stations
+        .into_iter()
+        .map(|station| StationRow {
+            slug: station.slug,
+            url: station.url,
+            media: station.media,
+            identity: station.identity,
+        })
+        .collect())
+}
+
+/// Adds a station by URL (§10's table, in full):
+///
+/// | Probe outcome | Stored | Returned |
+/// | --- | --- | --- |
+/// | `Accepted::Live` | yes, with identity | `Verified` |
+/// | retryable failure | yes, `identity: None` | `Unverified` |
+/// | non-retryable failure | no | `Err` |
+/// | not live (finite, HLS, `IcyFramingUnsupported`) | no | `Err` |
+/// | URL fails validation | no | `Err`, no request made |
+///
+/// A duplicate URL — compared by [`MediaId`], not by URL text, so two
+/// spellings of one station normalize to the same station and are never
+/// saved twice — is not an error: the add resolves to the station already
+/// saved, re-probes it so the add still refreshes what it can, and reports
+/// [`AddStationOutcome::AlreadySaved`].
+pub async fn add_station(
+    http: &Arc<HttpService>,
+    stations: &StationStore,
+    url: &str,
+) -> Result<AddStationOutcome, FeedError> {
+    let (media, parsed) = station_identity_of(url)?;
+    let mut snapshot = load_mutating_stations(stations)?;
+
+    if let Some(existing) = snapshot.stations.iter().position(|s| s.media == media) {
+        let slug = snapshot.stations[existing].slug.clone();
+        if let Ok(identity) = probe_station(http, &parsed).await {
+            snapshot.stations[existing].identity = Some(identity);
+            snapshot.stations[existing].probed_at = Some(stations.now());
+            stations.save(&snapshot)?;
+        }
+        let identity = snapshot.stations[existing].identity.clone();
+        return Ok(AddStationOutcome::AlreadySaved { slug, identity });
+    }
+
+    let occupied: BTreeSet<String> = snapshot.stations.iter().map(|s| s.slug.clone()).collect();
+
+    match probe_station(http, &parsed).await {
+        Ok(identity) => {
+            let slug = choose_station_slug(identity.name.as_deref(), &parsed, &occupied)?;
+            snapshot.stations.push(Station {
+                slug: slug.clone(),
+                url: parsed,
+                media,
+                identity: Some(identity.clone()),
+                added_at: stations.now(),
+                probed_at: Some(stations.now()),
+            });
+            stations.save(&snapshot)?;
+            Ok(AddStationOutcome::Verified { slug, identity })
+        }
+        // No classification was obtained: the server said nothing about
+        // what the URL is, so it enters as an unverified candidate (§3 R1).
+        Err(failure) if failure.is_retryable() => {
+            let slug = choose_station_slug(None, &parsed, &occupied)?;
+            snapshot.stations.push(Station {
+                slug: slug.clone(),
+                url: parsed,
+                media,
+                identity: None,
+                added_at: stations.now(),
+                probed_at: None,
+            });
+            stations.save(&snapshot)?;
+            Ok(AddStationOutcome::Unverified {
+                slug,
+                reason: failure.to_string(),
+            })
+        }
+        // Positively classified as not a station: never stored (§3 R1).
+        Err(failure) => Err(FeedError::StationsUnreadable {
+            reason: format!("{} is not a live stream: {failure}", redact_url(url)),
+        }),
+    }
+}
+
+/// Drops a saved station (§6). Synchronous and network-free: unlike
+/// [`add_station`] and [`reprobe_station`], removing a station is a local
+/// edit alone (§3 R3's no-network invariant extends to it).
+pub fn remove_station(
+    stations: &StationStore,
+    slug: &str,
+) -> Result<RemoveStationOutcome, FeedError> {
+    let mut snapshot = load_mutating_stations(stations)?;
+    let before = snapshot.stations.len();
+    snapshot.stations.retain(|station| station.slug != slug);
+    if snapshot.stations.len() == before {
+        return Err(FeedError::UnknownSlug {
+            slug: slug.to_string(),
+        });
+    }
+    stations.save(&snapshot)?;
+    Ok(RemoveStationOutcome {
+        slug: slug.to_owned(),
+    })
+}
+
+/// Re-probes a saved station, refreshing its cached identity on success
+/// (§6, §10). On **any** failure the record is left exactly as it was and
+/// the failure is returned: R1 governs what may *enter* the list, never
+/// what is evicted from it, so a station that goes down between probes
+/// stays saved under its last-known identity rather than being dropped.
+pub async fn reprobe_station(
+    http: &Arc<HttpService>,
+    stations: &StationStore,
+    slug: &str,
+) -> Result<AddStationOutcome, FeedError> {
+    let mut snapshot = load_mutating_stations(stations)?;
+    let index = snapshot
+        .stations
+        .iter()
+        .position(|station| station.slug == slug)
+        .ok_or_else(|| FeedError::UnknownSlug {
+            slug: slug.to_string(),
+        })?;
+    let url = snapshot.stations[index].url.clone();
+
+    match probe_station(http, &url).await {
+        Ok(identity) => {
+            snapshot.stations[index].identity = Some(identity.clone());
+            snapshot.stations[index].probed_at = Some(stations.now());
+            stations.save(&snapshot)?;
+            Ok(AddStationOutcome::Verified {
+                slug: slug.to_owned(),
+                identity,
+            })
+        }
+        Err(failure) => Err(FeedError::StationsUnreadable {
+            reason: format!(
+                "{} could not be reprobed: {failure}",
+                redact_url(url.as_str())
+            ),
+        }),
+    }
 }
