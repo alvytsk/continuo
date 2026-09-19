@@ -101,6 +101,13 @@ pub struct RuntimeParts {
 pub enum EnqueueItem {
     Path(PathBuf),
     Url(String),
+    /// A saved station: its URL, and the name the queue row shows for it —
+    /// a bare `Url` is named by its last path segment, which for a station
+    /// is usually `stream`.
+    Station {
+        url: String,
+        title: String,
+    },
     Episode(EpisodeCandidate),
 }
 
@@ -1183,6 +1190,13 @@ fn new_entry(item: EnqueueItem) -> Result<NewQueueEntry, String> {
     let (media, display) = match item {
         EnqueueItem::Path(path) => (resolve_path(&path), DisplayMetadata::default()),
         EnqueueItem::Url(url) => (resolve_source(&url), DisplayMetadata::default()),
+        EnqueueItem::Station { url, title } => (
+            resolve_source(&url),
+            DisplayMetadata {
+                title: Some(title),
+                ..DisplayMetadata::default()
+            },
+        ),
         EnqueueItem::Episode(candidate) => {
             let fallback = candidate.enclosure.ok_or_else(|| {
                 crate::application::podcast::PodcastResolveError::NotPlayable.to_string()

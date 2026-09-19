@@ -973,7 +973,7 @@ pub async fn refresh_all(
 
 /// One row of the Radio tab (§6, §7). `media` is the identity
 /// `station_identity_of` derived once, at add time, from the same
-/// `resolve_source` call `EnqueueItem::Url` itself resolves through — never
+/// `resolve_source` call `EnqueueItem::Station` itself resolves through — never
 /// recomputed here, so a row's enqueue and a row's drawn tick can never
 /// disagree about which queue entry is theirs.
 #[derive(Clone, Debug, PartialEq)]

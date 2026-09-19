@@ -1121,7 +1121,7 @@ fn enter_on_a_station_enqueues_and_enter_again_removes_it() {
             &effects[..],
             [BrowserEffect::Enqueue(items)] if matches!(
                 &items[..],
-                [EnqueueItem::Url(enqueued)] if enqueued == url
+                [EnqueueItem::Station { url: enqueued, .. }] if enqueued == url
             )
         ),
         "{effects:?}"
@@ -1502,6 +1502,32 @@ fn a_station_queued_elsewhere_draws_a_tick_on_the_radio_tab() {
     assert_eq!(state.queued_at(0), None, "the queue is now empty");
 }
 
+/// A station URL usually ends in `/stream`, and that is what the playlist row
+/// read before the enqueue carried the station's own name.
+#[test]
+fn a_station_enqueues_under_its_icy_name_or_else_its_slug() {
+    let mut named = station_row("one", "https://one.example/stream");
+    named.identity = Some(StationIdentity {
+        name: Some("Radio One".to_owned()),
+        ..StationIdentity::default()
+    });
+    let unnamed = station_row("two", "https://two.example/stream");
+    for (row, expected) in [(named, "Radio One"), (unnamed, "two")] {
+        let mut state = radio(vec![row]);
+        let effects = press(&mut state, &[KeyCode::Enter]);
+        assert!(
+            matches!(
+                &effects[..],
+                [BrowserEffect::Enqueue(items)] if matches!(
+                    &items[..],
+                    [EnqueueItem::Station { title, .. }] if title == expected
+                )
+            ),
+            "{effects:?}"
+        );
+    }
+}
+
 #[test]
 fn enter_on_an_unqueued_station_enqueues_it() {
     let row = station_row("one", "https://one.example/stream");
@@ -1515,7 +1541,7 @@ fn enter_on_an_unqueued_station_enqueues_it() {
     };
     assert_eq!(items.len(), 1, "{items:?}");
     let media = match &items[0] {
-        EnqueueItem::Url(url) => {
+        EnqueueItem::Station { url, .. } => {
             resolve_source(url)
                 .unwrap_or_else(|error| panic!("resolve: {error}"))
                 .0

@@ -504,8 +504,8 @@ impl BrowserState {
     /// marked; the marks clear once they are enqueued. Rows already in the
     /// queue are skipped, and Enter on one alone takes it out instead.
     ///
-    /// A Radio row enqueues as `EnqueueItem::Url(station.url.to_string())`,
-    /// which `resolve_source` (M7.1 §7) resolves through the exact same
+    /// A Radio row enqueues as `EnqueueItem::Station`, titled by its icy-name
+    /// or else its slug, with `station.url.to_string()` as the URL, which `resolve_source` (M7.1 §7) resolves through the exact same
     /// `NormalizedUrl::parse` call `station_identity_of` used to derive
     /// `StationRow::media` at add time, from the same canonical `url::Url`
     /// text — so the identity this enqueue produces and the tick
@@ -533,10 +533,18 @@ impl BrowserState {
                     .get(index)
                     .map(|episode| EnqueueItem::Episode(episode.clone())),
                 (BrowserTab::Podcasts, None) => None,
-                (BrowserTab::Radio, _) => self
-                    .stations
-                    .get(index)
-                    .map(|station| EnqueueItem::Url(station.url.to_string())),
+                (BrowserTab::Radio, _) => {
+                    self.stations
+                        .get(index)
+                        .map(|station| EnqueueItem::Station {
+                            url: station.url.to_string(),
+                            title: station
+                                .identity
+                                .as_ref()
+                                .and_then(|identity| identity.name.clone())
+                                .unwrap_or_else(|| station.slug.clone()),
+                        })
+                }
             })
             .collect();
         if items.is_empty() {
