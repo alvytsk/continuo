@@ -204,8 +204,10 @@ fn the_hit_map_covers_visible_rows_the_progress_bar_and_transport() {
         buttons,
         [
             TransportButton::Previous,
+            TransportButton::SeekBack,
             TransportButton::PlayPause,
             TransportButton::Stop,
+            TransportButton::SeekForward,
             TransportButton::Next
         ]
     );
@@ -343,11 +345,9 @@ fn a_live_entry_shows_live_and_listening_time_with_no_bar_or_duration() {
         !screen.contains(" / "),
         "a live entry has no total: {screen}"
     );
-    // `progress_row` matches the first line starting with "│ [", which is
-    // also how the transport row's own Previous button ("[|<]") begins — a
-    // false positive once the bar row itself carries no bracket at all. So
-    // the bar row is checked directly, by its region, rather than through
-    // that helper.
+    // `progress_row` finds the bar row by its opening bracket, the very thing
+    // a live row must not have. So the bar row is checked directly, by its
+    // region, rather than through that helper.
     let bar_row_y = regions(Rect::new(0, 0, 100, 30), Tier::Normal).progress.y;
     let bar_line = screen
         .lines()

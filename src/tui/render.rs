@@ -9,7 +9,7 @@ mod browser;
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph, Widget, Wrap};
 
@@ -61,8 +61,10 @@ pub struct HitMap {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TransportButton {
     Previous,
+    SeekBack,
     PlayPause,
     Stop,
+    SeekForward,
     Next,
 }
 
@@ -451,19 +453,24 @@ fn draw_transport(
 ) -> Vec<(Rect, TransportButton)> {
     // Reconnecting alongside Playing: Space means pause in both (M7 §6.3),
     // so the button has to say so.
-    let play_pause = if matches!(
+    let pausing = matches!(
         view.phase,
         PlaybackPhase::Playing | PlaybackPhase::Reconnecting
-    ) {
-        "[||]"
-    } else {
-        "[>]"
-    };
+    );
+    let play_pause = if pausing { " ‖ " } else { " ▶ " };
+    // Each label is a chip: the glyph centred in a padded, filled cell run.
+    // Play and pause are both one cell wide, so the glyph holds its place
+    // when one turns into the other.
+    // The doubled triangles seek, as ← and → do. The bar on Previous and
+    // Next is `ǀ`, the single form of the pause mark, so the two stand the
+    // same height.
     let labels = [
-        ("[|<]", TransportButton::Previous),
+        (" ǀ◀ ", TransportButton::Previous),
+        (" ◀◀ ", TransportButton::SeekBack),
         (play_pause, TransportButton::PlayPause),
-        ("[■]", TransportButton::Stop),
-        ("[>|]", TransportButton::Next),
+        (" ■ ", TransportButton::Stop),
+        (" ▶▶ ", TransportButton::SeekForward),
+        (" ▶ǀ ", TransportButton::Next),
     ];
     let mut rest = area;
     if tier == Tier::Normal {
@@ -471,14 +478,24 @@ fn draw_transport(
     }
     let mut buttons = Vec::with_capacity(labels.len());
     for (label, button) in labels {
-        let line = Line::styled(label, Style::new().fg(button_color(button, theme)));
+        let style = button_style(button, theme);
+        // `‖` and `ǀ` are the bars fonts centre in their cell; bold gives
+        // them the weight of the triangles beside them.
+        let line: Line = label
+            .chars()
+            .map(|glyph| {
+                let bar = matches!(glyph, '‖' | 'ǀ');
+                let style = if bar { style.bold() } else { style };
+                Span::styled(glyph.to_string(), style)
+            })
+            .collect();
         let width = u16::try_from(line.width()).unwrap_or(u16::MAX);
         let rect = take_left(&mut rest, width);
         line.render(rect, buffer);
         if !rect.is_empty() {
             buttons.push((rect, button));
         }
-        take_left(&mut rest, 2);
+        take_left(&mut rest, 1);
     }
     if tier != Tier::Minimal {
         take_left(&mut rest, 1);
@@ -508,10 +525,10 @@ fn draw_volume(buffer: &mut Buffer, rest: &mut Rect, view: &PlayerView, theme: &
     line.render(slider, buffer);
 }
 
-fn button_color(button: TransportButton, theme: &Theme) -> Color {
+fn button_style(button: TransportButton, theme: &Theme) -> Style {
     match button {
-        TransportButton::PlayPause => theme.green,
-        _ => theme.text,
+        TransportButton::PlayPause => Style::new().bg(theme.green).fg(theme.ink),
+        _ => Style::new().bg(theme.panel).fg(theme.text),
     }
 }
 
@@ -563,13 +580,14 @@ fn draw_progress(
         line.render(bar, buffer);
         take_left(&mut bar, used);
     } else {
+        let green = Style::new().fg(theme.green);
         let glyph = match view.phase {
-            PlaybackPhase::Playing | PlaybackPhase::Reconnecting => "▶ ",
-            PlaybackPhase::Paused => "Ⅱ ",
-            _ => "",
+            PlaybackPhase::Playing | PlaybackPhase::Reconnecting => Span::styled("▶ ", green),
+            PlaybackPhase::Paused => Span::styled("‖ ", green.add_modifier(Modifier::BOLD)),
+            _ => Span::raw(""),
         };
         Line::from(vec![
-            Span::styled(glyph, Style::new().fg(theme.green)),
+            glyph,
             Span::styled(label, Style::new().fg(theme.green)),
         ])
         .render(regions.time, buffer);
