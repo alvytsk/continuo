@@ -111,8 +111,14 @@ fn mp3_flac_and_wav_play_before_the_body_completes() {
         let body_len = std::fs::metadata(support::fixture_path(fixture))
             .unwrap_or_else(|error| panic!("{fixture}: must exist: {error}"))
             .len() as usize;
-        let server =
-            TestServer::start(Script::from_fixture(fixture).trickle(512, Duration::from_millis(5)));
+        // Paced by the body's own size, so every format's transfer takes at
+        // least four seconds however small the file is. A fixed piece size
+        // gave the 81 KB MP3 well under a second, and `bytes_written` counts
+        // every connection's bytes, so a loaded CI runner that was slow to
+        // reach `Playing` saw the total pass the body's length.
+        let server = TestServer::start(
+            Script::from_fixture(fixture).trickle(body_len / 400, Duration::from_millis(10)),
+        );
         let mut engine = TestEngine::start_idle();
         engine.load_remote(&server.url(path));
         assert_eq!(engine.handle().submit_play(), Admission::Accepted);
