@@ -22,6 +22,7 @@ Every audio fixture in this directory, and what it is for:
 | `sine-noxing.mp3` | 5 s, MP3, **no Xing/LAME header** | `Continuity::Unresolved` is reachable: nothing in the container or the transport declares a length |
 | `sine-long-noxing.mp3` | 600 s, mono CBR MP3, no Xing | A rescan long enough to *time* (M3.1's seek wedge) |
 | `sine-long-vbr-noxing.mp3` | 600 s, mono, genuinely VBR, no Xing | The byte-offset estimate's actual failure mode, not just its cost |
+| `sine-22k-mono.mp3` | 5 s, 22.05 kHz mono MP3, no Xing | A reconnect whose decoder differs from the one it replaces |
 | `sine-tagged.flac` | `sine.flac` with a `TITLE` tag carrying `ESC [2J` and a newline | `--probe-only` escapes decoder metadata instead of printing it raw |
 
 M4 adds no audio fixture. `sine-5s.flac` is the one it reuses: `tests/m4_playback_identity.rs` and `tests/m4_cli.rs`'s probe test both serve it from the loopback server as a podcast episode's enclosure.
@@ -110,6 +111,23 @@ this container's demuxer can — every remote source starts at `Unknown` and
 is only promoted by a trial seek that actually lands (§6). The point of this
 fixture is narrower than that promotion: it proves the tail-`moov` file opens
 at all, which a sequential source cannot do.
+
+`sine-22k-mono.mp3` — 5 s, 440 Hz, 22050 Hz, mono, MP3 with **no
+Xing/LAME header**:
+
+    ffmpeg -f lavfi -i "sine=frequency=440:sample_rate=22050:duration=5" -ac 1 \
+      -c:a libmp3lame -b:a 64k -write_xing 0 tests/fixtures/sine-22k-mono.mp3
+
+`sine-noxing.mp3`'s deliberate mismatch. M7 §7 lets a station come back on a
+reconnect with entirely different audio parameters, and the engine has to
+build conversion for the decoder it actually got rather than the one it
+replaced — so `tests/m7_reconnect.rs` serves this 22.05 kHz mono body to the
+connection that follows a 44.1 kHz stereo one. `-write_xing 0` is
+load-bearing for the same reason it is on `sine-noxing.mp3`: a length the
+container declares would make this finite, and a reconnect that comes back
+finite is refused rather than played. Verified with `ffprobe` (22050 Hz, 1
+channel, 5.07 s) and by byte search: no `Xing`, `Info` or `VBRI` marker
+anywhere in the file.
 
 `sine-long-noxing.mp3` — 600 s (10 min), 440 Hz, 44100 Hz, mono, MP3 with
 **no Xing/LAME header**:

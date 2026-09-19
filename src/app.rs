@@ -20,7 +20,7 @@ use crate::http::service::HttpService;
 use crate::lifecycle::RunOutcome;
 use crate::lifecycle::input::InputReader;
 use crate::lifecycle::signals::ShutdownSignals;
-use crate::media::capabilities::{MediaCapabilities, SeekSupport};
+use crate::media::capabilities::{Continuity, MediaCapabilities, SeekSupport};
 use crate::media::display::{display_name, episode_name, fit_to_width, format_hms};
 use crate::media::id::MediaId;
 use crate::media::source::SourceLocation;
@@ -424,7 +424,10 @@ fn handle_keys(
             Some(command) => {
                 let optimistic = router.route(
                     engine,
-                    mirror.state == PlaybackState::Playing,
+                    matches!(
+                        mirror.state,
+                        PlaybackState::Playing | PlaybackState::Reconnecting
+                    ),
                     mirror.position,
                     mirror.duration,
                     Instant::now(),
@@ -469,6 +472,7 @@ fn run_probe_only(source: &str) -> Result<(), PlaybackError> {
         interrupt: SourceInterrupt::new(Limits::default().buffer_bytes),
         hook: Arc::new(InertHook),
         limits: Limits::default(),
+        expected: None,
     };
     let mut prepared = prepare(&location, &context)?;
 
@@ -937,10 +941,17 @@ fn status_parts(mirror: &Mirror) -> (String, String) {
     if mirror.provenance == PositionProvenance::Estimated {
         suffix.push_str(" ~est");
     }
-    let duration = mirror
-        .duration
-        .map(format_hms)
-        .unwrap_or_else(|| "--:--:--".to_string());
+    let live = mirror
+        .capabilities
+        .is_some_and(|capabilities| capabilities.continuity == Continuity::Indefinite);
+    let duration = if live {
+        "live".to_owned()
+    } else {
+        mirror
+            .duration
+            .map(format_hms)
+            .unwrap_or_else(|| "--:--:--".to_string())
+    };
     // §11: unresolved and unsupported are different facts about the same
     // `SeekSupport`, and an HTTP transport must never be reported in a way
     // that reads as live radio — neither note ever replaces the duration
@@ -1501,6 +1512,16 @@ mod tests {
             }),
             ..Mirror::default()
         }
+    }
+
+    #[test]
+    fn a_live_source_reads_live_not_as_a_duration() {
+        let mut mirror = mirror_with_capabilities(SeekSupport::Unsupported);
+        if let Some(capabilities) = mirror.capabilities.as_mut() {
+            capabilities.continuity = Continuity::Indefinite;
+        }
+        let line = status_line(&mirror);
+        assert!(line.contains("live"), "{line}");
     }
 
     #[test]

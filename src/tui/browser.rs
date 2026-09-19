@@ -17,7 +17,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 use crate::application::browse::{BrowseRequest, BrowseResult, DirEntry, EntryKind};
 use crate::application::runtime::EnqueueItem;
 use crate::application::view::QueueRow;
-use crate::library::{EpisodeCandidate, FeedSummary};
+use crate::library::{EpisodeCandidate, FeedSummary, StationRow};
 use crate::media::id::MediaId;
 use crate::queue::QueueEntryId;
 use crate::tui::input::blocks_ordinary_bindings;
@@ -26,6 +26,8 @@ use crate::tui::input::blocks_ordinary_bindings;
 pub enum BrowserTab {
     Files,
     Podcasts,
+    /// The Radio tab: saved stations (M7.1 §7).
+    Radio,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -54,6 +56,8 @@ pub struct BrowserState {
     /// The feed being viewed, by slug, and its episodes; `None` while the
     /// Podcasts tab shows the feed list.
     pub episodes: Option<(String, Vec<EpisodeCandidate>)>,
+    /// The Radio tab's saved stations (M7.1 §7).
+    pub stations: Vec<StationRow>,
     /// An index into the visible list.
     pub cursor: usize,
     /// Indices into the visible list, only ever of enqueueable rows.
@@ -95,6 +99,7 @@ impl BrowserState {
             entries: Vec::new(),
             feeds: Vec::new(),
             episodes: None,
+            stations: Vec::new(),
             cursor: 0,
             marked: BTreeSet::new(),
             loading: true,
@@ -119,6 +124,7 @@ impl BrowserState {
             (BrowserTab::Files, _) => self.entries.get(index)?.media.as_ref()?,
             (BrowserTab::Podcasts, None) => return None,
             (BrowserTab::Podcasts, Some((_, episodes))) => &episodes.get(index)?.media,
+            (BrowserTab::Radio, _) => &self.stations.get(index)?.media,
         };
         self.queued.get(media).copied()
     }
@@ -151,6 +157,11 @@ impl BrowserState {
                     self.episodes = Some((slug, list));
                 }
             }
+            BrowseResult::Stations(stations) => {
+                if self.tab == BrowserTab::Radio {
+                    self.stations = self.settle(stations);
+                }
+            }
             BrowseResult::Mutation { request, outcome } => {
                 // ponytail: an identical mutation resubmitted after a close
                 // and reopen adopts the earlier answer; both committed, and
@@ -176,12 +187,19 @@ impl BrowserState {
                         kind: NoticeKind::Err,
                     },
                 });
-                if self.tab == BrowserTab::Podcasts {
-                    self.loading = true;
-                    follow_up = Some(match &self.episodes {
-                        Some((slug, _)) => BrowseRequest::Episodes { slug: slug.clone() },
-                        None => BrowseRequest::Feeds,
-                    });
+                match self.tab {
+                    BrowserTab::Podcasts => {
+                        self.loading = true;
+                        follow_up = Some(match &self.episodes {
+                            Some((slug, _)) => BrowseRequest::Episodes { slug: slug.clone() },
+                            None => BrowseRequest::Feeds,
+                        });
+                    }
+                    BrowserTab::Radio => {
+                        self.loading = true;
+                        follow_up = Some(BrowseRequest::Stations);
+                    }
+                    BrowserTab::Files => {}
                 }
             }
         }
@@ -208,9 +226,12 @@ impl BrowserState {
     /// Up/Down/`j`/`k` move, Tab switches tabs, Enter opens or enqueues,
     /// Space marks, Backspace/Left goes back, `b`/Esc closes. On the
     /// Podcasts tab `a` prompts for a feed URL, `r`/`R` refresh one/all and
-    /// `d` asks before removing (M6 §4); the prompt and the question take
-    /// every key while they are up. A Ctrl or Alt chord does nothing, as in
-    /// the rest of the keyboard map.
+    /// `d` asks before removing (M6 §4). The Radio tab's `a`/`r`/`d` mirror
+    /// this exactly, sending `AddStation`/`ReprobeStation`/`RemoveStation`
+    /// instead (M7.1 §7); `R` stays Podcasts-only, since refreshing every feed
+    /// has no Radio equivalent. The prompt and the question take every key
+    /// while they are up. A Ctrl or Alt chord does nothing, as in the rest
+    /// of the keyboard map.
     pub fn handle_key(&mut self, key: KeyEvent) -> Vec<BrowserEffect> {
         if key.kind != KeyEventKind::Press {
             return Vec::new();
@@ -220,7 +241,11 @@ impl BrowserState {
         }
         if let Some(slug) = self.confirm.take() {
             return if key.code == KeyCode::Char('y') && !blocks_ordinary_bindings(&key) {
-                self.submit(BrowseRequest::Unsubscribe { slug })
+                let request = match self.tab {
+                    BrowserTab::Radio => BrowseRequest::RemoveStation { slug },
+                    _ => BrowseRequest::Unsubscribe { slug },
+                };
+                self.submit(request)
             } else {
                 Vec::new()
             };
@@ -255,10 +280,20 @@ impl BrowserState {
                 Vec::new()
             }
             KeyCode::Char('r') if self.can_manage() => match self.target_slug() {
-                Some(slug) => self.submit(BrowseRequest::Refresh { slug: Some(slug) }),
+                Some(slug) => {
+                    let request = match self.tab {
+                        BrowserTab::Radio => BrowseRequest::ReprobeStation { slug },
+                        _ => BrowseRequest::Refresh { slug: Some(slug) },
+                    };
+                    self.submit(request)
+                }
                 None => Vec::new(),
             },
-            KeyCode::Char('R') if self.can_manage() && !self.feeds.is_empty() => {
+            KeyCode::Char('R')
+                if self.can_manage()
+                    && self.tab == BrowserTab::Podcasts
+                    && !self.feeds.is_empty() =>
+            {
                 self.submit(BrowseRequest::Refresh { slug: None })
             }
             KeyCode::Char('d') if self.can_manage() => {
@@ -278,6 +313,7 @@ impl BrowserState {
             (BrowserTab::Files, _) => self.entries.len(),
             (BrowserTab::Podcasts, None) => self.feeds.len(),
             (BrowserTab::Podcasts, Some((_, episodes))) => episodes.len(),
+            (BrowserTab::Radio, _) => self.stations.len(),
         }
     }
 
@@ -297,20 +333,27 @@ impl BrowserState {
             (BrowserTab::Podcasts, Some((_, episodes))) => episodes
                 .get(index)
                 .is_some_and(|episode| episode.enclosure.is_some()),
+            (BrowserTab::Radio, _) => self.stations.get(index).is_some(),
         }
     }
 
-    /// Whether a management key may act: the Podcasts tab, nothing loading,
-    /// no mutation in flight.
+    /// Whether a management key may act: the Podcasts or Radio tab, nothing
+    /// loading, no mutation in flight.
     fn can_manage(&self) -> bool {
-        self.tab == BrowserTab::Podcasts && !self.loading && self.pending.is_none()
+        matches!(self.tab, BrowserTab::Podcasts | BrowserTab::Radio)
+            && !self.loading
+            && self.pending.is_none()
     }
 
-    /// The feed `r` and `d` act on: the open feed, else the cursor's row.
+    /// The slug `r` and `d` act on: on Podcasts, the open feed, else the
+    /// cursor's row; on Radio, always the cursor's station.
     fn target_slug(&self) -> Option<String> {
-        match &self.episodes {
-            Some((slug, _)) => Some(slug.clone()),
-            None => self.feeds.get(self.cursor).map(|feed| feed.slug.clone()),
+        match self.tab {
+            BrowserTab::Radio => self.stations.get(self.cursor).map(|row| row.slug.clone()),
+            _ => match &self.episodes {
+                Some((slug, _)) => Some(slug.clone()),
+                None => self.feeds.get(self.cursor).map(|feed| feed.slug.clone()),
+            },
         }
     }
 
@@ -320,9 +363,14 @@ impl BrowserState {
             BrowseRequest::Subscribe { .. } => "Subscribing…",
             BrowseRequest::Refresh { .. } => "Refreshing…",
             BrowseRequest::Unsubscribe { .. } => "Removing…",
-            BrowseRequest::Directory(_) | BrowseRequest::Feeds | BrowseRequest::Episodes { .. } => {
-                "Loading…"
-            }
+            // Sent from the Radio tab's `a`, `r` and `d` (M7.1 §7).
+            BrowseRequest::AddStation { .. } => "Adding…",
+            BrowseRequest::RemoveStation { .. } => "Removing…",
+            BrowseRequest::ReprobeStation { .. } => "Re-probing…",
+            BrowseRequest::Directory(_)
+            | BrowseRequest::Feeds
+            | BrowseRequest::Episodes { .. }
+            | BrowseRequest::Stations => "Loading…",
         };
         self.notice = Some(Notice {
             text: text.to_owned(),
@@ -333,7 +381,8 @@ impl BrowserState {
     }
 
     /// Printable characters append, Backspace pops, Enter submits the
-    /// trimmed URL (nothing when empty), Esc cancels. Shortcuts never fire.
+    /// trimmed URL (nothing when empty) as `AddStation` on the Radio tab and
+    /// `Subscribe` on Podcasts (M7.1 §7), Esc cancels. Shortcuts never fire.
     fn prompt_key(&mut self, key: KeyEvent) -> Vec<BrowserEffect> {
         match key.code {
             KeyCode::Esc => {
@@ -351,7 +400,11 @@ impl BrowserState {
                 if url.is_empty() {
                     Vec::new()
                 } else {
-                    self.submit(BrowseRequest::Subscribe { url })
+                    let request = match self.tab {
+                        BrowserTab::Radio => BrowseRequest::AddStation { url },
+                        _ => BrowseRequest::Subscribe { url },
+                    };
+                    self.submit(request)
                 }
             }
             KeyCode::Char(c) if !c.is_control() && !blocks_ordinary_bindings(&key) => {
@@ -388,6 +441,7 @@ impl BrowserState {
         self.error = None;
     }
 
+    /// Files → Podcasts → Radio → Files (M7.1 §7).
     fn switch_tab(&mut self) -> Vec<BrowserEffect> {
         self.start_loading();
         let request = match self.tab {
@@ -398,6 +452,12 @@ impl BrowserState {
                 BrowseRequest::Feeds
             }
             BrowserTab::Podcasts => {
+                self.tab = BrowserTab::Radio;
+                self.episodes = None;
+                self.stations.clear();
+                BrowseRequest::Stations
+            }
+            BrowserTab::Radio => {
                 self.tab = BrowserTab::Files;
                 self.entries.clear();
                 BrowseRequest::Directory(self.cwd.clone())
@@ -429,6 +489,7 @@ impl BrowserState {
                 Some(_) if self.enqueueable(self.cursor) => self.enqueue_selection(),
                 Some(_) => Vec::new(),
             },
+            BrowserTab::Radio => self.enqueue_selection(),
         }
     }
 
@@ -442,6 +503,13 @@ impl BrowserState {
     /// The marked rows in listing order, or the cursor's row when nothing is
     /// marked; the marks clear once they are enqueued. Rows already in the
     /// queue are skipped, and Enter on one alone takes it out instead.
+    ///
+    /// A Radio row enqueues as `EnqueueItem::Station`, titled by its icy-name
+    /// or else its slug, with `station.url.to_string()` as the URL, which `resolve_source` (M7.1 §7) resolves through the exact same
+    /// `NormalizedUrl::parse` call `station_identity_of` used to derive
+    /// `StationRow::media` at add time, from the same canonical `url::Url`
+    /// text — so the identity this enqueue produces and the tick
+    /// `queued_at` draws for the row can never disagree.
     fn enqueue_selection(&mut self) -> Vec<BrowserEffect> {
         if self.marked.is_empty()
             && let Some(id) = self.queued_at(self.cursor)
@@ -465,6 +533,18 @@ impl BrowserState {
                     .get(index)
                     .map(|episode| EnqueueItem::Episode(episode.clone())),
                 (BrowserTab::Podcasts, None) => None,
+                (BrowserTab::Radio, _) => {
+                    self.stations
+                        .get(index)
+                        .map(|station| EnqueueItem::Station {
+                            url: station.url.to_string(),
+                            title: station
+                                .identity
+                                .as_ref()
+                                .and_then(|identity| identity.name.clone())
+                                .unwrap_or_else(|| station.slug.clone()),
+                        })
+                }
             })
             .collect();
         if items.is_empty() {
@@ -493,6 +573,8 @@ impl BrowserState {
                 // the cached rows stay up until the answer lands (M6 §4).
                 vec![BrowserEffect::Request(BrowseRequest::Feeds)]
             }
+            // The Radio tab has no sub-view to leave (M7.1 §7).
+            BrowserTab::Radio => Vec::new(),
         }
     }
 }

@@ -8,12 +8,14 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use support::browse::answer;
 use support::server::{DocumentReply, Script, TestServer};
 use tenuto::application::browse::{BrowseRequest, BrowseResult, BrowseWorker};
 use tenuto::application::runtime::LibraryStores;
 use tenuto::clock::SystemClock;
 use tenuto::feed::cache::CacheStore;
 use tenuto::library::list_feeds;
+use tenuto::station::store::StationStore;
 use tenuto::subscription::store::SubscriptionStore;
 
 fn rss(title: &str) -> Vec<u8> {
@@ -43,27 +45,10 @@ fn stores(root: &Path) -> LibraryStores {
             Arc::new(SystemClock),
         ),
         cache: CacheStore::new(root.join("cache/tenuto/feeds")),
-    }
-}
-
-fn answer(
-    worker: &BrowseWorker,
-    request: BrowseRequest,
-) -> (BrowseRequest, Result<String, String>) {
-    worker.request(request);
-    let deadline = Instant::now() + Duration::from_secs(20);
-    loop {
-        if let Some(result) = worker.try_result() {
-            match result {
-                BrowseResult::Mutation { request, outcome } => return (request, outcome),
-                other => panic!("expected a mutation answer, got {other:?}"),
-            }
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the browse worker never answered"
-        );
-        std::thread::sleep(Duration::from_millis(5));
+        stations: StationStore::new(
+            root.join("data/tenuto/stations.json"),
+            Arc::new(SystemClock),
+        ),
     }
 }
 

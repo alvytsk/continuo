@@ -327,6 +327,33 @@ fn clicking_play_pause_carries_the_selection() {
 }
 
 #[test]
+fn clicking_a_seek_button_seeks_like_its_arrow_key() {
+    let view = sample_view();
+    let hits = draw_hits(&view, &UiState::new(true));
+    for (button, key) in [
+        (TransportButton::SeekBack, KeyCode::Left),
+        (TransportButton::SeekForward, KeyCode::Right),
+    ] {
+        let mut ui = UiState::new(true);
+        let rect = hits
+            .buttons
+            .iter()
+            .find(|(_, b)| *b == button)
+            .expect("seek button")
+            .0;
+        let (col, row) = centre(rect);
+        let clicked = handle_mouse(mouse_down(col, row), &hits, &mut ui, &view);
+        let pressed = handle_key(KeyEvent::from(key), &mut ui, &view);
+        let step = |effects: &[Effect]| match app(effects)[..] {
+            [AppCommand::SeekBy(step)] => Some(*step),
+            _ => None,
+        };
+        assert!(step(&clicked).is_some(), "{button:?}");
+        assert_eq!(step(&clicked), step(&pressed), "{button:?}");
+    }
+}
+
+#[test]
 fn clicking_progress_seeks_a_loaded_decoded_track_but_not_an_undecoded_one() {
     let loaded = view(
         PlaybackPhase::Playing,

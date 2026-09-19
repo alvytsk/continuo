@@ -16,7 +16,7 @@ use url::Url;
 use super::channel::{ByteChannel, HeaderOutcome, ReadOutcome, SourceInterrupt, WaitHook};
 use super::error::{Operation, Phase, RemoteFailure, redact_url};
 use super::limits::Limits;
-use super::response::{self, Accepted, Established};
+use super::response::{Accepted, Established};
 use super::service::{FetchRequest, HttpService};
 use crate::media::capabilities::{DemuxerSeek, SourceEvidence};
 
@@ -134,6 +134,17 @@ impl WaitBudget {
     }
 }
 
+/// A station identity header, trimmed, with an all-whitespace value treated
+/// as absent — the same "decorative field, never costs a station its
+/// classification" rule `icy-br`/`icy-logo` already follow (§5). Otherwise
+/// a trailing space survives into the draw, e.g. `Lofi  · 128 kbps`.
+fn trimmed_or_none(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|trimmed| !trimmed.is_empty())
+        .map(str::to_string)
+}
+
 /// The wait budget for one blocking operation: `limits.stall` once opening is
 /// over, or the smaller of `limits.stall` and however much of the opening
 /// deadline remains while it is not - tagged with which of the two it was.
@@ -164,6 +175,19 @@ fn wait_budget(
     }
 }
 
+/// The ICY identity of a live source (M7.1 §5). Every field is optional
+/// because ICY guarantees none of them: `response::is_icy` accepts a
+/// response carrying `icy-br` and no `icy-name`, and such a station is
+/// legitimately verified-but-unnamed. Display text throughout — the caller
+/// escapes it before drawing it.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct StationIdentity {
+    pub name: Option<String>,
+    pub genre: Option<String>,
+    pub bitrate_kbps: Option<u32>,
+    pub logo: Option<Url>,
+}
+
 /// Finite remote media over HTTP, read and seekable through the byte channel.
 pub struct HttpMediaSource {
     service: Arc<HttpService>,
@@ -192,6 +216,7 @@ pub struct HttpMediaSource {
     /// re-entering the channel (§8).
     retired: bool,
     consumed: u64,
+    identity: Option<StationIdentity>,
 }
 
 impl HttpMediaSource {
@@ -246,11 +271,35 @@ impl HttpMediaSource {
             }
         };
 
-        let (byte_len, byte_seekable) = match accepted.accepted {
-            Accepted::Sequential { len } => (len, false),
-            Accepted::Ranged { range } => (range.total, true),
+        let (byte_len, byte_seekable, live, identity) = match accepted.accepted {
+            Accepted::Sequential { len } => (len, false, false, None),
+            Accepted::Ranged { range } => (range.total, true, false, None),
+            Accepted::Live => (
+                None,
+                false,
+                true,
+                Some(StationIdentity {
+                    name: trimmed_or_none(accepted.headers.get("icy-name")),
+                    genre: trimmed_or_none(accepted.headers.get("icy-genre")),
+                    // A bitrate that is not a plain decimal, and a logo that
+                    // is not an absolute URL, are simply absent: a decorative
+                    // field never costs a station its classification (§5).
+                    bitrate_kbps: accepted
+                        .headers
+                        .get("icy-br")
+                        .and_then(|value| value.trim().parse::<u32>().ok()),
+                    // Only an absolute http(s) URL with a host is kept: a
+                    // `file:`/`data:`/`javascript:` value would never be
+                    // fetched by `fetch_document` anyway, and admitting it
+                    // here just persists a logo that can never load (§5).
+                    logo: accepted.headers.get("icy-logo").and_then(|value| {
+                        Url::parse(value.trim()).ok().filter(|u| {
+                            matches!(u.scheme(), "http" | "https") && u.host_str().is_some()
+                        })
+                    }),
+                }),
+            ),
         };
-        let live = response::is_live(&accepted.headers);
         let established = Established {
             total: byte_len,
             validator: accepted.validator,
@@ -291,8 +340,15 @@ impl HttpMediaSource {
             at_byte_eof: false,
             retired: false,
             consumed: 0,
+            identity,
         };
         Ok((source, opening_limits))
+    }
+
+    /// The ICY identity of a live source (M7.1 §5); `None` for finite media.
+    /// Display text: the caller escapes it.
+    pub fn station_identity(&self) -> Option<&StationIdentity> {
+        self.identity.as_ref()
     }
 
     pub fn evidence(&self) -> SourceEvidence {

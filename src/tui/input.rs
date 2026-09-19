@@ -130,6 +130,8 @@ fn left_click(
 fn transport_effect(button: TransportButton, selected: Option<QueueEntryId>) -> Effect {
     Effect::App(match button {
         TransportButton::Previous => AppCommand::Previous { selected },
+        TransportButton::SeekBack => AppCommand::SeekBy(-SEEK_STEP),
+        TransportButton::SeekForward => AppCommand::SeekBy(SEEK_STEP),
         TransportButton::PlayPause => AppCommand::PlayPause { selected },
         TransportButton::Stop => AppCommand::Stop,
         TransportButton::Next => AppCommand::Next { selected },

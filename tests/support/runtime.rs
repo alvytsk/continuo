@@ -18,6 +18,7 @@ use tenuto::persistence::store::StateStore;
 use tenuto::persistence::writer::WriterHandle;
 use tenuto::playback::engine::EngineHandle;
 use tenuto::playback::output::null_output::NullOutput;
+use tenuto::playback::reconnect::ReconnectPolicy;
 use tenuto::queue::QueueEntryId;
 use tenuto::session::Session;
 
@@ -33,6 +34,20 @@ pub fn null_engine() -> EngineFactory {
 
 pub fn rig_with(state: PersistedState) -> Rig {
     rig_with_parts(state, None, null_engine())
+}
+
+/// A rig whose engine reconnects on `policy` rather than on the production
+/// one, so a whole outage fits inside a test's patience.
+pub fn rig_with_reconnect_policy(state: PersistedState, policy: ReconnectPolicy) -> Rig {
+    rig_with_parts(
+        state,
+        None,
+        Box::new(move || {
+            let engine = EngineHandle::spawn(Box::new(NullOutput::new()));
+            engine.set_reconnect_policy(policy);
+            engine
+        }),
+    )
 }
 
 pub fn rig_with_parts(

@@ -12,21 +12,35 @@ use ratatui::widgets::{Block, Clear, Widget};
 use super::{centered_box, clock, row};
 use crate::application::browse::EntryKind;
 use crate::commands::displayable;
+use crate::media::display::fit_to_width;
 use crate::tui::browser::{BrowserState, BrowserTab, NoticeKind};
 use crate::tui::layout::{inset, take_left, take_right, visible_rows};
 use crate::tui::theme::Theme;
 
-const HINTS: &str = "enter open/add/remove · space mark · tab files/podcasts · ⌫ back · b close";
-const PODCAST_HINTS: &str =
-    "enter open/add/remove · space mark · a subscribe · r/R refresh · d remove · ⌫ back · b close";
+const HINTS: &str =
+    "enter open/add/remove · space mark · tab files/podcasts/radio · ⌫ back · b close";
+const PODCAST_HINTS: &str = "enter open/add/remove · space mark · tab files/podcasts/radio · \
+    a subscribe · r/R refresh · d remove · ⌫ back · b close";
 const NO_FEEDS: &str = "No subscriptions — press a to add a feed URL";
+// The Radio tab's hints and empty-list text (M7.1 §7).
+const RADIO_HINTS: &str = "enter add/remove · space mark · tab files/podcasts/radio · \
+    a add · r re-probe · d remove · ⌫ back · b close";
+const NO_STATIONS: &str = "No saved stations — press a to add a stream URL";
 const PROMPT: &str = "Feed URL: ";
+const RADIO_PROMPT: &str = "Stream URL: ";
 const LOADING: &str = "Loading…";
 const EMPTY_DIRECTORY: &str = "(empty directory)";
 const NO_EPISODES: &str = "No cached episodes";
 const UNTITLED: &str = "(untitled)";
+const UNREACHED: &str = "(unreached)";
 const MARK_COLUMNS: u16 = 2;
 const DETAIL_COLUMNS: u16 = 14;
+/// A verified station's identity ("genre · bitrate") needs more room than
+/// `DETAIL_COLUMNS` gives the Files/Podcasts detail column — spec §7's own
+/// example, `Lofi · 128 kbps`, is 15 characters, one past `DETAIL_COLUMNS`
+/// — so the Radio tab gets a wider column of its own rather than widening
+/// `DETAIL_COLUMNS` for every tab.
+const RADIO_DETAIL_COLUMNS: u16 = 24;
 /// The row width below which the detail column is dropped.
 const DETAIL_MIN_ROW: u16 = 40;
 
@@ -54,6 +68,7 @@ pub(super) fn draw_browser(buffer: &mut Buffer, area: Rect, browser: &BrowserSta
     let hints = match browser.tab {
         BrowserTab::Files => HINTS,
         BrowserTab::Podcasts => PODCAST_HINTS,
+        BrowserTab::Radio => RADIO_HINTS,
     };
     if body.height >= 4 {
         Line::styled(hints, Style::new().fg(theme.muted)).render(row(body, hint_y), buffer);
@@ -84,6 +99,8 @@ fn tabs(active: BrowserTab, theme: &Theme) -> Line<'static> {
         Span::styled(" Files ", style(BrowserTab::Files)),
         Span::raw(" "),
         Span::styled(" Podcasts ", style(BrowserTab::Podcasts)),
+        Span::raw(" "),
+        Span::styled(" Radio ", style(BrowserTab::Radio)),
     ])
 }
 
@@ -102,6 +119,7 @@ fn location(browser: &BrowserState) -> String {
                 .unwrap_or(slug);
             format!("Subscriptions › {}", displayable(title))
         }
+        (BrowserTab::Radio, _) => "Radio".to_owned(),
     }
 }
 
@@ -122,6 +140,7 @@ fn draw_list(buffer: &mut Buffer, area: Rect, browser: &BrowserState, theme: &Th
             (BrowserTab::Files, _) => EMPTY_DIRECTORY,
             (BrowserTab::Podcasts, None) => NO_FEEDS,
             (BrowserTab::Podcasts, Some(_)) => NO_EPISODES,
+            (BrowserTab::Radio, _) => NO_STATIONS,
         };
         Some((empty.to_owned(), theme.muted))
     } else {
@@ -156,11 +175,13 @@ fn draw_list(buffer: &mut Buffer, area: Rect, browser: &BrowserState, theme: &Th
     }
 }
 
-/// What one list row shows: its label, an optional right-hand detail, and
-/// the style both take when the row is not under the cursor.
+/// What one list row shows: its label, an optional right-hand detail (drawn
+/// in a column `detail_columns` wide when there is room), and the style both
+/// take when the row is not under the cursor.
 struct RowCells {
     label: String,
     detail: Option<String>,
+    detail_columns: u16,
     style: Style,
 }
 
@@ -176,6 +197,7 @@ fn row_cells(browser: &BrowserState, index: usize, theme: &Theme) -> Option<RowC
             RowCells {
                 label,
                 detail: None,
+                detail_columns: DETAIL_COLUMNS,
                 style: Style::new().fg(color),
             }
         }),
@@ -185,6 +207,7 @@ fn row_cells(browser: &BrowserState, index: usize, theme: &Theme) -> Option<RowC
                 Some(count) => format!("{count} episodes"),
                 None => "not refreshed".to_owned(),
             }),
+            detail_columns: DETAIL_COLUMNS,
             style: Style::new().fg(theme.text),
         }),
         (BrowserTab::Podcasts, Some((_, episodes))) => episodes.get(index).map(|episode| {
@@ -202,9 +225,57 @@ fn row_cells(browser: &BrowserState, index: usize, theme: &Theme) -> Option<RowC
                 detail: episode
                     .declared_duration
                     .map(|value| format!("({})", clock(value))),
+                detail_columns: DETAIL_COLUMNS,
                 style,
             }
         }),
+        // Slug, then identity for a verified station: genre and bitrate,
+        // joined and omitted when absent — the name is not drawn again, the
+        // slug already stands for it (M7.1 §7). An unverified station draws
+        // its URL and an unreached marker instead. Untrusted server text, so
+        // escaped the same way the Files tab's names are at line 181.
+        (BrowserTab::Radio, _) => {
+            browser
+                .stations
+                .get(index)
+                .map(|station| match &station.identity {
+                    Some(identity) => {
+                        let parts: Vec<String> = [
+                            identity.genre.as_deref().map(displayable),
+                            identity.bitrate_kbps.map(|kbps| format!("{kbps} kbps")),
+                        ]
+                        .into_iter()
+                        .flatten()
+                        .collect();
+                        let detail = (!parts.is_empty()).then(|| {
+                            // A hostile genre can be arbitrarily long and may
+                            // be full-width (CJK, emoji); a right-aligned
+                            // Line that overflows its column truncates from
+                            // the left (keeps the tail), and counting `char`s
+                            // rather than display columns would still let a
+                            // wide genre overflow the column and hit that
+                            // same left-clip. `fit_to_width` (already used
+                            // for the status row) truncates by display width
+                            // from the right instead, so the whole joined
+                            // string renders untouched whenever it already
+                            // fits, and a long one keeps its front.
+                            fit_to_width(&parts.join(" · "), usize::from(RADIO_DETAIL_COLUMNS))
+                        });
+                        RowCells {
+                            label: displayable(&station.slug),
+                            detail,
+                            detail_columns: RADIO_DETAIL_COLUMNS,
+                            style: Style::new().fg(theme.text),
+                        }
+                    }
+                    None => RowCells {
+                        label: displayable(station.url.as_str()),
+                        detail: Some(UNREACHED.to_owned()),
+                        detail_columns: RADIO_DETAIL_COLUMNS,
+                        style: Style::new().fg(theme.muted),
+                    },
+                })
+        }
     }
 }
 
@@ -244,7 +315,7 @@ fn draw_row(
     if let Some(detail) = cells.detail
         && rest.width >= DETAIL_MIN_ROW
     {
-        let column = take_right(&mut rest, DETAIL_COLUMNS);
+        let column = take_right(&mut rest, cells.detail_columns);
         take_right(&mut rest, 1);
         Line::styled(detail, style)
             .alignment(Alignment::Right)
@@ -298,10 +369,11 @@ fn draw_notice_block(
 
 fn notice_lines(browser: &BrowserState, theme: &Theme) -> Option<(Vec<String>, Color)> {
     if let Some(prompt) = &browser.prompt {
-        return Some((
-            vec![format!("{PROMPT}{}▏", displayable(prompt))],
-            theme.text,
-        ));
+        let label = match browser.tab {
+            BrowserTab::Radio => RADIO_PROMPT,
+            BrowserTab::Files | BrowserTab::Podcasts => PROMPT,
+        };
+        return Some((vec![format!("{label}{}▏", displayable(prompt))], theme.text));
     }
     if let Some(slug) = &browser.confirm {
         return Some((

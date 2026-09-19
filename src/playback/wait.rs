@@ -239,6 +239,14 @@ impl WaitService {
             // publishes none after that. If a transport is ever left running
             // unparked outside Playing/Paused, this stops being true and
             // needs revisiting.
+            //
+            // M7: `Reconnecting` keeps the transport running unparked so the
+            // ring plays out, and is included in `facts.playing` for exactly
+            // the reason this comment warns about — audio heard after a
+            // disconnect must be counted. The spans it publishes are the
+            // already-pushed frames draining; once the ring is dry the
+            // callback emits silence, which publishes no span at all, so the
+            // position stands still rather than running on.
             if facts.playing {
                 let now = (self.clock)();
                 let mut transport = lock(&self.transport);

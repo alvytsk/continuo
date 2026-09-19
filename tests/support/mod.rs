@@ -21,6 +21,7 @@
 
 #![allow(dead_code)]
 
+pub mod browse;
 pub mod server;
 
 use std::path::Path;
@@ -32,12 +33,15 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::Sender;
 use url::Url;
 
+use tenuto::http::channel::{SourceInterrupt, WaitHook};
 use tenuto::http::limits::Limits;
 use tenuto::http::service::HttpService;
+use tenuto::http::source::{HttpMediaSource, OpeningDeadline};
+use tenuto::media::capabilities::MediaCapabilities;
 use tenuto::media::id::{AbsolutePath, MediaId, NormalizedUrl};
 use tenuto::media::source::SourceLocation;
 use tenuto::playback::callback::CallbackCore;
-use tenuto::playback::command::{LoadRequestId, PlaybackCommand, ResumeIntent};
+use tenuto::playback::command::{Admission, LoadRequestId, PlaybackCommand, ResumeIntent};
 use tenuto::playback::engine::EngineHandle;
 use tenuto::playback::error::PlaybackError;
 use tenuto::playback::event::{PlaybackEvent, Progress, ShutdownReport, StartDisposition};
@@ -115,6 +119,36 @@ pub fn media(name: &str) -> MediaId {
         Ok(path) => MediaId::LocalFile(path),
         Err(error) => panic!("a literal absolute path must parse: {error}"),
     }
+}
+
+/// A `WaitHook` that does nothing, for a harness open that never needs to
+/// service anything while waiting.
+struct NoopHook;
+impl WaitHook for NoopHook {
+    fn service(&self) {}
+}
+
+/// Open `/radio` on `server` at the HTTP seam, bypassing the engine, and
+/// finish opening immediately.
+///
+/// Shared by `tests/m7_http_live.rs` and `tests/m7_1_no_icy_metadata.rs`, both
+/// of which only need the request the open makes, not a playing engine.
+pub fn open_station(server: &server::TestServer) -> HttpMediaSource {
+    let limits = Limits::brisk();
+    let service = HttpService::spawn(limits).unwrap_or_else(|error| panic!("service: {error}"));
+    let url = Url::parse(&server.url("/radio")).unwrap_or_else(|error| panic!("{error}"));
+    let interrupt = SourceInterrupt::new(limits.buffer_bytes);
+    let (source, opening) = HttpMediaSource::open(
+        service,
+        url,
+        interrupt,
+        Arc::new(NoopHook),
+        limits,
+        OpeningDeadline(Instant::now() + limits.open),
+    )
+    .unwrap_or_else(|error| panic!("open: {error}"));
+    opening.finish_opening();
+    source
 }
 
 struct Device {
@@ -211,6 +245,7 @@ impl Driver {
 pub struct Loaded {
     pub position: Duration,
     pub disposition: StartDisposition,
+    pub capabilities: MediaCapabilities,
 }
 
 /// Where a `SeekCompleted` landed, and its provenance (§3), from
@@ -394,7 +429,11 @@ impl TestEngine {
     /// `stall` deadline generous enough that draining the ring and reading
     /// the frozen position afterwards cannot itself race the brisk 500 ms
     /// one into a spurious `Failed`.
-    pub fn load_remote_with_limits(&mut self, url: &str, limits: Limits) {
+    ///
+    /// Hands back the token it allocated, so a caller that needs both custom
+    /// limits and a `PlayLoaded` for this very load can name it. Ignoring the
+    /// return value is the common case.
+    pub fn load_remote_with_limits(&mut self, url: &str, limits: Limits) -> LoadRequestId {
         let request = self.next_request();
         self.load_remote_inner(
             request,
@@ -403,6 +442,7 @@ impl TestEngine {
             Some(limits),
             true,
         );
+        request
     }
 
     /// `load_remote`, but for a load this test expects to fail rather than
@@ -477,12 +517,22 @@ impl TestEngine {
             Ok(normalized) => MediaId::RemoteUrl(normalized),
             Err(error) => panic!("test URL {url:?} must normalize: {error}"),
         };
-        self.send(PlaybackCommand::Load {
+        // Through `submit`, not the bare command channel: a remote `Load` is
+        // one of the submissions that acts on the source interrupt out of
+        // band (M7 §6.1 - it retires the source it is about to replace), so
+        // a harness that side-steps `submit` would exercise a path the
+        // application never takes.
+        let admission = self.handle().submit(PlaybackCommand::Load {
             request,
             media,
             source: SourceLocation::Http(parsed),
             resume,
         });
+        assert_eq!(
+            admission,
+            Admission::Accepted,
+            "the engine must accept the load"
+        );
         if await_paused {
             self.await_state(PlaybackState::Paused);
         }
@@ -880,6 +930,35 @@ impl TestEngine {
         }
     }
 
+    /// `await_event` with the device clock running, for an event that only
+    /// arrives once buffered audio has been played out.
+    ///
+    /// A disconnect reaches the decoder only when it next reads, and with the
+    /// clock frozen the ring stays full so it never does - the same reason
+    /// `play_until_terminal` above drives the clock rather than leaving it
+    /// frozen. Anything a *disconnect* causes is awaited through here;
+    /// anything a *command* causes is awaited with plain `await_event`.
+    ///
+    /// Closes behind the same command round trip `play_for` does, and for the
+    /// same reason. This mode does not pace the clock against the playback it
+    /// drives: while the consumer keeps up, `pump_audio` never sees a full
+    /// ring and so never returns, and the worker publishes no new position
+    /// for as long as that lasts. An event emitted the moment it finally does
+    /// return therefore arrives *before* the pass that accounts for
+    /// everything played since - so a test reading the position straight off
+    /// this event would read one from seconds of playback ago. The barrier
+    /// makes the position this returns behind the event that caused it.
+    pub fn play_until_event(
+        &mut self,
+        predicate: impl Fn(&PlaybackEvent) -> bool,
+    ) -> PlaybackEvent {
+        self.set_mode(ADVANCING);
+        let event = self.await_event(predicate);
+        self.set_mode(FROZEN);
+        self.settle();
+        event
+    }
+
     pub fn stop_draining_events(&mut self) {
         self.draining.store(false, Ordering::Relaxed);
     }
@@ -924,6 +1003,7 @@ impl TestEngine {
         let PlaybackEvent::Loaded {
             position,
             disposition,
+            capabilities,
             ..
         } = event
         else {
@@ -932,6 +1012,7 @@ impl TestEngine {
         Loaded {
             position,
             disposition,
+            capabilities,
         }
     }
 

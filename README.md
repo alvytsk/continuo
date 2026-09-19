@@ -98,21 +98,26 @@ With the mouse on, a click selects a queue row, a second click plays it, the whe
 
 ### The browser
 
-`b` opens a browser with two tabs. Files shows one directory at a time. Podcasts shows your subscriptions and their cached episodes.
+`b` opens a browser with three tabs. Files shows one directory at a time. Podcasts shows your subscriptions and their cached episodes. Radio shows your saved stations.
 
 | Key | Action |
 |---|---|
 | Up, Down, `j`, `k` | Move |
-| Tab | Switch between Files and Podcasts |
-| Enter | Open a directory or a feed. Enqueue a file or an episode. On a row already queued, remove it from the queue |
+| Tab | Switch between Files, Podcasts and Radio |
+| Enter | Open a directory or a feed. Enqueue a file, an episode or a station. On a row already queued, remove it from the queue |
 | Space | Mark several rows to enqueue together. Rows already queued are skipped |
 | Backspace, Left | Go up one level |
 | `a` (Podcasts) | Subscribe by URL |
+| `a` (Radio) | Add a station by its stream URL |
 | `r`, `R` (Podcasts) | Refresh the highlighted feed, or every feed |
+| `r` (Radio) | Re-probe the highlighted station |
 | `d` (Podcasts) | Unsubscribe after a `y` confirmation |
+| `d` (Radio) | Remove the station after a `y` confirmation |
 | `b`, Esc | Close the browser |
 
 A row already in the queue shows a green `✓`. Opening the browser never refreshes a feed. `r` and `R` do, and so does `tenuto refresh` from a shell.
+
+**Radio.** Adding a station probes its stream once: the ICY identity it reports — name, genre, bitrate, logo — comes back cached, so the list draws on a cold start without a request. A verified row draws its slug, then genre and bitrate; the name itself is not drawn again, since the slug already stands for it. A station whose probe only got a retryable failure (a `429`, a `503`, a reset connection) is saved anyway, shown by its URL with an unreached marker; `r` tries the probe again. A station's logo, when it has one and it decodes, shows in the cover pane while that station plays.
 
 ### The queue
 
@@ -146,8 +151,14 @@ The slug is the short name you use in commands. Pass `--as` to choose it, or let
 
 - A server that supports range requests can seek and resume. Most podcast hosts do, including for MP3 files with no seek index.
 - A server without range support plays through from the start and cannot seek or resume.
-- A live stream is refused. Tenuto plays finite media only.
-- A dropped connection fails rather than reconnecting. Playing again makes one attempt to reopen at the saved position.
+- A live stream (Icecast, Shoutcast v2) plays without a position bar. It cannot seek or restart, and is never resumed: pausing closes the connection and playing rejoins the live edge.
+- If a live stream drops, Tenuto reconnects with backoff for up to five minutes, then fails; Space tries once more. Stop, pause, or another track cancels it immediately.
+- A dropped connection on a finite track fails. Playing again makes one attempt to reopen at the saved position.
+- A stream that interleaves ICY metadata, an HLS playlist, or a source whose continuity cannot be established is refused.
+
+```sh
+tenuto play https://example.org/stream
+```
 
 A seek inside an MP3 with no seek index lands on an estimate, which can be some way off on a long variable-bitrate file. Such positions are shown with a leading `~`. [Seeking accuracy](https://github.com/alvytsk/tenuto/blob/main/docs/reference.md#seeking-accuracy) explains why.
 
@@ -158,6 +169,7 @@ A seek inside an MP3 with no seek index lands on an estimate, which can be some 
 | `$XDG_STATE_HOME/tenuto/state.json` | Saved positions, volume and the queue |
 | `$XDG_STATE_HOME/tenuto/logs/` | One log per player run |
 | `$XDG_DATA_HOME/tenuto/subscriptions.json` | Your subscriptions |
+| `$XDG_DATA_HOME/tenuto/stations.json` | Your saved radio stations |
 | `$XDG_CACHE_HOME/tenuto/feeds/` | Cached episode lists |
 
 On macOS these resolve to the platform's own directories. The cache and the logs can be deleted at any time. Subscriptions and saved positions cannot be recovered once deleted.

@@ -204,8 +204,10 @@ fn the_hit_map_covers_visible_rows_the_progress_bar_and_transport() {
         buttons,
         [
             TransportButton::Previous,
+            TransportButton::SeekBack,
             TransportButton::PlayPause,
             TransportButton::Stop,
+            TransportButton::SeekForward,
             TransportButton::Next
         ]
     );
@@ -328,6 +330,50 @@ fn an_estimated_duration_is_marked_like_an_estimated_position() {
         .find(|line| line.contains("Morning Tide") && line.contains("03:05"))
         .expect("the first row");
     assert!(!established.contains("~03:05"), "{established}");
+}
+
+#[test]
+fn a_live_entry_shows_live_and_listening_time_with_no_bar_or_duration() {
+    let mut now = playing(ids()[0], true, None, false);
+    now.position = Duration::from_secs(754);
+    let mut v = view(PlaybackPhase::Playing, Some(now));
+    v.live = true;
+    let screen = text(&v, &UiState::new(true), 100, 30);
+    assert!(screen.contains("LIVE"), "{screen}");
+    assert!(screen.contains("12:34"), "{screen}");
+    assert!(
+        !screen.contains(" / "),
+        "a live entry has no total: {screen}"
+    );
+    // `progress_row` finds the bar row by its opening bracket, the very thing
+    // a live row must not have. So the bar row is checked directly, by its
+    // region, rather than through that helper.
+    let bar_row_y = regions(Rect::new(0, 0, 100, 30), Tier::Normal).progress.y;
+    let bar_line = screen
+        .lines()
+        .nth(usize::from(bar_row_y))
+        .unwrap_or_default();
+    assert!(
+        !bar_line.contains('['),
+        "a live entry draws no progress bar: {screen}"
+    );
+    // Scoped to the bar row alone, not the whole screen: the transport row's
+    // volume slider legitimately draws '━' regardless of live status.
+    assert!(
+        !bar_line.contains('━'),
+        "a live entry's bar is skipped, not zero-filled: {screen}"
+    );
+}
+
+#[test]
+fn a_reconnecting_station_says_so() {
+    let mut now = playing(ids()[0], true, None, false);
+    now.position = Duration::from_secs(5);
+    let mut v = view(PlaybackPhase::Reconnecting, Some(now));
+    v.live = true;
+    v.reconnecting = true;
+    let screen = text(&v, &UiState::new(true), 100, 30);
+    assert!(screen.contains("reconnecting…"), "{screen}");
 }
 
 #[test]

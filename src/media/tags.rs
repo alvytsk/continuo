@@ -7,11 +7,12 @@
 use std::time::Duration;
 
 use symphonia::core::formats::TrackType;
-use symphonia::core::meta::{MetadataRevision, StandardVisualKey};
+use symphonia::core::meta::{Metadata, MetadataRevision, StandardVisualKey};
 
 use crate::media::id::AbsolutePath;
 use crate::playback::decode::{
-    ProbedContainer, open_local_file, probe_container, standard_names, track_duration,
+    ProbedContainer, StandardNames, open_local_file, probe_container, standard_names,
+    track_duration,
 };
 use crate::playback::error::PlaybackError;
 use crate::playback::provenance::PositionProvenance;
@@ -64,6 +65,33 @@ pub(crate) fn front_cover_of(revision: Option<&MetadataRevision>) -> (Option<Cov
     }
 }
 
+/// The names and front cover across every revision the probe queued, a newer
+/// revision's value winning. `Metadata::current` is only the *oldest*: for an
+/// MP3 that is the ID3v1 trailer — 30-byte names, no picture — queued ahead
+/// of the ID3v2 tag that holds the real ones. Drains the queue to its latest
+/// revision.
+pub(crate) fn probed_metadata(
+    mut metadata: Metadata<'_>,
+) -> (StandardNames, Option<CoverBytes>, bool) {
+    let mut names = StandardNames::default();
+    let (mut front_cover, mut cover_oversized) = (None, false);
+    loop {
+        let revision = metadata.current();
+        let newer = standard_names(revision);
+        names.title = newer.title.or(names.title);
+        names.artist = newer.artist.or(names.artist);
+        names.album = newer.album.or(names.album);
+        names.year = newer.year.or(names.year);
+        let (cover, oversized) = front_cover_of(revision);
+        if cover.is_some() || oversized {
+            (front_cover, cover_oversized) = (cover, oversized);
+        }
+        if metadata.pop().is_none() {
+            return (names, front_cover, cover_oversized);
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct LocalTags {
     pub title: Option<String>,
@@ -96,10 +124,7 @@ pub fn probe_local_tags(path: &AbsolutePath) -> Result<LocalTags, PlaybackError>
     let (duration, duration_provenance) =
         track_duration(reader.default_track(TrackType::Audio), vbr_header);
 
-    let metadata = reader.metadata();
-    let revision = metadata.current();
-    let names = standard_names(revision);
-    let (front_cover, cover_oversized) = front_cover_of(revision);
+    let (names, front_cover, cover_oversized) = probed_metadata(reader.metadata());
 
     Ok(LocalTags {
         title: names.title,

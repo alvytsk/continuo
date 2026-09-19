@@ -361,7 +361,9 @@ async fn run_fetch(
     let (mut advertised, total, resumable) = match accepted {
         Accepted::Sequential { len } => (len, len, false),
         Accepted::Ranged { range } => (range.len(), range.total, true),
+        Accepted::Live => (None, None, false),
     };
+    let live = matches!(accepted, Accepted::Live);
 
     let validator = validator_from(&headers);
     // What every resumed request compares its response against: the
@@ -479,6 +481,7 @@ async fn run_fetch(
                         // `accept` refuses a 200 past byte zero, so a
                         // resumed request can only ever be ranged.
                         Accepted::Sequential { len } => len,
+                        Accepted::Live => None,
                     };
                     response = opened.response;
                     delivered = 0;
@@ -494,10 +497,14 @@ async fn run_fetch(
         if let Some(detail) = &ended {
             tracing::debug!(delivered, detail, "body ended with a transport error");
         }
-        channel.finish(
-            generation,
-            classify_body_end(advertised, delivered, operation, ended),
-        );
+        let outcome = if live {
+            // M7 §4: every end of a live body is a disconnect, a clean one
+            // included. `Eof` here would drain to `EndOfTrack`.
+            Outcome::Failed(RemoteFailure::LiveEnded)
+        } else {
+            classify_body_end(advertised, delivered, operation, ended)
+        };
+        channel.finish(generation, outcome);
         return;
     }
 }

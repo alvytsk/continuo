@@ -4,8 +4,8 @@
 //! §6's continuity/seek table lives here, applied uniformly: `DecodedSource`
 //! already folds transport evidence into `capabilities()` (Ruling 4), so this
 //! module's job is only to build that evidence for each kind of location and
-//! then translate the two capability facts §6 refuses — `Indefinite` and
-//! `Unresolved` — into the two distinct errors R3 calls for.
+//! then translate the one capability fact §6 refuses — `Unresolved` — into
+//! the error R3 calls for.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -41,6 +41,9 @@ pub struct PrepareContext {
     pub interrupt: Arc<SourceInterrupt>,
     pub hook: Arc<dyn WaitHook>,
     pub limits: Limits,
+    /// The continuity an established session already has. A prepared source
+    /// that disagrees is refused before anything adopts it (M7 §3.5).
+    pub expected: Option<Continuity>,
 }
 
 /// Open `location` and classify it, refusing anything that is not provably
@@ -54,13 +57,16 @@ pub fn prepare(
         SourceLocation::Http(url) => open_http(url, context)?,
     };
     let capabilities = source.capabilities();
+    if let Some(expected) = context.expected
+        && expected != capabilities.continuity
+    {
+        return Err(RemoteFailure::ResourceChanged.into());
+    }
     match capabilities.continuity {
-        // R3: two different facts, two different refusals. Live media is
-        // explicitly ongoing; an unresolved source has proven neither that it
-        // ends nor that it does not.
-        Continuity::Indefinite => Err(RemoteFailure::UnsupportedLiveMedia.into()),
+        // An unresolved source has proven neither that it ends nor that it
+        // does not; it is still refused. A live one now plays (M7).
         Continuity::Unresolved => Err(RemoteFailure::ContinuityUndetermined.into()),
-        Continuity::Finite => Ok(Prepared {
+        Continuity::Finite | Continuity::Indefinite => Ok(Prepared {
             source,
             capabilities,
         }),
@@ -108,9 +114,13 @@ fn open_http(url: &Url, context: &PrepareContext) -> Result<DecodedSource, Playb
     // starts (Ruling 2).
     opening_limits.set_probe_cap(Some(context.limits.probe_bytes));
 
-    // Evidence is read off the source before it is boxed and consumed by the
-    // probe — there is no way back to it afterwards.
+    // Evidence and the station name are read off the source before it is
+    // boxed and consumed by the probe — there is no way back to it
+    // afterwards.
     let evidence = source.evidence();
+    let station = source
+        .station_identity()
+        .and_then(|identity| identity.name.clone());
     let mut hint = Hint::new();
     if let Some(extension) = extension_from_url(url) {
         hint.with_extension(&extension);
@@ -135,7 +145,11 @@ fn open_http(url: &Url, context: &PrepareContext) -> Result<DecodedSource, Playb
     // playback, so they come off here regardless of outcome: once this
     // returns, ordinary reads are bounded only by `limits.stall` (§8).
     opening_limits.finish_opening();
-    result.map_err(|error| promote_latched(error, &latch))
+    let mut decoded = result.map_err(|error| promote_latched(error, &latch))?;
+    if let Some(name) = station {
+        decoded.set_fallback_title(name);
+    }
+    Ok(decoded)
 }
 
 /// A poisoned lock means a thread already panicked while holding it; there is

@@ -95,6 +95,9 @@ pub enum Accepted {
     Ranged {
         range: ByteRange,
     },
+    /// An ongoing stream: no length, no ranges, and no end that is not a
+    /// disconnect (M7 §4).
+    Live,
 }
 
 /// What a validated response established: how its bytes may be used, the
@@ -164,16 +167,39 @@ pub fn if_range_value(validator: &Validator) -> Option<String> {
     validator.strong_etag.clone()
 }
 
-/// Explicit live/ICY semantics. Deliberately narrow: §6 forbids inferring
-/// continuity from a missing `Content-Length`, a chunked encoding, an audio
-/// MIME type or a URL suffix.
-pub fn is_live(headers: &Headers) -> bool {
-    headers.get("icy-name").is_some()
-        || headers.get("icy-metaint").is_some()
-        || headers.get("icy-br").is_some()
-        || headers
-            .get("content-type")
-            .is_some_and(|value| value.eq_ignore_ascii_case("application/vnd.apple.mpegurl"))
+fn is_hls(headers: &Headers) -> bool {
+    headers.get("content-type").is_some_and(|value| {
+        value
+            .trim()
+            .eq_ignore_ascii_case("application/vnd.apple.mpegurl")
+    })
+}
+
+/// Explicit ICY semantics. Deliberately narrow: continuity is never inferred
+/// from a missing `Content-Length`, chunked framing, a MIME type or a suffix.
+fn is_icy(headers: &Headers) -> bool {
+    headers.get("icy-name").is_some() || headers.get("icy-br").is_some()
+}
+
+/// The live classification of a *successful* response, `None` when it is not
+/// live. Called only from `accept`'s 200 and 206 arms, after status, encoding,
+/// multipart and validator checks — an error status is never audio.
+fn classify_live(headers: &Headers) -> Option<Result<(), RemoteFailure>> {
+    if is_hls(headers) {
+        return Some(Err(RemoteFailure::UnsupportedLiveMedia));
+    }
+    // Only a positive interval means the body is interleaved. StreamGuys
+    // answers every client that did not ask for metadata with
+    // `icy-metaint: 0`, so presence alone proves nothing (M7 §12 models the
+    // value as `Option<NonZeroU32>` for the same reason).
+    if headers
+        .get("icy-metaint")
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .is_some_and(|interval| interval > 0)
+    {
+        return Some(Err(RemoteFailure::IcyFramingUnsupported));
+    }
+    is_icy(headers).then_some(Ok(()))
 }
 
 /// Decide whether a response may be installed at `requested_start`.
@@ -214,6 +240,9 @@ pub fn accept(
                     reason: RangeRejection::RangeIgnored,
                 });
             }
+            if let Some(live) = classify_live(headers) {
+                return live.map(|()| Accepted::Live);
+            }
             // §7's best-effort rule cuts both ways: without a strong validator
             // we may not claim to detect a same-length replacement, but a
             // length that contradicts the total already established is
@@ -238,6 +267,15 @@ pub fn accept(
                 return Err(RemoteFailure::InvalidRange {
                     reason: RangeRejection::WrongStart,
                 });
+            }
+            if let Some(live) = classify_live(headers) {
+                live?;
+                if requested_start != 0 {
+                    return Err(RemoteFailure::InvalidRange {
+                        reason: RangeRejection::WrongStart,
+                    });
+                }
+                return Ok(Accepted::Live);
             }
             if let Some(declared) = declared_len
                 && Some(declared) != range.len()

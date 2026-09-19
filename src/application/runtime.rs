@@ -32,7 +32,7 @@ use crate::http::limits::Limits;
 use crate::http::service::HttpService;
 use crate::library::EpisodeCandidate;
 use crate::lifecycle::hooks::TestHook;
-use crate::media::capabilities::{MediaCapabilities, SeekSupport};
+use crate::media::capabilities::{Continuity, MediaCapabilities, SeekSupport};
 use crate::media::id::MediaId;
 use crate::media::source::SourceLocation;
 use crate::media::tags::CoverBytes;
@@ -55,6 +55,7 @@ use crate::queue::{
 use crate::session::{
     Action, Advance, DisplayUpdate, LoadTarget, RegisterLoadError, Removal, Session,
 };
+use crate::station::store::StationStore;
 use crate::subscription::store::SubscriptionStore;
 
 /// Shown when the engine refuses a command for want of queue room.
@@ -68,10 +69,15 @@ const METADATA_WORKERS: usize = 2;
 /// deviceless output while production uses the environment's choice.
 pub type EngineFactory = Box<dyn FnMut() -> EngineHandle + Send>;
 
-/// The local library files a podcast entry resolves against before it loads.
+/// The local library files a podcast entry resolves against before it
+/// loads, and, since M7.1 (design doc §6, §8.1), the saved radio stations the
+/// browse worker's `Stations`/`AddStation`/`RemoveStation`/`ReprobeStation`
+/// requests read and write, and `active_cover()` looks a station's logo up
+/// in.
 pub struct LibraryStores {
     pub subscriptions: SubscriptionStore,
     pub cache: CacheStore,
+    pub stations: StationStore,
 }
 
 pub struct RuntimeParts {
@@ -95,6 +101,13 @@ pub struct RuntimeParts {
 pub enum EnqueueItem {
     Path(PathBuf),
     Url(String),
+    /// A saved station: its URL, and the name the queue row shows for it —
+    /// a bare `Url` is named by its last path segment, which for a station
+    /// is usually `stream`.
+    Station {
+        url: String,
+        title: String,
+    },
     Episode(EpisodeCandidate),
 }
 
@@ -383,9 +396,11 @@ impl PlayerRuntime {
     /// unchanged, so a caller resolves a cover only when it moves — and it
     /// does move without the media changing, when a load brings HTTP up or
     /// delivers the stream's embedded cover.
-    // ponytail: a feed refresh that changes an episode's artwork URL is not
-    // in the key; the new art shows on the next load. Add a cache stamp if
-    // that ever matters.
+    // A feed refresh or a station re-probe that changes an entry's artwork
+    // URL is not itself part of this key — but `load` still moves on the
+    // entry's next load, and `Artwork::requested` (src/tui/mod.rs) is keyed
+    // on the cover source as well as the media, so the new art does show on
+    // that next load (M7.1 §8.1), not merely "eventually".
     pub fn cover_key(&self) -> Option<CoverKey> {
         let queue = self.session.state().queue();
         let entry = queue.get(queue.active()?)?;
@@ -397,12 +412,19 @@ impl PlayerRuntime {
     }
 
     /// The active queue entry's identity and where its cover comes from: a
-    /// local file's own path; a podcast episode's feed artwork URL, only
-    /// once playback has opened the HTTP service — nothing is fetched for a
-    /// merely restored or enqueued episode (§8); otherwise, for a podcast
-    /// without feed art or a plain remote URL, the front cover embedded in
-    /// the stream, which exists only once that stream is loaded. `None`
-    /// when none of those applies, or there is no active entry.
+    /// local file's own path; a podcast episode's feed artwork URL or a
+    /// saved station's logo URL, only once playback has opened the HTTP
+    /// service — nothing is fetched for a merely restored or enqueued
+    /// episode or station (§8, §8.1); otherwise, for a podcast without feed
+    /// art, a remote URL no station claims, or a station with no stored
+    /// logo, the front cover embedded in the stream, which exists only once
+    /// that stream is loaded. `None` when none of those applies, or there is
+    /// no active entry.
+    ///
+    /// Artwork is R4's one exception (§8.1): elsewhere stored identity never
+    /// overrides a live open, but a podcast's feed art and a station's logo
+    /// are read straight from the store, which is authoritative for them.
+    /// Both refresh on add or re-probe/feed refresh, never mid-playback.
     pub fn active_cover(&self) -> Option<(MediaId, CoverSource)> {
         let queue = self.session.state().queue();
         let entry = queue.get(queue.active()?)?;
@@ -417,7 +439,19 @@ impl PlayerRuntime {
         };
         let source = match entry.source() {
             QueueSource::LocalFile(path) => CoverSource::Local(path.clone()),
-            QueueSource::RemoteUrl(_) => embedded()?,
+            QueueSource::RemoteUrl(_) => {
+                // A saved station's logo, from the store (§8.1) — never from
+                // the response in hand, so `prepare()` and M7's contract
+                // surface stay out of it. `self.http` is the same gate the
+                // podcast arm uses: nothing is fetched for a merely listed,
+                // enqueued or restored station.
+                let station_art = || {
+                    let http = Arc::clone(self.http.as_ref()?);
+                    let logo = self.library.as_ref()?.stations.logo_for(entry.media())?;
+                    Some(CoverSource::Remote { url: logo, http })
+                };
+                station_art().or_else(embedded)?
+            }
             QueueSource::Podcast { .. } => {
                 let feed_art = || {
                     let http = Arc::clone(self.http.as_ref()?);
@@ -552,6 +586,11 @@ impl PlayerRuntime {
                 PersistenceStatus::Saving
             },
             last_requested: self.last_requested,
+            live: self.indefinite(),
+            reconnecting: self
+                .mirror
+                .as_ref()
+                .is_some_and(|mirror| mirror.state == PlaybackState::Reconnecting),
         }
     }
 
@@ -588,6 +627,7 @@ impl PlayerRuntime {
                     | PlaybackState::Loading
                     | PlaybackState::Playing
                     | PlaybackState::Paused
+                    | PlaybackState::Reconnecting
                     | PlaybackState::Stopped
             )
         );
@@ -599,6 +639,9 @@ impl PlayerRuntime {
             Some(PlaybackState::Ended) => PlaybackPhase::Ended,
             Some(PlaybackState::Paused) => PlaybackPhase::Paused,
             Some(PlaybackState::Playing) => PlaybackPhase::Playing,
+            // Controlled exactly like Playing by the decision table; its own
+            // phase only so a front end can say the connection is gone.
+            Some(PlaybackState::Reconnecting) => PlaybackPhase::Reconnecting,
             Some(PlaybackState::Stopped | PlaybackState::Failed) => PlaybackPhase::Stopped,
             Some(PlaybackState::Idle | PlaybackState::Loading) => PlaybackPhase::Loading,
         }
@@ -612,8 +655,19 @@ impl PlayerRuntime {
                 selected,
                 phase: self.phase(),
                 last_requested: self.last_requested,
+                live: self.indefinite(),
             },
         )
+    }
+
+    /// Whether the engine is holding indefinite media. Named for
+    /// `Continuity`, not "live", so it cannot be read as `phase`'s own local
+    /// `live` — which asks the unrelated question of whether anything is
+    /// still answering the transport keys.
+    fn indefinite(&self) -> bool {
+        self.mirror
+            .as_ref()
+            .is_some_and(|mirror| mirror.capabilities.continuity == Continuity::Indefinite)
     }
 
     /// Whether the decision table would let a seek through right now — the
@@ -644,7 +698,10 @@ impl PlayerRuntime {
         };
         let optimistic = self.router.route(
             engine,
-            mirror.state == PlaybackState::Playing,
+            matches!(
+                mirror.state,
+                PlaybackState::Playing | PlaybackState::Reconnecting
+            ),
             mirror.position,
             mirror.duration,
             Instant::now(),
@@ -1098,13 +1155,19 @@ impl PlayerRuntime {
             loaded: true,
             state: mirror.state,
             position: mirror.position,
-            duration: mirror
-                .duration
-                .map(|value| DisplayDuration {
-                    value,
-                    source: DurationSource::Decoded(mirror.duration_provenance),
-                })
-                .or(display.duration),
+            // Indefinite media has no length, so a duration a feed or a tag
+            // declared for it is wrong rather than merely unconfirmed (M7 §5).
+            duration: if mirror.capabilities.continuity == Continuity::Indefinite {
+                None
+            } else {
+                mirror
+                    .duration
+                    .map(|value| DisplayDuration {
+                        value,
+                        source: DurationSource::Decoded(mirror.duration_provenance),
+                    })
+                    .or(display.duration)
+            },
             estimated_position: mirror.provenance == PositionProvenance::Estimated,
             degraded: mirror.quality == PositionQuality::Degraded,
             buffering: mirror.buffering,
@@ -1127,6 +1190,13 @@ fn new_entry(item: EnqueueItem) -> Result<NewQueueEntry, String> {
     let (media, display) = match item {
         EnqueueItem::Path(path) => (resolve_path(&path), DisplayMetadata::default()),
         EnqueueItem::Url(url) => (resolve_source(&url), DisplayMetadata::default()),
+        EnqueueItem::Station { url, title } => (
+            resolve_source(&url),
+            DisplayMetadata {
+                title: Some(title),
+                ..DisplayMetadata::default()
+            },
+        ),
         EnqueueItem::Episode(candidate) => {
             let fallback = candidate.enclosure.ok_or_else(|| {
                 crate::application::podcast::PodcastResolveError::NotPlayable.to_string()

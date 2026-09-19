@@ -111,6 +111,10 @@ pub struct PlayerView {
     pub status: Option<String>,
     pub persistence: PersistenceStatus,
     pub last_requested: Option<QueueEntryId>,
+    /// The engine is holding indefinite media: no timeline, no seeking.
+    pub live: bool,
+    /// A live source has lost its connection and is being reconnected.
+    pub reconnecting: bool,
 }
 
 /// Every queue row, in queue order.

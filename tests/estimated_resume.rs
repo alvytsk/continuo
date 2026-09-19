@@ -108,10 +108,12 @@ impl Rig {
                     PlaybackEvent::Loaded {
                         position,
                         disposition,
+                        capabilities,
                         ..
                     } => Some(Loaded {
                         position: *position,
                         disposition: *disposition,
+                        capabilities: *capabilities,
                     }),
                     _ => None,
                 };

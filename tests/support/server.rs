@@ -131,6 +131,22 @@ pub struct Script {
     // instead of the media-serving logic below; `None` leaves every existing
     // `Script` behavior untouched.
     documents: Option<Vec<DocumentReply>>,
+    /// ICY response headers without metadata framing: a station M7 plays.
+    icy_station: bool,
+    /// An absolute `icy-logo` URL for a station fixture; `None` sends none.
+    icy_logo: Option<String>,
+    /// Overrides the station fixture's `icy-br` value; `None` sends the
+    /// default `128`.
+    icy_br: Option<String>,
+    /// Overrides the station fixture's `icy-name` value; `None` sends the
+    /// default `Test Radio`.
+    icy_name: Option<String>,
+    /// Overrides the station fixture's `icy-genre` value; `None` sends the
+    /// default `Lofi`.
+    icy_genre: Option<String>,
+    /// Connection n (1-based) is served by `sequence[n - 2]` once n > 1; the
+    /// last entry serves every later connection.
+    sequence: Vec<Script>,
 }
 
 impl Script {
@@ -275,6 +291,63 @@ impl Script {
     pub fn trickle(mut self, bytes: usize, gap: Duration) -> Self {
         self.trickle = Some((bytes, gap));
         self
+    }
+
+    /// A real Icecast mount answers `Range: bytes=0-` — which
+    /// `HttpService::fetch` always sends, even on the opening request — the
+    /// same way it answers a plain GET: a 200, no `Content-Range`. Turning
+    /// ranges off here is what makes that true of the script, so a caller
+    /// never has to remember `.without_ranges()` alongside it.
+    pub fn icy_station(mut self) -> Self {
+        self.icy_station = true;
+        self.ranges = false;
+        self
+    }
+
+    /// Sets the station fixture's `icy-logo` header (M7.1 §5). Absolute, since
+    /// a relative value is deliberately dropped by the parser under test.
+    pub fn icy_logo(mut self, url: String) -> Self {
+        self.icy_logo = Some(url);
+        self
+    }
+
+    /// Overrides the station fixture's `icy-br` header, so a malformed
+    /// bitrate can be exercised (M7.1 §5: a decorative field never costs a
+    /// station its classification).
+    pub fn icy_br(mut self, value: String) -> Self {
+        self.icy_br = Some(value);
+        self
+    }
+
+    /// Overrides the station fixture's `icy-name` header, so a value padded
+    /// with whitespace can be exercised (the parser under test must trim it).
+    pub fn icy_name(mut self, value: String) -> Self {
+        self.icy_name = Some(value);
+        self
+    }
+
+    /// Overrides the station fixture's `icy-genre` header, so a value padded
+    /// with whitespace can be exercised (the parser under test must trim it).
+    pub fn icy_genre(mut self, value: String) -> Self {
+        self.icy_genre = Some(value);
+        self
+    }
+
+    pub fn then(mut self, next: Script) -> Self {
+        self.sequence.push(next);
+        self
+    }
+
+    /// The script that answers connection `ordinal` (1-based).
+    fn for_ordinal(&self, ordinal: usize) -> &Script {
+        match ordinal.checked_sub(2) {
+            None => self,
+            Some(index) => self
+                .sequence
+                .get(index)
+                .or_else(|| self.sequence.last())
+                .unwrap_or(self),
+        }
     }
 }
 
@@ -666,7 +739,7 @@ fn write_whole_body(
     gate: &StallGate,
     bytes_written: &AtomicUsize,
 ) {
-    let endless = script.live || script.unresolved;
+    let endless = script.live || script.unresolved || script.icy_station;
     let chunked_framing = script.chunked || endless;
 
     let mut header = String::from("HTTP/1.1 200 OK\r\n");
@@ -685,6 +758,17 @@ fn write_whole_body(
     if script.live {
         header.push_str("icy-name: Test Radio\r\nicy-metaint: 16000\r\n");
     }
+    if script.icy_station {
+        let bitrate = script.icy_br.as_deref().unwrap_or("128");
+        let name = script.icy_name.as_deref().unwrap_or("Test Radio");
+        let genre = script.icy_genre.as_deref().unwrap_or("Lofi");
+        header.push_str(&format!(
+            "icy-name: {name}\r\nicy-br: {bitrate}\r\nicy-genre: {genre}\r\n"
+        ));
+        if let Some(logo) = &script.icy_logo {
+            header.push_str(&format!("icy-logo: {logo}\r\n"));
+        }
+    }
     if chunked_framing {
         header.push_str("Transfer-Encoding: chunked\r\n");
     } else {
@@ -697,7 +781,7 @@ fn write_whole_body(
     }
 
     if endless {
-        write_endless_body(stream, script, gate, bytes_written);
+        write_endless_body(stream, script, ordinal, gate, bytes_written);
     } else {
         let mut writer = BodyWriter::new(script, chunked_framing, ordinal);
         let mut offset = 0;
@@ -719,6 +803,7 @@ fn write_whole_body(
 fn write_endless_body(
     stream: &mut TcpStream,
     script: &Script,
+    ordinal: usize,
     gate: &StallGate,
     bytes_written: &AtomicUsize,
 ) {
@@ -726,7 +811,7 @@ fn write_endless_body(
         // Nothing to repeat; writing headers only is the best this can do.
         return;
     }
-    let mut writer = BodyWriter::new(script, true, 1);
+    let mut writer = BodyWriter::new(script, true, ordinal);
     let mut cursor = 0usize;
     loop {
         let take = writer.next_len(script.body.len() - cursor);
@@ -803,6 +888,7 @@ fn handle_connection(
         guard.push(recorded.clone());
         guard.len()
     };
+    let script = script.for_ordinal(ordinal);
 
     if script.stall_headers {
         gate.park();

@@ -1,6 +1,7 @@
 //! Reading and decoding a candidate cover within fixed limits (design doc
 //! M5 §9): at most 10 MiB encoded, at most 16 million decoded pixels, JPEG
-//! or PNG only. Every rejection is a typed [`ArtworkError`] rather than a
+//! or PNG — or an SVG, rasterized within a fixed 512-pixel bound with every
+//! external reference refused (M7.1 §8.2, [`super::svg`]). Every rejection is a typed [`ArtworkError`] rather than a
 //! panic or an unbounded allocation, so a hostile or merely oversized file
 //! next to a track can never cost more than these limits allow.
 
@@ -25,7 +26,7 @@ pub enum ArtworkError {
     TooLarge,
     #[error("artwork is larger than 16 million pixels")]
     TooManyPixels,
-    #[error("artwork is not JPEG or PNG")]
+    #[error("artwork is not JPEG, PNG or SVG")]
     Unsupported,
     #[error("artwork could not be decoded")]
     Corrupt,
@@ -68,13 +69,16 @@ pub fn read_limited(path: &Path) -> Result<Vec<u8>, ArtworkError> {
     Ok(bytes)
 }
 
-/// Decodes `bytes` as a bounded JPEG or PNG. Dimensions are checked, and
+/// Decodes `bytes` as a bounded JPEG, PNG or SVG. Dimensions are checked, and
 /// rejected as [`ArtworkError::TooManyPixels`], *before* any pixel data is
 /// decoded; only then does decoding proceed, with the decoder's own limits
 /// set to exactly those dimensions plus a fixed allocation ceiling.
 pub fn decode_limited(bytes: &[u8]) -> Result<image::DynamicImage, ArtworkError> {
     if bytes.len() as u64 > MAX_ENCODED_BYTES {
         return Err(ArtworkError::TooLarge);
+    }
+    if super::svg::looks_like_svg(bytes) {
+        return super::svg::decode_svg(bytes);
     }
 
     let format = image::ImageReader::new(Cursor::new(bytes))

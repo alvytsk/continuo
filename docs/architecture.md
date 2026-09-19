@@ -1,12 +1,12 @@
 # Tenuto architecture
 
-Tenuto is a keyboard-first terminal audio player for local files, finite remote audio over HTTP, and podcast episodes from RSS or Atom feeds. It ships as one Rust binary, `tenuto`, with a plain `play` command and a full-screen `tui` player.
+Tenuto is a keyboard-first terminal audio player for local files, finite remote audio over HTTP, live HTTP radio, and podcast episodes from RSS or Atom feeds. It ships as one Rust binary, `tenuto`, with a plain `play` command and a full-screen `tui` player.
 
-This document describes the system as built through milestone 6. It uses the C4 model: context, containers, components, one runtime sequence, and deployment. The design decisions behind each part live in the specs under [`superpowers/specs/`](superpowers/specs/). The acceptance records live in [`m3-acceptance.md`](m3-acceptance.md), [`m5-acceptance.md`](m5-acceptance.md) and [`m6-acceptance.md`](m6-acceptance.md). Known debt lives in [`m1-known-debt.md`](m1-known-debt.md).
+This document describes the system as built through milestone 7.1. It uses the C4 model: context, containers, components, one runtime sequence, and deployment. The design decisions behind each part live in the specs under [`superpowers/specs/`](superpowers/specs/). The acceptance records live in [`m3-acceptance.md`](m3-acceptance.md), [`m5-acceptance.md`](m5-acceptance.md), [`m6-acceptance.md`](m6-acceptance.md), [`m7-acceptance.md`](m7-acceptance.md) and [`m7.1-acceptance.md`](m7.1-acceptance.md). Known debt lives in [`m1-known-debt.md`](m1-known-debt.md).
 
 ## 1. Scope and invariants
 
-Transport and media semantics are separate. HTTP does not by itself make media finite, seekable, resumable, or live. Tenuto refuses a live stream instead of playing it.
+Transport and media semantics are separate. HTTP does not by itself make media finite, seekable, resumable, or live. A live stream plays as indefinite media: it cannot seek, never completes, and is never checkpointed.
 
 The one invariant every other rule serves:
 
@@ -15,6 +15,8 @@ The one invariant every other rule serves:
 The position contract:
 
 > **Position** is the session's logical resume point. It advances from estimated playback of media frames. Stop and transport recreation preserve it. Restoration, media selection, explicit restart, and successful seeks establish a new position.
+
+For indefinite media, position is listening time: audio heard since the load. It survives reconnect, pause and stop, excludes silence, and is never a resume point or a seek target. `capabilities.continuity` says which meaning applies.
 
 A position carries two independent labels:
 
@@ -27,7 +29,7 @@ Provenance is sticky. Decoding forward from an estimated landing stays `Estimate
 
 Other fixed rules:
 
-- Nothing plays, fetches, or refreshes on its own. Every network request follows an explicit user action.
+- Nothing plays, fetches or refreshes on its own. Every network request follows an explicit user action. Reconnect attempts for a live stream continue a current Play: they are cancellable at once, bounded, and never start or resume after a process restart.
 - Feed listings never write files. A corrupt cache is reported and left in place.
 - A partial success never exits zero.
 - Every URL in a message or a log line has passed `redact_url` first.
@@ -278,7 +280,11 @@ Every event carries the `session_rev` the application keys its rendering on. `En
 
 Lifecycle events, seek outcomes, end of track, and errors are ordered and lossless. Progress is keep-latest and may be coalesced. Diagnostics such as dropped spans and xruns accumulate into one aggregated `Warning`. The event channel reserves `RESERVED_EVENT_SLOTS` (9) for terminal and protected outcomes, so a backlog of ordinary events can never starve the outcome the application waits for. Ordinary events that do not fit wait in `pending_events` under the `PENDING_CAP` drop-and-displace policy.
 
+The worker's `PlaybackState` moves through `Idle`, `Loading`, `Playing`, `Paused`, `Reconnecting`, `Stopped`, `Ended` and `Failed`. `Reconnecting` exists only for indefinite media (§7.5): entered from `Playing` on a disconnect, it returns to `Playing` on a successful fresh open, or falls out to `Paused`, `Stopped` or `Failed` the same way `Playing` would.
+
 Cancellation is out of band. An interrupt word carries separate stop, shutdown and `SEEK` bits. A blocked read must wake for a seek, and a seek must not cancel its own first attempt. `SourceInterrupt::frozen` is a level, not an edge. A pause persists until a play, and every wait re-tests the flag on each wake.
+
+**Out-of-band submission.** `submit_seek` retires the source only when it can seek. `submit_pause` closes an indefinite source instead of freezing it. An admitted `Load` retires the source it replaces.
 
 ### 7.2 Position accounting
 
@@ -320,6 +326,32 @@ A seek's deadline bounds source I/O, not demuxer work over the 64 KiB `MediaSour
 
 The buffer plus one chunk is the application's bound. HTTP/2 stream and connection windows are set from the same two numbers. HTTP/1.1 has no equivalent knob in reqwest, so that path's library buffering is not part of the stated cap. Redirect policy is shared by media and document fetches: hop cap, loop detection, scheme check, and refusal of an HTTPS to HTTP downgrade.
 
+### 7.5 Live media
+
+`Worker::is_indefinite()` is the one place above `http` that reads `capabilities.continuity`; nothing else sees a body mode. One sequence, `Worker::fresh_open`, serves every case that (re)opens an indefinite source: a reconnect attempt, Play from `Paused`, Play from `Stopped`, and Play from `Failed` on an established station.
+
+1. Retire the source interrupt and drop whatever is still open first. The session shares one `SourceInterrupt`, and dropping an `HttpMediaSource` retires it through its own `Drop`, so an old decoder left in place would retire the very generation the next step begins.
+2. `prepare(descriptor, expected = Indefinite)`, cancellable; a mismatched continuity fails with `ResourceChanged` before anything is adopted.
+3. Check for cancellation; a cancelled prepare is abandoned with nothing adopted.
+4. Capture the old transport's final played position, if one exists, and tear it down, discarding its ring.
+5. Adopt the prepared source. Capabilities are unchanged by construction, so no `CapabilitiesChanged` is published.
+6. `open_transport(playing = false)` at the captured anchor, then prime until at least one frame is staged; a read error, decode error or cancellation here is a failed attempt, not a success.
+7. Check for cancellation once more, then start running and announce `StateChanged(Playing)`.
+
+Success is step 7, not the return of any earlier call. `reinstall()` is never used on this path: a fresh decoder may differ in sample rate or channel count, and only `open_transport` configures conversion for the source it is given.
+
+**Disconnect** (indefinite media, state `Playing`, not a cancellation): the source returning `Ok(None)`, a retryable `RemoteFailure` from a read (the 15 s stall timeout included), or a fatal decode error. Entering `Reconnecting`: retire the fetch and decoder, leave the output transport running so the ring plays out, announce `StateChanged(Reconnecting)`, record `outage_started` if unset, and schedule `next_attempt_at`. The reconnect loop runs from the worker's own pass, never from a sleep, so a pause, stop, replacing load or shutdown ends an attempt at once rather than after it finishes.
+
+`ReconnectPolicy` and `Outage` (`src/playback/reconnect.rs`) hold the timing as pure data:
+
+| Item | Default |
+|---|---|
+| Backoff | 1 s, 2 s, 4 s, 8 s, then 15 s, repeating |
+| Budget | 5 min of wall time from `outage_started`, evaluated only when an attempt or a playing connection fails; an in-flight open is not cut short by it |
+| Outage ends | after 30 s of sustained playback (listening time advanced, not bytes or decoded frames) |
+| Non-retryable failure | `Failed` at once |
+| Pause, Stop, a new Load, Shutdown | clear the outage; a `Play` from `Failed` therefore always starts with a fresh budget |
+
 ## 8. Identity and capabilities
 
 `SourceLocation` names a local path or an HTTP URL. Continuity and seek support are separate axes. `Continuity::Unresolved` differs from `Indefinite`. `SeekSupport::Unknown` differs from `Unsupported`.
@@ -333,6 +365,8 @@ The buffer plus one chunk is the application's bound. HTTP/2 stream and connecti
 | `Finite` | `Native` or `RestartAndDiscard` | `Supported` |
 
 `RestartAndDiscard` exists in the type and is never constructed. No code path attempts it.
+
+The `Indefinite` row plays: a live stream is accepted rather than refused, with resume capability `Unsupported` because there is nothing to resume. `http::response::Accepted` gains `Live` beside `Sequential` and `Ranged` and remains the only body-mode model a response is classified into.
 
 Canonical `MediaId` strings:
 
@@ -473,6 +507,8 @@ and `/docs`, so the 17 MB of audio fixtures stay out of it.
 - **The library layer is async but does synchronous filesystem work between awaits.** The CLI blocks a `main` with nothing else to do. The terminal player keeps that work on the browse worker.
 - **Feed formats.** RSS 2.0 and Atom 1.0 only. RSS 1.0 and JSON Feed are refused by name. Bytes decide the encoding. An undecodable document is refused, not repaired.
 - **Out of scope for v0.1.** Streaming services, yt-dlp, media servers, equalizer, themes, plugins, a daemon and client split, remote control, MPRIS and media keys. The spectrum analyzer is the one visual addition the M5 spec allowed.
-- **Known limitations.** Non-UTF-8 paths. Estimated position where the device reports no latency. Seek support that stays `Unknown` until probed. Symphonia reads an embedded picture in full while probing, before the 10 MiB artwork cap applies.
+- **Known limitations.** Non-UTF-8 paths. Estimated position where the device reports no latency. Seek support that stays `Unknown` until probed. Symphonia reads an embedded picture in full while probing, before the 10 MiB artwork cap applies. Shoutcast v1 (`ICY 200 OK`) and streams without ICY headers are not playable (`docs/m1-known-debt.md`).
+- **Live radio, next.** ICY now-playing titles (M7.2) are the planned follow-up: a pure demultiplexer ahead of Symphonia, a generation-keyed latest-value slot, and a droppable `StreamMetadata` event. Not implemented; recorded in the M7 spec §12 so the seams are in the right place.
+- **Radio tab and stations.json (M7.1).** A saved-station list, `stations.json`, mirrors `subscriptions.json` in atomicity and quarantine behavior. A probe opens the real source through `HttpMediaSource::open` rather than a bespoke header-only request, so a station's verified identity can never disagree with what playback itself would classify. A station's logo is fetched and decoded (SVG via `resvg` 0.48, `default-features = false`, both `image_href_resolver` halves closed) only on add or re-probe, never mid-playback — the one exception to the rule that stored identity is never authority over a live open.
 
-The reference acceptance scenario is the Radio-T flow: subscribe, list, play an episode, seek, stop, play again and resume, quit, start again and resume from the last checkpoint. The automated suites cover it against a local test server with no public-network dependency. The manual terminal checks for M5 and M6 are recorded as pending in their acceptance documents.
+The reference acceptance scenario is the Radio-T flow: subscribe, list, play an episode, seek, stop, play again and resume, quit, start again and resume from the last checkpoint. The automated suites cover it against a local test server with no public-network dependency. The manual terminal checks for M5, M6, M7 and M7.1 are recorded as pending in their acceptance documents.
