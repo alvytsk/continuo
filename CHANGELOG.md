@@ -9,12 +9,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Live HTTP radio with bounded reconnect.
+- Live HTTP radio. An Icecast or Shoutcast v2 stream plays without a
+  position bar, from `tenuto play <url>` or the queue. It cannot seek or
+  restart and is never resumed: pausing closes the connection and playing
+  rejoins the live edge.
+- A live stream that drops reconnects with backoff for up to five minutes,
+  then fails; Space tries once more. Stop, pause or another track cancels
+  the reconnect immediately.
+- A Radio tab in the browser over the saved stations: `a` adds a station by
+  its stream URL, `r` re-probes it, `d` removes it after a `y`
+  confirmation, Enter enqueues it. A row shows the station's slug, genre
+  and bitrate from the ICY identity cached when it was added, so the tab
+  lists without a network request.
+- Stations are saved in `$XDG_DATA_HOME/tenuto/stations.json`.
+- A station's logo shows in the cover pane while that station plays.
+- SVG cover art, rasterized within a fixed size with every external
+  reference refused.
+- Seek buttons in the transport row: `◀◀` and `▶▶` step ten seconds, as
+  ← and → do.
 
 ### Changed
 
 - A seek on a source that cannot seek no longer drops its connection.
 - Loading another track interrupts a stalled one immediately.
+- A live stream is no longer refused. A stream that interleaves ICY
+  metadata and an HLS playlist still are, and the message now names HLS.
+- The transport controls are filled buttons with solid glyphs, and the row
+  holds still when play turns to pause.
+
+### Fixed
+
+- An MP3 with both an ID3v2 tag and an ID3v1 trailer showed the trailer's
+  30-byte title and no cover. The ID3v2 title and cover now win.
 
 ## [0.1.2] - 2026-09-17
 
