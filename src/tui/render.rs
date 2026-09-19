@@ -32,6 +32,8 @@ pub struct Visuals<'a> {
     pub cover: CoverView<'a>,
     /// One level per band, 0.0 to 1.0.
     pub spectrum: Option<&'a [f32]>,
+    /// Each band's falling peak, 0.0 to 1.0; drawn as a cap above its bar.
+    pub peaks: Option<&'a [f32]>,
     /// Drawn while `UiState::overlay` is `Overlay::Browser`.
     pub browser: Option<&'a BrowserState>,
 }
@@ -116,7 +118,15 @@ const LEVELS: [&str; 9] = [" ", "▁", "▂", "▃", "▄", "▅", "▆", "▇",
 const FLAT_BANDS: usize = 24;
 /// A band at or above this level gets an amber cap on its top cell.
 const PEAK_LEVEL: f32 = 0.8;
+/// The spectrum height below which no row is given up to band numbers.
+const LABELLED_MIN_ROWS: u16 = 5;
+/// A band's falling peak: a light rule, thinner than the thinnest block, and
+/// continuous across the columns of a wide bar.
+const PEAK_CAP: &str = "─";
 const VOLUME_COLUMNS: usize = 10;
+/// The transport row width below which the compact tier has no slider: the
+/// buttons, `reconnecting…` and the slider would no longer fit.
+const SLIDER_MIN_ROW: u16 = 64;
 const MARKER_COLUMNS: u16 = 2;
 const NUMBER_COLUMNS: u16 = 4;
 /// Rows below the last entry, like an editor past the end of a file.
@@ -136,7 +146,7 @@ pub fn draw(
 ) -> HitMap {
     let area = frame.area();
     let tier = tier_for(area.width, area.height);
-    let regions = regions(area, tier);
+    let regions = regions(area, tier, info_line_count(view));
     let theme = Theme::default();
     let buffer = frame.buffer_mut();
     buffer.set_style(area, Style::new().fg(theme.text));
@@ -149,18 +159,19 @@ pub fn draw(
     if tier != Tier::Minimal {
         bordered(&theme).render(regions.player, buffer);
     }
-    draw_status(buffer, regions.status, view, ui, tier, &theme);
+    let slider = has_volume_slider(tier, regions.transport);
+    draw_status(buffer, regions.status, view, ui, slider, &theme);
     if let Some(cover) = regions.cover {
         match visuals.cover {
             CoverView::Placeholder => draw_cover_placeholder(buffer, cover, &theme),
             CoverView::Image(widget) => widget.render_cover(cover, buffer),
         }
     }
-    draw_info(buffer, &regions, view, tier, &theme);
+    draw_info(buffer, &regions, view, &theme);
     if let Some(spectrum) = regions.spectrum {
-        draw_spectrum(buffer, spectrum, visuals.spectrum, &theme);
+        draw_spectrum(buffer, spectrum, visuals.spectrum, visuals.peaks, &theme);
     }
-    let buttons = draw_transport(buffer, regions.transport, view, tier, &theme);
+    let buttons = draw_transport(buffer, regions.transport, view, tier, slider, &theme);
     let progress = draw_progress(buffer, &regions, view, tier, &theme);
     let rows = draw_queue(buffer, regions.queue, view, ui, tier, &theme);
     draw_footer(buffer, regions.footer, view, &theme);
@@ -287,14 +298,25 @@ fn centred(line: Line<'_>, area: Rect) -> Line<'_> {
     }
 }
 
+/// Whether the transport row ends in the volume slider: in the normal tier,
+/// and in the compact one when the row is wide enough to keep the buttons
+/// and the state beside it.
+fn has_volume_slider(tier: Tier, transport: Rect) -> bool {
+    match tier {
+        Tier::Normal => true,
+        Tier::Compact => transport.width >= SLIDER_MIN_ROW,
+        _ => false,
+    }
+}
+
 /// The brand on the left and the session flags on the right. The volume
-/// lives here except in the normal tier, whose transport row has a slider.
+/// lives here unless the transport row has a slider.
 fn draw_status(
     buffer: &mut Buffer,
     area: Rect,
     view: &PlayerView,
     ui: &UiState,
-    tier: Tier,
+    slider: bool,
     theme: &Theme,
 ) {
     let mut rest = area;
@@ -309,7 +331,7 @@ fn draw_status(
     take_left(&mut rest, 1);
     let muted = Style::new().fg(theme.muted);
     let mouse = if ui.mouse_capture { "on" } else { "off" };
-    let flags = if tier == Tier::Normal {
+    let flags = if slider {
         format!(" mouse {mouse} ")
     } else {
         format!(" vol {}% · mouse {mouse} ", view.volume.percent())
@@ -349,52 +371,77 @@ fn draw_cover_placeholder(buffer: &mut Buffer, area: Rect, theme: &Theme) {
     }
 }
 
-/// The title, and in the normal tier the artist beneath it and then the
-/// album with its year.
-fn draw_info(buffer: &mut Buffer, regions: &Regions, view: &PlayerView, tier: Tier, theme: &Theme) {
-    let area = regions.info;
+/// The information lines there are to show: the title, the artist when
+/// known, and the album with its year when either is.
+fn info_lines<'a>(view: &'a PlayerView, theme: &Theme) -> Vec<Line<'a>> {
     let Some(now) = &view.now_playing else {
-        Line::styled(NOTHING_PLAYING, Style::new().fg(theme.muted)).render(area, buffer);
-        return;
+        return vec![Line::styled(NOTHING_PLAYING, Style::new().fg(theme.muted))];
     };
-    Line::styled(
+    let mut lines = vec![Line::styled(
         now.title.as_str(),
         Style::new().fg(theme.cream).add_modifier(Modifier::BOLD),
-    )
-    .render(row(area, area.y), buffer);
-    if tier != Tier::Normal {
-        return;
-    }
+    )];
     if let Some(artist) = &now.artist {
-        Line::styled(artist.as_str(), Style::new().fg(theme.text))
-            .render(row(area, area.y.saturating_add(1)), buffer);
+        lines.push(Line::styled(artist.as_str(), Style::new().fg(theme.text)));
     }
     let release: Vec<&str> = [now.album.as_deref(), now.year.as_deref()]
         .into_iter()
         .flatten()
         .collect();
     if !release.is_empty() {
-        Line::styled(release.join(" · "), Style::new().fg(theme.muted))
-            .render(row(area, area.y.saturating_add(2)), buffer);
+        lines.push(Line::styled(
+            release.join(" · "),
+            Style::new().fg(theme.muted),
+        ));
+    }
+    lines
+}
+
+/// How many information lines `view` has, for [`regions`].
+pub fn info_line_count(view: &PlayerView) -> u16 {
+    u16::try_from(info_lines(view, &Theme::default()).len()).unwrap_or(u16::MAX)
+}
+
+/// As many of the information lines as the tier gave rows to.
+fn draw_info(buffer: &mut Buffer, regions: &Regions, view: &PlayerView, theme: &Theme) {
+    let area = regions.info;
+    for (line, y) in info_lines(view, theme)
+        .into_iter()
+        .zip(area.top()..area.bottom())
+    {
+        line.render(row(area, y), buffer);
     }
 }
 
 /// Flat bars without analysis; otherwise each bar's level in eighths of a
 /// row, never below the floor glyph, with an amber cap on a loud bar. Bars
-/// are equally wide with a one-column gap between them: one per band when
-/// the width allows, otherwise as many as fit, each sampling the nearest
-/// band. When every bar is at least two columns wide and the area at least
-/// three rows tall, the bottom row numbers the bands instead.
-fn draw_spectrum(buffer: &mut Buffer, area: Rect, levels: Option<&[f32]>, theme: &Theme) {
+/// are equally wide with a one-column gap between them, as wide as one bar
+/// per band allows, and as many as then fit: fewer than the bands sample the
+/// nearest band, more than the bands interpolate between neighbours, so the
+/// row is full at every width. They end at the right edge, in line with the
+/// progress bar; less than a bar's worth of columns is left empty on the
+/// left. When every bar is at least two columns wide and the area tall
+/// enough to spare a row, the bottom row numbers the bars instead. A peak
+/// is a cream cap in the row it has fallen to, while that row is above the
+/// bar.
+fn draw_spectrum(
+    buffer: &mut Buffer,
+    area: Rect,
+    levels: Option<&[f32]>,
+    peaks: Option<&[f32]>,
+    theme: &Theme,
+) {
     let levels = levels.filter(|levels| !levels.is_empty());
     let bands = levels.map_or(FLAT_BANDS, <[f32]>::len);
     let width = usize::from(area.width);
-    let bars_count = bands.min(width.div_ceil(2));
-    if width == 0 || bars_count == 0 {
+    if width == 0 {
         return;
     }
-    let slot = (width + 1) / bars_count;
-    let labelled = slot >= 3 && bars_count == bands && area.height >= 3;
+    // Every bar owns a slot ending in its gap; the last gap is off the area.
+    let slot = ((width + 1) / bands).max(2);
+    let bars_count = (width + 1) / slot;
+    let spare = (width + 1) % slot;
+    let labelled = slot >= 3 && area.height >= LABELLED_MIN_ROWS;
     let bars = Rect {
         height: area.height.saturating_sub(u16::from(labelled)),
         ..area
@@ -404,16 +451,35 @@ fn draw_spectrum(buffer: &mut Buffer, area: Rect, levels: Option<&[f32]>, theme:
         return;
     }
     let labels = Style::new().fg(theme.muted);
-    for (column, x) in (area.left()..area.right()).enumerate() {
-        let bar = column / slot;
-        if bar >= bars_count || column % slot == slot - 1 {
-            continue;
+    let level_of = |levels: Option<&[f32]>, band: usize| {
+        levels
+            .and_then(|levels| levels.get(band))
+            .copied()
+            .filter(|level| level.is_finite())
+            .unwrap_or(0.0)
+            .clamp(0.0, 1.0)
+    };
+    // A bar's value: its nearest band, or between two when bars outnumber bands.
+    let value_of = |values: Option<&[f32]>, bar: usize| {
+        if bars_count <= bands {
+            return level_of(values, bar * bands / bars_count);
         }
-        let band = bar * bands / bars_count;
-        if labelled && column % slot == 0 {
-            let number = format!("{:02}", band + 1);
+        let at = (bar * (bands - 1)) as f32 / (bars_count - 1) as f32;
+        let low = at.floor();
+        // `at` is within [0, bands - 1].
+        let band = low as usize;
+        let next = level_of(values, (band + 1).min(bands - 1));
+        level_of(values, band) + (next - level_of(values, band)) * (at - low)
+    };
+    // The float is clamped to [0, height × 8] before the cast.
+    let eighths_of = |level: f32| ((level * (height * 8) as f32).round() as usize).max(1);
+    for bar in 0..bars_count {
+        // Below `width`, which came from a `u16`.
+        let left = area.x.saturating_add((spare + bar * slot) as u16);
+        if labelled {
+            let number = format!("{:02}", bar + 1);
             let cell = Rect {
-                x,
+                x: left,
                 y: bars.bottom(),
                 width: 2,
                 height: 1,
@@ -421,23 +487,25 @@ fn draw_spectrum(buffer: &mut Buffer, area: Rect, levels: Option<&[f32]>, theme:
             .intersection(area);
             Line::styled(number, labels).render(cell, buffer);
         }
-        let level = levels
-            .and_then(|levels| levels.get(band))
-            .copied()
-            .filter(|level| level.is_finite())
-            .unwrap_or(0.0)
-            .clamp(0.0, 1.0);
-        // The float is clamped to [0, height × 8] before the cast.
-        let eighths = ((level * (height * 8) as f32).round() as usize).max(1);
+        let level = value_of(levels, bar);
+        let eighths = eighths_of(level);
         let top = (eighths - 1) / 8;
-        for (from_bottom, y) in (bars.top()..bars.bottom()).rev().enumerate() {
-            let fill = eighths.saturating_sub(from_bottom * 8).min(8);
-            let color = if from_bottom == top && level >= PEAK_LEVEL {
-                theme.amber
-            } else {
-                theme.green
-            };
-            if let Some(cell) = buffer.cell_mut((x, y)) {
+        let cap = Some((eighths_of(value_of(peaks, bar)) - 1) / 8).filter(|cap| *cap > top);
+        for x in (left..).take(slot - 1) {
+            for (from_bottom, y) in (bars.top()..bars.bottom()).rev().enumerate() {
+                let Some(cell) = buffer.cell_mut((x, y)) else {
+                    continue;
+                };
+                if cap == Some(from_bottom) {
+                    cell.set_symbol(PEAK_CAP).set_fg(theme.cream);
+                    continue;
+                }
+                let fill = eighths.saturating_sub(from_bottom * 8).min(8);
+                let color = if from_bottom == top && level >= PEAK_LEVEL {
+                    theme.amber
+                } else {
+                    theme.green
+                };
                 cell.set_symbol(LEVELS[fill]).set_fg(color);
             }
         }
@@ -449,6 +517,7 @@ fn draw_transport(
     area: Rect,
     view: &PlayerView,
     tier: Tier,
+    slider: bool,
     theme: &Theme,
 ) -> Vec<(Rect, TransportButton)> {
     // Reconnecting alongside Playing: Space means pause in both (M7 §6.3),
@@ -473,7 +542,7 @@ fn draw_transport(
         (" ▶ǀ ", TransportButton::Next),
     ];
     let mut rest = area;
-    if tier == Tier::Normal {
+    if slider {
         draw_volume(buffer, &mut rest, view, theme);
     }
     let mut buttons = Vec::with_capacity(labels.len());
@@ -847,22 +916,87 @@ fn row(area: Rect, y: u16) -> Rect {
 mod tests {
     use super::*;
 
-    #[test]
-    fn the_spectrum_fills_the_width_with_evenly_spaced_bars() {
-        let area = Rect::new(0, 0, 38, 4);
-        let mut buffer = Buffer::empty(area);
-        draw_spectrum(&mut buffer, area, Some(&[1.0; 24]), &Theme::default());
-        let drawn: Vec<bool> = (0..38).map(|x| buffer[(x, 3)].symbol() != " ").collect();
-        // 19 one-column bars, one gap each, the last column left over.
-        let expected: Vec<bool> = (0..38).map(|x| x % 2 == 0 && x < 37).collect();
-        assert_eq!(drawn, expected);
+    /// The drawn runs of `y`, as (first column, width).
+    fn runs(buffer: &Buffer, width: u16, y: u16) -> Vec<(u16, u16)> {
+        let mut runs: Vec<(u16, u16)> = Vec::new();
+        for x in 0..width {
+            if buffer[(x, y)].symbol() == " " {
+                continue;
+            }
+            match runs.last_mut() {
+                Some((start, len)) if *start + *len == x => *len += 1,
+                _ => runs.push((x, 1)),
+            }
+        }
+        runs
+    }
 
-        let area = Rect::new(0, 0, 100, 4);
+    #[test]
+    fn the_spectrum_ends_at_the_right_edge_with_equal_bars() {
+        // Widths a 21- or 24-band row does not divide, as a resized window gives.
+        for (width, bands) in [(38, 24), (60, 21), (76, 21), (100, 24), (39, 10)] {
+            let area = Rect::new(0, 0, width, 4);
+            let mut buffer = Buffer::empty(area);
+            draw_spectrum(
+                &mut buffer,
+                area,
+                Some(&vec![1.0; bands]),
+                None,
+                &Theme::default(),
+            );
+            let bars = runs(&buffer, width, 0);
+            let case = format!("{width} columns, {bands} bands: {bars:?}");
+            assert!(
+                bars.len() >= bands.min(usize::from(width).div_ceil(2)),
+                "{case}"
+            );
+            // Less than a bar and its gap is spare, all of it on the left.
+            assert!(bars.first().is_some_and(|bar| bar.0 <= bar.1), "{case}");
+            assert_eq!(bars.last().map(|bar| bar.0 + bar.1), Some(width), "{case}");
+            assert!(
+                bars.windows(2)
+                    .all(|pair| pair[0].0 + pair[0].1 + 1 == pair[1].0),
+                "{case}"
+            );
+            assert!(bars.iter().all(|bar| bar.1 == bars[0].1), "{case}");
+        }
+    }
+
+    #[test]
+    fn bars_beyond_the_bands_interpolate_between_neighbours() {
+        // Four bands in nine columns: five one-column bars.
+        let area = Rect::new(0, 0, 9, 8);
         let mut buffer = Buffer::empty(area);
-        draw_spectrum(&mut buffer, area, Some(&[1.0; 24]), &Theme::default());
-        let drawn: Vec<bool> = (0..100).map(|x| buffer[(x, 2)].symbol() != " ").collect();
-        // 24 three-column bars in four-column slots: 95 columns used.
-        let expected: Vec<bool> = (0..100).map(|x| x % 4 != 3 && x < 95).collect();
-        assert_eq!(drawn, expected);
+        draw_spectrum(
+            &mut buffer,
+            area,
+            Some(&[0.0, 0.5, 0.5, 1.0]),
+            None,
+            &Theme::default(),
+        );
+        let full_rows = |x: u16| (0..8).filter(|y| buffer[(x, *y)].symbol() == "█").count();
+        let heights: Vec<usize> = (0..9).step_by(2).map(full_rows).collect();
+        // The ends are the outer bands; the second bar is between 0.0 and 0.5.
+        assert_eq!(heights, [0, 3, 4, 5, 8]);
+    }
+
+    #[test]
+    fn a_peak_cap_floats_above_its_bar() {
+        let area = Rect::new(0, 0, 3, 4);
+        let mut buffer = Buffer::empty(area);
+        let theme = Theme::default();
+        // Bars one row tall; the first band's peak is up in the third row.
+        draw_spectrum(
+            &mut buffer,
+            area,
+            Some(&[0.25, 0.25]),
+            Some(&[0.75, 0.25]),
+            &theme,
+        );
+        let column = |x: u16| -> Vec<&str> { (0..4).map(|y| buffer[(x, y)].symbol()).collect() };
+        assert_eq!(column(0), [" ", PEAK_CAP, " ", "█"]);
+        assert_eq!(buffer[(0, 1)].fg, theme.cream);
+        // A peak resting on its bar's top cell is the bar itself.
+        assert_eq!(column(2), [" ", " ", " ", "█"]);
     }
 }

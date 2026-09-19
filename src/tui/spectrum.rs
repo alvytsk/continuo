@@ -7,8 +7,12 @@
 //! playback; otherwise the drawn levels decay. The clock check is the view's
 //! own, so a worker that is late clearing a stale frame cannot freeze the
 //! row.
+//!
+//! Each band also keeps a peak: where its bar last reached, held for
+//! [`PEAK_HOLD`] and then falling at [`PEAK_FALL_PER_SECOND`], slower than
+//! the bar, and never below it.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use ratatui::layout::Rect;
 
@@ -19,6 +23,11 @@ use crate::playback::spectrum::worker::{SpectrumFrame, frame_is_fresh};
 
 /// How much of each drawn level survives a draw without a fresh frame.
 pub const DECAY_PER_DRAW: f32 = 0.85;
+
+/// How long a peak stays where its bar left it before it starts to fall.
+pub const PEAK_HOLD: Duration = Duration::from_millis(500);
+/// How much of the full height a falling peak loses each second.
+pub const PEAK_FALL_PER_SECOND: f32 = 0.5;
 
 /// Whether the analysis worker should be running for this frame.
 pub fn wants_analysis(spectrum: Option<Rect>, phase: PlaybackPhase) -> bool {
@@ -55,6 +64,10 @@ impl<'a> DrawSource<'a> {
 #[derive(Debug, Default)]
 pub struct SpectrumDisplay {
     levels: Vec<f32>,
+    peaks: Vec<f32>,
+    /// When each peak was last pushed up by its bar.
+    raised: Vec<Instant>,
+    updated: Option<Instant>,
 }
 
 impl SpectrumDisplay {
@@ -76,10 +89,42 @@ impl SpectrumDisplay {
                 }
             }
         }
+        self.settle_peaks(now);
+    }
+
+    /// Lifts each peak to its bar; one past its hold falls by the time since
+    /// the last update, down to the bar at most.
+    fn settle_peaks(&mut self, now: Instant) {
+        let elapsed = self.updated.map_or(Duration::ZERO, |updated| {
+            now.saturating_duration_since(updated)
+        });
+        self.updated = Some(now);
+        let fall = PEAK_FALL_PER_SECOND * elapsed.as_secs_f32();
+        self.peaks.resize(self.levels.len(), 0.0);
+        self.raised.resize(self.levels.len(), now);
+        for ((peak, raised), level) in self
+            .peaks
+            .iter_mut()
+            .zip(&mut self.raised)
+            .zip(&self.levels)
+        {
+            if now.saturating_duration_since(*raised) > PEAK_HOLD {
+                *peak -= fall;
+            }
+            if *peak <= *level {
+                *peak = *level;
+                *raised = now;
+            }
+        }
     }
 
     /// `None` until any levels were drawn: the row then shows flat bars.
     pub fn levels(&self) -> Option<&[f32]> {
         (!self.levels.is_empty()).then_some(self.levels.as_slice())
+    }
+
+    /// Each band's peak, alongside [`Self::levels`].
+    pub fn peaks(&self) -> Option<&[f32]> {
+        (!self.peaks.is_empty()).then_some(self.peaks.as_slice())
     }
 }

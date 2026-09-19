@@ -401,6 +401,7 @@ fn run_loop(
                 .map_or(CoverView::Placeholder, CoverView::Image),
             browser: browsing.state.as_ref(),
             spectrum: spectrum.levels(),
+            peaks: spectrum.peaks(),
         };
         // Checked again at the last moment: a worker's fatal panic can
         // restore the primary screen while this pass prepares its frame, and
@@ -428,7 +429,12 @@ fn update_spectrum(
 ) -> io::Result<()> {
     let size = terminal.size()?;
     let area = Rect::new(0, 0, size.width, size.height);
-    let row = regions(area, tier_for(area.width, area.height)).spectrum;
+    let row = regions(
+        area,
+        tier_for(area.width, area.height),
+        render::info_line_count(view),
+    )
+    .spectrum;
     let frame = runtime.spectrum().and_then(|handle| {
         handle.set_enabled(wants_analysis(row, view.phase));
         handle.latest()
@@ -559,7 +565,8 @@ impl Artwork {
                     ProtocolType::Sixel | ProtocolType::Iterm2
                 )
             });
-        let cover = regions(area, tier_for(area.width, area.height))
+        // The cover is the same however many information lines there are.
+        let cover = regions(area, tier_for(area.width, area.height), 1)
             .cover
             .filter(|_| !covered);
         self.covers.prepare(self.picker.as_ref(), self.mode, cover);

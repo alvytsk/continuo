@@ -78,8 +78,10 @@ fn all_rects(regions: &Regions) -> Vec<Rect> {
 
 #[test]
 fn tiers_follow_the_smallest_matching_dimension() {
-    assert_eq!(tier_for(100, 20), Tier::Compact);
+    assert_eq!(tier_for(100, 22), Tier::Compact);
     assert_eq!(tier_for(60, 40), Tier::Compact);
+    assert_eq!(tier_for(100, 21), Tier::Short);
+    assert_eq!(tier_for(60, 18), Tier::Short);
     assert_eq!(tier_for(80, 28), Tier::Normal);
     assert_eq!(tier_for(49, 40), Tier::Minimal);
     assert_eq!(tier_for(120, 17), Tier::Minimal);
@@ -98,12 +100,19 @@ fn regions_are_valid_for_zero_and_tiny_areas() {
         Rect::new(7, 3, 20, 5),
         Rect::new(7, 3, 45, 16),
         Rect::new(7, 3, 100, 20),
+        Rect::new(7, 3, 100, 24),
         Rect::new(7, 3, 100, 30),
         Rect::new(u16::MAX - 2, u16::MAX - 2, 2, 2),
     ];
-    for tier in [Tier::Resize, Tier::Minimal, Tier::Compact, Tier::Normal] {
+    for tier in [
+        Tier::Resize,
+        Tier::Minimal,
+        Tier::Short,
+        Tier::Compact,
+        Tier::Normal,
+    ] {
         for area in areas {
-            let regions = regions(area, tier);
+            let regions = regions(area, tier, 3);
             for rect in all_rects(&regions) {
                 assert!(within(rect, area), "{tier:?} {area:?}: {rect:?} escapes");
             }
@@ -217,16 +226,75 @@ fn the_hit_map_covers_visible_rows_the_progress_bar_and_transport() {
 }
 
 #[test]
-fn compact_drops_secondary_metadata_at_mixed_dimensions() {
+fn a_title_alone_gets_the_full_width_and_leaves_its_rows_to_the_spectrum() {
+    let title = "#459 – DeepSeek, China, OpenAI, NVIDIA, xAI, TSMC, Stargate";
+    let mut now = playing(ids()[0], true, Some(decoded(185)), false);
+    now.title = title.into();
+    let full = text(
+        &view(PlaybackPhase::Playing, Some(now.clone())),
+        &UiState::new(true),
+        100,
+        30,
+    );
+    assert!(full.contains(title), "{full}");
+    (now.artist, now.album, now.year) = (None, None, None);
+    let alone = text(
+        &view(PlaybackPhase::Playing, Some(now)),
+        &UiState::new(true),
+        100,
+        30,
+    );
+    assert!(alone.contains(title), "{alone}");
+    // The rows the artist and album gave up go to the spectrum above the time.
+    let time_row = |screen: &str| screen.lines().position(|row| row.contains("▶ 01:02"));
+    assert_eq!(time_row(&full), time_row(&alone));
+}
+
+#[test]
+fn compact_keeps_the_artist_and_short_drops_secondary_metadata() {
     let v = view(
         PlaybackPhase::Playing,
         Some(playing(ids()[0], true, None, false)),
     );
-    for (w, h) in [(100, 20), (60, 40)] {
+    for (w, h) in [(100, 24), (60, 40)] {
         let screen = text(&v, &UiState::new(true), w, h);
+        assert!(screen.contains("Morning Tide"), "{w}x{h}\n{screen}");
+        assert!(screen.contains("Harbor"), "{w}x{h}\n{screen}");
         assert!(!screen.contains("Coast"), "{w}x{h}\n{screen}");
-        assert!(screen.contains("Morning Tide"));
     }
+    let short = text(&v, &UiState::new(true), 100, 20);
+    assert!(short.contains("Morning Tide"), "{short}");
+    assert!(
+        !short.contains("Harbor") && !short.contains("Coast"),
+        "{short}"
+    );
+}
+
+#[test]
+fn compact_puts_the_time_over_a_bracketed_bar_and_a_slider_where_it_fits() {
+    let v = view(
+        PlaybackPhase::Playing,
+        Some(playing(ids()[0], true, Some(decoded(185)), false)),
+    );
+    let wide = text(&v, &UiState::new(true), 100, 24);
+    let rows: Vec<&str> = wide.lines().collect();
+    let time = rows
+        .iter()
+        .position(|row| row.contains("▶ "))
+        .expect("time row");
+    assert!(
+        rows[time + 1].contains('[') && rows[time + 1].contains(']'),
+        "{wide}"
+    );
+    assert!(rows[time + 2].contains("VOL ━━━━━━━━──   80%"), "{wide}");
+    assert!(!wide.contains("vol 80%"), "{wide}");
+    // Too narrow for the slider beside the buttons: the border keeps it.
+    let narrow = text(&v, &UiState::new(true), 56, 24);
+    assert!(
+        narrow.contains("vol 80%") && !narrow.contains("VOL"),
+        "{narrow}"
+    );
+    assert!(narrow.contains("playing"), "{narrow}");
 }
 
 #[test]
@@ -348,7 +416,9 @@ fn a_live_entry_shows_live_and_listening_time_with_no_bar_or_duration() {
     // `progress_row` finds the bar row by its opening bracket, the very thing
     // a live row must not have. So the bar row is checked directly, by its
     // region, rather than through that helper.
-    let bar_row_y = regions(Rect::new(0, 0, 100, 30), Tier::Normal).progress.y;
+    let bar_row_y = regions(Rect::new(0, 0, 100, 30), Tier::Normal, 3)
+        .progress
+        .y;
     let bar_line = screen
         .lines()
         .nth(usize::from(bar_row_y))
@@ -466,7 +536,7 @@ fn a_prepared_cover_replaces_the_placeholder_in_the_cover_region() {
         ..Default::default()
     };
     let (buffer, _) = render(&v, &UiState::new(true), &visuals, 100, 30);
-    let expected = regions(Rect::new(0, 0, 100, 30), Tier::Normal).cover;
+    let expected = regions(Rect::new(0, 0, 100, 30), Tier::Normal, 3).cover;
     assert_eq!(probe.0.get(), expected);
     assert_eq!(expected.map(|r| (r.width, r.height)), Some((20, 10)));
     assert!(!screen(&buffer).contains('░'));
@@ -624,6 +694,49 @@ mod spectrum_display {
     }
 
     #[test]
+    fn a_peak_holds_then_falls_slower_than_its_bar() {
+        let t0 = Instant::now();
+        let np = now_playing();
+        let mut display = SpectrumDisplay::default();
+        display.update(
+            &source(PlaybackPhase::Playing, &np, Some(&frame(t0, 0.8))),
+            t0,
+        );
+        assert_eq!(display.peaks(), Some(&[0.8_f32, 0.8][..]));
+
+        // The bar drops at once; the peak stays where the bar reached.
+        let t1 = t0 + Duration::from_millis(100);
+        display.update(
+            &source(PlaybackPhase::Playing, &np, Some(&frame(t1, 0.2))),
+            t1,
+        );
+        assert_eq!(levels(&display), vec![0.2, 0.2]);
+        assert_eq!(display.peaks(), Some(&[0.8_f32, 0.8][..]));
+
+        // Past the hold it falls, still well above the bar.
+        let t2 = t0 + Duration::from_millis(800);
+        display.update(
+            &source(PlaybackPhase::Playing, &np, Some(&frame(t2, 0.2))),
+            t2,
+        );
+        let peak = display.peaks().unwrap()[0];
+        assert!(peak < 0.8 && peak > 0.2, "{peak}");
+
+        // It never sinks below its bar, and a louder bar lifts it again.
+        let t3 = t0 + Duration::from_secs(10);
+        display.update(
+            &source(PlaybackPhase::Playing, &np, Some(&frame(t3, 0.2))),
+            t3,
+        );
+        assert_eq!(display.peaks(), Some(&[0.2_f32, 0.2][..]));
+        display.update(
+            &source(PlaybackPhase::Playing, &np, Some(&frame(t3, 0.9))),
+            t3,
+        );
+        assert_eq!(display.peaks(), Some(&[0.9_f32, 0.9][..]));
+    }
+
+    #[test]
     fn a_frame_for_another_revision_or_token_decays() {
         let t0 = Instant::now();
         let np = now_playing();
@@ -670,8 +783,8 @@ mod spectrum_display {
 
     #[test]
     fn analysis_runs_only_while_the_row_exists_and_playback_is_playing() {
-        let normal = regions(Rect::new(0, 0, 100, 30), Tier::Normal).spectrum;
-        let minimal = regions(Rect::new(0, 0, 45, 16), Tier::Minimal).spectrum;
+        let normal = regions(Rect::new(0, 0, 100, 30), Tier::Normal, 3).spectrum;
+        let minimal = regions(Rect::new(0, 0, 45, 16), Tier::Minimal, 3).spectrum;
         assert!(wants_analysis(normal, PlaybackPhase::Playing));
         assert!(!wants_analysis(minimal, PlaybackPhase::Playing));
         for phase in [

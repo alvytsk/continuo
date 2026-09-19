@@ -48,7 +48,7 @@ Options:
 - `--artwork auto` asks the terminal which image protocol it supports and falls back to colored half-blocks after 250 ms without an answer. `blocks` always uses half-blocks. `off` never loads artwork and shows only the placeholder.
 - Under tmux, `auto` and `blocks` run `tmux set -p allow-passthrough on` for the current pane. `off` avoids that.
 
-The layout adapts to the terminal size. At 80 columns by 28 rows and above the player shows the cover, track information, spectrum, transport and progress above the queue. Below 80 columns or 28 rows it is compact. Below 50 columns or 18 rows it is minimal, with no cover and no spectrum. Below 30 columns or 8 rows it asks for a larger window, while space and `q` keep working. Either dimension alone drops a tier.
+The layout adapts to the terminal size. At 80 columns by 28 rows and above the player shows the cover with the track information, the spectrum and the time beside it, then progress and transport, above the queue. The spectrum takes the rows the information leaves, so it is taller when a track has only a title. Below 80 columns or 28 rows it is compact: a smaller cover beside the title, the artist, a spectrum of three or four rows and the time. Below 22 rows the compact player shrinks to a small cover and a one-row spectrum. Below 50 columns or 18 rows it is minimal, with no cover and no spectrum. Below 30 columns or 8 rows it asks for a larger window, while space and `q` keep working. Either dimension alone drops a tier.
 
 ### Keys
 

@@ -12,10 +12,15 @@ pub enum Tier {
     Resize,
     /// Title, state, progress, transport and the queue; no cover or spectrum.
     Minimal,
-    /// A smaller cover and a one-row spectrum; no secondary metadata.
+    /// The compact tier squeezed for a short terminal: a small cover, a
+    /// one-row spectrum, the time beside the bar; no secondary metadata.
+    Short,
+    /// The normal design scaled down: a smaller cover and at most two
+    /// information lines.
     Compact,
-    /// The full design: a cover beside a three-line information column and
-    /// the spectrum, the time under the information, the bar on its own row.
+    /// The full design: a cover beside one column of up to three information
+    /// lines, the spectrum in the rows they leave, and the time; the bar on
+    /// its own row.
     Normal,
 }
 
@@ -25,6 +30,8 @@ pub fn tier_for(width: u16, height: u16) -> Tier {
         Tier::Resize
     } else if width < 50 || height < 18 {
         Tier::Minimal
+    } else if height < 22 {
+        Tier::Short
     } else if width < 80 || height < 28 {
         Tier::Compact
     } else {
@@ -37,16 +44,17 @@ pub struct Regions {
     /// The brand and session flags. In the bordered tiers this is the inside
     /// of the player's top border; in the minimal tier a row of its own.
     pub status: Rect,
-    /// The whole player region: bordered in the normal and compact tiers.
+    /// The whole player region: bordered in every tier but the minimal one.
     pub player: Rect,
     pub cover: Option<Rect>,
-    /// The title row, plus the artist and album rows in the normal tier. In
-    /// the resize tier, the space for the too-small message.
+    /// The title row, plus as many of the artist and album rows as there are
+    /// to show: one more in the compact tier, two in the normal one. In the
+    /// resize tier, the space for the too-small message.
     pub info: Rect,
     pub spectrum: Option<Rect>,
     pub transport: Rect,
-    /// The position label: its own row in the normal tier, otherwise the
-    /// start of `progress`.
+    /// The position label: its own row in the normal and compact tiers,
+    /// otherwise the start of `progress`.
     pub time: Rect,
     /// The row the bar is drawn on; the label shares it when `time` is the
     /// same rectangle.
@@ -56,24 +64,24 @@ pub struct Regions {
     pub footer: Rect,
 }
 
-/// Border, air, the cover's rows, a blank row, the bar, the transport, air,
-/// border.
-const NORMAL_PLAYER_ROWS: u16 = 17;
+/// Border, air, the cover's rows, the bar, the transport, air, border.
+const NORMAL_PLAYER_ROWS: u16 = 16;
 /// Square at the usual 2:1 cell aspect.
 const NORMAL_COVER: (u16, u16) = (20, 10);
-/// The information column keeps at least this much, or a third of what
-/// is left after the cover, so a long title still reads on a wide terminal.
-const NORMAL_INFO_MIN: u16 = 30;
-/// Title, artist, album, a blank row, then the time.
-const NORMAL_TIME_ROW: u16 = 4;
-const COMPACT_PLAYER_ROWS: u16 = 6;
-const COMPACT_COVER: (u16, u16) = (8, 4);
-const COMPACT_SPECTRUM_ROWS: u16 = 1;
+/// Title, artist, album.
+const NORMAL_INFO_ROWS: u16 = 3;
+/// Six rows of cover beside the information, then the bar and the
+/// transport, inside the border.
+const COMPACT_PLAYER_ROWS: u16 = 10;
+const COMPACT_COVER: (u16, u16) = (12, 6);
+/// The title and the artist.
+const COMPACT_INFO_ROWS: u16 = 2;
+const SHORT_PLAYER_ROWS: u16 = 6;
+const SHORT_COVER: (u16, u16) = (8, 4);
+const SHORT_SPECTRUM_ROWS: u16 = 1;
 const MINIMAL_PLAYER_ROWS: u16 = 3;
 /// Between the cover and the information column.
 const COVER_GAP: u16 = 1;
-/// Between the information column and the spectrum.
-const SPECTRUM_GAP: u16 = 2;
 /// How far the status text sits inside the border row on each side.
 const STATUS_INSET: u16 = 2;
 /// The margin the bordered tiers keep from the terminal's edges.
@@ -81,7 +89,10 @@ const WINDOW_MARGIN: (u16, u16) = (2, 1);
 /// A column of air inside each border of a bordered tier's boxes.
 const AIR: u16 = 1;
 
-pub fn regions(area: Rect, tier: Tier) -> Regions {
+/// `info_lines` is how many information lines there are to show. Beside the
+/// cover the spectrum gets the rows they and the time leave, so it is taller
+/// for a track with a title alone. Nothing else depends on it.
+pub fn regions(area: Rect, tier: Tier, info_lines: u16) -> Regions {
     let mut rest = area;
     let none = Rect {
         width: 0,
@@ -124,16 +135,16 @@ pub fn regions(area: Rect, tier: Tier) -> Regions {
                 footer,
             }
         }
-        Tier::Compact => {
+        Tier::Short => {
             let mut rest = margin(area);
             let footer = take_bottom(&mut rest, 1);
-            let player = take_top(&mut rest, COMPACT_PLAYER_ROWS);
+            let player = take_top(&mut rest, SHORT_PLAYER_ROWS);
             let mut column = inset(player);
-            let mut cover = take_left(&mut column, COMPACT_COVER.0);
-            cover.height = cover.height.min(COMPACT_COVER.1);
+            let mut cover = take_left(&mut column, SHORT_COVER.0);
+            cover.height = cover.height.min(SHORT_COVER.1);
             take_left(&mut column, COVER_GAP);
             let info = take_top(&mut column, 1);
-            let spectrum = take_top(&mut column, COMPACT_SPECTRUM_ROWS);
+            let spectrum = take_top(&mut column, SHORT_SPECTRUM_ROWS);
             let transport = take_top(&mut column, 1);
             let progress = take_top(&mut column, 1);
             Regions {
@@ -144,6 +155,33 @@ pub fn regions(area: Rect, tier: Tier) -> Regions {
                 spectrum: Some(spectrum),
                 transport,
                 time: progress,
+                progress,
+                queue: rest,
+                footer,
+            }
+        }
+        Tier::Compact => {
+            let mut rest = margin(area);
+            let footer = take_bottom(&mut rest, 1);
+            let player = take_top(&mut rest, COMPACT_PLAYER_ROWS);
+            let mut column = inset(player);
+            take_left(&mut column, AIR);
+            take_right(&mut column, AIR);
+            let mut top = take_top(&mut column, COMPACT_COVER.1);
+            let cover = take_left(&mut top, COMPACT_COVER.0);
+            take_left(&mut top, COVER_GAP);
+            let info = take_top(&mut top, info_lines.clamp(1, COMPACT_INFO_ROWS));
+            let time = take_bottom(&mut top, 1);
+            let progress = take_top(&mut column, 1);
+            let transport = take_top(&mut column, 1);
+            Regions {
+                status: status_in_border(player),
+                player,
+                cover: Some(cover),
+                info,
+                spectrum: Some(top),
+                transport,
+                time,
                 progress,
                 queue: rest,
                 footer,
@@ -160,13 +198,10 @@ pub fn regions(area: Rect, tier: Tier) -> Regions {
             let mut top = take_top(&mut column, NORMAL_COVER.1);
             let cover = take_left(&mut top, NORMAL_COVER.0);
             take_left(&mut top, COVER_GAP);
-            let info_width = NORMAL_INFO_MIN.max(top.width / 3);
-            let info = take_left(&mut top, info_width);
-            take_left(&mut top, SPECTRUM_GAP);
-            take_top(&mut column, 1);
+            let info = take_top(&mut top, info_lines.clamp(1, NORMAL_INFO_ROWS));
+            let time = take_bottom(&mut top, 1);
             let progress = take_top(&mut column, 1);
             let transport = take_top(&mut column, 1);
-            let time = nth_row(info, NORMAL_TIME_ROW);
             Regions {
                 status: status_in_border(player),
                 player,
@@ -211,23 +246,6 @@ fn status_in_border(player: Rect) -> Rect {
         width: player.width - dx * 2,
         height: player.height.min(1),
         ..player
-    }
-}
-
-/// Row `n` of `area`, or an empty rectangle at `area` when it has no such row.
-fn nth_row(area: Rect, n: u16) -> Rect {
-    if n < area.height {
-        Rect {
-            y: area.y.saturating_add(n),
-            height: 1,
-            ..area
-        }
-    } else {
-        Rect {
-            width: 0,
-            height: 0,
-            ..area
-        }
     }
 }
 
@@ -325,29 +343,72 @@ mod tests {
     }
 
     #[test]
-    fn normal_and_compact_player_geometry() {
-        let normal = regions(Rect::new(0, 0, 100, 30), Tier::Normal);
+    fn the_spectrum_takes_the_rows_the_information_leaves() {
+        let area = Rect::new(0, 0, 100, 30);
+        let title_only = regions(area, Tier::Normal, 1);
+        assert_eq!(title_only.info, Rect::new(25, 3, 71, 1));
+        assert_eq!(title_only.spectrum, Some(Rect::new(25, 4, 71, 8)));
+        assert_eq!(title_only.time, Rect::new(25, 12, 71, 1));
+        // No lines is still the title row; more than the tier shows is its most.
+        assert_eq!(regions(area, Tier::Normal, 0), title_only);
+        assert_eq!(
+            regions(area, Tier::Normal, 9),
+            regions(area, Tier::Normal, 3)
+        );
+
+        let area = Rect::new(0, 0, 100, 24);
+        let compact = regions(area, Tier::Compact, 1);
+        assert_eq!(compact.info, Rect::new(17, 2, 79, 1));
+        assert_eq!(compact.spectrum, Some(Rect::new(17, 3, 79, 4)));
+        assert_eq!(compact.time, Rect::new(17, 7, 79, 1));
+        assert_eq!(
+            regions(area, Tier::Compact, 3),
+            regions(area, Tier::Compact, 2)
+        );
+        // The other tiers show one line whatever there is.
+        for (area, tier) in [
+            (Rect::new(0, 0, 100, 20), Tier::Short),
+            (Rect::new(0, 0, 45, 16), Tier::Minimal),
+        ] {
+            assert_eq!(regions(area, tier, 1), regions(area, tier, 3));
+        }
+    }
+
+    #[test]
+    fn normal_compact_and_short_player_geometry() {
+        let normal = regions(Rect::new(0, 0, 100, 30), Tier::Normal, 3);
         assert_eq!(normal.status, Rect::new(4, 1, 92, 1));
-        assert_eq!(normal.player, Rect::new(2, 1, 96, 17));
+        assert_eq!(normal.player, Rect::new(2, 1, 96, 16));
         assert_eq!(normal.cover, Some(Rect::new(4, 3, 20, 10)));
-        assert_eq!(normal.info, Rect::new(25, 3, 30, 10));
-        assert_eq!(normal.time, Rect::new(25, 7, 30, 1));
-        assert_eq!(normal.spectrum, Some(Rect::new(57, 3, 39, 10)));
-        assert_eq!(normal.progress, Rect::new(4, 14, 92, 1));
-        assert_eq!(normal.transport, Rect::new(4, 15, 92, 1));
-        assert_eq!(normal.queue, Rect::new(2, 18, 96, 10));
-        assert_eq!(queue_body(normal.queue), Rect::new(4, 19, 92, 8));
+        assert_eq!(normal.info, Rect::new(25, 3, 71, 3));
+        assert_eq!(normal.spectrum, Some(Rect::new(25, 6, 71, 6)));
+        assert_eq!(normal.time, Rect::new(25, 12, 71, 1));
+        assert_eq!(normal.progress, Rect::new(4, 13, 92, 1));
+        assert_eq!(normal.transport, Rect::new(4, 14, 92, 1));
+        assert_eq!(normal.queue, Rect::new(2, 17, 96, 11));
+        assert_eq!(queue_body(normal.queue), Rect::new(4, 18, 92, 9));
         assert_eq!(normal.footer, Rect::new(2, 28, 96, 1));
 
-        let compact = regions(Rect::new(0, 0, 100, 20), Tier::Compact);
+        let compact = regions(Rect::new(0, 0, 100, 24), Tier::Compact, 3);
         assert_eq!(compact.status, Rect::new(4, 1, 92, 1));
-        assert_eq!(compact.player, Rect::new(2, 1, 96, 6));
-        assert_eq!(compact.cover, Some(Rect::new(3, 2, 8, 4)));
-        assert_eq!(compact.spectrum.map(|r| r.height), Some(1));
-        assert_eq!(compact.progress.y, 5);
-        assert_eq!(compact.time, compact.progress);
+        assert_eq!(compact.player, Rect::new(2, 1, 96, 10));
+        assert_eq!(compact.cover, Some(Rect::new(4, 2, 12, 6)));
+        assert_eq!(compact.info, Rect::new(17, 2, 79, 2));
+        assert_eq!(compact.spectrum, Some(Rect::new(17, 4, 79, 3)));
+        assert_eq!(compact.time, Rect::new(17, 7, 79, 1));
+        assert_eq!(compact.progress, Rect::new(4, 8, 92, 1));
+        assert_eq!(compact.transport, Rect::new(4, 9, 92, 1));
+        assert_eq!(compact.queue, Rect::new(2, 11, 96, 11));
 
-        let minimal = regions(Rect::new(0, 0, 45, 16), Tier::Minimal);
+        let short = regions(Rect::new(0, 0, 100, 20), Tier::Short, 3);
+        assert_eq!(short.status, Rect::new(4, 1, 92, 1));
+        assert_eq!(short.player, Rect::new(2, 1, 96, 6));
+        assert_eq!(short.cover, Some(Rect::new(3, 2, 8, 4)));
+        assert_eq!(short.spectrum.map(|r| r.height), Some(1));
+        assert_eq!(short.progress.y, 5);
+        assert_eq!(short.time, short.progress);
+
+        let minimal = regions(Rect::new(0, 0, 45, 16), Tier::Minimal, 3);
         assert_eq!((minimal.cover, minimal.spectrum), (None, None));
         assert_eq!(
             (minimal.info.y, minimal.progress.y, minimal.transport.y),

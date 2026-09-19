@@ -27,6 +27,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reference refused.
 - Seek buttons in the transport row: `◀◀` and `▶▶` step ten seconds, as
   ← and → do.
+- Peak caps over the spectrum bars: each holds where its bar last reached,
+  then falls more slowly than the bar.
 
 ### Changed
 
@@ -34,6 +36,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Loading another track interrupts a stalled one immediately.
 - A live stream is no longer refused. A stream that interleaves ICY
   metadata and an HLS playlist still are, and the message now names HLS.
+- Beside the cover, the title, artist and album now run the full width
+  and the spectrum sits under them, in the rows they leave: taller for a
+  track with a title alone. A long title is no longer cut at a third of the
+  width, and the spectrum is no longer a narrow strip near 80 columns.
+- The compact layout is roomier: a larger cover beside the title, the
+  artist, a spectrum of three or four rows and the time, with the progress bar on its
+  own row and the volume slider where the width allows. A terminal under 22
+  rows keeps the previous small player.
 - The transport controls are filled buttons with solid glyphs, and the row
   holds still when play turns to pause.
 
@@ -41,6 +51,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - An MP3 with both an ID3v2 tag and an ID3v1 trailer showed the trailer's
   30-byte title and no cover. The ID3v2 title and cover now win.
+- The spectrum stopped short of the right edge at most window widths: the
+  columns its bars did not divide were left empty there, up to a third of
+  the row. The row now holds as many equal bars as fit, the extra ones
+  interpolated between neighbouring bands, and ends at the right edge in
+  line with the progress bar. The numbers under the bars count bars.
 
 ## [0.1.2] - 2026-09-17
 
